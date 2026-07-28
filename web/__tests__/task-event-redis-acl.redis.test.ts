@@ -38,6 +38,14 @@ const destructiveAdminUrl = adminUrl && destructive ? validateDestructiveRedisUr
 const enabled = Boolean(destructiveAdminUrl)
 const fingerprintKey = Buffer.alloc(32, 59)
 const legacyFixtureTaskId = randomUUID()
+const publisherRules = [
+  '~forge:task-events:v2:*:history', '~forge:task-events:v2:*:seq', '&forge:task-events:v2:*:live',
+  '+select', '+ping', '+info', '+client|setinfo', '+eval', '+incr', '+zadd', '+zcard', '+zremrangebyrank', '+publish',
+] as const
+const subscriberRules = [
+  '~forge:task-events:v2:*:history', '~forge:task-events:v2:*:seq', '&forge:task-events:v2:*:live',
+  '+select', '+ping', '+info', '+client|setinfo', '+get', '+zrangebyscore', '+subscribe', '+unsubscribe', '+psubscribe', '+punsubscribe',
+] as const
 
 function opaque(value: Buffer | null): string {
   return createHmac('sha256', fingerprintKey).update(value ?? Buffer.alloc(0)).digest('hex')
@@ -96,6 +104,51 @@ describe.skipIf(!enabled)('S4 real Redis ACL task-event proof', () => {
     ownedUsers.add(user)
   }
 
+  function aclTokens(value: unknown): readonly string[] {
+    if (typeof value === 'string') return value.trim().split(/\s+/).filter(Boolean)
+    if (Array.isArray(value) && value.every((entry) => typeof entry === 'string')) return value
+    throw new Error('S4 Redis ACL proof received an invalid non-secret ACL field shape.')
+  }
+
+  function aclFields(value: unknown): ReadonlyMap<string, unknown> {
+    if (!Array.isArray(value) || value.length % 2 !== 0) {
+      throw new Error('S4 Redis ACL proof could not verify the configured ACL identity.')
+    }
+    const fields = new Map<string, unknown>()
+    for (let index = 0; index < value.length; index += 2) {
+      if (typeof value[index] !== 'string') throw new Error('S4 Redis ACL proof could not verify the configured ACL identity.')
+      fields.set(value[index], value[index + 1])
+    }
+    return fields
+  }
+
+  async function assertAclIdentity(user: string, expected: Readonly<{ keys: readonly string[]; channels: readonly string[]; commands: readonly string[] }>): Promise<void> {
+    const result = await admin.call('ACL', 'GETUSER', user)
+    if (result === null) throw new Error('S4 Redis ACL proof could not find the configured ACL identity.')
+    const fields = aclFields(result)
+    const flags = aclTokens(fields.get('flags'))
+    const keys = aclTokens(fields.get('keys'))
+    const channels = aclTokens(fields.get('channels'))
+    const commands = aclTokens(fields.get('commands'))
+    if (!flags.includes('on') || !expected.keys.every((rule) => keys.includes(rule)) || !expected.channels.every((rule) => channels.includes(rule)) || !expected.commands.every((rule) => commands.includes(rule))) {
+      throw new Error('S4 Redis ACL proof found an inconsistent configured ACL identity.')
+    }
+  }
+
+  async function assertAclAbsent(user: string): Promise<void> {
+    if (await admin.call('ACL', 'GETUSER', user) !== null) {
+      throw new Error('S4 Redis ACL proof found a temporary ACL identity after cleanup.')
+    }
+  }
+
+  async function assertActiveClientUsers(users: readonly string[]): Promise<void> {
+    if (new Set(users).size !== users.length) throw new Error('S4 Redis ACL proof configured non-distinct ACL identities.')
+    const listing = await admin.client('LIST')
+    if (typeof listing !== 'string' || !users.every((user) => listing.includes(`user=${user}`))) {
+      throw new Error('S4 Redis ACL proof could not verify the active ACL client identities.')
+    }
+  }
+
   async function dumpFingerprint(key: string): Promise<Readonly<{ type: string; dump: string }>> {
     const [type, dumped] = await Promise.all([admin.type(key), admin.callBuffer('DUMP', key)])
     if (dumped !== null && !Buffer.isBuffer(dumped)) throw new Error('S4 Redis ACL proof requires binary DUMP replies.')
@@ -124,18 +177,16 @@ describe.skipIf(!enabled)('S4 real Redis ACL task-event proof', () => {
     subscriberUrl = authenticatedUrl(subscriberUser, subscriberPassword)
     legacyUrl = authenticatedUrl(legacyUser, legacyPassword)
 
-    await setUser(publisherUser, publisherPassword, [
-      '~forge:task-events:v2:*:history', '~forge:task-events:v2:*:seq', '&forge:task-events:v2:*:live',
-      '+select', '+ping', '+info', '+client|setinfo', '+eval', '+incr', '+zadd', '+zcard', '+zremrangebyrank', '+publish',
-    ])
-    await setUser(subscriberUser, subscriberPassword, [
-      '~forge:task-events:v2:*:history', '~forge:task-events:v2:*:seq', '&forge:task-events:v2:*:live',
-      '+select', '+ping', '+info', '+client|setinfo', '+get', '+zrangebyscore', '+subscribe', '+unsubscribe', '+psubscribe', '+punsubscribe',
-    ])
-    await setUser(legacyUser, legacyPassword, [
+    await setUser(publisherUser, publisherPassword, publisherRules)
+    await setUser(subscriberUser, subscriberPassword, subscriberRules)
+    const legacyRules = [
       `~forge:task:${legacyFixtureTaskId}:history`, `~forge:task:${legacyFixtureTaskId}:seq`,
       '+select', '+ping', '+info', '+client|setinfo', '+zadd', '+set',
-    ])
+    ] as const
+    await setUser(legacyUser, legacyPassword, legacyRules)
+    await assertAclIdentity(publisherUser, { keys: publisherRules.filter((rule) => rule.startsWith('~')), channels: publisherRules.filter((rule) => rule.startsWith('&')), commands: publisherRules.filter((rule) => rule.startsWith('+')) })
+    await assertAclIdentity(subscriberUser, { keys: subscriberRules.filter((rule) => rule.startsWith('~')), channels: subscriberRules.filter((rule) => rule.startsWith('&')), commands: subscriberRules.filter((rule) => rule.startsWith('+')) })
+    await assertAclIdentity(legacyUser, { keys: legacyRules.filter((rule) => rule.startsWith('~')), channels: [], commands: legacyRules.filter((rule) => rule.startsWith('+')) })
   })
 
   afterAll(async () => {
@@ -144,8 +195,7 @@ describe.skipIf(!enabled)('S4 real Redis ACL task-event proof', () => {
       for (const user of ownedUsers) await admin.call('ACL', 'DELUSER', user)
       if (ownedKeys.size > 0) await admin.del(...ownedKeys)
       expect(await admin.dbsize()).toBe(0)
-      const users = await admin.call('ACL', 'USERS') as string[]
-      for (const user of ownedUsers) expect(users).not.toContain(user)
+      for (const user of ownedUsers) await assertAclAbsent(user)
     } finally {
       admin?.disconnect()
     }
@@ -196,9 +246,7 @@ describe.skipIf(!enabled)('S4 real Redis ACL task-event proof', () => {
     expect(sequence).toBe('1')
     const publisherClient = (globalThis as { forgeTaskEventPublisherRedis?: Redis }).forgeTaskEventPublisherRedis
     if (publisherClient) clients.add(publisherClient)
-    const clientList = await admin.client('LIST')
-    expect(clientList).toContain(`user=${publisherUser}`)
-    expect(clientList).toContain(`user=${subscriberUser}`)
+    await assertActiveClientUsers([publisherUser, subscriberUser])
     console.info('S4_REDIS_ACL_ROLE_ISOLATION_OK')
   })
 
@@ -214,6 +262,7 @@ describe.skipIf(!enabled)('S4 real Redis ACL task-event proof', () => {
     const subscriber = client(subscriberUrl)
     const oldWriter = client(legacyUrl)
     await Promise.all([publisher.connect(), subscriber.connect(), oldWriter.connect()])
+    await assertActiveClientUsers([publisherUser, subscriberUser, legacyUser])
     await Promise.all([
       expectNoPerm(() => publisher.zrangebyscore(keys.history, 1, '+inf')),
       expectNoPerm(() => publisher.subscribe(keys.live)),
@@ -248,6 +297,7 @@ describe.skipIf(!enabled)('S4 real Redis ACL task-event proof', () => {
 
     const terminated = new Promise<boolean>((resolve) => oldWriter.once('end', () => resolve(true)))
     expect(await admin.call('ACL', 'DELUSER', legacyUser)).toBe(1)
+    await assertAclAbsent(legacyUser)
     const ended = await Promise.race([terminated, new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 1_000))])
     expect(ended).toBe(true)
     await expect(oldWriter.set(legacy.sequence, '1')).rejects.toThrow()
