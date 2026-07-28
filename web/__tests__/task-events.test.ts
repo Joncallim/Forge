@@ -12,6 +12,8 @@ const { mockEval, mockPublish, mockPublisherRedis, mockReadS4RuntimeModeV1 } = v
 })
 
 vi.mock('@/lib/task-event-redis', () => ({
+  LEGACY_TASK_EVENT_STORAGE_PATTERN: 'forge:task:*',
+  TASK_EVENT_V2_STORAGE_PATTERN: 'forge:task-events:v2:*',
   taskEventPublisherRedis: vi.fn(() => mockPublisherRedis),
   taskEventRedisConfiguration: vi.fn((runtimeMode: string) => ({
     dedicated: runtimeMode === 'protected',

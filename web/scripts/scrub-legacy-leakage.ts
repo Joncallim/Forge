@@ -4,9 +4,14 @@ import postgres from 'postgres'
 import { getRequiredEnv } from '../lib/env'
 import { ARCHITECT_PLAN_HEADER } from '../lib/mcps/architect-plan-entries'
 import {
+  LEGACY_TASK_EVENT_STORAGE_PATTERN,
+  TASK_EVENT_V2_STORAGE_PATTERN,
+  parseLegacyTaskEventStorageKey,
+  parseV2TaskEventStorageKey,
+  taskEventRedisKeys,
+} from '../lib/task-event-redis'
+import {
   LEGACY_LEAKAGE_SCRUB_CHECKPOINT_PREFIX,
-  LEGACY_TASK_EVENT_PATTERNS,
-  V2_TASK_EVENT_HISTORY_PATTERN,
   containsForbiddenV2EventData,
   legacyLeakageRowFingerprint,
   runLegacyLeakageScrub,
@@ -75,8 +80,8 @@ Database mutation inventory: task_logs; eligible, unversioned legacy Architect
 artifacts; work_packages; approval_gates; and the operation-scoped app_settings
 checkpoint key (${LEGACY_LEAKAGE_SCRUB_CHECKPOINT_PREFIX}<operation-id>).
 Redis is separate: apply/resume purge only legacy forge:task:*:history and
-forge:task:*:seq keys and scan (but never delete) v2
-forge:task-events:v2:*:history values. Protected Architect plan entries are
+forge:task:*:seq keys and exhaustively validate (but never delete) stored v2
+forge:task-events:v2:* keys. Protected Architect plan entries are
 never selected or updated.
 
 Environment:
@@ -559,12 +564,17 @@ async function scanKeys(
   let cursor = '0'
   let iterations = 0
   let keysExamined = 0
+  const seenNonterminalCursors = new Set<string>()
   do {
     const [next, keys] = await redis.scan(cursor, 'MATCH', pattern, 'COUNT', 250)
-    cursor = next
     iterations += 1
     keysExamined += keys.length
     if (keys.length > 0) await visit(keys)
+    if (next !== '0' && (next === cursor || seenNonterminalCursors.has(next))) {
+      return { complete: false, keysExamined }
+    }
+    if (next !== '0') seenNonterminalCursors.add(next)
+    cursor = next
     if (iterations >= MAX_REDIS_SCAN_ITERATIONS && cursor !== '0') {
       return { complete: false, keysExamined }
     }
@@ -572,89 +582,194 @@ async function scanKeys(
   return { complete: true, keysExamined }
 }
 
-async function countLegacyKeys(redis: Redis): Promise<{ complete: boolean; keysExamined: number }> {
-  let complete = true
-  let keysExamined = 0
-  for (const pattern of LEGACY_TASK_EVENT_PATTERNS) {
-    const evidence = await scanKeys(redis, pattern, async () => undefined)
-    complete &&= evidence.complete
-    keysExamined += evidence.keysExamined
+function emptyRedisEvidence(): RedisScanEvidence {
+  return {
+    complete: true,
+    keysExamined: 0,
+    keysDeleted: 0,
+    remainingKeys: 0,
+    valuesExamined: 0,
+    violations: 0,
   }
-  return { complete, keysExamined }
+}
+
+function addRedisEvidence(left: RedisScanEvidence, right: RedisScanEvidence): RedisScanEvidence {
+  return {
+    complete: left.complete && right.complete,
+    keysExamined: left.keysExamined + right.keysExamined,
+    keysDeleted: left.keysDeleted + right.keysDeleted,
+    remainingKeys: right.remainingKeys,
+    valuesExamined: left.valuesExamined + right.valuesExamined,
+    violations: left.violations + right.violations,
+  }
+}
+
+function canonicalSequence(value: unknown): number | null {
+  if (typeof value !== 'string' || !/^[1-9][0-9]*$/.test(value)) return null
+  const parsed = Number(value)
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+function validateStoredV2Envelope(
+  raw: string,
+  score: string,
+  taskId: string,
+  sentinels: readonly string[],
+): boolean {
+  const parsedScore = Number(score)
+  if (!Number.isSafeInteger(parsedScore) || parsedScore < 1) return false
+  try {
+    const envelope: unknown = JSON.parse(raw)
+    if (!isRecord(envelope)
+      || Object.keys(envelope).length !== 4
+      || envelope.schemaVersion !== 2
+      || !Number.isSafeInteger(envelope.id)
+      || envelope.id !== parsedScore
+      || typeof envelope.type !== 'string'
+      || !isRecord(envelope.data)) return false
+    // Current production envelopes do not carry taskId. If a future closed
+    // schema adds it, it must agree with the task identity encoded by the key.
+    if (Object.hasOwn(envelope.data, 'taskId') && envelope.data.taskId !== taskId) return false
+    return !containsForbiddenV2EventData({ type: envelope.type, data: envelope.data }, sentinels)
+  } catch {
+    return false
+  }
 }
 
 async function scanSortedSetValues(
   redis: Redis,
   key: string,
+  taskId: string,
   sentinels: readonly string[],
-): Promise<{ complete: boolean; valuesExamined: number; violations: number }> {
+): Promise<{ complete: boolean; valuesExamined: number; violations: number; maxSequence: number }> {
   let cursor = '0'
   let iterations = 0
   let valuesExamined = 0
   let violations = 0
+  let maxSequence = 0
+  const seenNonterminalCursors = new Set<string>()
   do {
     const [next, entries] = await redis.zscan(key, cursor, 'COUNT', 250)
-    cursor = next
     iterations += 1
+    if (entries.length % 2 !== 0) violations += 1
     for (let index = 0; index < entries.length; index += 2) {
+      if (index + 1 >= entries.length) break
       valuesExamined += 1
-      try {
-        if (containsForbiddenV2EventData(JSON.parse(entries[index]), sentinels)) violations += 1
-      } catch {
-        violations += 1
-      }
+      const parsedScore = Number(entries[index + 1])
+      if (Number.isSafeInteger(parsedScore) && parsedScore > maxSequence) maxSequence = parsedScore
+      if (!validateStoredV2Envelope(entries[index], entries[index + 1], taskId, sentinels)) violations += 1
     }
+    if (next !== '0' && (next === cursor || seenNonterminalCursors.has(next))) {
+      return { complete: false, valuesExamined, violations, maxSequence }
+    }
+    if (next !== '0') seenNonterminalCursors.add(next)
+    cursor = next
     if (iterations >= MAX_REDIS_SCAN_ITERATIONS && cursor !== '0') {
-      return { complete: false, valuesExamined, violations }
+      return { complete: false, valuesExamined, violations, maxSequence }
     }
   } while (cursor !== '0')
-  return { complete: true, valuesExamined, violations }
+  return { complete: true, valuesExamined, violations, maxSequence }
+}
+
+async function scanLegacyStorage(redis: Redis, apply: boolean): Promise<RedisScanEvidence> {
+  let evidence = emptyRedisEvidence()
+  let remainingKeys = 0
+  const scan = await scanKeys(redis, LEGACY_TASK_EVENT_STORAGE_PATTERN, async (keys) => {
+    const exactKeys: string[] = []
+    for (const key of keys) {
+      if (parseLegacyTaskEventStorageKey(key) === null) {
+        evidence = addRedisEvidence(evidence, { ...emptyRedisEvidence(), violations: 1 })
+      } else {
+        exactKeys.push(key)
+        if (!apply) remainingKeys += 1
+      }
+    }
+    if (apply && exactKeys.length > 0) {
+      const deleted = await redis.del(...exactKeys)
+      evidence = addRedisEvidence(evidence, { ...emptyRedisEvidence(), keysDeleted: deleted })
+    }
+  })
+  return {
+    ...evidence,
+    complete: evidence.complete && scan.complete,
+    keysExamined: evidence.keysExamined + scan.keysExamined,
+    remainingKeys,
+  }
+}
+
+async function scanV2Storage(redis: Redis, sentinels: readonly string[]): Promise<RedisScanEvidence> {
+  let evidence = emptyRedisEvidence()
+  // Validate each discovered key against its direct companion. This avoids an
+  // unbounded task-id map while still proving both sides of every pair.
+  const scan = await scanKeys(redis, TASK_EVENT_V2_STORAGE_PATTERN, async (keys) => {
+    for (const key of keys) {
+      const parsed = parseV2TaskEventStorageKey(key)
+      if (!parsed) {
+        evidence = addRedisEvidence(evidence, { ...emptyRedisEvidence(), violations: 1 })
+        continue
+      }
+      const type = await redis.type(key)
+      if ((parsed.kind === 'history' && type !== 'zset') || (parsed.kind === 'seq' && type !== 'string')) {
+        evidence = addRedisEvidence(evidence, { ...emptyRedisEvidence(), violations: 1 })
+        continue
+      }
+      const pair = taskEventRedisKeys(parsed.taskId)
+      if (parsed.kind === 'history') {
+        const values = await scanSortedSetValues(redis, key, parsed.taskId, sentinels)
+        const pairType = await redis.type(pair.sequence)
+        const sequence = pairType === 'string'
+          ? canonicalSequence(await redis.get(pair.sequence))
+          : null
+        evidence = addRedisEvidence(evidence, {
+          ...emptyRedisEvidence(),
+          complete: values.complete,
+          valuesExamined: values.valuesExamined,
+          violations: values.violations
+            + (pairType === 'string' && sequence !== null && sequence >= values.maxSequence ? 0 : 1),
+        })
+      } else {
+        const sequence = canonicalSequence(await redis.get(key))
+        const pairType = await redis.type(pair.history)
+        evidence = addRedisEvidence(evidence, {
+          ...emptyRedisEvidence(),
+          violations: sequence === null || pairType !== 'zset' ? 1 : 0,
+        })
+      }
+    }
+  })
+  return {
+    ...evidence,
+    complete: evidence.complete && scan.complete,
+    keysExamined: evidence.keysExamined + scan.keysExamined,
+  }
 }
 
 export function createLegacyLeakageRedisAdapter(redis: Redis): LegacyLeakageScrubRedis {
   return {
-    async purgeLegacyTaskEventKeys({ apply }): Promise<RedisScanEvidence> {
-      let complete = true
-      let keysExamined = 0
-      let keysDeleted = 0
-      for (const pattern of LEGACY_TASK_EVENT_PATTERNS) {
-        const evidence = await scanKeys(redis, pattern, async (keys) => {
-          if (!apply) return
-          keysDeleted += await redis.del(...keys)
-        })
-        complete &&= evidence.complete
-        keysExamined += evidence.keysExamined
+    async purgeLegacyTaskEventKeys({ apply, sentinels = [] }): Promise<RedisScanEvidence> {
+      const preflight = await scanLegacyStorage(redis, false)
+      if (!apply || !preflight.complete || preflight.violations > 0) {
+        return preflight
       }
-      const remaining = await countLegacyKeys(redis)
+      const v2Preflight = await scanV2Storage(redis, sentinels)
+      if (!v2Preflight.complete || v2Preflight.violations > 0) {
+        return addRedisEvidence(preflight, { ...v2Preflight, remainingKeys: preflight.remainingKeys })
+      }
+      const deleted = await scanLegacyStorage(redis, true)
+      const postLegacy = await scanLegacyStorage(redis, false)
+      const postV2 = await scanV2Storage(redis, sentinels)
       return {
-        complete: complete && remaining.complete,
-        keysExamined,
-        keysDeleted,
-        remainingKeys: remaining.keysExamined,
-        valuesExamined: 0,
-        violations: 0,
+        ...addRedisEvidence(addRedisEvidence(deleted, postLegacy), postV2),
+        remainingKeys: postLegacy.remainingKeys,
       }
     },
 
     async scanV2TaskEventHistory(sentinels): Promise<RedisScanEvidence> {
-      let valuesExamined = 0
-      let violations = 0
-      const keyScan = await scanKeys(redis, V2_TASK_EVENT_HISTORY_PATTERN, async (keys) => {
-        for (const key of keys) {
-          const evidence = await scanSortedSetValues(redis, key, sentinels)
-          valuesExamined += evidence.valuesExamined
-          violations += evidence.violations
-          if (!evidence.complete) violations += 1
-        }
-      })
-      return {
-        complete: keyScan.complete,
-        keysExamined: keyScan.keysExamined,
-        keysDeleted: 0,
-        remainingKeys: 0,
-        valuesExamined,
-        violations,
-      }
+      return scanV2Storage(redis, sentinels)
     },
   }
 }
