@@ -19,171 +19,293 @@ const ANSWERS_RETRY_QUEUE_KEY = 'forge:answers:retry'
 const ANSWERS_DEAD_QUEUE_KEY = 'forge:answers:dead'
 const ANSWERS_CLAIMS_KEY = 'forge:answers:claims'
 
+const QUEUE_ENVELOPE_SCHEMA_VERSION = 1
+const DEAD_LETTER_SCHEMA_VERSION = 1
+const DEAD_LETTER_FAILURE_CATEGORY = 'job_processing_failed'
+const STUCK_RECOVERY_SCAN_LIMIT = 100
+const TASK_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+const CLAIM_MARKER_PATTERN = /^([1-9][0-9]*):([0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/
+
 type RetryableJob = {
   attempt?: number
 }
 
-const TASK_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
-const DEAD_LETTER_FAILURE_CATEGORY = 'job_processing_failed'
-const STUCK_RECOVERY_SCAN_LIMIT = 100
+type QueueEnvelope<TJob> = {
+  schemaVersion: typeof QUEUE_ENVELOPE_SCHEMA_VERSION
+  occurrenceId: string
+  job: TJob
+}
 
-const CLAIM_JOB_SCRIPT = `
--- forge:queue:claim-v1
+export type QueueTransitionOutcome = 'applied' | 'already_applied'
+
+type QueueTransitionResult = QueueTransitionOutcome | 'stale_not_owner'
+
+type ClaimedQueueJob<TJob> = {
+  raw: string
+  occurrenceId: string
+  job: TJob
+}
+
+type TerminalIntent =
+  | { kind: 'ack' }
+  | { kind: 'dead_letter'; record: string }
+  | { kind: 'retry'; envelope: string; nextRetryAt: Date }
+
+type ActiveClaim = {
+  marker: string
+  occurrenceId: string
+  raw: string
+  intent?: TerminalIntent
+}
+
+const LUA_MARKER_HELPERS = `
+local claim_uuid_pattern = '^[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]%-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]%-[1-8][0-9a-f][0-9a-f][0-9a-f]%-[89ab][0-9a-f][0-9a-f][0-9a-f]%-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]$'
+local function redis_now_ms()
+  local now = redis.call('TIME')
+  return (tonumber(now[1]) * 1000) + math.floor(tonumber(now[2]) / 1000)
+end
+local function valid_uuid(value)
+  return type(value) == 'string' and string.match(value, claim_uuid_pattern) ~= nil
+end
+local function valid_marker(marker, now_ms)
+  if type(marker) ~= 'string' then
+    return false
+  end
+  local timestamp, nonce = string.match(marker, '^([1-9][0-9]*):([^:]+)$')
+  if not timestamp or not valid_uuid(nonce) then
+    return false
+  end
+  local numeric_timestamp = tonumber(timestamp)
+  if not numeric_timestamp
+      or numeric_timestamp < 1
+      or numeric_timestamp > 9007199254740991
+      or numeric_timestamp > now_ms then
+    return false
+  end
+  return true
+end
+`
+
+const LUA_TYPE_HELPER = `
 local function assert_type(key, expected)
   local actual = redis.call('TYPE', key)['ok']
   if actual ~= 'none' and actual ~= expected then
     error('forge_queue_type_mismatch')
   end
 end
+`
+
+const CLAIM_JOB_SCRIPT = `
+-- forge:queue:claim-v2
+${LUA_TYPE_HELPER}
+${LUA_MARKER_HELPERS}
 assert_type(KEYS[1], 'list')
 assert_type(KEYS[2], 'hash')
-if not redis.call('LPOS', KEYS[1], ARGV[1]) then
+if not valid_uuid(ARGV[3]) or not valid_uuid(ARGV[4]) then
+  error('forge_queue_claim_identity_invalid')
+end
+if redis.call('HEXISTS', KEYS[2], ARGV[3]) == 1 then
   return 0
 end
-if redis.call('HEXISTS', KEYS[2], ARGV[1]) == 1 then
-  return 0
+if ARGV[5] == 'legacy' then
+  if redis.call('LREM', KEYS[1], 1, ARGV[1]) ~= 1 then
+    return 0
+  end
+  redis.call('LPUSH', KEYS[1], ARGV[2])
+elseif ARGV[5] == 'envelope' then
+  if not redis.call('LPOS', KEYS[1], ARGV[2]) then
+    return 0
+  end
+else
+  error('forge_queue_claim_mode_invalid')
 end
-local now = redis.call('TIME')
-local claimed_at = (tonumber(now[1]) * 1000) + math.floor(tonumber(now[2]) / 1000)
-local marker = tostring(claimed_at) .. ':' .. ARGV[2]
-redis.call('HSET', KEYS[2], ARGV[1], marker)
+local marker = tostring(redis_now_ms()) .. ':' .. ARGV[4]
+redis.call('HSET', KEYS[2], ARGV[3], marker)
 return marker
 `
 
 const ACK_JOB_SCRIPT = `
--- forge:queue:ack-v1
-local function assert_type(key, expected)
-  local actual = redis.call('TYPE', key)['ok']
-  if actual ~= 'none' and actual ~= expected then
-    error('forge_queue_type_mismatch')
-  end
-end
+-- forge:queue:ack-v2
+${LUA_TYPE_HELPER}
+${LUA_MARKER_HELPERS}
 assert_type(KEYS[1], 'list')
 assert_type(KEYS[2], 'hash')
-if redis.call('HGET', KEYS[2], ARGV[1]) ~= ARGV[2] then
-  return 0
+local now_ms = redis_now_ms()
+local current_marker = redis.call('HGET', KEYS[2], ARGV[2])
+if current_marker and not valid_marker(current_marker, now_ms) then
+  error('forge_queue_claim_marker_invalid')
 end
-if redis.call('LREM', KEYS[1], 1, ARGV[1]) ~= 1 then
-  return 0
+if not valid_marker(ARGV[3], now_ms) then
+  error('forge_queue_claim_marker_invalid')
 end
-redis.call('HDEL', KEYS[2], ARGV[1])
-return 1
+if redis.call('LPOS', KEYS[1], ARGV[1]) then
+  if current_marker ~= ARGV[3] then
+    return 0
+  end
+  if redis.call('LREM', KEYS[1], 1, ARGV[1]) ~= 1 then
+    return 0
+  end
+  redis.call('HDEL', KEYS[2], ARGV[2])
+  return 1
+end
+if not current_marker then
+  return 2
+end
+return 0
 `
 
 const DISCARD_INVALID_JOB_SCRIPT = `
--- forge:queue:discard-invalid-v1
-local function assert_type(key, expected)
-  local actual = redis.call('TYPE', key)['ok']
-  if actual ~= 'none' and actual ~= expected then
-    error('forge_queue_type_mismatch')
-  end
-end
+-- forge:queue:discard-invalid-v2
+${LUA_TYPE_HELPER}
 assert_type(KEYS[1], 'list')
-assert_type(KEYS[2], 'hash')
-if redis.call('LREM', KEYS[1], 1, ARGV[1]) ~= 1 then
-  return 0
+if redis.call('LREM', KEYS[1], 1, ARGV[1]) == 1 then
+  return 1
 end
-redis.call('HDEL', KEYS[2], ARGV[1])
-return 1
+return 2
 `
 
 const RETRY_JOB_SCRIPT = `
--- forge:queue:retry-v1
-local function assert_type(key, expected)
-  local actual = redis.call('TYPE', key)['ok']
-  if actual ~= 'none' and actual ~= expected then
-    error('forge_queue_type_mismatch')
-  end
-end
+-- forge:queue:retry-v2
+${LUA_TYPE_HELPER}
+${LUA_MARKER_HELPERS}
 assert_type(KEYS[1], 'list')
 assert_type(KEYS[2], 'hash')
 assert_type(KEYS[3], 'zset')
-if redis.call('HGET', KEYS[2], ARGV[1]) ~= ARGV[2] then
-  return 0
+local now_ms = redis_now_ms()
+local current_marker = redis.call('HGET', KEYS[2], ARGV[2])
+if current_marker and not valid_marker(current_marker, now_ms) then
+  error('forge_queue_claim_marker_invalid')
 end
-if redis.call('LREM', KEYS[1], 1, ARGV[1]) ~= 1 then
-  return 0
+if not valid_marker(ARGV[3], now_ms) then
+  error('forge_queue_claim_marker_invalid')
 end
-redis.call('HDEL', KEYS[2], ARGV[1])
-redis.call('ZADD', KEYS[3], ARGV[3], ARGV[4])
-return 1
+if redis.call('LPOS', KEYS[1], ARGV[1]) then
+  if current_marker ~= ARGV[3] then
+    return 0
+  end
+  if redis.call('LREM', KEYS[1], 1, ARGV[1]) ~= 1 then
+    return 0
+  end
+  redis.call('HDEL', KEYS[2], ARGV[2])
+  redis.call('ZADD', KEYS[3], ARGV[4], ARGV[5])
+  return 1
+end
+if not current_marker and redis.call('ZSCORE', KEYS[3], ARGV[5]) then
+  return 2
+end
+return 0
 `
 
 const DEAD_LETTER_JOB_SCRIPT = `
--- forge:queue:dead-letter-v1
-local function assert_type(key, expected)
-  local actual = redis.call('TYPE', key)['ok']
-  if actual ~= 'none' and actual ~= expected then
-    error('forge_queue_type_mismatch')
-  end
-end
+-- forge:queue:dead-letter-v2
+${LUA_TYPE_HELPER}
+${LUA_MARKER_HELPERS}
 assert_type(KEYS[1], 'list')
 assert_type(KEYS[2], 'hash')
 assert_type(KEYS[3], 'list')
-if redis.call('HGET', KEYS[2], ARGV[1]) ~= ARGV[2] then
-  return 0
+local now_ms = redis_now_ms()
+local current_marker = redis.call('HGET', KEYS[2], ARGV[2])
+if current_marker and not valid_marker(current_marker, now_ms) then
+  error('forge_queue_claim_marker_invalid')
 end
-if redis.call('LREM', KEYS[1], 1, ARGV[1]) ~= 1 then
-  return 0
+if not valid_marker(ARGV[3], now_ms) then
+  error('forge_queue_claim_marker_invalid')
 end
-redis.call('HDEL', KEYS[2], ARGV[1])
-redis.call('LPUSH', KEYS[3], ARGV[3])
-return 1
+if redis.call('LPOS', KEYS[1], ARGV[1]) then
+  if current_marker ~= ARGV[3] then
+    return 0
+  end
+  if redis.call('LREM', KEYS[1], 1, ARGV[1]) ~= 1 then
+    return 0
+  end
+  redis.call('HDEL', KEYS[2], ARGV[2])
+  redis.call('LPUSH', KEYS[3], ARGV[4])
+  return 1
+end
+if not current_marker and redis.call('LPOS', KEYS[3], ARGV[4]) then
+  return 2
+end
+return 0
 `
 
 const PROMOTE_RETRY_SCRIPT = `
--- forge:queue:promote-retry-v1
-local function assert_type(key, expected)
-  local actual = redis.call('TYPE', key)['ok']
-  if actual ~= 'none' and actual ~= expected then
-    error('forge_queue_type_mismatch')
-  end
-end
+-- forge:queue:promote-retry-v2
+${LUA_TYPE_HELPER}
 assert_type(KEYS[1], 'zset')
 assert_type(KEYS[2], 'list')
-if redis.call('ZREM', KEYS[1], ARGV[1]) ~= 1 then
-  return 0
-end
-if not redis.call('LPOS', KEYS[2], ARGV[1]) then
+if redis.call('ZREM', KEYS[1], ARGV[1]) == 1 then
   redis.call('LPUSH', KEYS[2], ARGV[1])
+  return 1
 end
-return 1
+if redis.call('LPOS', KEYS[2], ARGV[1]) then
+  return 2
+end
+return 0
 `
 
 const RECOVER_STUCK_JOB_SCRIPT = `
--- forge:queue:recover-stuck-v1
-local function assert_type(key, expected)
-  local actual = redis.call('TYPE', key)['ok']
-  if actual ~= 'none' and actual ~= expected then
-    error('forge_queue_type_mismatch')
-  end
-end
+-- forge:queue:recover-stuck-v2
+${LUA_TYPE_HELPER}
+${LUA_MARKER_HELPERS}
 assert_type(KEYS[1], 'list')
 assert_type(KEYS[2], 'hash')
 assert_type(KEYS[3], 'list')
 if not redis.call('LPOS', KEYS[1], ARGV[1]) then
-  return 0
+  return 2
 end
-local now = redis.call('TIME')
-local now_ms = (tonumber(now[1]) * 1000) + math.floor(tonumber(now[2]) / 1000)
-local claimed_marker = redis.call('HGET', KEYS[2], ARGV[1])
-local claimed_at = nil
-if claimed_marker then
-  claimed_at = tonumber(string.match(claimed_marker, '^(%d+):'))
-  if not claimed_at then
+local now_ms = redis_now_ms()
+local current_marker = redis.call('HGET', KEYS[2], ARGV[2])
+if current_marker then
+  if not valid_marker(current_marker, now_ms) then
     error('forge_queue_claim_marker_invalid')
   end
-end
-if claimed_at and claimed_at > 0 and (now_ms - claimed_at) < tonumber(ARGV[2]) then
-  return 0
+  local timestamp = tonumber(string.match(current_marker, '^([1-9][0-9]*):'))
+  if (now_ms - timestamp) < tonumber(ARGV[3]) then
+    if redis.call('LREM', KEYS[1], 1, ARGV[1]) ~= 1 then
+      return 2
+    end
+    redis.call('RPUSH', KEYS[1], ARGV[1])
+    return 3
+  end
 end
 if redis.call('LREM', KEYS[1], 1, ARGV[1]) ~= 1 then
-  return 0
+  return 2
+end
+redis.call('HDEL', KEYS[2], ARGV[2])
+redis.call('LPUSH', KEYS[3], ARGV[1])
+return 1
+`
+
+const RECOVER_LEGACY_JOB_SCRIPT = `
+-- forge:queue:recover-legacy-v2
+${LUA_TYPE_HELPER}
+${LUA_MARKER_HELPERS}
+assert_type(KEYS[1], 'list')
+assert_type(KEYS[2], 'hash')
+assert_type(KEYS[3], 'list')
+if not redis.call('LPOS', KEYS[1], ARGV[1]) then
+  return 2
+end
+local now_ms = redis_now_ms()
+local current_marker = redis.call('HGET', KEYS[2], ARGV[1])
+if current_marker then
+  if not valid_marker(current_marker, now_ms) then
+    error('forge_queue_claim_marker_invalid')
+  end
+  local timestamp = tonumber(string.match(current_marker, '^([1-9][0-9]*):'))
+  if (now_ms - timestamp) < tonumber(ARGV[3]) then
+    if redis.call('LREM', KEYS[1], 1, ARGV[1]) ~= 1 then
+      return 2
+    end
+    redis.call('RPUSH', KEYS[1], ARGV[1])
+    return 3
+  end
+end
+if redis.call('LREM', KEYS[1], 1, ARGV[1]) ~= 1 then
+  return 2
 end
 redis.call('HDEL', KEYS[2], ARGV[1])
-if not redis.call('LPOS', KEYS[3], ARGV[1]) then
-  redis.call('LPUSH', KEYS[3], ARGV[1])
-end
+redis.call('LPUSH', KEYS[3], ARGV[2])
 return 1
 `
 
@@ -192,10 +314,7 @@ export interface TaskJob {
   attempt: number
 }
 
-export interface ClaimedTaskJob {
-  raw: string
-  job: TaskJob
-}
+export type ClaimedTaskJob = ClaimedQueueJob<TaskJob>
 
 export interface ApprovalJob {
   taskId: string
@@ -203,24 +322,51 @@ export interface ApprovalJob {
   attempt: number
 }
 
-export interface ClaimedApprovalJob {
-  raw: string
-  job: ApprovalJob
-}
+export type ClaimedApprovalJob = ClaimedQueueJob<ApprovalJob>
 
 export interface AnswersJob {
   taskId: string
   attempt: number
 }
 
-export interface ClaimedAnswersJob {
-  raw: string
-  job: AnswersJob
+export type ClaimedAnswersJob = ClaimedQueueJob<AnswersJob>
+
+function canonicalEnvelope<TJob>(occurrenceId: string, job: TJob): string {
+  return JSON.stringify({
+    schemaVersion: QUEUE_ENVELOPE_SCHEMA_VERSION,
+    occurrenceId,
+    job,
+  } satisfies QueueEnvelope<TJob>)
+}
+
+function normalizeOccurrenceId(value: unknown): string {
+  if (typeof value !== 'string' || !TASK_ID_PATTERN.test(value)) {
+    throw new Error('queue occurrence must be a canonical UUID')
+  }
+  return value
+}
+
+function parseClosedObject(raw: string): Record<string, unknown> {
+  if (scanJsonObjectKeys(raw) !== 'valid') {
+    throw new Error('queue payload is not closed JSON')
+  }
+  const parsed = JSON.parse(raw) as unknown
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('queue payload must be an object')
+  }
+  return parsed as Record<string, unknown>
+}
+
+function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  const actual = Object.keys(value).sort()
+  const expected = [...keys].sort()
+  return actual.length === expected.length
+    && actual.every((key, index) => key === expected[index])
 }
 
 abstract class RedisListQueue<TJob extends RetryableJob> {
   protected readonly client: Redis
-  private readonly activeClaimMarkers = new Map<string, string>()
+  private readonly activeClaims = new Map<string, ActiveClaim>()
 
   constructor(
     private readonly queueKey: string,
@@ -241,31 +387,99 @@ abstract class RedisListQueue<TJob extends RetryableJob> {
 
   protected abstract parse(raw: string): TJob
 
-  private async transition(
+  private parseEnvelope(raw: string): QueueEnvelope<TJob> {
+    const value = parseClosedObject(raw)
+    if (!hasExactKeys(value, ['schemaVersion', 'occurrenceId', 'job'])
+      || value.schemaVersion !== QUEUE_ENVELOPE_SCHEMA_VERSION) {
+      throw new Error('queue occurrence envelope is not closed')
+    }
+    const occurrenceId = normalizeOccurrenceId(value.occurrenceId)
+    const job = this.parse(JSON.stringify(value.job))
+    if (canonicalEnvelope(occurrenceId, job) !== raw) {
+      throw new Error('queue occurrence envelope is not canonical')
+    }
+    return { schemaVersion: QUEUE_ENVELOPE_SCHEMA_VERSION, occurrenceId, job }
+  }
+
+  private parseClaimCandidate(raw: string): {
+    envelope: QueueEnvelope<TJob>
+    envelopeRaw: string
+    mode: 'envelope' | 'legacy'
+  } {
+    try {
+      const envelope = this.parseEnvelope(raw)
+      return { envelope, envelopeRaw: raw, mode: 'envelope' }
+    } catch {
+      const job = this.parse(raw)
+      const occurrenceId = randomUUID()
+      const envelope = {
+        schemaVersion: QUEUE_ENVELOPE_SCHEMA_VERSION,
+        occurrenceId,
+        job,
+      } satisfies QueueEnvelope<TJob>
+      return { envelope, envelopeRaw: canonicalEnvelope(occurrenceId, job), mode: 'legacy' }
+    }
+  }
+
+  private async evalClosed(
+    failureMessage: string,
     script: string,
     keys: readonly string[],
     args: readonly string[],
-  ): Promise<boolean> {
-    const result = await this.client.call('EVAL', script, keys.length, ...keys, ...args)
-    if (result === 0) return false
-    if (result === 1) return true
+  ): Promise<unknown> {
+    try {
+      return await this.client.call('EVAL', script, keys.length, ...keys, ...args)
+    } catch {
+      throw new Error(failureMessage)
+    }
+  }
+
+  private decodeTransition(result: unknown): QueueTransitionResult {
+    if (result === 1) return 'applied'
+    if (result === 2) return 'already_applied'
+    if (result === 0) return 'stale_not_owner'
     throw new Error('Queue transition returned an invalid result')
+  }
+
+  private activeClaim(raw: string): ActiveClaim {
+    let envelope: QueueEnvelope<TJob>
+    try {
+      envelope = this.parseEnvelope(raw)
+    } catch {
+      throw new Error('Queue transition ownership mismatch')
+    }
+    const active = this.activeClaims.get(envelope.occurrenceId)
+    if (!active || active.raw !== raw) {
+      throw new Error('Queue transition ownership mismatch')
+    }
+    return active
+  }
+
+  private intent(active: ActiveClaim, create: () => TerminalIntent): TerminalIntent {
+    active.intent ??= create()
+    return active.intent
   }
 
   private async transitionClaimed(
     script: string,
-    raw: string,
+    active: ActiveClaim,
     keys: readonly string[],
-    args: readonly string[] = [],
-  ): Promise<boolean> {
-    const marker = this.activeClaimMarkers.get(raw)
-    if (marker === undefined) return false
-    const transitioned = await this.transition(script, keys, [raw, marker, ...args])
-    this.activeClaimMarkers.delete(raw)
-    return transitioned
+    args: readonly string[],
+  ): Promise<QueueTransitionOutcome> {
+    const result = this.decodeTransition(await this.evalClosed(
+      'Queue transition failed',
+      script,
+      keys,
+      [active.raw, active.occurrenceId, active.marker, ...args],
+    ))
+    if (result === 'stale_not_owner') {
+      throw new Error('Queue transition stale_not_owner')
+    }
+    this.activeClaims.delete(active.occurrenceId)
+    return result
   }
 
-  async claim(timeoutSeconds: number): Promise<{ raw: string; job: TJob } | null> {
+  async claim(timeoutSeconds: number): Promise<ClaimedQueueJob<TJob> | null> {
     const raw = await this.client.brpoplpush(
       this.queueKey,
       this.processingQueueKey,
@@ -273,13 +487,14 @@ abstract class RedisListQueue<TJob extends RetryableJob> {
     )
     if (raw === null) return null
 
-    let job: TJob
+    let candidate: ReturnType<RedisListQueue<TJob>['parseClaimCandidate']>
     try {
-      job = this.parse(raw)
+      candidate = this.parseClaimCandidate(raw)
     } catch {
-      await this.transition(
+      await this.evalClosed(
+        'Queue invalid-job discard failed',
         DISCARD_INVALID_JOB_SCRIPT,
-        [this.processingQueueKey, this.claimsKey],
+        [this.processingQueueKey],
         [raw],
       )
       console.warn('[worker/queue] Dropped invalid job payload')
@@ -287,67 +502,125 @@ abstract class RedisListQueue<TJob extends RetryableJob> {
     }
 
     const claimNonce = randomUUID()
-    const marker = await this.client.call(
-      'EVAL',
+    const marker = await this.evalClosed(
+      'Queue claim transition failed',
       CLAIM_JOB_SCRIPT,
-      2,
-      this.processingQueueKey,
-      this.claimsKey,
-      raw,
-      claimNonce,
+      [this.processingQueueKey, this.claimsKey],
+      [
+        raw,
+        candidate.envelopeRaw,
+        candidate.envelope.occurrenceId,
+        claimNonce,
+        candidate.mode,
+      ],
     )
     if (marker === 0) {
       throw new Error('Queue claim is no longer available')
     }
-    if (typeof marker !== 'string' || !marker.endsWith(`:${claimNonce}`)) {
+    const markerMatch = typeof marker === 'string' ? CLAIM_MARKER_PATTERN.exec(marker) : null
+    if (!markerMatch
+      || !Number.isSafeInteger(Number(markerMatch[1]))
+      || Number(markerMatch[1]) < 1
+      || markerMatch[2] !== claimNonce) {
       throw new Error('Queue claim returned an invalid marker')
     }
-    this.activeClaimMarkers.set(raw, marker)
-    return { raw, job }
+    const validatedMarker = marker as string
+    this.activeClaims.set(candidate.envelope.occurrenceId, {
+      marker: validatedMarker,
+      occurrenceId: candidate.envelope.occurrenceId,
+      raw: candidate.envelopeRaw,
+    })
+    return {
+      raw: candidate.envelopeRaw,
+      occurrenceId: candidate.envelope.occurrenceId,
+      job: candidate.envelope.job,
+    }
   }
 
-  async ack(raw: string): Promise<void> {
-    await this.transitionClaimed(
+  async ack(raw: string): Promise<QueueTransitionOutcome> {
+    const active = this.activeClaim(raw)
+    const intent = this.intent(active, () => ({ kind: 'ack' }))
+    if (intent.kind !== 'ack') {
+      throw new Error('Queue transition ownership mismatch')
+    }
+    return this.transitionClaimed(
       ACK_JOB_SCRIPT,
-      raw,
+      active,
       [this.processingQueueKey, this.claimsKey],
+      [],
     )
   }
 
-  async retry(raw: string, job: TJob, delayMs: number): Promise<Date> {
+  async retry(
+    raw: string,
+    job: TJob,
+    delayMs: number,
+  ): Promise<{ nextRetryAt: Date; outcome: QueueTransitionOutcome }> {
+    if (!Number.isSafeInteger(delayMs) || delayMs < 0) {
+      throw new Error('Queue retry delay must be a non-negative safe integer')
+    }
+    const active = this.activeClaim(raw)
+    const current = this.parseEnvelope(raw)
     const canonicalJob = this.parse(JSON.stringify(job))
-    const nextAttempt = (canonicalJob.attempt ?? 1) + 1
-    const nextJob = this.parse(JSON.stringify({
-      ...canonicalJob,
-      attempt: nextAttempt,
-    }))
-    const nextRetryAt = new Date(Date.now() + delayMs)
-
-    await this.transitionClaimed(
+    if (JSON.stringify(canonicalJob) !== JSON.stringify(current.job)) {
+      throw new Error('Queue transition ownership mismatch')
+    }
+    const intent = this.intent(active, () => {
+      const nextJob = this.parse(JSON.stringify({
+        ...canonicalJob,
+        attempt: (canonicalJob.attempt ?? 1) + 1,
+      }))
+      const nextRetryAt = new Date(Date.now() + delayMs)
+      return {
+        kind: 'retry',
+        envelope: canonicalEnvelope(active.occurrenceId, nextJob),
+        nextRetryAt,
+      }
+    })
+    if (intent.kind !== 'retry') {
+      throw new Error('Queue transition ownership mismatch')
+    }
+    const outcome = await this.transitionClaimed(
       RETRY_JOB_SCRIPT,
-      raw,
+      active,
       [this.processingQueueKey, this.claimsKey, this.retryQueueKey],
-      [String(nextRetryAt.getTime()), JSON.stringify(nextJob)],
+      [String(intent.nextRetryAt.getTime()), intent.envelope],
     )
-
-    return nextRetryAt
+    return { nextRetryAt: intent.nextRetryAt, outcome }
   }
 
-  async deadLetter(raw: string, job: TJob): Promise<void> {
+  async deadLetter(raw: string, job: TJob): Promise<QueueTransitionOutcome> {
+    const active = this.activeClaim(raw)
+    const current = this.parseEnvelope(raw)
     const canonicalJob = this.parse(JSON.stringify(job))
-    await this.transitionClaimed(
-      DEAD_LETTER_JOB_SCRIPT,
-      raw,
-      [this.processingQueueKey, this.claimsKey, this.deadQueueKey],
-      [JSON.stringify({
+    if (JSON.stringify(canonicalJob) !== JSON.stringify(current.job)) {
+      throw new Error('Queue transition ownership mismatch')
+    }
+    const intent = this.intent(active, () => ({
+      kind: 'dead_letter',
+      record: JSON.stringify({
+        schemaVersion: DEAD_LETTER_SCHEMA_VERSION,
+        occurrenceId: active.occurrenceId,
         job: canonicalJob,
         failureCategory: DEAD_LETTER_FAILURE_CATEGORY,
         deadLetteredAt: new Date().toISOString(),
-      })],
+      }),
+    }))
+    if (intent.kind !== 'dead_letter') {
+      throw new Error('Queue transition ownership mismatch')
+    }
+    return this.transitionClaimed(
+      DEAD_LETTER_JOB_SCRIPT,
+      active,
+      [this.processingQueueKey, this.claimsKey, this.deadQueueKey],
+      [intent.record],
     )
   }
 
   async promoteDueRetries(limit = 20): Promise<number> {
+    if (!Number.isSafeInteger(limit) || limit < 1) {
+      throw new Error('Queue promotion limit must be a positive safe integer')
+    }
     const due = await this.client.zrangebyscore(
       this.retryQueueKey,
       0,
@@ -359,37 +632,84 @@ abstract class RedisListQueue<TJob extends RetryableJob> {
 
     let promoted = 0
     for (const raw of due) {
-      const transitioned = await this.transition(
+      try {
+        this.parseEnvelope(raw)
+      } catch {
+        throw new Error('Queue retry occurrence is invalid')
+      }
+      const result = this.decodeTransition(await this.evalClosed(
+        'Queue retry promotion failed',
         PROMOTE_RETRY_SCRIPT,
         [this.retryQueueKey, this.queueKey],
         [raw],
-      )
-      if (transitioned) promoted += 1
+      ))
+      if (result === 'stale_not_owner') {
+        throw new Error('Queue retry promotion ownership mismatch')
+      }
+      if (result === 'applied') promoted += 1
     }
 
     return promoted
   }
 
-  async recoverStuckJobs(staleMs: number): Promise<number> {
+  async recoverStuckJobs(
+    staleMs: number,
+    options: { drain?: boolean } = {},
+  ): Promise<number> {
     if (!Number.isSafeInteger(staleMs) || staleMs < 0) {
       throw new Error('Queue stale interval must be a non-negative safe integer')
     }
-    const processing = await this.client.lrange(
-      this.processingQueueKey,
-      0,
-      STUCK_RECOVERY_SCAN_LIMIT - 1,
-    )
+    const initialLength = await this.client.llen(this.processingQueueKey)
+    const pageCount = options.drain
+      ? Math.ceil(initialLength / STUCK_RECOVERY_SCAN_LIMIT)
+      : Math.min(initialLength, 1)
+    let remaining = initialLength
     let recovered = 0
 
-    for (const raw of processing) {
-      const transitioned = await this.transition(
-        RECOVER_STUCK_JOB_SCRIPT,
-        [this.processingQueueKey, this.claimsKey, this.queueKey],
-        [raw, String(staleMs)],
-      )
-      if (transitioned) {
-        this.activeClaimMarkers.delete(raw)
-        recovered += 1
+    for (let page = 0; page < pageCount; page += 1) {
+      const pageSize = Math.min(remaining, STUCK_RECOVERY_SCAN_LIMIT)
+      if (pageSize < 1) break
+      const processing = await this.client.lrange(this.processingQueueKey, 0, pageSize - 1)
+      remaining -= processing.length
+
+      for (const raw of processing) {
+        let envelope: QueueEnvelope<TJob>
+        try {
+          envelope = this.parseEnvelope(raw)
+        } catch {
+          let job: TJob
+          try {
+            job = this.parse(raw)
+          } catch {
+            throw new Error('Queue recovery found an invalid occurrence envelope')
+          }
+          const occurrenceId = randomUUID()
+          const legacyResult = await this.evalClosed(
+            'Queue legacy occurrence recovery failed',
+            RECOVER_LEGACY_JOB_SCRIPT,
+            [this.processingQueueKey, this.claimsKey, this.queueKey],
+            [raw, canonicalEnvelope(occurrenceId, job), String(staleMs)],
+          )
+          if (legacyResult !== 1 && legacyResult !== 2 && legacyResult !== 3) {
+            throw new Error('Queue legacy occurrence recovery returned an invalid result')
+          }
+          if (legacyResult === 1) recovered += 1
+          continue
+        }
+
+        const rawResult = await this.evalClosed(
+          'Queue recovery found an invalid claim marker',
+          RECOVER_STUCK_JOB_SCRIPT,
+          [this.processingQueueKey, this.claimsKey, this.queueKey],
+          [raw, envelope.occurrenceId, String(staleMs)],
+        )
+        if (rawResult !== 1 && rawResult !== 2 && rawResult !== 3) {
+          throw new Error('Queue recovery returned an invalid result')
+        }
+        if (rawResult === 1) {
+          this.activeClaims.delete(envelope.occurrenceId)
+          recovered += 1
+        }
       }
     }
 
@@ -397,7 +717,7 @@ abstract class RedisListQueue<TJob extends RetryableJob> {
   }
 
   disconnect(): void {
-    this.activeClaimMarkers.clear()
+    this.activeClaims.clear()
     this.client.disconnect()
   }
 }
@@ -418,14 +738,7 @@ function normalizeTaskId(value: unknown): string {
 }
 
 function parseClosedJob(raw: string, allowedKeys: readonly string[]): Record<string, unknown> {
-  if (scanJsonObjectKeys(raw) !== 'valid') {
-    throw new Error('job payload is not closed JSON')
-  }
-  const parsed = JSON.parse(raw) as unknown
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    throw new Error('job payload must be an object')
-  }
-  const job = parsed as Record<string, unknown>
+  const job = parseClosedObject(raw)
   if (Object.keys(job).some((key) => !allowedKeys.includes(key))) {
     throw new Error('job payload contains unsupported fields')
   }
@@ -471,8 +784,11 @@ export class ApprovalQueue extends RedisListQueue<ApprovalJob> {
     if (job.action !== 'approve') {
       throw new Error('approval action must be approve')
     }
-
-    return { taskId: normalizeTaskId(job.taskId), action: job.action, attempt: normalizeAttempt(job) }
+    return {
+      taskId: normalizeTaskId(job.taskId),
+      action: job.action,
+      attempt: normalizeAttempt(job),
+    }
   }
 
   override async claim(timeoutSeconds: number): Promise<ClaimedApprovalJob | null> {
