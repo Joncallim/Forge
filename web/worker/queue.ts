@@ -60,6 +60,11 @@ type QueueEnvelope<TJob> = {
 
 export type QueueTransitionOutcome = 'applied' | 'already_applied'
 
+export type QueueRetryResult = {
+  outcome: QueueTransitionOutcome
+  nextRetryAt: Date
+}
+
 type QueueTransitionResult = QueueTransitionOutcome | 'stale_not_owner'
 
 type RetryPromotionCandidate = {
@@ -99,7 +104,7 @@ type TerminalIntent =
   | { kind: 'ack' }
   | { kind: 'dead_letter'; record: string }
   | { kind: 'release' }
-  | { kind: 'retry'; envelope: string; nextRetryAt: Date }
+  | { kind: 'retry'; delayMs: number; envelope: string }
 
 type ActiveClaim = {
   marker: string
@@ -291,12 +296,25 @@ return 2
 `
 
 const RETRY_JOB_SCRIPT = `
--- forge:queue:retry-v2
+-- forge:queue:retry-v3
 ${LUA_TYPE_HELPER}
 ${LUA_MARKER_HELPERS}
 assert_type(KEYS[1], 'list')
 assert_type(KEYS[2], 'hash')
 assert_type(KEYS[3], 'zset')
+local max_safe_integer = 9007199254740991
+local max_date_ms = 8640000000000000
+local delay_ms_raw = ARGV[4]
+local delay_ms = tonumber(delay_ms_raw)
+if type(delay_ms_raw) ~= 'string'
+    or not string.match(delay_ms_raw, '^[0-9]+$')
+    or not delay_ms
+    or delay_ms ~= delay_ms
+    or delay_ms < 0
+    or delay_ms > max_safe_integer
+    or math.floor(delay_ms) ~= delay_ms then
+  error('forge_queue_retry_delay_invalid')
+end
 local now_ms = redis_now_ms()
 local current_marker = redis.call('HGET', KEYS[2], ARGV[2])
 if current_marker and not valid_marker(current_marker, now_ms) then
@@ -307,19 +325,28 @@ if not valid_marker(ARGV[3], now_ms) then
 end
 if redis.call('LPOS', KEYS[1], ARGV[1]) then
   if current_marker ~= ARGV[3] then
-    return 0
+    return {0, ''}
+  end
+  if now_ms > max_safe_integer
+      or now_ms > max_date_ms
+      or delay_ms > max_safe_integer - now_ms
+      or delay_ms > max_date_ms - now_ms then
+    error('forge_queue_retry_timestamp_invalid')
   end
   if redis.call('LREM', KEYS[1], 1, ARGV[1]) ~= 1 then
-    return 0
+    return {0, ''}
   end
   redis.call('HDEL', KEYS[2], ARGV[2])
-  redis.call('ZADD', KEYS[3], ARGV[4], ARGV[5])
-  return 1
+  redis.call('ZADD', KEYS[3], now_ms + delay_ms, ARGV[5])
+  return {1, redis.call('ZSCORE', KEYS[3], ARGV[5])}
 end
-if not current_marker and redis.call('ZSCORE', KEYS[3], ARGV[5]) then
-  return 2
+if not current_marker and not redis.call('LPOS', KEYS[1], ARGV[1]) then
+  local existing_score = redis.call('ZSCORE', KEYS[3], ARGV[5])
+  if existing_score then
+    return {2, existing_score}
+  end
 end
-return 0
+return {0, ''}
 `
 
 const DEAD_LETTER_JOB_SCRIPT = `
@@ -812,6 +839,38 @@ abstract class RedisListQueue<TJob extends RetryableJob> {
     throw new Error('Queue transition returned an invalid result')
   }
 
+  private decodeRetryTransition(result: unknown): QueueRetryResult | 'stale_not_owner' {
+    if (!Array.isArray(result) || result.length !== 2) {
+      throw new Error('Queue retry transition returned an invalid result')
+    }
+    const [rawOutcome, rawScore] = result
+    if (rawOutcome === 0 && rawScore === '') {
+      return 'stale_not_owner'
+    }
+    const outcome = rawOutcome === 1
+      ? 'applied'
+      : rawOutcome === 2
+        ? 'already_applied'
+        : null
+    if (!outcome
+        || typeof rawScore !== 'string'
+        || !/^(?:0|[1-9][0-9]*)$/.test(rawScore)) {
+      throw new Error('Queue retry transition returned an invalid result')
+    }
+    const score = Number(rawScore)
+    if (!Number.isFinite(score)
+        || !Number.isSafeInteger(score)
+        || score < 0
+        || score > 8_640_000_000_000_000) {
+      throw new Error('Queue retry transition returned an invalid result')
+    }
+    const nextRetryAt = new Date(score)
+    if (nextRetryAt.getTime() !== score) {
+      throw new Error('Queue retry transition returned an invalid result')
+    }
+    return { outcome, nextRetryAt }
+  }
+
   private activeClaim(raw: string): ActiveClaim {
     let envelope: QueueEnvelope<TJob>
     try {
@@ -953,8 +1012,8 @@ abstract class RedisListQueue<TJob extends RetryableJob> {
     raw: string,
     job: TJob,
     delayMs: number,
-  ): Promise<{ nextRetryAt: Date; outcome: QueueTransitionOutcome }> {
-    if (!Number.isSafeInteger(delayMs) || delayMs < 0) {
+  ): Promise<QueueRetryResult> {
+    if (!Number.isFinite(delayMs) || !Number.isSafeInteger(delayMs) || delayMs < 0) {
       throw new Error('Queue retry delay must be a non-negative safe integer')
     }
     const active = this.activeClaim(raw)
@@ -968,23 +1027,32 @@ abstract class RedisListQueue<TJob extends RetryableJob> {
         ...canonicalJob,
         attempt: (canonicalJob.attempt ?? 1) + 1,
       }))
-      const nextRetryAt = new Date(Date.now() + delayMs)
       return {
         kind: 'retry',
+        delayMs,
         envelope: canonicalEnvelope(active.occurrenceId, nextJob),
-        nextRetryAt,
       }
     })
     if (intent.kind !== 'retry') {
       throw new Error('Queue transition ownership mismatch')
     }
-    const outcome = await this.transitionClaimed(
+    const result = this.decodeRetryTransition(await this.evalClosed(
+      'Queue transition failed',
       RETRY_JOB_SCRIPT,
-      active,
       [this.processingQueueKey, this.claimsKey, this.retryQueueKey],
-      [String(intent.nextRetryAt.getTime()), intent.envelope],
-    )
-    return { nextRetryAt: intent.nextRetryAt, outcome }
+      [
+        active.raw,
+        active.occurrenceId,
+        active.marker,
+        String(intent.delayMs),
+        intent.envelope,
+      ],
+    ))
+    if (result === 'stale_not_owner') {
+      throw new Error('Queue transition stale_not_owner')
+    }
+    this.activeClaims.delete(active.occurrenceId)
+    return result
   }
 
   async deadLetter(raw: string, job: TJob): Promise<QueueTransitionOutcome> {

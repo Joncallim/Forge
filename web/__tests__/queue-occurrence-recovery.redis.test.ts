@@ -165,6 +165,191 @@ describe.skipIf(!enabled)('queue occurrence and recovery real Redis proof', () =
   })
 
   it('preserves two identical occurrences through recovery, retry, promotion, and dead letter', async () => {
+    type RetryClockJob = TaskJob | ApprovalJob | AnswersJob
+    type RetryClockQueue = {
+      claim: (timeoutSeconds: number) => Promise<{
+        job: RetryClockJob
+        occurrenceId: string
+        raw: string
+      } | null>
+      promoteDueRetries: (limit?: number) => Promise<number>
+      recoverStuckJobs: (staleMs: number) => Promise<number>
+      retry: (raw: string, job: RetryClockJob, delayMs: number) => Promise<{
+        nextRetryAt: Date
+        outcome: 'already_applied' | 'applied'
+      }>
+    }
+    const retryClockCases = [
+      {
+        create: () => queue() as unknown as RetryClockQueue,
+        job: (attempt: number): RetryClockJob => ({ taskId: TASK_ID, attempt }),
+        processing: 'forge:tasks:processing',
+        ready: 'forge:tasks',
+        retry: 'forge:tasks:retry',
+      },
+      {
+        create: () => approvalQueue() as unknown as RetryClockQueue,
+        job: (attempt: number): RetryClockJob => ({
+          taskId: TASK_ID,
+          action: 'approve',
+          attempt,
+        }),
+        processing: 'forge:approvals:processing',
+        ready: 'forge:approvals',
+        retry: 'forge:approvals:retry',
+      },
+      {
+        create: () => answersQueue() as unknown as RetryClockQueue,
+        job: (attempt: number): RetryClockJob => ({ taskId: TASK_ID, attempt }),
+        processing: 'forge:answers:processing',
+        ready: 'forge:answers',
+        retry: 'forge:answers:retry',
+      },
+    ]
+    const retryClockScenarios = [
+      { delayMs: 0, loseResponse: false, workerSkewMs: 120_000 },
+      { delayMs: 60_000, loseResponse: true, workerSkewMs: -120_000 },
+    ] as const
+    const dateNow = vi.spyOn(Date, 'now')
+
+    try {
+      for (const [caseIndex, queueCase] of retryClockCases.entries()) {
+        for (const [scenarioIndex, scenario] of retryClockScenarios.entries()) {
+          await admin.del(...QUEUE_KEYS)
+          const job = queueCase.job(100 + (caseIndex * 10) + scenarioIndex)
+          await admin.lpush(queueCase.ready, JSON.stringify(job))
+          const retryQueue = queueCase.create()
+          const claimed = await retryQueue.claim(1)
+          if (!claimed) throw new Error('Queue Redis retry clock fixture was not claimed.')
+          const retryClient = (retryQueue as unknown as { client: Redis }).client
+          const originalCall = retryClient.call.bind(retryClient)
+          let loseResponse = scenario.loseResponse
+          const call = vi.spyOn(retryClient, 'call').mockImplementation(async (
+            ...args: Parameters<Redis['call']>
+          ) => {
+            const result = await originalCall(...args)
+            if (loseResponse && String(args[1]).includes('forge:queue:retry-v3')) {
+              loseResponse = false
+              throw new Error('simulated retry response loss')
+            }
+            return result
+          })
+
+          const redisBefore = await redisTimeMs()
+          dateNow.mockReturnValue(redisBefore + scenario.workerSkewMs)
+          if (scenario.loseResponse) {
+            await expect(retryQueue.retry(claimed.raw, claimed.job, scenario.delayMs))
+              .rejects.toThrow('Queue transition failed')
+          }
+          const retryResult = await retryQueue.retry(
+            claimed.raw,
+            claimed.job,
+            scenario.delayMs,
+          )
+          const redisAfterApplied = await redisTimeMs()
+          const scheduled = await admin.zrange(queueCase.retry, 0, -1, 'WITHSCORES')
+          expect(scheduled).toHaveLength(2)
+          const scheduledScore = Number(scheduled[1])
+          expect(retryResult).toEqual({
+            nextRetryAt: new Date(scheduledScore),
+            outcome: scenario.loseResponse ? 'already_applied' : 'applied',
+          })
+          expect(retryResult.nextRetryAt.getTime()).toBe(scheduledScore)
+          expect(scheduledScore).toBeGreaterThanOrEqual(redisBefore + scenario.delayMs)
+          expect(scheduledScore).toBeLessThanOrEqual(redisAfterApplied + scenario.delayMs)
+
+          const retryCalls = call.mock.calls.filter((args) =>
+            String(args[1]).includes('forge:queue:retry-v3'))
+          expect(retryCalls.at(-1)?.[9]).toBe(String(scenario.delayMs))
+          const rawReply = await call.mock.results.at(-1)?.value
+          expect(rawReply).toEqual([
+            scenario.loseResponse ? 2 : 1,
+            String(scheduledScore),
+          ])
+
+          if (scenario.delayMs === 60_000) {
+            const scheduledMember = scheduled[0]
+            if (!scheduledMember) {
+              throw new Error('Queue Redis owned delayed retry member was not scheduled.')
+            }
+            await expect(retryQueue.promoteDueRetries()).resolves.toBe(0)
+            expect(await admin.zscore(queueCase.retry, scheduledMember))
+              .toBe(String(scheduledScore))
+
+            const fixturePromotionTime = await redisTimeMs()
+            await admin.zadd(queueCase.retry, fixturePromotionTime, scheduledMember)
+            await expect(retryQueue.promoteDueRetries()).resolves.toBe(1)
+            expect(await admin.zscore(queueCase.retry, scheduledMember)).toBeNull()
+            expect(
+              (await admin.lrange(queueCase.ready, 0, -1))
+                .filter((raw) => raw === scheduledMember),
+            ).toEqual([scheduledMember])
+          }
+        }
+
+        await admin.del(...QUEUE_KEYS)
+        const staleJob = queueCase.job(140 + caseIndex)
+        await admin.lpush(queueCase.ready, JSON.stringify(staleJob))
+        const staleOwner = queueCase.create()
+        const staleClaim = await staleOwner.claim(1)
+        if (!staleClaim) throw new Error('Queue Redis stale retry fixture was not claimed.')
+        const staleClient = (staleOwner as unknown as { client: Redis }).client
+        const staleCall = vi.spyOn(staleClient, 'call')
+        const laterOwner = queueCase.create()
+        await expect(laterOwner.recoverStuckJobs(0)).resolves.toBe(1)
+        await expect(staleOwner.retry(staleClaim.raw, staleClaim.job, 60_000))
+          .rejects.toThrow('Queue transition stale_not_owner')
+        const rawStaleReply = await staleCall.mock.results.at(-1)?.value
+        expect(rawStaleReply).toEqual([0, ''])
+        expect(await admin.zcard(queueCase.retry)).toBe(0)
+        expect(await admin.llen(queueCase.processing)).toBe(0)
+      }
+    } finally {
+      dateNow.mockRestore()
+    }
+
+    await admin.del(...QUEUE_KEYS)
+    const maxDateMs = 8_640_000_000_000_000
+    const maxBoundaryQueue = queue()
+    const maxBoundaryJob = { taskId: TASK_ID, attempt: 180 }
+    await admin.lpush('forge:tasks', JSON.stringify(maxBoundaryJob))
+    const maxBoundaryClaim = await maxBoundaryQueue.claim(1)
+    if (!maxBoundaryClaim) throw new Error('Queue Redis maximum retry fixture was not claimed.')
+    const redisBeforeBoundary = await redisTimeMs()
+    const maxBoundaryHeadroomMs = 60_000
+    const maxValidDelayMs = maxDateMs - redisBeforeBoundary - maxBoundaryHeadroomMs
+    const maxBoundaryResult = await maxBoundaryQueue.retry(
+      maxBoundaryClaim.raw,
+      maxBoundaryClaim.job,
+      maxValidDelayMs,
+    )
+    const [maxBoundaryMember] = await admin.zrange('forge:tasks:retry', 0, 0)
+    if (!maxBoundaryMember) throw new Error('Queue Redis maximum retry was not scheduled.')
+    const maxBoundaryScore = Number(await admin.zscore(
+      'forge:tasks:retry',
+      maxBoundaryMember,
+    ))
+    expect(maxBoundaryResult.nextRetryAt.getTime()).toBe(maxBoundaryScore)
+    expect(maxBoundaryScore).toBeGreaterThanOrEqual(maxDateMs - maxBoundaryHeadroomMs)
+    expect(maxBoundaryScore).toBeLessThanOrEqual(maxDateMs)
+
+    await admin.del(...QUEUE_KEYS)
+    const overflowQueue = queue()
+    const overflowJob = { taskId: TASK_ID, attempt: 181 }
+    await admin.lpush('forge:tasks', JSON.stringify(overflowJob))
+    const overflowClaim = await overflowQueue.claim(1)
+    if (!overflowClaim) throw new Error('Queue Redis overflowing retry fixture was not claimed.')
+    await expect(overflowQueue.retry(overflowClaim.raw, overflowClaim.job, maxDateMs))
+      .rejects.toThrow('Queue transition failed')
+    expect(await admin.lrange('forge:tasks:processing', 0, -1)).toEqual([overflowClaim.raw])
+    expect(await admin.zcard('forge:tasks:retry')).toBe(0)
+
+    for (const invalidDelay of [-1, 0.5, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 53]) {
+      await expect(overflowQueue.retry('', overflowJob, invalidDelay))
+        .rejects.toThrow('Queue retry delay must be a non-negative safe integer')
+    }
+
+    await admin.del(...QUEUE_KEYS)
     const taskQueue = queue()
     const legacy = JSON.stringify({ taskId: TASK_ID, attempt: 1 })
     await admin.rpush('forge:tasks', legacy, legacy)
