@@ -202,11 +202,12 @@ Those are later gates and must be run and reviewed separately.
 
 The database-authoritative S4 runtime mode alone selects legacy or protected
 task-event operation. Environment variables never activate, downgrade, or
-bypass that decision. While the mode is legacy, the shared application
-`REDIS_URL` is the compatibility path. In protected mode,
-`FORGE_TASK_EVENT_PUBLISHER_REDIS_URL` and
-`FORGE_TASK_EVENT_SUBSCRIBER_REDIS_URL` are both mandatory, authenticated, and
-must identify different ACL users. A partial pair fails closed.
+bypass that decision. Credential selection is a separate decision. In legacy
+mode, shared `REDIS_URL` is used only when neither dedicated URL is configured.
+A complete, distinct, authenticated dedicated pair takes precedence even in
+legacy mode. Exactly one dedicated URL is a partial pair and fails closed.
+Protected mode requires the complete dedicated pair and never falls back to
+shared `REDIS_URL`.
 
 The Redis URL used by this scrub is an operator-private maintenance/admin
 connection. It is not authorization for a protected application to use the
@@ -214,15 +215,24 @@ shared fallback. Do not put real passwords or hashes in this runbook, command
 arguments, shell history, logs, or test output; use a protected secret file,
 secret manager, or administrator-controlled import channel.
 
-Before activation, preprovision the two dedicated users while the database mode
-is still legacy, then leave them unused while the drain and scrub are checked.
-After old writers and Server-Sent Events clients are drained, revoke the legacy
-write authority and terminate remaining clients. Complete preview/apply/resume,
-the legacy zero scan, and fail-closed v2 validation. Permanently delete or
-revoke the legacy user and prove both the old live connection and fresh old
-credentials cannot write. Only then permit the separately authorized
-database-controlled protected-mode activation. Environment changes alone cannot
-flip it.
+Create the Redis ACL principals and store their secrets out of process before
+the drain. Do not inject `FORGE_TASK_EVENT_PUBLISHER_REDIS_URL` or
+`FORGE_TASK_EVENT_SUBSCRIBER_REDIS_URL` into any running legacy web, worker,
+publisher, or subscriber process. A complete pair switches task-event
+credentials immediately, even while database mode remains legacy.
+
+Drain and stop every legacy process and old Server-Sent Events client before
+configuring replacement processes. Revoke the legacy write authority and
+terminate remaining clients. Complete preview/apply/resume, the legacy zero
+scan, and fail-closed v2 validation. Permanently delete or revoke the legacy
+user and prove the old live connection and fresh old
+credentials cannot write. Configure the dedicated URLs only on replacement
+processes while those processes remain stopped. Only then permit the separately authorized,
+database-controlled protected-mode activation. Start the replacement processes
+with the dedicated URLs only after the separately authorized database
+activation step permits protected mode. Environment changes alone cannot flip
+the mode. Keep ingress and producers disabled until their separate release
+gates pass.
 
 The closed-world ACL contract proven by PR #290 uses `reset`, `on`,
 `sanitize-payload`, exactly one opaque password hash, no selectors, one endpoint,
@@ -269,7 +279,9 @@ FORGE_S4_REDIS_ACL_TEST_REQUIRED=1 FORGE_S4_REDIS_ACL_DESTRUCTIVE_TEST=1 \
 
 These are separate gates and do not claim the deferred complete cross-sink
 production proof. Before activation, keep the database mode legacy and do not
-use the dedicated roles while investigating. After protected activation,
-missing or partial dedicated URLs fail closed and environment changes cannot
-downgrade the mode. Preserve checkpoint and resume identities; never edit a
-checkpoint or recreate a revoked legacy user to roll back.
+inject the dedicated URLs into running legacy processes while investigating.
+Creating the ACL users and storing their secrets out of process does not select
+application credentials. After protected activation, missing or partial
+dedicated URLs fail closed and environment changes cannot downgrade the mode.
+Preserve checkpoint and resume identities; never edit a checkpoint or recreate
+a revoked legacy user to roll back.

@@ -238,14 +238,14 @@ separate gates; do not treat one as evidence for the others.
 
 The database-authoritative S4 runtime mode is the only authority that selects
 the legacy or protected task-event path. Environment variables never activate,
-downgrade, or bypass that decision. While the database mode is legacy, the
-shared application `REDIS_URL` is the compatibility path. Once the database
-mode is protected, distinct authenticated
-`FORGE_TASK_EVENT_PUBLISHER_REDIS_URL` and
-`FORGE_TASK_EVENT_SUBSCRIBER_REDIS_URL` values are mandatory; a missing or
-partial pair fails closed. The scrub command's private `REDIS_URL` is a
-dedicated maintenance/admin connection. It does not authorize a protected
-application to use the shared fallback.
+downgrade, or bypass that decision. Credential selection is a separate
+decision. In legacy mode, shared `REDIS_URL` is used only when neither
+dedicated URL is configured. A complete, distinct, authenticated dedicated
+pair takes precedence even in legacy mode. Exactly one dedicated URL is a
+partial pair and fails closed. Protected mode requires the complete dedicated
+pair and never falls back to shared `REDIS_URL`. The scrub command's private
+`REDIS_URL` is a dedicated maintenance/admin connection. It does not authorize
+a protected application to use the shared fallback.
 
 Each protected URL must use `redis://` or `rediss://`, a username, a password,
 and the same endpoint and explicit database. The publisher and subscriber
@@ -276,11 +276,16 @@ placeholders in operator documentation.
 #### Ordered cutover checklist
 
 1. Keep project ingress, packet issuance, and v2 producers disabled.
-2. Preprovision separate publisher and subscriber principals and URLs while
-   the database mode remains legacy. Do not use them yet.
-3. Quiesce and drain old web, worker, publisher, and subscriber processes.
-   Close old Server-Sent Events connections and wait through their recycle
-   window. Verify that old Redis clients are absent.
+2. Create the Redis ACL principals and store their secrets out of process
+   before the drain. Do not inject
+   `FORGE_TASK_EVENT_PUBLISHER_REDIS_URL` or
+   `FORGE_TASK_EVENT_SUBSCRIBER_REDIS_URL` into any running legacy web,
+   worker, publisher, or subscriber process. A complete pair switches its
+   task-event credentials immediately, even while database mode remains
+   legacy.
+3. Drain and stop every legacy process and old Server-Sent Events client
+   before configuring replacement processes. Wait through the Server-Sent
+   Events recycle window and verify that old Redis clients are absent.
 4. Revoke or disable legacy publish/write authority and terminate remaining
    clients. Use the scrub runbook's dedicated admin connection for maintenance.
 5. Preview, apply, and resume the existing scrub exactly as documented. Never
@@ -289,9 +294,14 @@ placeholders in operator documentation.
    purge, permanently delete or revoke the legacy user and prove that both an
    old live connection and a fresh connection using old credentials cannot
    write.
-7. Only after those checks pass, permit the separately authorized,
+7. Configure the dedicated URLs only on replacement processes while those
+   processes remain stopped.
+8. Only after those checks pass, permit the separately authorized,
    database-controlled protected-mode activation. Changing environment values
    alone cannot flip the mode.
+9. Start the replacement processes with the dedicated URLs only after the
+   separately authorized database activation step permits protected mode.
+   Keep ingress and producers disabled until their separate release gates pass.
 
 Do not treat expiration as erasure. The scrub exhaustively scans the full
 `forge:task-events:v2:*` prefix, validates recognized `:history` and `:seq`
@@ -334,11 +344,13 @@ cross-sink production proof.
 
 #### Rollback-safe handling
 
-Before activation, keep the database mode legacy and leave the dedicated roles
-unused while investigating. Never re-enable a legacy producer or user after
-purge or revocation merely to roll back. Once the database mode is protected,
-missing or partial dedicated URLs fail closed; changing environment variables
-cannot downgrade it. Preserve the operation identity, checkpoint, and resume
+Before activation, keep the database mode legacy and do not inject the
+dedicated URLs into running legacy processes while investigating. Creating the
+ACL users and storing their secrets out of process does not select application
+credentials. Never re-enable a legacy producer or user after purge or
+revocation merely to roll back. Once the database mode is protected, missing
+or partial dedicated URLs fail closed; changing environment variables cannot
+downgrade it. Preserve the operation identity, checkpoint, and resume
 credentials required by the scrub rather than editing or recreating a
 checkpoint.
 
