@@ -5,6 +5,8 @@ const TITLE_SYSTEM_PROMPT =
   'You write short task titles. Given a task prompt, respond with ONLY a concise, ' +
   'specific title (max 8 words, no quotes, no trailing punctuation) summarizing what the task asks for.'
 
+export const UNTITLED_TASK_TITLE = 'Untitled task' as const
+
 function truncatePrompt(prompt: string): string {
   return prompt.length > 200 ? `${prompt.slice(0, 200)}…` : prompt
 }
@@ -15,7 +17,7 @@ function sanitizeTitle(text: string): string {
 
 function fallbackTitle(prompt: string): string {
   const oneLine = prompt.trim().split('\n')[0]
-  return sanitizeTitle(oneLine).slice(0, 80) || 'Untitled task'
+  return sanitizeTitle(oneLine).slice(0, 80) || UNTITLED_TASK_TITLE
 }
 
 // ---------------------------------------------------------------------------

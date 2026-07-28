@@ -29,6 +29,7 @@ import {
   projectTaskCompatibilityRun,
   projectTaskCompatibilityTask,
   projectTaskCompatibilityVcsChange,
+  projectTaskCompatibilityWorkPackage,
   sanitizeWorkPackageMetadata,
 } from '@/lib/mcps/leakage-drain'
 import { taskQuestionSummary } from '@/lib/mcps/clarification-projection'
@@ -341,14 +342,13 @@ export async function GET(
     const harnessById = new Map(taskHarnesses.map((harness) => [harness.id, harness]))
     const taskWorkPackagesWithPrompts = taskWorkPackages.map((pkg) => {
       const harness = pkg.harnessId ? harnessById.get(pkg.harnessId) : undefined
-      return {
-        ...pkg,
+      return projectTaskCompatibilityWorkPackage(pkg, {
         metadata: taskDetailWorkPackageMetadata(pkg.metadata),
         harnessRole: harness?.role ?? null,
         harnessDisplayName: harness?.displayName ?? null,
         harnessDescription: harness?.description ?? null,
         artifacts: artifactsByWorkPackageId.get(pkg.id) ?? [],
-      }
+      })
     })
     const taskApprovalGatesWithValidatedReviews = taskApprovalGates.map(taskDetailApprovalGate)
 

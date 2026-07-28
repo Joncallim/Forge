@@ -63,12 +63,18 @@ vi.mock('@/lib/session', () => ({
 const mockLoadProtectedApprovalReviewPreflight = vi.fn().mockResolvedValue(null)
 const mockReadProtectedMcpOperatorReview = vi.fn().mockResolvedValue([])
 const mockListApprovedPackagePlanRegistrations = vi.fn().mockResolvedValue([])
-const { mockAppendArchitectClarificationAnswer, mockReadS4RuntimeModeV1, mockArchitectPlanStorageConfiguration } = vi.hoisted(() => ({
+const {
+  mockAppendArchitectClarificationAnswer,
+  mockReadS4RuntimeModeV1,
+  mockArchitectPlanStorageConfiguration,
+  mockGenerateTaskTitle,
+} = vi.hoisted(() => ({
   mockAppendArchitectClarificationAnswer: vi.fn(),
   mockReadS4RuntimeModeV1: vi.fn().mockResolvedValue('protected'),
   mockArchitectPlanStorageConfiguration: vi.fn().mockReturnValue({
     mode: 'protected', digestKey: Buffer.alloc(32, 7), digestKeyId: 'test-v1',
   }),
+  mockGenerateTaskTitle: vi.fn().mockResolvedValue('Generated task title'),
 }))
 vi.mock('@/lib/mcps/protected-review-preflight', () => ({
   loadProtectedApprovalReviewPreflight: mockLoadProtectedApprovalReviewPreflight,
@@ -85,6 +91,10 @@ vi.mock('@/lib/mcps/s4-lease', async (importOriginal) => ({
 vi.mock('@/lib/mcps/s4-protocol-store', async (importOriginal) => ({
   ...await importOriginal<typeof import('@/lib/mcps/s4-protocol-store')>(),
   architectPlanStorageConfiguration: mockArchitectPlanStorageConfiguration,
+}))
+vi.mock('@/lib/task-title', () => ({
+  generateTaskTitle: mockGenerateTaskTitle,
+  UNTITLED_TASK_TITLE: 'Untitled task',
 }))
 
 // Existing route-contract cases exercise behavior behind the release gate.
@@ -2573,6 +2583,12 @@ describe('GET /api/tasks/:id — task details', () => {
       summary: 'Update the Providers page.',
       sequence: 1,
       status: 'pending',
+      assignedRole: 'frontend',
+      steps: ['Update the page.'],
+      requiredCapabilities: { required: ['repository.read'] },
+      acceptanceCriteria: ['The page is updated.'],
+      reviewRequirement: 'both',
+      blockedReason: 'RAW-BLOCKED-REASON-SENTINEL /private/package/path',
       dependsOn: [],
       targetFiles: ['web/app/dashboard/providers/page.tsx'],
       targetAreas: ['Providers'],
@@ -2586,6 +2602,7 @@ describe('GET /api/tasks/:id — task details', () => {
       },
       createdAt: new Date(),
       updatedAt: new Date(),
+      futureDatabaseColumn: 'RAW-FUTURE-WORK-PACKAGE-COLUMN',
     }
     const qaWorkPackage = {
       ...workPackage,
@@ -2729,11 +2746,13 @@ describe('GET /api/tasks/:id — task details', () => {
 
     expect(res.status).toBe(200)
     const body = await res.json()
+    expect(body.workPackages[0]).not.toHaveProperty('futureDatabaseColumn')
     expect(body.workPackages).toMatchObject([{
       id: 'package-1',
       harnessRole: 'frontend',
       harnessDisplayName: 'Frontend',
       harnessDescription: 'Dashboard UI specialist.',
+      blockedReason: 'legacy_task_log_unavailable',
       metadata: { safeCount: 1 },
       artifacts: [{
         id: 'artifact-1',
@@ -2746,6 +2765,7 @@ describe('GET /api/tasks/:id — task details', () => {
       harnessRole: 'qa',
       harnessDisplayName: 'QA',
       harnessDescription: 'Regression specialist.',
+      blockedReason: 'legacy_task_log_unavailable',
       metadata: { safeCount: 2 },
       artifacts: [{
         id: 'artifact-2',
@@ -2782,6 +2802,8 @@ describe('GET /api/tasks/:id — task details', () => {
     )).toEqual(['artifact-1', 'artifact-2'])
     expect(JSON.stringify(body.workPackages)).not.toContain('RAW-')
     expect(body.workPackages[0]).not.toHaveProperty('promptOverlay')
+    expect(JSON.stringify(body.workPackages)).not.toContain('RAW-BLOCKED-REASON-SENTINEL')
+    expect(JSON.stringify(body.workPackages)).not.toContain('RAW-FUTURE-WORK-PACKAGE-COLUMN')
     expect(body.questions).toEqual([{
       id: questionRow.id,
       status: 'answered',
@@ -2986,6 +3008,7 @@ describe('GET /api/tasks/:id — task details', () => {
       .mockReturnValueOnce(chain([]))
       .mockReturnValueOnce(chain([]))
       .mockReturnValueOnce(rejectingChain(missingTableError))
+      .mockReturnValueOnce(chain([]))
 
     const { GET } = await import('@/app/api/tasks/[id]/route')
     const res = await GET(authRequest(`/api/tasks/${task.id}`) as never, {
@@ -8456,6 +8479,14 @@ describe('POST /api/providers — baseUrl requirement', () => {
 // ---------------------------------------------------------------------------
 
 describe('POST /api/tasks — enqueues to Redis', () => {
+  function captureTaskInsert(returnedTask: Record<string, unknown>) {
+    const insertChain = chain([returnedTask]) as Record<string, unknown>
+    const values = vi.fn(() => insertChain)
+    insertChain.values = values
+    mockDbInsert.mockReturnValue(insertChain)
+    return values
+  }
+
   beforeEach(() => {
     vi.clearAllMocks()
     mockGetSession.mockReset()
@@ -8464,6 +8495,17 @@ describe('POST /api/tasks — enqueues to Redis', () => {
     mockDbUpdate.mockReset()
     mockRedisLpush.mockReset()
     mockRedisPublish.mockReset()
+    mockGenerateTaskTitle.mockReset()
+    mockGenerateTaskTitle.mockResolvedValue('Generated task title')
+    mockReadS4RuntimeModeV1.mockReset()
+    mockReadS4RuntimeModeV1.mockResolvedValue('protected')
+  })
+
+  afterEach(() => {
+    mockGenerateTaskTitle.mockReset()
+    mockGenerateTaskTitle.mockResolvedValue('Generated task title')
+    mockReadS4RuntimeModeV1.mockReset()
+    mockReadS4RuntimeModeV1.mockResolvedValue('protected')
   })
 
   it('calls redis.lpush("forge:tasks", ...) when task is created', async () => {
@@ -8529,6 +8571,122 @@ describe('POST /api/tasks — enqueues to Redis', () => {
     expect(res.status).toBe(404)
     const body = await res.json()
     expect(body.error).toMatch(/project not found/i)
+    expect(mockDbInsert).not.toHaveBeenCalled()
+    expect(mockRedisLpush).not.toHaveBeenCalled()
+  })
+
+  it('uses the fixed protected title without exposing the prompt to title generation', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbSelect.mockReturnValue(chain([{ id: 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11' }]))
+    const createdTask = {
+      id: 'task-protected-title',
+      projectId: 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
+      title: 'Untitled task',
+      prompt: 'RAW-PROMPT-MUST-NOT-REACH-TITLE-PROVIDER',
+      status: 'pending',
+    }
+    const values = captureTaskInsert(createdTask)
+    mockRedisLpush.mockResolvedValue(1)
+
+    const { POST } = await import('@/app/api/tasks/route')
+    const res = await POST(authRequest('/api/tasks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        projectId: createdTask.projectId,
+        prompt: createdTask.prompt,
+      }),
+    }) as never)
+
+    expect(res.status).toBe(201)
+    expect(mockReadS4RuntimeModeV1).toHaveBeenCalledOnce()
+    expect(mockGenerateTaskTitle).not.toHaveBeenCalled()
+    expect(values).toHaveBeenCalledWith(expect.objectContaining({ title: 'Untitled task' }))
+    expect((await res.json()).task).toMatchObject({
+      title: 'Untitled task',
+      prompt: createdTask.prompt,
+    })
+  })
+
+  it('retains an explicit protected title without invoking title generation', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbSelect.mockReturnValue(chain([{ id: 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11' }]))
+    const createdTask = {
+      id: 'task-explicit-title',
+      projectId: 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
+      title: 'Operator supplied title',
+      prompt: 'Prompt stays authoritative.',
+      status: 'pending',
+    }
+    const values = captureTaskInsert(createdTask)
+    mockRedisLpush.mockResolvedValue(1)
+
+    const { POST } = await import('@/app/api/tasks/route')
+    const res = await POST(authRequest('/api/tasks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        projectId: createdTask.projectId,
+        title: '  Operator supplied title  ',
+        prompt: createdTask.prompt,
+      }),
+    }) as never)
+
+    expect(res.status).toBe(201)
+    expect(mockReadS4RuntimeModeV1).not.toHaveBeenCalled()
+    expect(mockGenerateTaskTitle).not.toHaveBeenCalled()
+    expect(values).toHaveBeenCalledWith(expect.objectContaining({ title: 'Operator supplied title' }))
+    expect((await res.json()).task.title).toBe('Operator supplied title')
+  })
+
+  it('preserves legacy title generation when no title is supplied', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockReadS4RuntimeModeV1.mockResolvedValue('legacy')
+    mockGenerateTaskTitle.mockResolvedValue('Legacy generated title')
+    mockDbSelect.mockReturnValue(chain([{ id: 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11' }]))
+    const createdTask = {
+      id: 'task-legacy-title',
+      projectId: 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
+      title: 'Legacy generated title',
+      prompt: 'Generate a legacy task title.',
+      status: 'pending',
+    }
+    const values = captureTaskInsert(createdTask)
+    mockRedisLpush.mockResolvedValue(1)
+
+    const { POST } = await import('@/app/api/tasks/route')
+    const res = await POST(authRequest('/api/tasks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        projectId: createdTask.projectId,
+        prompt: createdTask.prompt,
+      }),
+    }) as never)
+
+    expect(res.status).toBe(201)
+    expect(mockGenerateTaskTitle).toHaveBeenCalledWith(createdTask.prompt, undefined)
+    expect(values).toHaveBeenCalledWith(expect.objectContaining({ title: 'Legacy generated title' }))
+  })
+
+  it('fails closed before title generation or persistence when runtime authority is unavailable', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockReadS4RuntimeModeV1.mockRejectedValue(new Error('authority unavailable'))
+    mockDbSelect.mockReturnValue(chain([{ id: 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11' }]))
+
+    const { POST } = await import('@/app/api/tasks/route')
+    const res = await POST(authRequest('/api/tasks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        projectId: 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
+        prompt: 'Prompt must not reach a provider.',
+      }),
+    }) as never)
+
+    expect(res.status).toBe(500)
+    expect(await res.json()).toEqual({ error: 'Internal server error' })
+    expect(mockGenerateTaskTitle).not.toHaveBeenCalled()
     expect(mockDbInsert).not.toHaveBeenCalled()
     expect(mockRedisLpush).not.toHaveBeenCalled()
   })

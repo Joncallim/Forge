@@ -273,6 +273,52 @@ function compatibleField(input: CompatibilityRecord, key: string): unknown {
   return Object.hasOwn(input, key) ? input[key] : null
 }
 
+type TaskCompatibilityWorkPackageAnnotations = {
+  metadata?: unknown
+  harnessRole?: unknown
+  harnessDisplayName?: unknown
+  harnessDescription?: unknown
+  artifacts?: unknown
+}
+
+/**
+ * The one closed task-facing work-package projection. Plan fields are
+ * intentionally public to the authorized task view; operational block text is
+ * not, and future database columns must be explicitly reviewed before export.
+ */
+export function projectTaskCompatibilityWorkPackage(
+  workPackage: CompatibilityRecord,
+  annotations: TaskCompatibilityWorkPackageAnnotations = {},
+): Record<string, unknown> {
+  const metadata = Object.hasOwn(annotations, 'metadata')
+    ? annotations.metadata
+    : compatibleField(workPackage, 'metadata')
+
+  return {
+    id: compatibleField(workPackage, 'id'),
+    taskId: compatibleField(workPackage, 'taskId'),
+    harnessId: compatibleField(workPackage, 'harnessId'),
+    assignedRole: compatibleField(workPackage, 'assignedRole'),
+    title: compatibleField(workPackage, 'title'),
+    summary: compatibleField(workPackage, 'summary'),
+    status: compatibleField(workPackage, 'status'),
+    sequence: compatibleField(workPackage, 'sequence'),
+    steps: compatibleField(workPackage, 'steps'),
+    requiredCapabilities: compatibleField(workPackage, 'requiredCapabilities'),
+    acceptanceCriteria: compatibleField(workPackage, 'acceptanceCriteria'),
+    mcpRequirements: compatibleField(workPackage, 'mcpRequirements'),
+    reviewRequirement: compatibleField(workPackage, 'reviewRequirement'),
+    blockedReason: taskCompatibilityError(compatibleField(workPackage, 'blockedReason')),
+    metadata: sanitizeWorkPackageMetadata(metadata),
+    createdAt: compatibleField(workPackage, 'createdAt'),
+    updatedAt: compatibleField(workPackage, 'updatedAt'),
+    harnessRole: annotations.harnessRole ?? null,
+    harnessDisplayName: annotations.harnessDisplayName ?? null,
+    harnessDescription: annotations.harnessDescription ?? null,
+    artifacts: annotations.artifacts ?? [],
+  }
+}
+
 /**
  * Architect `adr_text` is always protected when it belongs to an Architect
  * run. Current rows carry a protected-history marker or planning/replan stage;
