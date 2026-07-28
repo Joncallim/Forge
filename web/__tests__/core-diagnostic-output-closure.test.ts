@@ -1944,7 +1944,7 @@ describe('core operational output closure', () => {
     }
   })
 
-  it('persists only the queue-authoritative retry deadline after worker failure', async () => {
+  it('reconciles one ambiguous retry before persisting the queue-authoritative deadline', async () => {
     const workerEnvNames = [
       'FORGE_WORKER_MAX_ATTEMPTS',
       'FORGE_PROVIDER_HEALTH_INTERVAL_SECONDS',
@@ -1959,19 +1959,38 @@ describe('core operational output closure', () => {
     const queueDeadlines = {
       answers: new Date(1_800_000_060_122),
       approvals: new Date(1_800_000_060_121),
-      tasks: new Date(1_800_000_060_123),
+      taskOriginal: new Date(1_800_000_060_123),
+      taskReplay: new Date(1_800_000_060_124),
     }
-    const approvalRetry = vi.fn().mockResolvedValue({
-      nextRetryAt: queueDeadlines.approvals,
-      outcome: 'applied',
-    })
-    const answersRetry = vi.fn().mockResolvedValue({
-      nextRetryAt: queueDeadlines.answers,
-      outcome: 'applied',
-    })
-    const taskRetry = vi.fn()
-      .mockResolvedValueOnce({ nextRetryAt: queueDeadlines.tasks, outcome: 'applied' })
+    const approvalRetry = vi.fn()
+      .mockRejectedValueOnce(new Error('lost_after_apply'))
+      .mockResolvedValueOnce({
+        nextRetryAt: queueDeadlines.approvals,
+        outcome: 'already_applied',
+      })
       .mockRejectedValueOnce(new Error('redis_retry_unavailable'))
+      .mockRejectedValueOnce(new Error('redis_retry_reconciliation_unavailable'))
+    const answersRetry = vi.fn()
+      .mockRejectedValueOnce(new Error('failed_before_apply'))
+      .mockResolvedValueOnce({
+        nextRetryAt: queueDeadlines.answers,
+        outcome: 'applied',
+      })
+      .mockRejectedValueOnce(new Error('redis_retry_unavailable'))
+      .mockRejectedValueOnce(new Error('redis_retry_reconciliation_unavailable'))
+    const taskRetry = vi.fn()
+      .mockResolvedValueOnce({
+        nextRetryAt: queueDeadlines.taskOriginal,
+        outcome: 'applied',
+      })
+      .mockRejectedValueOnce(new Error('lost_after_apply'))
+      .mockResolvedValueOnce({
+        nextRetryAt: queueDeadlines.taskReplay,
+        outcome: 'already_applied',
+      })
+      .mockRejectedValueOnce(new Error('redis_retry_unavailable'))
+      .mockRejectedValueOnce(new Error('redis_retry_reconciliation_unavailable'))
+    const deadLetter = vi.fn().mockResolvedValue('applied')
     const finishTaskAttempt = vi.fn().mockResolvedValue(undefined)
     const attemptCounts = { answers: 0, approvals: 0, tasks: 0 }
     const startTaskAttempt = vi.fn(async (input: {
@@ -1987,7 +2006,7 @@ describe('core operational output closure', () => {
     class PassiveQueue {
       ack = vi.fn().mockResolvedValue('applied')
       claim = vi.fn().mockResolvedValue(null)
-      deadLetter = vi.fn().mockResolvedValue('applied')
+      deadLetter = deadLetter
       disconnect = vi.fn()
       promoteDueRetries = vi.fn().mockResolvedValue(0)
       recoverStuckJobs = vi.fn().mockResolvedValue(0)
@@ -1999,7 +2018,7 @@ describe('core operational output closure', () => {
       override retry = approvalRetry
       override claim = vi.fn(async () => {
         approvalClaimCount += 1
-        if (approvalClaimCount > 1) return null
+        if (approvalClaimCount > 2) return null
         const job = { taskId: TASK_ID, action: 'approve' as const, attempt: 1 }
         return { job, raw: JSON.stringify(job) }
       })
@@ -2009,7 +2028,7 @@ describe('core operational output closure', () => {
       override retry = answersRetry
       override claim = vi.fn(async () => {
         answersClaimCount += 1
-        if (answersClaimCount > 1) return null
+        if (answersClaimCount > 2) return null
         const job = { taskId: TASK_ID, attempt: 1 }
         return { job, raw: JSON.stringify(job) }
       })
@@ -2019,7 +2038,7 @@ describe('core operational output closure', () => {
       override retry = taskRetry
       override claim = vi.fn(async () => {
         taskClaimCount += 1
-        if (taskClaimCount <= 2) {
+        if (taskClaimCount <= 3) {
           const job = { taskId: TASK_ID, attempt: 1 }
           return { job, raw: JSON.stringify(job) }
         }
@@ -2091,14 +2110,27 @@ describe('core operational output closure', () => {
       const { startWorker } = await import('@/worker/runtime')
       const handle = await startWorker('standalone')
       await vi.waitFor(() => {
-        expect(finishTaskAttempt).toHaveBeenCalledTimes(4)
+        expect(taskRetry).toHaveBeenCalledTimes(5)
       })
       await handle.stop()
 
-      expect(approvalRetry).toHaveBeenCalledOnce()
-      expect(answersRetry).toHaveBeenCalledOnce()
-      expect(taskRetry).toHaveBeenCalledTimes(2)
-      expect(finishTaskAttempt.mock.calls).toEqual([
+      expect(approvalRetry).toHaveBeenCalledTimes(4)
+      expect(answersRetry).toHaveBeenCalledTimes(4)
+      expect(taskRetry).toHaveBeenCalledTimes(5)
+      expect(approvalRetry.mock.calls[1]).toEqual(approvalRetry.mock.calls[0])
+      expect(approvalRetry.mock.calls[3]).toEqual(approvalRetry.mock.calls[2])
+      expect(answersRetry.mock.calls[1]).toEqual(answersRetry.mock.calls[0])
+      expect(answersRetry.mock.calls[3]).toEqual(answersRetry.mock.calls[2])
+      expect(taskRetry.mock.calls[2]).toEqual(taskRetry.mock.calls[1])
+      expect(taskRetry.mock.calls[4]).toEqual(taskRetry.mock.calls[3])
+      expect(approvalRetry.mock.calls[1]?.[1]).toBe(approvalRetry.mock.calls[0]?.[1])
+      expect(approvalRetry.mock.calls[3]?.[1]).toBe(approvalRetry.mock.calls[2]?.[1])
+      expect(answersRetry.mock.calls[1]?.[1]).toBe(answersRetry.mock.calls[0]?.[1])
+      expect(answersRetry.mock.calls[3]?.[1]).toBe(answersRetry.mock.calls[2]?.[1])
+      expect(taskRetry.mock.calls[2]?.[1]).toBe(taskRetry.mock.calls[1]?.[1])
+      expect(taskRetry.mock.calls[4]?.[1]).toBe(taskRetry.mock.calls[3]?.[1])
+      expect(finishTaskAttempt).toHaveBeenCalledTimes(7)
+      expect(finishTaskAttempt.mock.calls).toEqual(expect.arrayContaining([
         [{
           attemptId: 'approvals-retry-clock-1',
           errorMessage: 'business_failure',
@@ -2114,26 +2146,99 @@ describe('core operational output closure', () => {
         [{
           attemptId: 'tasks-retry-clock-1',
           errorMessage: 'business_failure',
-          nextRetryAt: queueDeadlines.tasks,
+          nextRetryAt: queueDeadlines.taskOriginal,
           status: 'failed',
         }],
         [{
           attemptId: 'tasks-retry-clock-2',
           errorMessage: 'business_failure',
-          nextRetryAt: null,
+          nextRetryAt: queueDeadlines.taskReplay,
           status: 'failed',
         }],
-      ])
-      expect(finishTaskAttempt.mock.calls.slice(0, 3).map((call) =>
-        (call[0] as { nextRetryAt: Date }).nextRetryAt.getTime())).toEqual([
+        [{
+          attemptId: 'approvals-retry-clock-2',
+          errorMessage: 'business_failure',
+          nextRetryAt: null,
+          status: 'indeterminate',
+        }],
+        [{
+          attemptId: 'answers-retry-clock-2',
+          errorMessage: 'business_failure',
+          nextRetryAt: null,
+          status: 'indeterminate',
+        }],
+        [{
+          attemptId: 'tasks-retry-clock-3',
+          errorMessage: 'business_failure',
+          nextRetryAt: null,
+          status: 'indeterminate',
+        }],
+      ]))
+      expect(finishTaskAttempt.mock.calls
+        .map((call) => (call[0] as { nextRetryAt: Date | null }).nextRetryAt)
+        .filter((deadline): deadline is Date => deadline instanceof Date)
+        .map((deadline) => deadline.getTime())
+        .sort()).toEqual([
         queueDeadlines.approvals.getTime(),
         queueDeadlines.answers.getTime(),
-        queueDeadlines.tasks.getTime(),
-      ])
+        queueDeadlines.taskOriginal.getTime(),
+        queueDeadlines.taskReplay.getTime(),
+      ].sort())
+      const terminalUnknownCalls = finishTaskAttempt.mock.calls
+        .map(([input]) => input as { nextRetryAt: Date | null; status: string })
+        .filter((input) => input.nextRetryAt === null)
+      expect(terminalUnknownCalls).toHaveLength(3)
+      expect(terminalUnknownCalls.every((input) => input.status === 'indeterminate')).toBe(true)
+      const finishCounts = finishTaskAttempt.mock.calls.reduce<Record<string, number>>(
+        (counts, [input]) => {
+          const attemptId = (input as { attemptId: string }).attemptId
+          counts[attemptId] = (counts[attemptId] ?? 0) + 1
+          return counts
+        },
+        {},
+      )
+      expect(finishCounts).toEqual({
+        'answers-retry-clock-1': 1,
+        'answers-retry-clock-2': 1,
+        'approvals-retry-clock-1': 1,
+        'approvals-retry-clock-2': 1,
+        'tasks-retry-clock-1': 1,
+        'tasks-retry-clock-2': 1,
+        'tasks-retry-clock-3': 1,
+      })
+      expect(deadLetter).not.toHaveBeenCalled()
       expect(consoleError).toHaveBeenCalledWith(
         '[worker] Queue infrastructure failure',
         expect.objectContaining({ phase: 'retry', queueName: 'task', taskId: TASK_ID }),
       )
+      expect(consoleError).toHaveBeenCalledWith(
+        '[worker] Queue infrastructure failure',
+        expect.objectContaining({
+          phase: 'retry_reconciliation',
+          queueName: 'task',
+          taskId: TASK_ID,
+        }),
+      )
+      const queueFailurePhases = consoleError.mock.calls
+        .filter(([message]) => message === '[worker] Queue infrastructure failure')
+        .map(([, details]) => (details as { phase: string }).phase)
+        .sort()
+      expect(queueFailurePhases).toEqual([
+        'retry',
+        'retry',
+        'retry',
+        'retry',
+        'retry',
+        'retry',
+        'retry_reconciliation',
+        'retry_reconciliation',
+        'retry_reconciliation',
+      ])
+      const operationalOutput = JSON.stringify(consoleError.mock.calls)
+      expect(operationalOutput).not.toContain('lost_after_apply')
+      expect(operationalOutput).not.toContain('failed_before_apply')
+      expect(operationalOutput).not.toContain('redis_retry_unavailable')
+      expect(operationalOutput).not.toContain('redis_retry_reconciliation_unavailable')
     } finally {
       for (const name of workerEnvNames) {
         const value = workerEnv[name]
@@ -2628,6 +2733,12 @@ describe('core output source sentinel', () => {
   it('keeps queue failures projected while retaining internal attempt diagnostics', () => {
     const queueSource = fs.readFileSync(path.join(repoRoot, 'worker/queue.ts'), 'utf8')
     const runtimeSource = fs.readFileSync(path.join(repoRoot, 'worker/runtime.ts'), 'utf8')
+    const schemaSource = fs.readFileSync(path.join(repoRoot, 'db/schema.ts'), 'utf8')
+    const taskAttemptsSource = fs.readFileSync(path.join(repoRoot, 'worker/task-attempts.ts'), 'utf8')
+    const taskPageSource = fs.readFileSync(
+      path.join(repoRoot, 'app/dashboard/tasks/[id]/page.tsx'),
+      'utf8',
+    )
     const retryScript = queueSource.match(
       /const RETRY_JOB_SCRIPT = `([\s\S]*?)`\n\nconst DEAD_LETTER_JOB_SCRIPT/,
     )?.[1] ?? ''
@@ -2794,11 +2905,34 @@ describe('core output source sentinel', () => {
     expect(queueSource).not.toMatch(/this\.client\.lpush\(this\.deadQueueKey,[\s\S]{0,300}\berrorMessage\b/)
     expect(runtimeSource).toContain('errorMessage: message')
     expect(runtimeSource).toContain('const message = retainedErrorMessage(err)')
-    expect(runtimeSource).toMatch(
-      /retryResult = await queue\.retry\([\s\S]{0,650}nextRetryAt: retryResult\.nextRetryAt/,
+    const retryTransitionBlock = runtimeSource.match(
+      /const retryDelayMs = backoffDelayMs\(job\.attempt\)[\s\S]*?nextRetryAt: retryResult\.nextRetryAt,[\s\S]*?status: 'failed'/,
+    )?.[0] ?? ''
+    expect(retryTransitionBlock).not.toBe('')
+    expect(retryTransitionBlock.match(/queue\.retry\(raw, job, retryDelayMs\)/g)).toHaveLength(2)
+    expect(retryTransitionBlock).not.toMatch(
+      /logQueueInfrastructureFailure\('retry_reconciliation'[\s\S]{0,320}status: 'failed'/,
     )
-    expect(runtimeSource).toMatch(
-      /logQueueInfrastructureFailure\('retry'[\s\S]{0,500}nextRetryAt: null/,
+    expect(retryTransitionBlock).toMatch(
+      /logQueueInfrastructureFailure\('retry_reconciliation', queueName, job\.taskId\)[\s\S]{0,180}finishTaskAttempt\(\{[\s\S]{0,180}nextRetryAt: null,[\s\S]{0,80}status: 'indeterminate'[\s\S]{0,220}logAttemptInfrastructureFailure\('finish_after_failure', queueName, job\.taskId\)[\s\S]{0,80}return/,
+    )
+    expect(retryTransitionBlock).not.toMatch(
+      /retry_reconciliation[\s\S]{0,300}(?:while|setTimeout|sleep)\b/,
+    )
+    expect(taskAttemptsSource).toContain("'queue.attempt.indeterminate'")
+    expect(taskAttemptsSource).toContain("status === 'failed' || status === 'indeterminate'")
+    expect(schemaSource).toMatch(
+      /export type TaskAttemptStatus =[\s\S]{0,140}\| 'indeterminate'/,
+    )
+    expect(taskPageSource).toContain("indeterminate: 'Retry status unknown'")
+    expect(taskPageSource).toMatch(
+      /case 'indeterminate':[\s\S]{0,180}border-amber-200 bg-amber-50 text-amber-900/,
+    )
+    expect(taskPageSource).toMatch(
+      /<dt className="text-muted-foreground">Completed<\/dt>\s*<dd>\{formatDatetime\(attempt\.completedAt\)\}<\/dd>/,
+    )
+    expect(taskPageSource).toMatch(
+      /<dt className="text-muted-foreground">Next retry<\/dt>\s*<dd>\{formatDatetime\(attempt\.nextRetryAt\)\}<\/dd>/,
     )
     expect(runtimeSource).not.toMatch(
       /nextRetryAt\s*=\s*[\s\S]{0,80}Date\.now\(\)/,

@@ -1,11 +1,10 @@
 import { db } from '../db'
-import { taskAttempts } from '../db/schema'
+import { taskAttempts, type TaskAttemptStatus } from '../db/schema'
 import { eq } from 'drizzle-orm'
 import { recordTaskLogBestEffort } from './task-logs'
 import { taskCompatibilityError } from '@/lib/mcps/leakage-drain'
 
 type QueueName = 'tasks' | 'approvals' | 'answers'
-type AttemptStatus = 'running' | 'completed' | 'failed' | 'dead_lettered'
 
 export function describeQueueWorker(queueName: string): { name: string; role: string } {
   if (queueName === 'approvals') {
@@ -26,11 +25,21 @@ export function describeQueueWorker(queueName: string): { name: string; role: st
   }
 }
 
-function statusLevel(status: AttemptStatus): 'info' | 'success' | 'warning' | 'error' {
+function statusLevel(status: TaskAttemptStatus): 'info' | 'success' | 'warning' | 'error' {
   if (status === 'completed') return 'success'
-  if (status === 'failed') return 'warning'
+  if (status === 'failed' || status === 'indeterminate') return 'warning'
   if (status === 'dead_lettered') return 'error'
   return 'info'
+}
+
+function statusLabel(status: TaskAttemptStatus): string {
+  return status === 'indeterminate' ? 'Retry status unknown' : status
+}
+
+function statusEventType(status: TaskAttemptStatus): string {
+  if (status === 'dead_lettered') return 'queue.attempt.dead_lettered'
+  if (status === 'indeterminate') return 'queue.attempt.indeterminate'
+  return `queue.attempt.${status}`
 }
 
 export async function startTaskAttempt({
@@ -92,7 +101,7 @@ export async function finishTaskAttempt({
   attemptId: string
   errorMessage?: string | null
   nextRetryAt?: Date | null
-  status: AttemptStatus
+  status: TaskAttemptStatus
 }): Promise<void> {
   const [attempt] = await db
     .update(taskAttempts)
@@ -112,12 +121,13 @@ export async function finishTaskAttempt({
 
   if (attempt) {
     const worker = describeQueueWorker(attempt.queueName)
+    const label = statusLabel(status)
     await recordTaskLogBestEffort({
-      eventType: status === 'dead_lettered' ? 'queue.attempt.dead_lettered' : `queue.attempt.${status}`,
+      eventType: statusEventType(status),
       level: statusLevel(status),
       message: errorMessage
-        ? `${worker.name} finished ${attempt.queueName} attempt ${attempt.attemptNumber} as ${status}: ${taskCompatibilityError(errorMessage)}`
-        : `${worker.name} finished ${attempt.queueName} attempt ${attempt.attemptNumber} as ${status}.`,
+        ? `${worker.name} finished ${attempt.queueName} attempt ${attempt.attemptNumber} as ${label}: ${taskCompatibilityError(errorMessage)}`
+        : `${worker.name} finished ${attempt.queueName} attempt ${attempt.attemptNumber} as ${label}.`,
       metadata: {
         attemptNumber: attempt.attemptNumber,
         nextRetryAt: nextRetryAt?.toISOString() ?? null,
@@ -134,7 +144,9 @@ export async function finishTaskAttempt({
         ? 'Queue attempt completed'
         : status === 'dead_lettered'
           ? 'Queue attempt dead-lettered'
-          : 'Queue attempt warning',
+          : status === 'indeterminate'
+            ? 'Retry status unknown'
+            : 'Queue attempt warning',
     })
   }
 }
