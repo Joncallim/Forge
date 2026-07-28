@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 type RedisHarnessInstance = {
   brpoplpush: ReturnType<typeof vi.fn>
   call: ReturnType<typeof vi.fn>
+  callBuffer: ReturnType<typeof vi.fn>
   eval: ReturnType<typeof vi.fn>
   hdel: ReturnType<typeof vi.fn>
   hget: ReturnType<typeof vi.fn>
@@ -100,11 +101,18 @@ vi.mock('ioredis', () => {
       if (queued !== null) list(destination).unshift(queued)
       return queued
     })
-    eval = vi.fn(async (script: string, numberOfKeys: number, ...values: string[]) => {
+    eval = vi.fn(async (
+      script: string,
+      numberOfKeys: number,
+      ...values: Array<Buffer | string>
+    ) => {
       if (injectedFailure(script, 'before')) throw new Error('injected_redis_failure')
-      const keys = values.slice(0, numberOfKeys)
-      const args = values.slice(numberOfKeys)
-      let result: number | string | string[] = 0
+      const text = (value: Buffer | string): string => Buffer.isBuffer(value)
+        ? value.toString('utf8')
+        : value
+      const keys = values.slice(0, numberOfKeys).map(text)
+      const args = values.slice(numberOfKeys).map(text)
+      let result: unknown = 0
 
       if (script.includes('forge:queue:claim-v2')) {
         const [source, envelope, occurrenceId, nonce, mode] = args
@@ -184,17 +192,58 @@ vi.mock('ioredis', () => {
           .filter(([, score]) => score >= 0 && score <= redisHarness.nowMs)
           .sort((left, right) => left[1] - right[1])
           .slice(0, Number(args[0]))
-          .map(([member]) => member)
-      } else if (script.includes('forge:queue:promote-retry-v3')) {
-        const [source, destination, mode] = args
-        if (mode === 'discard') {
-          result = zset(keys[0]).delete(source) ? 3 : 2
-        } else if (zset(keys[0]).has(source)) {
+          .flatMap(([member, score]) => [member, String(score)])
+      } else if (script.includes('forge:queue:promote-retry-v4')) {
+        const [
+          source,
+          expectedScore,
+          fingerprint,
+          mode,
+          destination,
+          candidateOccurrenceId,
+          receiptTtlMsRaw,
+          receiptCapRaw,
+          pruneLimitRaw,
+        ] = args
+        const dispositions = hash(keys[2])
+        const expiry = zset(keys[3])
+        const receiptTtlMs = Number(receiptTtlMsRaw)
+        const pruneLimit = Number(pruneLimitRaw)
+        const expired = [...expiry.entries()]
+          .filter(([, score]) => score <= redisHarness.nowMs - receiptTtlMs)
+          .sort((left, right) => left[1] - right[1])
+          .slice(0, pruneLimit)
+        for (const [expiredFingerprint] of expired) {
+          expiry.delete(expiredFingerprint)
+          dispositions.delete(expiredFingerprint)
+        }
+        const existing = dispositions.get(fingerprint)
+        const currentScore = zset(keys[0]).get(source)
+        if (currentScore === undefined) {
+          if (existing === 'discarded' && mode === 'discard') {
+            result = [2, 'discarded', '']
+          } else if (existing?.startsWith('promoted:') && mode !== 'discard') {
+            result = [2, 'promoted', existing.slice('promoted:'.length)]
+          } else {
+            result = [0, 'stale', '']
+          }
+        } else if (String(currentScore) !== expectedScore || existing) {
+          result = [0, 'stale', '']
+        } else if (dispositions.size >= Number(receiptCapRaw)
+          || expiry.size >= Number(receiptCapRaw)) {
+          throw new Error('forge_queue_retry_receipt_capacity_exhausted')
+        } else {
           zset(keys[0]).delete(source)
-          list(keys[1]).unshift(destination)
-          result = 1
-        } else if (list(keys[1]).includes(destination)) {
-          result = 2
+          if (mode === 'discard') {
+            dispositions.set(fingerprint, 'discarded')
+            expiry.set(fingerprint, redisHarness.nowMs)
+            result = [1, 'discarded', '']
+          } else {
+            list(keys[1]).unshift(destination)
+            dispositions.set(fingerprint, `promoted:${candidateOccurrenceId}`)
+            expiry.set(fingerprint, redisHarness.nowMs)
+            result = [1, 'promoted', candidateOccurrenceId]
+          }
         }
       } else if (script.includes('forge:queue:recover-stuck-v2')) {
         const marker = hash(keys[1]).get(args[1])
@@ -250,10 +299,22 @@ vi.mock('ioredis', () => {
       command: string,
       script: string,
       numberOfKeys: number,
-      ...values: string[]
+      ...values: Array<Buffer | string>
     ) => {
       if (command !== 'EVAL') throw new Error('unknown_redis_command')
       return await this.eval(script, numberOfKeys, ...values)
+    })
+    callBuffer = vi.fn(async (
+      command: string,
+      script: string,
+      numberOfKeys: number,
+      ...values: Array<Buffer | string>
+    ) => {
+      const result = await this.call(command, script, numberOfKeys, ...values)
+      const encode = (value: unknown): unknown => Array.isArray(value)
+        ? value.map(encode)
+        : Buffer.from(String(value), 'utf8')
+      return encode(result)
     })
     hdel = vi.fn().mockResolvedValue(1)
     hget = vi.fn().mockResolvedValue(null)
@@ -758,7 +819,7 @@ describe('core operational output closure', () => {
       expect(retryState.size).toBe(1)
       expect(redisHarness.lists.get(queueCase.processing)).not.toContain(retryClaim.raw)
 
-      redisHarness.failures.push({ marker: 'forge:queue:promote-retry-v3', stage: 'after' })
+      redisHarness.failures.push({ marker: 'forge:queue:promote-retry-v4', stage: 'after' })
       await expect(queue.promoteDueRetries()).rejects.toThrow('Queue retry promotion failed')
       await expect(queue.promoteDueRetries()).resolves.toBe(0)
       const promotedRaw = [...retryState.keys()][0]
@@ -874,7 +935,7 @@ describe('core operational output closure', () => {
       ]))
 
       const beforeFailure = new Map(redisHarness.zsets.get(queueCase.retry))
-      redisHarness.failures.push({ marker: 'forge:queue:promote-retry-v3', stage: 'before' })
+      redisHarness.failures.push({ marker: 'forge:queue:promote-retry-v4', stage: 'before' })
       await expect(queue.promoteDueRetries()).rejects.toThrow('Queue retry promotion failed')
       expect(redisHarness.zsets.get(queueCase.retry)).toEqual(beforeFailure)
       expect(redisHarness.lists.get(queueCase.ready)?.length ?? 0).toBe(0)
@@ -899,7 +960,7 @@ describe('core operational output closure', () => {
       redisHarness.zsets.set(queueCase.retry, new Map([
         [legacy, redisHarness.nowMs - 1],
       ]))
-      redisHarness.failures.push({ marker: 'forge:queue:promote-retry-v3', stage: 'after' })
+      redisHarness.failures.push({ marker: 'forge:queue:promote-retry-v4', stage: 'after' })
       await expect(queue.promoteDueRetries()).rejects.toThrow('Queue retry promotion failed')
       expect(redisHarness.zsets.get(queueCase.retry)?.size ?? 0).toBe(0)
       const responseLossReady = redisHarness.lists.get(queueCase.ready) ?? []
@@ -916,6 +977,141 @@ describe('core operational output closure', () => {
       lists: [...redisHarness.lists.values()],
       logs: warn.mock.calls,
       retry: [...redisHarness.zsets.values()].map((entries) => [...entries]),
+    })
+  })
+
+  it('arbitrates concurrent current, legacy, and poison retry promotion by exact receipt', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const { AnswersQueue, ApprovalQueue, TaskQueue } = await import('@/worker/queue')
+    const cases = [
+      {
+        create: () => new TaskQueue('redis://localhost:6379/0'),
+        job: { taskId: TASK_ID, attempt: 3 },
+        ready: 'forge:tasks',
+        receipts: 'forge:tasks:promotion-dispositions',
+        receiptExpiry: 'forge:tasks:promotion-disposition-expiry',
+        retry: 'forge:tasks:retry',
+      },
+      {
+        create: () => new ApprovalQueue('redis://localhost:6379/0'),
+        job: { taskId: TASK_ID, action: 'approve' as const, attempt: 4 },
+        ready: 'forge:approvals',
+        receipts: 'forge:approvals:promotion-dispositions',
+        receiptExpiry: 'forge:approvals:promotion-disposition-expiry',
+        retry: 'forge:approvals:retry',
+      },
+      {
+        create: () => new AnswersQueue('redis://localhost:6379/0'),
+        job: { taskId: TASK_ID, attempt: 5 },
+        ready: 'forge:answers',
+        receipts: 'forge:answers:promotion-dispositions',
+        receiptExpiry: 'forge:answers:promotion-disposition-expiry',
+        retry: 'forge:answers:retry',
+      },
+    ]
+
+    for (const [caseIndex, queueCase] of cases.entries()) {
+      const currentOccurrenceId = `00000000-0000-4000-8000-${String(900 + caseIndex)
+        .padStart(12, '0')}`
+      const scenarios = [
+        {
+          kind: 'current',
+          raw: JSON.stringify({
+            schemaVersion: 1,
+            occurrenceId: currentOccurrenceId,
+            job: queueCase.job,
+          }),
+        },
+        {
+          kind: 'legacy',
+          raw: JSON.stringify(queueCase.job),
+        },
+        {
+          kind: 'poison',
+          raw: JSON.stringify({
+            ...queueCase.job,
+            prompt: SENTINELS[0],
+          }),
+        },
+      ] as const
+
+      for (const [scenarioIndex, scenario] of scenarios.entries()) {
+        redisHarness.hashes.delete(queueCase.receipts)
+        redisHarness.lists.set(queueCase.ready, [])
+        redisHarness.zsets.delete(queueCase.receiptExpiry)
+        redisHarness.zsets.set(queueCase.retry, new Map([
+          [scenario.raw, redisHarness.nowMs - 10 - scenarioIndex],
+        ]))
+
+        const first = queueCase.create() as unknown as AtomicQueue
+        const firstClient = redisHarness.instances.at(-1)
+        const second = queueCase.create() as unknown as AtomicQueue
+        const secondClient = redisHarness.instances.at(-1)
+        if (!firstClient || !secondClient) {
+          throw new Error('Concurrent retry proof did not construct both clients.')
+        }
+
+        let scans = 0
+        let releaseScan!: () => void
+        const scanBarrier = new Promise<void>((resolve) => {
+          releaseScan = resolve
+        })
+        for (const client of [firstClient, secondClient]) {
+          const original = client.callBuffer.getMockImplementation()
+          if (!original) throw new Error('Concurrent retry proof has no buffer-call adapter.')
+          client.callBuffer.mockImplementation(async (...args: unknown[]) => {
+            const result = await (original as (...values: unknown[]) => unknown)(...args)
+            if (String(args[1]).includes('forge:queue:list-due-retries-v1')) {
+              scans += 1
+              if (scans === 2) releaseScan()
+              await scanBarrier
+            }
+            return result
+          })
+        }
+
+        const results = await Promise.all([
+          first.promoteDueRetries(),
+          second.promoteDueRetries(),
+        ])
+        expect([...results].sort()).toEqual(scenario.kind === 'poison' ? [0, 0] : [0, 1])
+        expect(redisHarness.zsets.get(queueCase.retry)?.size ?? 0).toBe(0)
+        const ready = redisHarness.lists.get(queueCase.ready) ?? []
+        expect(ready).toHaveLength(scenario.kind === 'poison' ? 0 : 1)
+        const receiptEntries = redisHarness.hashes.get(queueCase.receipts)
+        expect(receiptEntries?.size ?? 0).toBe(1)
+        expect(redisHarness.zsets.get(queueCase.receiptExpiry)?.size ?? 0).toBe(1)
+
+        const promotions = [firstClient, secondClient].map((client) => {
+          const callIndex = client.call.mock.calls.findIndex((args) =>
+            String(args[1]).includes('forge:queue:promote-retry-v4'))
+          if (callIndex < 0) throw new Error('Concurrent retry proof did not execute promotion.')
+          return {
+            args: client.call.mock.calls[callIndex],
+            result: client.call.mock.results[callIndex].value as Promise<unknown>,
+          }
+        })
+        expect(String(promotions[0].args[9])).toBe(String(promotions[1].args[9]))
+        expect(String(promotions[0].args[8])).toBe(String(promotions[1].args[8]))
+        const rawOutcomes = await Promise.all(promotions.map(({ result }) => result))
+        expect(rawOutcomes.map((raw) => Number((raw as unknown[])[0])).sort()).toEqual([1, 2])
+        if (scenario.kind === 'legacy') {
+          expect(String(promotions[0].args[12])).not.toBe(String(promotions[1].args[12]))
+          const winningOccurrenceId = parsedOccurrence(ready[0]).occurrenceId
+          expect([...receiptEntries!.values()]).toEqual([`promoted:${winningOccurrenceId}`])
+        } else if (scenario.kind === 'current') {
+          expect(parsedOccurrence(ready[0]).occurrenceId).toBe(currentOccurrenceId)
+          expect([...receiptEntries!.values()]).toEqual([`promoted:${currentOccurrenceId}`])
+        } else {
+          expect([...receiptEntries!.values()]).toEqual(['discarded'])
+        }
+      }
+    }
+
+    expect(warn).toHaveBeenCalledTimes(cases.length)
+    assertNoSentinels({
+      logs: warn.mock.calls,
+      receipts: [...redisHarness.hashes.values()].map((entries) => [...entries]),
     })
   })
 
@@ -1556,13 +1752,43 @@ describe('core output source sentinel', () => {
     expect(queueSource).toContain('const TRANSITION_RECEIPT_CAP = 50_000')
     expect(queueSource).toContain('const TRANSITION_RECEIPT_PRUNE_LIMIT = 100')
     expect(queueSource).toContain('-- forge:queue:list-due-retries-v1')
-    expect(queueSource).toContain('-- forge:queue:promote-retry-v3')
-    expect(queueSource).toContain("ARGV[3] == 'discard'")
-    expect(queueSource).toContain("return { destination: '', mode: 'discard' }")
+    expect(queueSource).toContain("'WITHSCORES'")
+    expect(queueSource).toContain('-- forge:queue:promote-retry-v4')
+    expect(queueSource).toContain('const PROMOTION_DISPOSITION_TTL_MS = 15 * 60 * 1000')
+    expect(queueSource).toContain('const PROMOTION_DISPOSITION_CAP = 50_000')
+    expect(queueSource).toContain('const PROMOTION_DISPOSITION_PRUNE_LIMIT = 100')
+    expect(queueSource).toContain("createHash('sha256')")
+    expect(queueSource).toContain("PROMOTION_FINGERPRINT_DOMAIN")
+    expect(queueSource).toContain('length.writeBigUInt64BE(BigInt(part.length))')
+    expect(queueSource).toContain("redis.call('ZSCORE', KEYS[1], raw_member)")
+    expect(queueSource).toContain("redis.call('HGET', KEYS[3], fingerprint)")
+    expect(queueSource).toContain("redis.call('HSET', KEYS[3], fingerprint, 'discarded')")
+    expect(queueSource).toContain(
+      "redis.call('HSET', KEYS[3], fingerprint, 'promoted:' .. candidate_occurrence_id)",
+    )
+    expect(queueSource).toContain("redis.call('ZADD', KEYS[4], now_ms, fingerprint)")
+    expect(queueSource).toContain("mode ~= 'discard' and mode ~= 'legacy'")
+    expect(queueSource).toContain(
+      "return { destination: '', mode: 'discard', occurrenceId: '' }",
+    )
     expect(queueSource).toContain("console.warn('[worker/queue] Dropped invalid retry payload')")
     expect(queueSource).toMatch(
-      /-- forge:queue:promote-retry-v3[\s\S]{0,900}redis\.call\('ZREM', KEYS\[1\], ARGV\[1\]\)[\s\S]{0,300}redis\.call\('LPUSH', KEYS\[2\], ARGV\[2\]\)/,
+      /-- forge:queue:promote-retry-v4[\s\S]{0,3000}redis\.call\('ZREM', KEYS\[1\], raw_member\)[\s\S]{0,500}redis\.call\('LPUSH', KEYS\[2\], destination\)/,
     )
+    const promotionScript = queueSource.match(
+      /const PROMOTE_RETRY_SCRIPT = `([\s\S]*?)`\n\nconst RECOVER_STUCK_JOB_SCRIPT/,
+    )?.[1] ?? ''
+    expect(promotionScript).toContain('if current_score ~= expected_score or existing then')
+    expect(promotionScript).toContain("'LIMIT',\n  0,\n  prune_limit")
+    expect(promotionScript).toContain(
+      "redis.call('HLEN', KEYS[3]) >= cap or redis.call('ZCARD', KEYS[4]) >= cap",
+    )
+    expect(promotionScript).toContain("return {2, 'promoted', winning_occurrence_id}")
+    expect(promotionScript).toContain("return {2, 'discarded', ''}")
+    expect(promotionScript).not.toContain("redis.call('LPOS'")
+    expect(promotionScript).not.toContain("redis.call('LRANGE'")
+    expect(promotionScript).not.toContain("redis.call('HSET', KEYS[3], raw_member")
+    expect(promotionScript).not.toContain("redis.call('ZADD', KEYS[4], now_ms, raw_member")
     expect(queueSource).not.toMatch(
       /promoteDueRetries[\s\S]{0,300}this\.client\.zrangebyscore/,
     )
