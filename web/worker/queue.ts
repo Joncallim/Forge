@@ -8,21 +8,30 @@ const TASK_PROCESSING_QUEUE_KEY = 'forge:tasks:processing'
 const TASK_RETRY_QUEUE_KEY = 'forge:tasks:retry'
 const TASK_DEAD_QUEUE_KEY = 'forge:tasks:dead'
 const TASK_CLAIMS_KEY = 'forge:tasks:claims'
+const TASK_ACK_RECEIPTS_KEY = 'forge:tasks:ack-receipts'
+const TASK_RELEASE_RECEIPTS_KEY = 'forge:tasks:release-receipts'
 const APPROVAL_QUEUE_KEY = 'forge:approvals'
 const APPROVAL_PROCESSING_QUEUE_KEY = 'forge:approvals:processing'
 const APPROVAL_RETRY_QUEUE_KEY = 'forge:approvals:retry'
 const APPROVAL_DEAD_QUEUE_KEY = 'forge:approvals:dead'
 const APPROVAL_CLAIMS_KEY = 'forge:approvals:claims'
+const APPROVAL_ACK_RECEIPTS_KEY = 'forge:approvals:ack-receipts'
+const APPROVAL_RELEASE_RECEIPTS_KEY = 'forge:approvals:release-receipts'
 const ANSWERS_QUEUE_KEY = 'forge:answers'
 const ANSWERS_PROCESSING_QUEUE_KEY = 'forge:answers:processing'
 const ANSWERS_RETRY_QUEUE_KEY = 'forge:answers:retry'
 const ANSWERS_DEAD_QUEUE_KEY = 'forge:answers:dead'
 const ANSWERS_CLAIMS_KEY = 'forge:answers:claims'
+const ANSWERS_ACK_RECEIPTS_KEY = 'forge:answers:ack-receipts'
+const ANSWERS_RELEASE_RECEIPTS_KEY = 'forge:answers:release-receipts'
 
 const QUEUE_ENVELOPE_SCHEMA_VERSION = 1
 const DEAD_LETTER_SCHEMA_VERSION = 1
 const DEAD_LETTER_FAILURE_CATEGORY = 'job_processing_failed'
 const STUCK_RECOVERY_SCAN_LIMIT = 100
+const TRANSITION_RECEIPT_TTL_MS = 15 * 60 * 1000
+const TRANSITION_RECEIPT_CAP = 50_000
+const TRANSITION_RECEIPT_PRUNE_LIMIT = 100
 const TASK_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 const CLAIM_MARKER_PATTERN = /^([1-9][0-9]*):([0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/
 
@@ -49,6 +58,7 @@ type ClaimedQueueJob<TJob> = {
 type TerminalIntent =
   | { kind: 'ack' }
   | { kind: 'dead_letter'; record: string }
+  | { kind: 'release' }
   | { kind: 'retry'; envelope: string; nextRetryAt: Date }
 
 type ActiveClaim = {
@@ -95,6 +105,36 @@ local function assert_type(key, expected)
 end
 `
 
+const LUA_RECEIPT_HELPERS = `
+local function receipt_member(occurrence_id, marker)
+  local _, nonce = string.match(marker, '^([1-9][0-9]*):([^:]+)$')
+  if not valid_uuid(occurrence_id) or not valid_uuid(nonce) then
+    error('forge_queue_receipt_identity_invalid')
+  end
+  return occurrence_id .. ':' .. nonce
+end
+local function prune_receipts(key, now_ms, ttl_ms, prune_limit)
+  local cutoff = now_ms - ttl_ms
+  local expired = redis.call(
+    'ZRANGEBYSCORE',
+    key,
+    '-inf',
+    cutoff,
+    'LIMIT',
+    0,
+    prune_limit
+  )
+  if #expired > 0 then
+    redis.call('ZREM', key, unpack(expired))
+  end
+end
+local function require_receipt_capacity(key, cap)
+  if redis.call('ZCARD', key) >= cap then
+    error('forge_queue_receipt_capacity_exhausted')
+  end
+end
+`
+
 const CLAIM_JOB_SCRIPT = `
 -- forge:queue:claim-v2
 ${LUA_TYPE_HELPER}
@@ -125,11 +165,13 @@ return marker
 `
 
 const ACK_JOB_SCRIPT = `
--- forge:queue:ack-v2
+-- forge:queue:ack-v3
 ${LUA_TYPE_HELPER}
 ${LUA_MARKER_HELPERS}
+${LUA_RECEIPT_HELPERS}
 assert_type(KEYS[1], 'list')
 assert_type(KEYS[2], 'hash')
+assert_type(KEYS[3], 'zset')
 local now_ms = redis_now_ms()
 local current_marker = redis.call('HGET', KEYS[2], ARGV[2])
 if current_marker and not valid_marker(current_marker, now_ms) then
@@ -138,17 +180,61 @@ end
 if not valid_marker(ARGV[3], now_ms) then
   error('forge_queue_claim_marker_invalid')
 end
+local receipt = receipt_member(ARGV[2], ARGV[3])
+prune_receipts(KEYS[3], now_ms, tonumber(ARGV[4]), tonumber(ARGV[6]))
 if redis.call('LPOS', KEYS[1], ARGV[1]) then
   if current_marker ~= ARGV[3] then
     return 0
   end
+  require_receipt_capacity(KEYS[3], tonumber(ARGV[5]))
   if redis.call('LREM', KEYS[1], 1, ARGV[1]) ~= 1 then
     return 0
   end
   redis.call('HDEL', KEYS[2], ARGV[2])
+  redis.call('ZADD', KEYS[3], now_ms, receipt)
   return 1
 end
-if not current_marker then
+if not current_marker and redis.call('ZSCORE', KEYS[3], receipt) then
+  return 2
+end
+return 0
+`
+
+const RELEASE_JOB_SCRIPT = `
+-- forge:queue:release-v1
+${LUA_TYPE_HELPER}
+${LUA_MARKER_HELPERS}
+${LUA_RECEIPT_HELPERS}
+assert_type(KEYS[1], 'list')
+assert_type(KEYS[2], 'hash')
+assert_type(KEYS[3], 'list')
+assert_type(KEYS[4], 'zset')
+local now_ms = redis_now_ms()
+local current_marker = redis.call('HGET', KEYS[2], ARGV[2])
+if current_marker and not valid_marker(current_marker, now_ms) then
+  error('forge_queue_claim_marker_invalid')
+end
+if not valid_marker(ARGV[3], now_ms) then
+  error('forge_queue_claim_marker_invalid')
+end
+local receipt = receipt_member(ARGV[2], ARGV[3])
+prune_receipts(KEYS[4], now_ms, tonumber(ARGV[4]), tonumber(ARGV[6]))
+if redis.call('LPOS', KEYS[1], ARGV[1]) then
+  if current_marker ~= ARGV[3] then
+    return 0
+  end
+  require_receipt_capacity(KEYS[4], tonumber(ARGV[5]))
+  if redis.call('LREM', KEYS[1], 1, ARGV[1]) ~= 1 then
+    return 0
+  end
+  redis.call('HDEL', KEYS[2], ARGV[2])
+  redis.call('LPUSH', KEYS[3], ARGV[1])
+  redis.call('ZADD', KEYS[4], now_ms, receipt)
+  return 1
+end
+if not current_marker
+    and redis.call('LPOS', KEYS[3], ARGV[1])
+    and redis.call('ZSCORE', KEYS[4], receipt) then
   return 2
 end
 return 0
@@ -374,6 +460,8 @@ abstract class RedisListQueue<TJob extends RetryableJob> {
     private readonly retryQueueKey: string,
     private readonly deadQueueKey: string,
     private readonly claimsKey: string,
+    private readonly ackReceiptsKey: string,
+    private readonly releaseReceiptsKey: string,
     redisUrl = getRequiredEnv('REDIS_URL'),
   ) {
     this.client = new Redis(redisUrl, {
@@ -546,8 +634,35 @@ abstract class RedisListQueue<TJob extends RetryableJob> {
     return this.transitionClaimed(
       ACK_JOB_SCRIPT,
       active,
-      [this.processingQueueKey, this.claimsKey],
-      [],
+      [this.processingQueueKey, this.claimsKey, this.ackReceiptsKey],
+      [
+        String(TRANSITION_RECEIPT_TTL_MS),
+        String(TRANSITION_RECEIPT_CAP),
+        String(TRANSITION_RECEIPT_PRUNE_LIMIT),
+      ],
+    )
+  }
+
+  async release(raw: string): Promise<QueueTransitionOutcome> {
+    const active = this.activeClaim(raw)
+    const intent = this.intent(active, () => ({ kind: 'release' }))
+    if (intent.kind !== 'release') {
+      throw new Error('Queue transition ownership mismatch')
+    }
+    return this.transitionClaimed(
+      RELEASE_JOB_SCRIPT,
+      active,
+      [
+        this.processingQueueKey,
+        this.claimsKey,
+        this.queueKey,
+        this.releaseReceiptsKey,
+      ],
+      [
+        String(TRANSITION_RECEIPT_TTL_MS),
+        String(TRANSITION_RECEIPT_CAP),
+        String(TRANSITION_RECEIPT_PRUNE_LIMIT),
+      ],
     )
   }
 
@@ -753,6 +868,8 @@ export class TaskQueue extends RedisListQueue<TaskJob> {
       TASK_RETRY_QUEUE_KEY,
       TASK_DEAD_QUEUE_KEY,
       TASK_CLAIMS_KEY,
+      TASK_ACK_RECEIPTS_KEY,
+      TASK_RELEASE_RECEIPTS_KEY,
       redisUrl,
     )
   }
@@ -775,6 +892,8 @@ export class ApprovalQueue extends RedisListQueue<ApprovalJob> {
       APPROVAL_RETRY_QUEUE_KEY,
       APPROVAL_DEAD_QUEUE_KEY,
       APPROVAL_CLAIMS_KEY,
+      APPROVAL_ACK_RECEIPTS_KEY,
+      APPROVAL_RELEASE_RECEIPTS_KEY,
       redisUrl,
     )
   }
@@ -804,6 +923,8 @@ export class AnswersQueue extends RedisListQueue<AnswersJob> {
       ANSWERS_RETRY_QUEUE_KEY,
       ANSWERS_DEAD_QUEUE_KEY,
       ANSWERS_CLAIMS_KEY,
+      ANSWERS_ACK_RECEIPTS_KEY,
+      ANSWERS_RELEASE_RECEIPTS_KEY,
       redisUrl,
     )
   }

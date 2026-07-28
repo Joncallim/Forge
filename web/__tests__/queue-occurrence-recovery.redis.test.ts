@@ -1,7 +1,17 @@
 import { randomUUID } from 'node:crypto'
 import Redis from 'ioredis'
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
-import { TaskQueue } from '@/worker/queue'
+import {
+  AnswersQueue,
+  ApprovalQueue,
+  TaskQueue,
+  type AnswersJob,
+  type ApprovalJob,
+  type ClaimedAnswersJob,
+  type ClaimedApprovalJob,
+  type ClaimedTaskJob,
+  type TaskJob,
+} from '@/worker/queue'
 
 const QUEUE_KEYS = [
   'forge:tasks',
@@ -9,16 +19,22 @@ const QUEUE_KEYS = [
   'forge:tasks:retry',
   'forge:tasks:dead',
   'forge:tasks:claims',
+  'forge:tasks:ack-receipts',
+  'forge:tasks:release-receipts',
   'forge:approvals',
   'forge:approvals:processing',
   'forge:approvals:retry',
   'forge:approvals:dead',
   'forge:approvals:claims',
+  'forge:approvals:ack-receipts',
+  'forge:approvals:release-receipts',
   'forge:answers',
   'forge:answers:processing',
   'forge:answers:retry',
   'forge:answers:dead',
   'forge:answers:claims',
+  'forge:answers:ack-receipts',
+  'forge:answers:release-receipts',
 ] as const
 
 const required = process.env.CI === 'true'
@@ -194,10 +210,11 @@ describe.skipIf(!enabled)('queue occurrence and recovery real Redis proof', () =
     await admin.del('forge:tasks')
     const fresh = Array.from({ length: 100 }, (_, index) => occurrence(index + 200))
     const staleTail = occurrence(400)
+    const freshNow = await redisTimeMs()
     await admin.rpush('forge:tasks:processing', ...fresh, staleTail)
     await admin.hset('forge:tasks:claims', Object.fromEntries([
-      ...fresh.map((raw) => [parseOccurrence(raw).occurrenceId, `${now}:${nonce}`]),
-      [parseOccurrence(staleTail).occurrenceId, `${now - 2_000}:${nonce}`],
+      ...fresh.map((raw) => [parseOccurrence(raw).occurrenceId, `${freshNow}:${nonce}`]),
+      [parseOccurrence(staleTail).occurrenceId, `${freshNow - 2_000}:${nonce}`],
     ]))
     expect(await taskQueue.recoverStuckJobs(1_000)).toBe(0)
     expect(await taskQueue.recoverStuckJobs(1_000)).toBe(1)
@@ -224,29 +241,43 @@ describe.skipIf(!enabled)('queue occurrence and recovery real Redis proof', () =
     expect(await claimLossQueue.recoverStuckJobs(0)).toBe(1)
     expect(await admin.llen('forge:tasks')).toBe(1)
 
-    const owned = await claimLossQueue.claim(1)
-    if (!owned) throw new Error('Queue Redis ownership proof could not claim its job.')
-    const originalMarker = await admin.hget('forge:tasks:claims', owned.occurrenceId)
-    if (!originalMarker) throw new Error('Queue Redis ownership proof has no claim marker.')
-    await admin.hset('forge:tasks:claims', owned.occurrenceId, `${await redisTimeMs()}:${randomUUID()}`)
-    const beforeStale = await admin.lrange('forge:tasks:processing', 0, -1)
-    await expect(claimLossQueue.ack(owned.raw))
+    const ownedByA = await claimLossQueue.claim(1)
+    if (!ownedByA) throw new Error('Queue Redis ownership proof could not claim its job.')
+    const markerA = await admin.hget('forge:tasks:claims', ownedByA.occurrenceId)
+    if (!markerA) throw new Error('Queue Redis ownership proof has no claim marker.')
+    const nonceA = markerA.split(':')[1]
+    const queueB = queue()
+    expect(await queueB.recoverStuckJobs(0)).toBe(1)
+    const readyAfterRecovery = await admin.lrange('forge:tasks', 0, -1)
+    await expect(claimLossQueue.ack(ownedByA.raw))
       .rejects.toThrow('Queue transition stale_not_owner')
-    expect(await admin.lrange('forge:tasks:processing', 0, -1)).toEqual(beforeStale)
-    await admin.hset('forge:tasks:claims', owned.occurrenceId, originalMarker)
+    expect(await admin.lrange('forge:tasks', 0, -1)).toEqual(readyAfterRecovery)
+    const ownedByB = await queueB.claim(1)
+    if (!ownedByB) throw new Error('Queue Redis later-owner proof could not reclaim its job.')
+    const markerB = await admin.hget('forge:tasks:claims', ownedByB.occurrenceId)
+    if (!markerB) throw new Error('Queue Redis later-owner proof has no claim marker.')
+    await expect(queueB.ack(ownedByB.raw)).resolves.toBe('applied')
+    await expect(claimLossQueue.ack(ownedByA.raw))
+      .rejects.toThrow('Queue transition stale_not_owner')
+    const ackReceipts = await admin.zrange('forge:tasks:ack-receipts', 0, -1)
+    expect(ackReceipts).toContain(`${ownedByB.occurrenceId}:${markerB.split(':')[1]}`)
+    expect(ackReceipts).not.toContain(`${ownedByA.occurrenceId}:${nonceA}`)
 
-    let loseAckResponse = true
     vi.spyOn(claimLossClient, 'call').mockRestore()
+    await admin.lpush('forge:tasks', JSON.stringify({ taskId: TASK_ID, attempt: 2 }))
+    const exactReplay = await claimLossQueue.claim(1)
+    if (!exactReplay) throw new Error('Queue Redis acknowledgement replay fixture was not claimed.')
+    let loseAckResponse = true
     vi.spyOn(claimLossClient, 'call').mockImplementation(async (...args: Parameters<Redis['call']>) => {
       const result = await originalCall(...args)
-      if (loseAckResponse && String(args[1]).includes('forge:queue:ack-v2')) {
+      if (loseAckResponse && String(args[1]).includes('forge:queue:ack-v3')) {
         loseAckResponse = false
         throw new Error('simulated response loss')
       }
       return result
     })
-    await expect(claimLossQueue.ack(owned.raw)).rejects.toThrow('Queue transition failed')
-    await expect(claimLossQueue.ack(owned.raw)).resolves.toBe('already_applied')
+    await expect(claimLossQueue.ack(exactReplay.raw)).rejects.toThrow('Queue transition failed')
+    await expect(claimLossQueue.ack(exactReplay.raw)).resolves.toBe('already_applied')
 
     const markerCases = [
       '0:11111111-1111-4111-8111-111111111111',
@@ -372,6 +403,142 @@ describe.skipIf(!enabled)('queue occurrence and recovery real Redis proof', () =
       await stop
       expect(await admin.llen('forge:tasks:processing')).toBe(0)
       expect(await admin.hlen('forge:tasks:claims')).toBe(0)
+
+      vi.restoreAllMocks()
+      const idlePositions = ['approval', 'answers', 'task'] as const
+      for (const position of idlePositions) {
+        await admin.del(...QUEUE_KEYS)
+        vi.resetModules()
+        delete (globalThis as typeof globalThis & { forgeWorkerRuntime?: unknown }).forgeWorkerRuntime
+
+        const claimEnteredGate: { resolve?: () => void } = {}
+        const claimEntered = new Promise<void>((resolve) => {
+          claimEnteredGate.resolve = resolve
+        })
+        const claimCounts = { approval: 0, answers: 0, task: 0 }
+
+        class IdleApprovalQueue extends ApprovalQueue {
+          override async claim(timeoutSeconds: number): Promise<ClaimedApprovalJob | null> {
+            claimCounts.approval += 1
+            if (position !== 'approval') return null
+            claimEnteredGate.resolve?.()
+            return await super.claim(timeoutSeconds)
+          }
+        }
+        class IdleAnswersQueue extends AnswersQueue {
+          override async claim(timeoutSeconds: number): Promise<ClaimedAnswersJob | null> {
+            claimCounts.answers += 1
+            if (position !== 'answers') return null
+            claimEnteredGate.resolve?.()
+            return await super.claim(timeoutSeconds)
+          }
+        }
+        class IdleTaskQueue extends TaskQueue {
+          override async claim(timeoutSeconds: number): Promise<ClaimedTaskJob | null> {
+            claimCounts.task += 1
+            if (position !== 'task') return null
+            claimEnteredGate.resolve?.()
+            return await super.claim(timeoutSeconds)
+          }
+        }
+
+        vi.doMock('@/worker/queue', () => ({
+          AnswersQueue: IdleAnswersQueue,
+          ApprovalQueue: IdleApprovalQueue,
+          TaskQueue: IdleTaskQueue,
+        }))
+        const idleProcessAnsweredQuestions = vi.fn()
+        const idleProcessApproval = vi.fn()
+        const idleProcessTask = vi.fn()
+        vi.doMock('@/worker/orchestrator', () => ({
+          processAnsweredQuestions: idleProcessAnsweredQuestions,
+          processApproval: idleProcessApproval,
+          processTask: idleProcessTask,
+        }))
+        const idleFinishTaskAttempt = vi.fn()
+        const idleStartTaskAttempt = vi.fn()
+        vi.doMock('@/worker/task-attempts', () => ({
+          finishTaskAttempt: idleFinishTaskAttempt,
+          startTaskAttempt: idleStartTaskAttempt,
+        }))
+        const taskLookup = vi.fn()
+        vi.doMock('@/db', () => ({
+          db: {
+            select: vi.fn((selection: Record<string, unknown>) => {
+              if (Object.keys(selection).length === 1 && 'id' in selection) taskLookup()
+              return query([])
+            }),
+          },
+        }))
+        vi.doMock('@/db/schema', () => ({
+          tasks: { id: 'tasks.id', status: 'tasks.status' },
+          workPackages: {
+            metadata: 'work_packages.metadata',
+            status: 'work_packages.status',
+            taskId: 'work_packages.task_id',
+          },
+        }))
+        vi.doMock('drizzle-orm', () => ({ and: vi.fn(), eq: vi.fn() }))
+        vi.doMock('@/worker/blocked-handoff-retry', () => ({
+          enqueueDueBlockedHandoffRetries: vi.fn().mockResolvedValue(0),
+        }))
+        vi.doMock('@/lib/mcps/filesystem-grant-reconciliation', () => ({
+          convergeRecognizedOperatorHolds: vi.fn().mockResolvedValue(0),
+        }))
+        vi.doMock('@/worker/work-package-handoff', () => ({
+          reconcilePendingS4CompletionHandoffs: vi.fn().mockResolvedValue(0),
+        }))
+        vi.doMock('@/lib/session', () => ({
+          reconcilePendingSessionCacheInvalidations: vi.fn().mockResolvedValue({
+            claimed: 0,
+            completed: 0,
+            deferred: 0,
+            stale: 0,
+          }),
+        }))
+
+        const idleReadyKey = {
+          approval: 'forge:approvals',
+          answers: 'forge:answers',
+          task: 'forge:tasks',
+        }[position]
+        const idleProcessingKey = `${idleReadyKey}:processing`
+        const idleClaimsKey = `${idleReadyKey}:claims`
+        const idleAckReceiptsKey = `${idleReadyKey}:ack-receipts`
+        const idleReleaseReceiptsKey = `${idleReadyKey}:release-receipts`
+        const idleJob: TaskJob | ApprovalJob | AnswersJob = position === 'approval'
+          ? { taskId: TASK_ID, action: 'approve', attempt: 1 }
+          : { taskId: TASK_ID, attempt: 1 }
+
+        const idleRuntime = await import('@/worker/runtime')
+        const idleHandle = await idleRuntime.startWorker('standalone')
+        workerHandle = idleHandle
+        await claimEntered
+        const idleStop = idleHandle.stop()
+        await admin.lpush(idleReadyKey, JSON.stringify(idleJob))
+        await idleStop
+        workerHandle = null
+
+        const returned = await admin.lrange(idleReadyKey, 0, -1)
+        expect(returned).toHaveLength(1)
+        expect(parseOccurrence(returned[0]).job).toEqual(idleJob)
+        expect(await admin.llen(idleProcessingKey)).toBe(0)
+        expect(await admin.hlen(idleClaimsKey)).toBe(0)
+        expect(await admin.zcard(idleAckReceiptsKey)).toBe(0)
+        expect(await admin.zcard(idleReleaseReceiptsKey)).toBe(1)
+        expect(taskLookup).not.toHaveBeenCalled()
+        expect(idleStartTaskAttempt).not.toHaveBeenCalled()
+        expect(idleFinishTaskAttempt).not.toHaveBeenCalled()
+        expect(idleProcessApproval).not.toHaveBeenCalled()
+        expect(idleProcessAnsweredQuestions).not.toHaveBeenCalled()
+        expect(idleProcessTask).not.toHaveBeenCalled()
+        if (position === 'approval') {
+          expect(claimCounts.answers).toBe(0)
+          expect(claimCounts.task).toBe(0)
+        } else if (position === 'answers') {
+          expect(claimCounts.task).toBe(0)
+        }
+      }
       console.info('QUEUE_OCCURRENCE_REDIS_SHUTDOWN_OK')
     } finally {
       businessGate.release?.()
@@ -399,5 +566,5 @@ describe.skipIf(!enabled)('queue occurrence and recovery real Redis proof', () =
         process.env.FORGE_WORKER_STUCK_JOB_RECOVERY_SECONDS = priorIntervals.stuck
       }
     }
-  }, 20_000)
+  }, 45_000)
 })

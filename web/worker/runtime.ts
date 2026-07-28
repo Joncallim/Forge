@@ -153,6 +153,7 @@ async function startWorkerOnce(
   type RuntimeQueue<TJob extends RuntimeJob> = {
     ack: (raw: string) => Promise<unknown>
     deadLetter: (raw: string, job: TJob) => Promise<unknown>
+    release: (raw: string) => Promise<unknown>
     retry: (raw: string, job: TJob, delayMs: number) => Promise<unknown>
   }
   type QueueOperation = 'approval' | 'answers' | 'task'
@@ -160,6 +161,7 @@ async function startWorkerOnce(
     | 'ack_after_success'
     | 'ack_missing_task'
     | 'dead_letter'
+    | 'release_after_shutdown'
     | 'retry'
     | 'task_lookup'
   type AttemptInfrastructurePhase = 'finish_after_failure' | 'finish_after_success' | 'start'
@@ -304,6 +306,22 @@ async function startWorkerOnce(
       await queue.ack(raw)
     } catch {
       logQueueInfrastructureFailure('ack_after_success', queueName, job.taskId)
+    }
+  }
+
+  const releaseClaimAfterShutdown = async <TJob extends RuntimeJob>(input: {
+    claimed: { job: TJob; raw: string }
+    queue: RuntimeQueue<TJob>
+    queueName: QueueOperation
+  }): Promise<void> => {
+    try {
+      await input.queue.release(input.claimed.raw)
+    } catch {
+      logQueueInfrastructureFailure(
+        'release_after_shutdown',
+        input.queueName,
+        input.claimed.job.taskId,
+      )
     }
   }
 
@@ -533,6 +551,16 @@ async function startWorkerOnce(
           console.error('[worker] Failed to claim approval', { workerId })
         }
 
+        if (shuttingDown) {
+          if (claimedApproval !== null) {
+            await releaseClaimAfterShutdown({
+              claimed: claimedApproval,
+              queue: approvalQueue,
+              queueName: 'approval',
+            })
+          }
+          break
+        }
         if (claimedApproval !== null) {
           await processClaimedJob({
             attemptQueueName: 'approvals',
@@ -554,6 +582,16 @@ async function startWorkerOnce(
           console.error('[worker] Failed to claim answers job', { workerId })
         }
 
+        if (shuttingDown) {
+          if (claimedAnswers !== null) {
+            await releaseClaimAfterShutdown({
+              claimed: claimedAnswers,
+              queue: answersQueue,
+              queueName: 'answers',
+            })
+          }
+          break
+        }
         if (claimedAnswers !== null) {
           await processClaimedJob({
             attemptQueueName: 'answers',
@@ -576,6 +614,16 @@ async function startWorkerOnce(
           continue
         }
 
+        if (shuttingDown) {
+          if (claimedTask !== null) {
+            await releaseClaimAfterShutdown({
+              claimed: claimedTask,
+              queue: taskQueue,
+              queueName: 'task',
+            })
+          }
+          break
+        }
         if (claimedTask === null) continue
 
         await processClaimedJob({

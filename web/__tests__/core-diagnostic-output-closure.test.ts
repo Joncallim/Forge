@@ -1,5 +1,6 @@
 import fs from 'node:fs'
 import path from 'node:path'
+import { randomUUID } from 'node:crypto'
 import ts from 'typescript'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -42,6 +43,7 @@ type AtomicQueue = {
   deadLetter: (raw: string, job: AtomicQueueJob) => Promise<'already_applied' | 'applied'>
   promoteDueRetries: () => Promise<number>
   recoverStuckJobs: (staleMs: number, options?: { drain?: boolean }) => Promise<number>
+  release: (raw: string) => Promise<'already_applied' | 'applied'>
   retry: (raw: string, job: AtomicQueueJob, delayMs: number) => Promise<{
     nextRetryAt: Date
     outcome: 'already_applied' | 'applied'
@@ -115,11 +117,38 @@ vi.mock('ioredis', () => {
           hash(keys[1]).set(occurrenceId, marker)
           result = marker
         }
-      } else if (script.includes('forge:queue:ack-v2')) {
+      } else if (script.includes('forge:queue:ack-v3')) {
+        const nonce = args[2].split(':')[1]
+        const receipt = `${args[1]}:${nonce}`
+        const receiptTtlMs = Number(args[3])
+        for (const [member, score] of zset(keys[2])) {
+          if (score <= redisHarness.nowMs - receiptTtlMs) zset(keys[2]).delete(member)
+        }
         if (hash(keys[1]).get(args[1]) === args[2] && removeFirst(list(keys[0]), args[0])) {
           hash(keys[1]).delete(args[1])
+          zset(keys[2]).set(receipt, redisHarness.nowMs)
           result = 1
-        } else if (!list(keys[0]).includes(args[0]) && !hash(keys[1]).has(args[1])) {
+        } else if (!list(keys[0]).includes(args[0])
+          && !hash(keys[1]).has(args[1])
+          && zset(keys[2]).has(receipt)) {
+          result = 2
+        }
+      } else if (script.includes('forge:queue:release-v1')) {
+        const nonce = args[2].split(':')[1]
+        const receipt = `${args[1]}:${nonce}`
+        const receiptTtlMs = Number(args[3])
+        for (const [member, score] of zset(keys[3])) {
+          if (score <= redisHarness.nowMs - receiptTtlMs) zset(keys[3]).delete(member)
+        }
+        if (hash(keys[1]).get(args[1]) === args[2] && removeFirst(list(keys[0]), args[0])) {
+          hash(keys[1]).delete(args[1])
+          list(keys[2]).unshift(args[0])
+          zset(keys[3]).set(receipt, redisHarness.nowMs)
+          result = 1
+        } else if (!list(keys[0]).includes(args[0])
+          && !hash(keys[1]).has(args[1])
+          && list(keys[2]).includes(args[0])
+          && zset(keys[3]).has(receipt)) {
           result = 2
         }
       } else if (script.includes('forge:queue:discard-invalid-v2')) {
@@ -607,30 +636,36 @@ describe('core operational output closure', () => {
     const { AnswersQueue, ApprovalQueue, TaskQueue } = await import('@/worker/queue')
     const cases = [
       {
+        ackReceipts: 'forge:tasks:ack-receipts',
         claims: 'forge:tasks:claims',
         create: () => new TaskQueue('redis://localhost:6379/0'),
         dead: 'forge:tasks:dead',
         job: (attempt: number) => ({ taskId: TASK_ID, attempt }),
         processing: 'forge:tasks:processing',
         ready: 'forge:tasks',
+        releaseReceipts: 'forge:tasks:release-receipts',
         retry: 'forge:tasks:retry',
       },
       {
+        ackReceipts: 'forge:approvals:ack-receipts',
         claims: 'forge:approvals:claims',
         create: () => new ApprovalQueue('redis://localhost:6379/0'),
         dead: 'forge:approvals:dead',
         job: (attempt: number) => ({ taskId: TASK_ID, action: 'approve' as const, attempt }),
         processing: 'forge:approvals:processing',
         ready: 'forge:approvals',
+        releaseReceipts: 'forge:approvals:release-receipts',
         retry: 'forge:approvals:retry',
       },
       {
+        ackReceipts: 'forge:answers:ack-receipts',
         claims: 'forge:answers:claims',
         create: () => new AnswersQueue('redis://localhost:6379/0'),
         dead: 'forge:answers:dead',
         job: (attempt: number) => ({ taskId: TASK_ID, attempt }),
         processing: 'forge:answers:processing',
         ready: 'forge:answers',
+        releaseReceipts: 'forge:answers:release-receipts',
         retry: 'forge:answers:retry',
       },
     ]
@@ -642,12 +677,55 @@ describe('core operational output closure', () => {
       redisHarness.claimPayloads.push(ackRaw)
       const ackClaim = await queue.claim(1)
       if (!ackClaim) throw new Error('Expected an acknowledgement fixture claim.')
-      redisHarness.failures.push({ marker: 'forge:queue:ack-v2', stage: 'after' })
+      redisHarness.failures.push({ marker: 'forge:queue:ack-v3', stage: 'after' })
       await expect(queue.ack(ackClaim.raw)).rejects.toThrow('Queue transition failed')
       await expect(queue.ack(ackClaim.raw)).resolves.toBe('already_applied')
       expect(redisHarness.lists.get(queueCase.processing)).not.toContain(ackClaim.raw)
       expect(redisHarness.hashes.get(queueCase.claims)?.has(ackClaim.occurrenceId) ?? false)
         .toBe(false)
+      expect([...(redisHarness.zsets.get(queueCase.ackReceipts)?.keys() ?? [])])
+        .toEqual([
+          expect.stringMatching(new RegExp(`^${ackClaim.occurrenceId}:[0-9a-f-]{36}$`)),
+        ])
+
+      const staleAckRaw = JSON.stringify(queueCase.job(15 + caseIndex))
+      redisHarness.claimPayloads.push(staleAckRaw)
+      const staleAckClaim = await queue.claim(1)
+      if (!staleAckClaim) throw new Error('Expected a stale acknowledgement fixture claim.')
+      const staleAckMarker = redisHarness.hashes.get(queueCase.claims)
+        ?.get(staleAckClaim.occurrenceId)
+      if (!staleAckMarker) throw new Error('Expected a stale acknowledgement marker.')
+      redisHarness.nowMs += 2_000
+      const recoveryQueue = queueCase.create() as unknown as AtomicQueue
+      await expect(recoveryQueue.recoverStuckJobs(1_000)).resolves.toBe(1)
+      await expect(queue.ack(staleAckClaim.raw))
+        .rejects.toThrow('Queue transition stale_not_owner')
+      expect(redisHarness.lists.get(queueCase.ready)).toContain(staleAckClaim.raw)
+      const laterOwner = await recoveryQueue.claim(1)
+      if (!laterOwner) throw new Error('Expected the later owner to reclaim the occurrence.')
+      await expect(recoveryQueue.ack(laterOwner.raw)).resolves.toBe('applied')
+      await expect(queue.ack(staleAckClaim.raw))
+        .rejects.toThrow('Queue transition stale_not_owner')
+      expect(redisHarness.zsets.get(queueCase.ackReceipts)?.has(
+        `${staleAckClaim.occurrenceId}:${staleAckMarker.split(':')[1]}`,
+      ) ?? false).toBe(false)
+
+      const releaseRaw = JSON.stringify(queueCase.job(18 + caseIndex))
+      redisHarness.claimPayloads.push(releaseRaw)
+      const releaseClaim = await queue.claim(1)
+      if (!releaseClaim) throw new Error('Expected a shutdown-release fixture claim.')
+      redisHarness.failures.push({ marker: 'forge:queue:release-v1', stage: 'after' })
+      await expect(queue.release(releaseClaim.raw)).rejects.toThrow('Queue transition failed')
+      await expect(queue.release(releaseClaim.raw)).resolves.toBe('already_applied')
+      expect(redisHarness.lists.get(queueCase.ready)?.filter(
+        (raw) => raw === releaseClaim.raw,
+      )).toHaveLength(1)
+      expect(redisHarness.hashes.get(queueCase.claims)?.has(releaseClaim.occurrenceId) ?? false)
+        .toBe(false)
+      expect([...(redisHarness.zsets.get(queueCase.releaseReceipts)?.keys() ?? [])])
+        .toEqual([
+          expect.stringMatching(new RegExp(`^${releaseClaim.occurrenceId}:[0-9a-f-]{36}$`)),
+        ])
 
       const retryRaw = JSON.stringify(queueCase.job(20 + caseIndex))
       redisHarness.claimPayloads.push(retryRaw)
@@ -896,6 +974,7 @@ describe('core operational output closure', () => {
     class PassiveQueue {
       ack = vi.fn().mockResolvedValue(undefined)
       deadLetter = vi.fn().mockResolvedValue(undefined)
+      release = vi.fn().mockResolvedValue(undefined)
       retry = vi.fn().mockResolvedValue(new Date())
       recoverStuckJobs = vi.fn().mockResolvedValue(0)
       promoteDueRetries = vi.fn().mockResolvedValue(0)
@@ -1081,6 +1160,189 @@ describe('core operational output closure', () => {
       }
     }
   })
+
+  it('releases post-stop approval, answers, and task claims before any business boundary', async () => {
+    const workerEnvNames = [
+      'FORGE_WORKER_CLAIM_TIMEOUT_SECONDS',
+      'FORGE_WORKER_STUCK_JOB_RECOVERY_SECONDS',
+      'FORGE_PROVIDER_HEALTH_INTERVAL_SECONDS',
+      'FORGE_BLOCKED_HANDOFF_SWEEP_INTERVAL_SECONDS',
+      'FORGE_SESSION_CACHE_PURGE_INTERVAL_SECONDS',
+    ] as const
+    const workerEnv = Object.fromEntries(workerEnvNames.map((name) => [name, process.env[name]]))
+    const positions = ['approval', 'answers', 'task'] as const
+
+    try {
+      process.env.FORGE_WORKER_CLAIM_TIMEOUT_SECONDS = '1'
+      process.env.FORGE_WORKER_STUCK_JOB_RECOVERY_SECONDS = '1'
+      process.env.FORGE_PROVIDER_HEALTH_INTERVAL_SECONDS = '0'
+      process.env.FORGE_BLOCKED_HANDOFF_SWEEP_INTERVAL_SECONDS = '0'
+      process.env.FORGE_SESSION_CACHE_PURGE_INTERVAL_SECONDS = '0'
+
+      for (const position of positions) {
+        vi.resetModules()
+        delete (globalThis as typeof globalThis & { forgeWorkerRuntime?: unknown }).forgeWorkerRuntime
+
+        const raw = JSON.stringify({
+          schemaVersion: 1,
+          occurrenceId: randomUUID(),
+          job: position === 'approval'
+            ? { taskId: TASK_ID, action: 'approve', attempt: 1 }
+            : { taskId: TASK_ID, attempt: 1 },
+        })
+        const job = position === 'approval'
+          ? { taskId: TASK_ID, action: 'approve' as const, attempt: 1 }
+          : { taskId: TASK_ID, attempt: 1 }
+        const state = {
+          claims: 0,
+          processing: [] as string[],
+          ready: [] as string[],
+        }
+        let resolveBlockedClaim!: (value: { raw: string; job: typeof job }) => void
+        let markClaimStarted: (() => void) | null = null
+        const claimStarted = new Promise<void>((resolve) => {
+          markClaimStarted = resolve
+        })
+        const blockedClaim = new Promise<{ raw: string; job: typeof job }>((resolve) => {
+          resolveBlockedClaim = resolve
+        })
+        const claimFns = {
+          approval: vi.fn().mockResolvedValue(null),
+          answers: vi.fn().mockResolvedValue(null),
+          task: vi.fn().mockResolvedValue(null),
+        }
+        claimFns[position] = vi.fn(async () => {
+          markClaimStarted?.()
+          return await blockedClaim
+        })
+        const queueInstances: Array<{
+          disconnect: ReturnType<typeof vi.fn>
+          kind: typeof position
+          release: ReturnType<typeof vi.fn>
+        }> = []
+
+        const queueClass = (kind: typeof position) => class {
+          ack = vi.fn()
+          claim = claimFns[kind]
+          deadLetter = vi.fn()
+          disconnect = vi.fn()
+          promoteDueRetries = vi.fn().mockResolvedValue(0)
+          recoverStuckJobs = vi.fn().mockResolvedValue(0)
+          release = vi.fn(async (releasedRaw: string) => {
+            state.processing = state.processing.filter((entry) => entry !== releasedRaw)
+            state.claims = 0
+            state.ready.unshift(releasedRaw)
+            return 'applied' as const
+          })
+          retry = vi.fn()
+
+          constructor() {
+            queueInstances.push({
+              disconnect: this.disconnect,
+              kind,
+              release: this.release,
+            })
+          }
+        }
+
+        vi.doMock('@/worker/queue', () => ({
+          AnswersQueue: queueClass('answers'),
+          ApprovalQueue: queueClass('approval'),
+          TaskQueue: queueClass('task'),
+        }))
+        const processAnsweredQuestions = vi.fn()
+        const processApproval = vi.fn()
+        const processTask = vi.fn()
+        vi.doMock('@/worker/orchestrator', () => ({
+          processAnsweredQuestions,
+          processApproval,
+          processTask,
+        }))
+        const finishTaskAttempt = vi.fn()
+        const startTaskAttempt = vi.fn()
+        vi.doMock('@/worker/task-attempts', () => ({ finishTaskAttempt, startTaskAttempt }))
+        const query = (rows: unknown[]) => {
+          const chain: Record<string, unknown> = {
+            then: (
+              resolve: (value: unknown[]) => unknown,
+              reject?: (reason: unknown) => unknown,
+            ) => Promise.resolve(rows).then(resolve, reject),
+          }
+          for (const method of ['from', 'innerJoin', 'where', 'limit']) {
+            chain[method] = () => chain
+          }
+          return chain
+        }
+        const taskLookup = vi.fn()
+        const dbSelect = vi.fn((selection: Record<string, unknown>) => {
+          if (Object.keys(selection).length === 1 && 'id' in selection) taskLookup()
+          return query([])
+        })
+        vi.doMock('@/db', () => ({ db: { select: dbSelect } }))
+        vi.doMock('@/db/schema', () => ({
+          tasks: { id: 'tasks.id', status: 'tasks.status' },
+          workPackages: {
+            metadata: 'work_packages.metadata',
+            status: 'work_packages.status',
+            taskId: 'work_packages.task_id',
+          },
+        }))
+        vi.doMock('drizzle-orm', () => ({ and: vi.fn(), eq: vi.fn() }))
+        vi.doMock('@/worker/blocked-handoff-retry', () => ({
+          enqueueDueBlockedHandoffRetries: vi.fn().mockResolvedValue(0),
+        }))
+        vi.doMock('@/lib/mcps/filesystem-grant-reconciliation', () => ({
+          convergeRecognizedOperatorHolds: vi.fn().mockResolvedValue(0),
+        }))
+        vi.doMock('@/worker/work-package-handoff', () => ({
+          reconcilePendingS4CompletionHandoffs: vi.fn().mockResolvedValue(0),
+        }))
+        vi.doMock('@/lib/session', () => ({
+          reconcilePendingSessionCacheInvalidations: vi.fn().mockResolvedValue({
+            claimed: 0,
+            completed: 0,
+            deferred: 0,
+            stale: 0,
+          }),
+        }))
+
+        const { startWorker } = await import('@/worker/runtime')
+        const handle = await startWorker('standalone')
+        await claimStarted
+        const stop = handle.stop()
+        state.processing = [raw]
+        state.claims = 1
+        resolveBlockedClaim({ raw, job })
+        await stop
+
+        const target = queueInstances.find((entry) => entry.kind === position)
+        if (!target) throw new Error('Expected the blocked queue fixture.')
+        expect(target.release).toHaveBeenCalledOnce()
+        expect(target.release).toHaveBeenCalledWith(raw)
+        expect(state).toEqual({ claims: 0, processing: [], ready: [raw] })
+        expect(taskLookup).not.toHaveBeenCalled()
+        expect(startTaskAttempt).not.toHaveBeenCalled()
+        expect(finishTaskAttempt).not.toHaveBeenCalled()
+        expect(processApproval).not.toHaveBeenCalled()
+        expect(processAnsweredQuestions).not.toHaveBeenCalled()
+        expect(processTask).not.toHaveBeenCalled()
+        if (position === 'approval') {
+          expect(claimFns.answers).not.toHaveBeenCalled()
+          expect(claimFns.task).not.toHaveBeenCalled()
+        } else if (position === 'answers') {
+          expect(claimFns.task).not.toHaveBeenCalled()
+        }
+        expect(queueInstances.every((entry) => entry.disconnect.mock.calls.length === 1))
+          .toBe(true)
+      }
+    } finally {
+      for (const name of workerEnvNames) {
+        const value = workerEnv[name]
+        if (value === undefined) delete process.env[name]
+        else process.env[name] = value
+      }
+    }
+  })
 })
 
 describe('core output source sentinel', () => {
@@ -1162,8 +1424,13 @@ describe('core output source sentinel', () => {
     expect(queueSource).toContain('occurrenceId: active.occurrenceId')
     expect(queueSource).toContain("return 'stale_not_owner'")
     expect(queueSource).toContain("error('forge_queue_claim_marker_invalid')")
-    expect(queueSource.match(/error\('forge_queue_claim_marker_invalid'\)/g)).toHaveLength(8)
+    expect(queueSource.match(/error\('forge_queue_claim_marker_invalid'\)/g)).toHaveLength(10)
     expect(queueSource).toContain("local now = redis.call('TIME')")
+    expect(queueSource).toContain("redis.call('ZADD', KEYS[3], now_ms, receipt)")
+    expect(queueSource).toContain("redis.call('ZSCORE', KEYS[3], receipt)")
+    expect(queueSource).toContain('const TRANSITION_RECEIPT_TTL_MS = 15 * 60 * 1000')
+    expect(queueSource).toContain('const TRANSITION_RECEIPT_CAP = 50_000')
+    expect(queueSource).toContain('const TRANSITION_RECEIPT_PRUNE_LIMIT = 100')
     expect(queueSource).toContain("redis.call('RPUSH', KEYS[1], ARGV[1])")
     expect(queueSource).toContain('const STUCK_RECOVERY_SCAN_LIMIT = 100')
     expect(queueSource).not.toMatch(/this\.client\.lpush\(this\.deadQueueKey,[\s\S]{0,300}\braw,/)
@@ -1174,6 +1441,11 @@ describe('core output source sentinel', () => {
     expect(runtimeSource).toContain('await recoverQueueWork({ drain: true })')
     expect(runtimeSource).toContain('queueRecoveryTimer = setInterval(')
     expect(runtimeSource).toContain('await queueRecoveryRun?.catch(() => {})')
+    expect(runtimeSource.match(/if \(shuttingDown\) \{[\s\S]{0,300}releaseClaimAfterShutdown/g))
+      .toHaveLength(3)
+    expect(runtimeSource).toMatch(
+      /logQueueInfrastructureFailure\(\s*'release_after_shutdown'/,
+    )
     expect(runtimeSource).not.toMatch(
       /stop:\s*async[\s\S]{0,300}(?:taskQueue|approvalQueue|answersQueue)\.disconnect\(\)/,
     )
