@@ -1033,6 +1033,7 @@ describe('legacy leakage CLI and operator guide', () => {
 
   it('keeps the accepted textual key generator and complete destructive inventory closed across policy, runbook, and help', async () => {
     const runbook = await readFile('../docs/operators/legacy-leakage-scrub-v1.md', 'utf8')
+    const operatorGuide = await readFile('../docs/operator-guide.md', 'utf8')
     const cliHelp = legacyLeakageScrubUsage()
     const databaseInventory = `Database mutation inventory: task_logs; eligible, unversioned legacy Architect
 artifacts; work_packages; approval_gates; and the operation-scoped app_settings
@@ -1064,7 +1065,48 @@ forge:task-events:v2:* keys.`
     expect(cliHelp).toContain(databaseInventory)
     expect(cliHelp).toContain(redisBoundaries)
     expect(runbook).toContain('Redis is a separate boundary, not part of that database inventory.')
-    expect(runbook).toContain('this command does not delete v2 history')
+    expect(runbook).toMatch(/never repairs,\s+rewrites,\s+expires,\s+or deletes v2 evidence/)
+    expect(runbook).toContain('full `forge:task-events:v2:*` prefix')
+    expect(runbook).toContain('unknown or malformed v2 keys')
+    expect(runbook).toContain('Expiry is not erasure.')
+    expect(runbook).toContain('database-authoritative S4 runtime mode')
+    expect(runbook).toContain('FORGE_TASK_EVENT_PUBLISHER_REDIS_URL')
+    expect(runbook).toContain('FORGE_TASK_EVENT_SUBSCRIBER_REDIS_URL')
+    expect(runbook).toMatch(/old Redis clients\s+are absent/)
+    expect(runbook).toMatch(/old live connection and fresh old\s+credentials cannot write/)
+    expect(runbook).toContain('FORGE_S4_REQUIRE_REDIS_TEST=1')
+    expect(runbook).toContain('FORGE_S4_REDIS_ACL_TEST_REQUIRED=1')
+    for (const proofContract of [
+      'S4_SCRUB_REDIS_START',
+      'S4_SCRUB_REDIS_V2_IMMUTABLE_OK',
+      'S4_SCRUB_REDIS_PURGE_RETRY_OK',
+      'S4_REDIS_ACL_ROLE_ISOLATION_OK',
+      'S4_REDIS_ACL_DENIALS_OK',
+      'S4_REDIS_ACL_LEGACY_REVOKED_OK',
+    ]) expect(runbook).toContain(proofContract)
+    expect(runbook).toMatch(/deferred complete cross-sink\s+production proof/)
+    expect(operatorGuide).toContain('database-authoritative S4 runtime mode')
+    expect(operatorGuide).toContain('shared application `REDIS_URL` is the compatibility path')
+    expect(operatorGuide).toMatch(/Changing environment values\s+alone cannot flip the mode/)
+    for (const aclToken of [
+      '~forge:task-events:v2:*:history',
+      '~forge:task-events:v2:*:seq',
+      '&forge:task-events:v2:*:live',
+      '+select|<db>',
+      '+client|setinfo',
+      '+zremrangebyrank',
+      '+zrangebyscore',
+      '+punsubscribe',
+    ]) expect(operatorGuide).toContain(aclToken)
+    for (const proofContract of [
+      'FORGE_S4_REQUIRE_POSTGRES_TEST=1',
+      'FORGE_S4_REDIS_TEST_URL=redis://localhost:6380/15',
+      'FORGE_S4_REDIS_ACL_TEST_ADMIN_URL=redis://localhost:6380/14',
+      'S4_SCRUB_POSTGRES_AUTH_CAS_RESUME_OK',
+      'S4_REDIS_ACL_LEGACY_REVOKED_OK',
+    ]) expect(operatorGuide).toContain(proofContract)
+    expect(operatorGuide).not.toMatch(/redis:\/\/[^\s`]+:[^@\s`]+@/)
+    expect(runbook).not.toMatch(/redis:\/\/[^\s`]+:[^@\s`]+@/)
     expect(LEGACY_LEAKAGE_SCRUB_DATABASE_POLICY).toEqual({
       task_logs: expect.objectContaining({ updated: ['message', 'front_matter', 'metadata'] }),
       artifacts: expect.objectContaining({ updated: ['content', 'metadata'] }),
