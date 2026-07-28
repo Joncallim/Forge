@@ -96,7 +96,16 @@ async function startWorkerOnce(
   source: WorkerSource,
   currentState: WorkerState,
 ): Promise<WorkerHandle> {
-  const [{ AnswersQueue, ApprovalQueue, TaskQueue }, { processAnsweredQuestions, processApproval, processTask }] = await Promise.all([
+  const [{
+    AnswersQueue,
+    ApprovalQueue,
+    RetryPromotionConflictError,
+    TaskQueue,
+  }, {
+    processAnsweredQuestions,
+    processApproval,
+    processTask,
+  }] = await Promise.all([
     import('./queue'),
     import('./orchestrator'),
   ])
@@ -551,11 +560,27 @@ async function startWorkerOnce(
         Math.min(stuckJobRecoveryMs, MAX_QUEUE_RECOVERY_INTERVAL_MS),
       )
 
+      const promoteQueueRetries = async (
+        queueName: 'answers' | 'approvals' | 'tasks',
+        queue: { promoteDueRetries(): Promise<number> },
+      ): Promise<number> => {
+        try {
+          return await queue.promoteDueRetries()
+        } catch (error) {
+          if (!(error instanceof RetryPromotionConflictError)) throw error
+          console.warn('[worker] Retry promotion compatibility conflict', {
+            category: 'mixed_version_retry_promotion',
+            queue: queueName,
+          })
+          return 0
+        }
+      }
+
       while (!shuttingDown) {
         const [promotedApprovals, promotedAnswers, promotedTasks] = await Promise.all([
-          approvalQueue.promoteDueRetries(),
-          answersQueue.promoteDueRetries(),
-          taskQueue.promoteDueRetries(),
+          promoteQueueRetries('approvals', approvalQueue),
+          promoteQueueRetries('answers', answersQueue),
+          promoteQueueRetries('tasks', taskQueue),
         ])
         if (promotedApprovals > 0 || promotedAnswers > 0 || promotedTasks > 0) {
           console.info('[worker] Promoted retry jobs', {

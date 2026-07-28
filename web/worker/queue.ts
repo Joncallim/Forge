@@ -65,6 +65,28 @@ export type QueueRetryResult = {
   nextRetryAt: Date
 }
 
+export const RETRY_PROMOTION_CONFLICT_CODE = 'queue_retry_promotion_conflict' as const
+
+export class RetryPromotionConflictError extends Error {
+  declare readonly code: typeof RETRY_PROMOTION_CONFLICT_CODE
+
+  constructor() {
+    super('Queue retry promotion conflict')
+    Object.defineProperty(this, 'name', {
+      configurable: true,
+      enumerable: false,
+      value: 'RetryPromotionConflictError',
+      writable: true,
+    })
+    Object.defineProperty(this, 'code', {
+      configurable: false,
+      enumerable: false,
+      value: RETRY_PROMOTION_CONFLICT_CODE,
+      writable: false,
+    })
+  }
+}
+
 type QueueTransitionResult = QueueTransitionOutcome | 'stale_not_owner'
 
 type RetryPromotionCandidate = {
@@ -91,7 +113,10 @@ type RetryPromotionTransition =
       outcome: QueueTransitionOutcome
     }
   | {
-      outcome: 'stale_not_owner'
+      outcome: 'ownership_conflict'
+    }
+  | {
+      outcome: 'receipt_integrity_failure'
     }
 
 type ClaimedQueueJob<TJob> = {
@@ -442,29 +467,17 @@ if mode ~= 'discard' and not valid_uuid(candidate_occurrence_id) then
 end
 local now_ms = redis_now_ms()
 local cutoff = now_ms - ttl_ms
-local expired = redis.call(
-  'ZRANGEBYSCORE',
-  KEYS[4],
-  '-inf',
-  cutoff,
-  'LIMIT',
-  0,
-  prune_limit
-)
-for _, expired_fingerprint in ipairs(expired) do
-  redis.call('ZREM', KEYS[4], expired_fingerprint)
-  redis.call('HDEL', KEYS[3], expired_fingerprint)
-end
 local current_score = redis.call('ZSCORE', KEYS[1], raw_member)
 local existing = redis.call('HGET', KEYS[3], fingerprint)
 local receipt_score = redis.call('ZSCORE', KEYS[4], fingerprint)
 if not current_score then
+  if not existing and not receipt_score then
+    return {0, 'ownership_conflict', ''}
+  end
   if not existing or not receipt_score then
-    if existing or receipt_score then
-      redis.call('HDEL', KEYS[3], fingerprint)
-      redis.call('ZREM', KEYS[4], fingerprint)
-    end
-    return {0, 'stale', ''}
+    redis.call('HDEL', KEYS[3], fingerprint)
+    redis.call('ZREM', KEYS[4], fingerprint)
+    return {0, 'receipt_integrity_failure', ''}
   end
   local receipt_timestamp = tonumber(receipt_score)
   local receipt_timestamp_valid = receipt_timestamp
@@ -482,7 +495,7 @@ if not current_score then
   if not receipt_timestamp_valid or not disposition_valid then
     redis.call('HDEL', KEYS[3], fingerprint)
     redis.call('ZREM', KEYS[4], fingerprint)
-    return {0, 'stale', ''}
+    return {0, 'receipt_integrity_failure', ''}
   end
   if existing == 'discarded' and mode == 'discard' then
     return {2, 'discarded', ''}
@@ -490,16 +503,32 @@ if not current_score then
   if winning_occurrence_id and mode ~= 'discard' then
     return {2, 'promoted', winning_occurrence_id}
   end
-  return {0, 'stale', ''}
+  return {0, 'receipt_integrity_failure', ''}
 end
-if current_score ~= expected_score or existing or receipt_score then
-  return {0, 'stale', ''}
+if current_score ~= expected_score then
+  return {0, 'ownership_conflict', ''}
+end
+if existing or receipt_score then
+  return {0, 'receipt_integrity_failure', ''}
+end
+local expired = redis.call(
+  'ZRANGEBYSCORE',
+  KEYS[4],
+  '-inf',
+  cutoff,
+  'LIMIT',
+  0,
+  prune_limit
+)
+for _, expired_fingerprint in ipairs(expired) do
+  redis.call('ZREM', KEYS[4], expired_fingerprint)
+  redis.call('HDEL', KEYS[3], expired_fingerprint)
 end
 if redis.call('HLEN', KEYS[3]) >= cap or redis.call('ZCARD', KEYS[4]) >= cap then
   error('forge_queue_retry_receipt_capacity_exhausted')
 end
 if redis.call('ZREM', KEYS[1], raw_member) ~= 1 then
-  return {0, 'stale', ''}
+  return {0, 'ownership_conflict', ''}
 end
 if mode == 'discard' then
   redis.call('HSET', KEYS[3], fingerprint, 'discarded')
@@ -810,13 +839,16 @@ abstract class RedisListQueue<TJob extends RetryableJob> {
       ? 'applied'
       : rawOutcome === 2
         ? 'already_applied'
-        : rawOutcome === 0
-          ? 'stale_not_owner'
-          : null
-    if (outcome === 'stale_not_owner'
-      && rawDisposition === 'stale'
+        : null
+    if (rawOutcome === 0
+      && rawDisposition === 'ownership_conflict'
       && rawOccurrenceId === '') {
-      return { outcome }
+      return { outcome: 'ownership_conflict' }
+    }
+    if (rawOutcome === 0
+      && rawDisposition === 'receipt_integrity_failure'
+      && rawOccurrenceId === '') {
+      return { outcome: 'receipt_integrity_failure' }
     }
     if ((outcome === 'applied' || outcome === 'already_applied')
       && rawDisposition === 'discarded'
@@ -1116,8 +1148,11 @@ abstract class RedisListQueue<TJob extends RetryableJob> {
           String(PROMOTION_DISPOSITION_PRUNE_LIMIT),
         ],
       ))
-      if (result.outcome === 'stale_not_owner') {
-        throw new Error('Queue retry promotion ownership mismatch')
+      if (result.outcome === 'ownership_conflict') {
+        throw new RetryPromotionConflictError()
+      }
+      if (result.outcome === 'receipt_integrity_failure') {
+        throw new Error('Queue retry promotion receipt integrity failure')
       }
       if (result.disposition === 'discarded') {
         if (result.outcome === 'applied') {
