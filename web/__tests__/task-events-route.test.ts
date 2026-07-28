@@ -25,8 +25,10 @@ vi.mock('ioredis', () => {
 
 const mockGetSession = vi.fn()
 const mockGetAccessibleTask = vi.fn()
+const { mockReadS4RuntimeModeV1 } = vi.hoisted(() => ({ mockReadS4RuntimeModeV1: vi.fn() }))
 vi.mock('@/lib/session', () => ({ getSession: mockGetSession }))
 vi.mock('@/lib/task-access', () => ({ getAccessibleTask: mockGetAccessibleTask }))
+vi.mock('@/lib/mcps/s4-lease', () => ({ readS4RuntimeModeV1: mockReadS4RuntimeModeV1 }))
 
 const originalPublisher = process.env.FORGE_TASK_EVENT_PUBLISHER_REDIS_URL
 const originalSubscriber = process.env.FORGE_TASK_EVENT_SUBSCRIBER_REDIS_URL
@@ -53,10 +55,11 @@ describe('dashboard task-event stream', () => {
     vi.clearAllMocks()
     state.constructorUrls.length = 0
     state.sub = null
-    process.env.FORGE_TASK_EVENT_PUBLISHER_REDIS_URL = 'redis://event-publisher@localhost/0'
-    process.env.FORGE_TASK_EVENT_SUBSCRIBER_REDIS_URL = 'redis://event-subscriber@localhost/0'
+    process.env.FORGE_TASK_EVENT_PUBLISHER_REDIS_URL = 'redis://event-publisher:publisher-password@localhost/0'
+    process.env.FORGE_TASK_EVENT_SUBSCRIBER_REDIS_URL = 'redis://event-subscriber:subscriber-password@localhost/0'
     mockGetSession.mockResolvedValue({ userId: 'user-1' })
     mockGetAccessibleTask.mockResolvedValue({ id: 'task-1' })
+    mockReadS4RuntimeModeV1.mockResolvedValue('protected')
   })
 
   afterEach(() => {
@@ -83,10 +86,21 @@ describe('dashboard task-event stream', () => {
     }, 50)
 
     const output = await readUntil(response.body!, '"status":"running"')
-    expect(state.constructorUrls).toEqual(['redis://event-subscriber@localhost/0'])
+    expect(state.constructorUrls).toEqual(['redis://event-subscriber:subscriber-password@localhost/0'])
     expect(state.sub?.psubscribe).toHaveBeenCalledWith('forge:task-events:v2:*:live')
     expect(output).toContain('event: task:status')
     expect(output).toContain('"taskId":"task-1"')
     expect(output).not.toContain('"status":"failed"')
+  })
+
+  it('does not construct a Redis subscriber when authoritative mode cannot be read', async () => {
+    mockReadS4RuntimeModeV1.mockRejectedValueOnce(new Error('runtime authority unavailable'))
+    const { GET } = await import('@/app/api/tasks/events/route')
+    const response = await GET(new Request('http://localhost/api/tasks/events') as never)
+
+    const reader = response.body!.getReader()
+    await reader.read()
+    reader.releaseLock()
+    expect(state.constructorUrls).toEqual([])
   })
 })

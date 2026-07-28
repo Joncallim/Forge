@@ -18,6 +18,26 @@ import { getTableName } from 'drizzle-orm'
 import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { canonicalS3Marker } from '../test-support/filesystem-grant-marker-fixtures'
 
+const taskEventRedisEnvironment = {
+  publisher: process.env.FORGE_TASK_EVENT_PUBLISHER_REDIS_URL,
+  subscriber: process.env.FORGE_TASK_EVENT_SUBSCRIBER_REDIS_URL,
+}
+
+beforeEach(() => {
+  // This suite's S4 authority mock is protected by default. Give every
+  // task-event-producing route the same authenticated, distinct-principal
+  // provisioned shape that protected runtime requires.
+  process.env.FORGE_TASK_EVENT_PUBLISHER_REDIS_URL = 'redis://api-event-publisher:publisher-password@events.example.test/0'
+  process.env.FORGE_TASK_EVENT_SUBSCRIBER_REDIS_URL = 'redis://api-event-subscriber:subscriber-password@events.example.test/0'
+})
+
+afterEach(() => {
+  if (taskEventRedisEnvironment.publisher === undefined) delete process.env.FORGE_TASK_EVENT_PUBLISHER_REDIS_URL
+  else process.env.FORGE_TASK_EVENT_PUBLISHER_REDIS_URL = taskEventRedisEnvironment.publisher
+  if (taskEventRedisEnvironment.subscriber === undefined) delete process.env.FORGE_TASK_EVENT_SUBSCRIBER_REDIS_URL
+  else process.env.FORGE_TASK_EVENT_SUBSCRIBER_REDIS_URL = taskEventRedisEnvironment.subscriber
+})
+
 // ---------------------------------------------------------------------------
 // Module-level mocks
 // ---------------------------------------------------------------------------
@@ -146,6 +166,20 @@ vi.mock('@/lib/redis', () => ({
     publish: mockRedisPublish,
   },
 }))
+
+// API contract tests exercise a protected runtime without a Redis server. The
+// dedicated publisher selection is covered in task-event-focused tests; this
+// narrow transport double keeps these route contracts deterministic.
+vi.mock('@/lib/task-event-redis', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/task-event-redis')>()
+  return {
+    ...actual,
+    taskEventPublisherRedis: () => ({
+      eval: (...args: unknown[]) => mockRedisEval(...args),
+      on: vi.fn(),
+    }),
+  }
+})
 
 const mockExecFile = vi.fn()
 vi.mock('node:child_process', () => ({
