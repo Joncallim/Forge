@@ -4,7 +4,7 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { inspect } from 'node:util'
-import Redis from 'ioredis'
+import Redis, { ReplyError } from 'ioredis'
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 import { createLegacyLeakageRedisAdapter } from '@/scripts/scrub-legacy-leakage'
 import { TASK_EVENT_V2_LIVE_PATTERN, taskEventRedisConfiguration, taskEventRedisKeys } from '@/lib/task-event-redis'
@@ -58,6 +58,7 @@ const subscriberRules = [
 ] as const
 const safeFailureProofEnvironment = 'FORGE_S4_REDIS_ACL_SAFE_FAILURE_PROOF'
 const safeFailureMessage = 'S4 Redis ACL proof sanitized a Redis operation failure.'
+const revocationMismatchMessage = 'S4 Redis ACL proof received an unexpected Redis revocation outcome.'
 const failureSentinels = [
   'S4_ACL_COMMAND_ARGUMENT_SENTINEL',
   'S4_ACL_CONNECTION_URL_SENTINEL',
@@ -68,6 +69,13 @@ const failureSentinels = [
   'S4_ACL_KEY_SENTINEL',
   'S4_ACL_CHANNEL_SENTINEL',
 ] as const
+type RedisRevocationMode = 'existing_authenticated' | 'fresh_credentials'
+type RedisRevocationEvidence = Readonly<{
+  userAbsent: boolean
+  activeClientAbsent: boolean
+  connectionReady: boolean
+  connectionTerminal: boolean
+}>
 
 async function runRedisStep<T>(fixedMessage: string, operation: () => Promise<T>): Promise<T> {
   try {
@@ -88,6 +96,11 @@ function fabricatedEnumerableRedisFailure(): object {
     identity: failureSentinels[4],
     task: { id: failureSentinels[5], key: failureSentinels[6], channel: failureSentinels[7] },
   }
+}
+
+function fabricatedRedisRevocationError(message: string, kind: 'reply' | 'operational' = 'reply'): Error {
+  const error = kind === 'reply' ? new ReplyError(message) : new Error(message)
+  return Object.assign(error, fabricatedEnumerableRedisFailure())
 }
 
 function enumerableStrings(value: unknown, seen = new Set<object>()): string[] {
@@ -112,6 +125,110 @@ async function captureSanitizedRedisFailure(): Promise<Error> {
     if (error instanceof Error) return error
   }
   throw new Error('S4 Redis ACL proof did not receive a sanitized Redis failure.')
+}
+
+function requireExpectedRedisRevocation(error: unknown, mode: RedisRevocationMode, evidence: RedisRevocationEvidence): void {
+  if (!(error instanceof Error) || !evidence.userAbsent || !evidence.activeClientAbsent || evidence.connectionReady) {
+    throw new Error(revocationMismatchMessage)
+  }
+  const redisReply = error instanceof ReplyError
+  const noAuth = redisReply && /^NOAUTH Authentication required\.?$/.test(error.message)
+  const expected = mode === 'existing_authenticated'
+    ? noAuth
+      || (redisReply && /^NOPERM this user has no permissions to run the 'set' command(?: or its subcommand)?\.?$/.test(error.message))
+      || (!redisReply && error.name === 'Error' && error.message === 'Connection is closed.' && evidence.connectionTerminal)
+    : noAuth
+      || (redisReply && /^WRONGPASS invalid username-password pair(?: or user is disabled)?\.?$/.test(error.message))
+  if (!expected) throw new Error(revocationMismatchMessage)
+}
+
+function assertSanitizedRevocationMismatch(error: unknown): void {
+  if (!(error instanceof Error)
+    || error.name !== 'Error'
+    || error.message !== revocationMismatchMessage
+    || Object.keys(error).length !== 0
+    || Object.getOwnPropertyNames(error).some((property) => property !== 'message' && property !== 'stack')) {
+    throw new Error('S4 Redis ACL proof received an unsafe revocation classifier mismatch.')
+  }
+  const payload = { error, phase: 'redis_acl_revocation_classifier' }
+  const rendered = [
+    String(error),
+    JSON.stringify(error),
+    inspect(error),
+    JSON.stringify(payload),
+    inspect(payload),
+    ...enumerableStrings(payload),
+  ].join('\n')
+  assertSentinelsAbsent(rendered)
+}
+
+function expectFabricatedRevocationMismatch(error: unknown, mode: RedisRevocationMode, evidence: RedisRevocationEvidence): void {
+  try {
+    requireExpectedRedisRevocation(error, mode, evidence)
+  } catch (mismatch) {
+    assertSanitizedRevocationMismatch(mismatch)
+    return
+  }
+  throw new Error('S4 Redis ACL proof accepted an unrelated Redis revocation outcome.')
+}
+
+function proveRedisRevocationClassifier(): void {
+  const existingEvidence: RedisRevocationEvidence = {
+    userAbsent: true,
+    activeClientAbsent: true,
+    connectionReady: false,
+    connectionTerminal: true,
+  }
+  const freshEvidence: RedisRevocationEvidence = {
+    ...existingEvidence,
+    connectionTerminal: false,
+  }
+  requireExpectedRedisRevocation(
+    fabricatedRedisRevocationError("NOPERM this user has no permissions to run the 'set' command"),
+    'existing_authenticated',
+    existingEvidence,
+  )
+  requireExpectedRedisRevocation(
+    fabricatedRedisRevocationError('WRONGPASS invalid username-password pair or user is disabled.'),
+    'fresh_credentials',
+    freshEvidence,
+  )
+  requireExpectedRedisRevocation(fabricatedRedisRevocationError('NOAUTH Authentication required.'), 'existing_authenticated', existingEvidence)
+  requireExpectedRedisRevocation(fabricatedRedisRevocationError('NOAUTH Authentication required.'), 'fresh_credentials', freshEvidence)
+  requireExpectedRedisRevocation(fabricatedRedisRevocationError('Connection is closed.', 'operational'), 'existing_authenticated', existingEvidence)
+
+  const unrelated = [
+    fabricatedRedisRevocationError('WRONGTYPE Operation against a key holding the wrong kind of value'),
+    fabricatedRedisRevocationError('ERR syntax error'),
+    fabricatedRedisRevocationError('ETIMEDOUT', 'operational'),
+    fabricatedRedisRevocationError('connect ECONNREFUSED 127.0.0.1:6379', 'operational'),
+    fabricatedRedisRevocationError('ERR unknown Redis failure'),
+  ]
+  for (const error of unrelated) {
+    expectFabricatedRevocationMismatch(error, 'existing_authenticated', existingEvidence)
+    expectFabricatedRevocationMismatch(error, 'fresh_credentials', freshEvidence)
+  }
+  expectFabricatedRevocationMismatch(
+    fabricatedRedisRevocationError("NOPERM this user has no permissions to run the 'set' command"),
+    'fresh_credentials',
+    freshEvidence,
+  )
+  expectFabricatedRevocationMismatch(
+    fabricatedRedisRevocationError('WRONGPASS invalid username-password pair or user is disabled.'),
+    'existing_authenticated',
+    existingEvidence,
+  )
+  expectFabricatedRevocationMismatch(fabricatedRedisRevocationError('Connection is closed.', 'operational'), 'fresh_credentials', freshEvidence)
+  expectFabricatedRevocationMismatch(
+    fabricatedRedisRevocationError('Connection is closed.', 'operational'),
+    'existing_authenticated',
+    { ...existingEvidence, connectionTerminal: false },
+  )
+  expectFabricatedRevocationMismatch(
+    fabricatedRedisRevocationError('NOAUTH Authentication required.', 'operational'),
+    'fresh_credentials',
+    freshEvidence,
+  )
 }
 
 function opaque(value: Buffer | null): string {
@@ -321,6 +438,23 @@ describe.skipIf(!enabled)('S4 real Redis ACL task-event proof', () => {
     }
   }
 
+  async function readRedisRevocationEvidence(user: string, connection: Redis): Promise<RedisRevocationEvidence> {
+    const [identity, listing] = await Promise.all([
+      runRedisStep('S4 Redis ACL proof could not inspect the revoked ACL identity.', () => admin.call('ACL', 'GETUSER', user)),
+      runRedisStep('S4 Redis ACL proof could not inspect revoked Redis client state.', () => admin.client('LIST')),
+    ])
+    if (typeof listing !== 'string') throw new Error('S4 Redis ACL proof received invalid revoked-client evidence.')
+    const activeClientAbsent = !listing
+      .split('\n')
+      .some((line) => line.split(' ').includes(`user=${user}`))
+    return {
+      userAbsent: identity === null,
+      activeClientAbsent,
+      connectionReady: connection.status === 'ready',
+      connectionTerminal: connection.status === 'end' || connection.status === 'close',
+    }
+  }
+
   async function databaseEvidence(connection: Redis): Promise<Readonly<{ count: number; fingerprint: string }>> {
     const [count, keyspace] = await runRedisStep('S4 Redis ACL proof could not inspect database isolation evidence.', () => Promise.all([connection.dbsize(), connection.info('keyspace')]))
     if (!Number.isSafeInteger(count) || count < 0 || typeof keyspace !== 'string') {
@@ -362,22 +496,20 @@ describe.skipIf(!enabled)('S4 real Redis ACL task-event proof', () => {
     throw new Error('S4 Redis ACL proof expected an exact Redis permission denial.')
   }
 
-  async function expectRejected(action: () => Promise<unknown>): Promise<void> {
-    try {
-      await action()
-    } catch {
-      return
-    }
-    throw new Error('S4 Redis ACL proof expected the revoked Redis client to be rejected.')
-  }
-
-  async function expectRevokedCredentialConnection(action: () => Promise<unknown>): Promise<void> {
+  async function expectRedisRevoked(
+    mode: RedisRevocationMode,
+    user: string,
+    connection: Redis,
+    action: () => Promise<unknown>,
+  ): Promise<void> {
     try {
       await action()
     } catch (error) {
-      if (error instanceof Error && /WRONGPASS|NOAUTH|NOPERM|Connection is closed/.test(error.message)) return
+      const evidence = await readRedisRevocationEvidence(user, connection)
+      requireExpectedRedisRevocation(error, mode, evidence)
+      return
     }
-    throw new Error('S4 Redis ACL proof expected the revoked Redis credentials to be denied.')
+    throw new Error(revocationMismatchMessage)
   }
 
   beforeAll(async () => {
@@ -616,6 +748,7 @@ describe.skipIf(!enabled)('S4 real Redis ACL task-event proof', () => {
   })
 
   it('S4_REDIS_ACL_LEGACY_REVOKED: legacy credentials cannot recreate purged keys after revocation', async () => {
+    proveRedisRevocationClassifier()
     const legacy = legacyKeys(legacyFixtureTaskId)
     const oldWriter = client(legacyUrl)
     await runRedisStep('S4 Redis ACL proof could not connect the legacy fixture writer.', () => oldWriter.connect())
@@ -636,10 +769,10 @@ describe.skipIf(!enabled)('S4 real Redis ACL task-event proof', () => {
     await assertAclAbsent(legacyUser)
     const ended = await Promise.race([terminated, new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 1_000))])
     expect(ended).toBe(true)
-    await expectRejected(() => oldWriter.set(legacy.sequence, '1'))
+    await expectRedisRevoked('existing_authenticated', legacyUser, oldWriter, () => oldWriter.set(legacy.sequence, '1'))
 
     const staleConnection = client(legacyUrl)
-    await expectRevokedCredentialConnection(() => staleConnection.connect())
+    await expectRedisRevoked('fresh_credentials', legacyUser, staleConnection, () => staleConnection.set(legacy.sequence, '1'))
     const legacyCountAfterRevocation = await runRedisStep('S4 Redis ACL proof could not verify legacy revocation state.', () => admin.exists(legacy.history, legacy.sequence))
     expect(legacyCountAfterRevocation).toBe(0)
     const v2Evidence = await runRedisStep('S4 Redis ACL proof could not verify final v2 evidence.', () => createLegacyLeakageRedisAdapter(admin).scanV2TaskEventHistory([]))
