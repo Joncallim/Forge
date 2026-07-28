@@ -143,20 +143,165 @@ async function startWorkerOnce(
     return row !== undefined
   }
 
-  const acknowledgeMissingTaskJob = async (
-    queueName: 'approval' | 'answers' | 'task',
-    taskId: string,
-    ack: () => Promise<void>,
-  ): Promise<boolean> => {
-    if (await taskExists(taskId)) return false
+  type RuntimeJob = {
+    attempt: number
+    taskId: string
+  }
+  type RuntimeQueue<TJob extends RuntimeJob> = {
+    ack: (raw: string) => Promise<void>
+    deadLetter: (raw: string, job: TJob) => Promise<void>
+    retry: (raw: string, job: TJob, delayMs: number) => Promise<unknown>
+  }
+  type QueueOperation = 'approval' | 'answers' | 'task'
+  type QueueInfrastructurePhase =
+    | 'ack_after_success'
+    | 'ack_missing_task'
+    | 'dead_letter'
+    | 'retry'
+    | 'task_lookup'
+  type AttemptInfrastructurePhase = 'finish_after_failure' | 'finish_after_success' | 'start'
 
-    await ack()
-    console.info('[worker] Dropped job for deleted task', {
+  const logQueueInfrastructureFailure = (
+    phase: QueueInfrastructurePhase,
+    queueName: QueueOperation,
+    taskId: string,
+  ): void => {
+    console.error('[worker] Queue infrastructure failure', {
+      phase,
       queueName,
       taskId,
       workerId,
     })
-    return true
+  }
+
+  const logAttemptInfrastructureFailure = (
+    phase: AttemptInfrastructurePhase,
+    queueName: QueueOperation,
+    taskId: string,
+  ): void => {
+    console.error('[worker] Attempt persistence failure', {
+      phase,
+      queueName,
+      taskId,
+      workerId,
+    })
+  }
+
+  const acknowledgeMissingTaskJob = async (
+    queueName: QueueOperation,
+    taskId: string,
+    ack: () => Promise<void>,
+  ): Promise<'acknowledged' | 'present' | 'retained'> => {
+    let exists: boolean
+    try {
+      exists = await taskExists(taskId)
+    } catch {
+      logQueueInfrastructureFailure('task_lookup', queueName, taskId)
+      return 'retained'
+    }
+    if (exists) return 'present'
+
+    try {
+      await ack()
+      console.info('[worker] Dropped job for deleted task', {
+        queueName,
+        taskId,
+        workerId,
+      })
+      return 'acknowledged'
+    } catch {
+      logQueueInfrastructureFailure('ack_missing_task', queueName, taskId)
+      return 'retained'
+    }
+  }
+
+  const processClaimedJob = async <TJob extends RuntimeJob>(input: {
+    attemptQueueName: 'answers' | 'approvals' | 'tasks'
+    claimed: { job: TJob; raw: string }
+    processBusiness: (finalAttempt: boolean) => Promise<void>
+    queue: RuntimeQueue<TJob>
+    queueName: QueueOperation
+  }): Promise<void> => {
+    const { claimed, queue, queueName } = input
+    const { job, raw } = claimed
+    const finalAttempt = job.attempt >= maxAttempts
+
+    const missingTaskDisposition = await acknowledgeMissingTaskJob(
+      queueName,
+      job.taskId,
+      () => queue.ack(raw),
+    )
+    if (missingTaskDisposition !== 'present') return
+
+    let attemptId: string
+    try {
+      attemptId = await startTaskAttempt({
+        attemptNumber: job.attempt,
+        jobPayload: job,
+        queueName: input.attemptQueueName,
+        taskId: job.taskId,
+        workerId,
+      })
+    } catch {
+      logAttemptInfrastructureFailure('start', queueName, job.taskId)
+      return
+    }
+
+    console.info('[worker] Processing job', {
+      attempt: job.attempt,
+      finalAttempt,
+      queueName,
+      taskId: job.taskId,
+      workerId,
+    })
+
+    try {
+      await input.processBusiness(finalAttempt)
+    } catch (err) {
+      const message = retainedErrorMessage(err)
+      const nextRetryAt = finalAttempt
+        ? null
+        : new Date(Date.now() + backoffDelayMs(job.attempt))
+      try {
+        await finishTaskAttempt({
+          attemptId,
+          errorMessage: message,
+          nextRetryAt,
+          status: finalAttempt ? 'dead_lettered' : 'failed',
+        })
+      } catch {
+        logAttemptInfrastructureFailure('finish_after_failure', queueName, job.taskId)
+      }
+      console.error('[worker] Job processing failed', {
+        attempt: job.attempt,
+        finalAttempt,
+        queueName,
+        taskId: job.taskId,
+        workerId,
+      })
+      try {
+        if (finalAttempt) {
+          await queue.deadLetter(raw, job)
+        } else {
+          await queue.retry(raw, job, backoffDelayMs(job.attempt))
+        }
+      } catch {
+        logQueueInfrastructureFailure(finalAttempt ? 'dead_letter' : 'retry', queueName, job.taskId)
+        return
+      }
+      return
+    }
+
+    try {
+      await finishTaskAttempt({ attemptId, status: 'completed' })
+    } catch {
+      logAttemptInfrastructureFailure('finish_after_success', queueName, job.taskId)
+    }
+    try {
+      await queue.ack(raw)
+    } catch {
+      logQueueInfrastructureFailure('ack_after_success', queueName, job.taskId)
+    }
   }
 
   const refreshProviderHealth = async (): Promise<void> => {
@@ -348,77 +493,14 @@ async function startWorkerOnce(
         }
 
         if (claimedApproval !== null) {
-          let ackedApproval = false
-          let approvalAttemptId: string | null = null
-          const finalAttempt = claimedApproval.job.attempt >= maxAttempts
-          try {
-            if (await acknowledgeMissingTaskJob(
-              'approval',
-              claimedApproval.job.taskId,
-              () => approvalQueue.ack(claimedApproval.raw),
-            )) {
-              ackedApproval = true
-            } else {
-              approvalAttemptId = await startTaskAttempt({
-                attemptNumber: claimedApproval.job.attempt,
-                jobPayload: claimedApproval.job,
-                queueName: 'approvals',
-                taskId: claimedApproval.job.taskId,
-                workerId,
-              })
-              console.info('[worker] Processing approval', {
-                attempt: claimedApproval.job.attempt,
-                taskId: claimedApproval.job.taskId,
-                workerId,
-              })
-              await processApproval(claimedApproval.job.taskId, { finalAttempt })
-              if (approvalAttemptId) {
-                await finishTaskAttempt({ attemptId: approvalAttemptId, status: 'completed' })
-              }
-              await approvalQueue.ack(claimedApproval.raw)
-              ackedApproval = true
-            }
-          } catch (err) {
-            const message = retainedErrorMessage(err)
-            const nextRetryAt = finalAttempt
-              ? null
-              : new Date(Date.now() + backoffDelayMs(claimedApproval.job.attempt))
-            if (approvalAttemptId) {
-              await finishTaskAttempt({
-                attemptId: approvalAttemptId,
-                errorMessage: message,
-                nextRetryAt,
-                status: finalAttempt ? 'dead_lettered' : 'failed',
-              })
-            }
-            if (finalAttempt) {
-              await approvalQueue.deadLetter(claimedApproval.raw, claimedApproval.job)
-            } else {
-              await approvalQueue.retry(
-                claimedApproval.raw,
-                claimedApproval.job,
-                backoffDelayMs(claimedApproval.job.attempt),
-              )
-            }
-            ackedApproval = true
-            console.error('[worker] Approval failed', {
-              attempt: claimedApproval.job.attempt,
-              finalAttempt,
-              taskId: claimedApproval.job.taskId,
-              workerId,
-            })
-          } finally {
-            if (!ackedApproval) {
-              try {
-                await approvalQueue.ack(claimedApproval.raw)
-              } catch {
-                console.error('[worker] Failed to acknowledge approval', {
-                  taskId: claimedApproval.job.taskId,
-                  workerId,
-                })
-              }
-            }
-          }
+          await processClaimedJob({
+            attemptQueueName: 'approvals',
+            claimed: claimedApproval,
+            processBusiness: (finalAttempt) =>
+              processApproval(claimedApproval.job.taskId, { finalAttempt }),
+            queue: approvalQueue,
+            queueName: 'approval',
+          })
         }
 
         let claimedAnswers = null as Awaited<ReturnType<InstanceType<typeof AnswersQueue>['claim']>>
@@ -431,77 +513,14 @@ async function startWorkerOnce(
         }
 
         if (claimedAnswers !== null) {
-          let ackedAnswers = false
-          let answersAttemptId: string | null = null
-          const finalAttempt = claimedAnswers.job.attempt >= maxAttempts
-          try {
-            if (await acknowledgeMissingTaskJob(
-              'answers',
-              claimedAnswers.job.taskId,
-              () => answersQueue.ack(claimedAnswers.raw),
-            )) {
-              ackedAnswers = true
-            } else {
-              answersAttemptId = await startTaskAttempt({
-                attemptNumber: claimedAnswers.job.attempt,
-                jobPayload: claimedAnswers.job,
-                queueName: 'answers',
-                taskId: claimedAnswers.job.taskId,
-                workerId,
-              })
-              console.info('[worker] Processing answered questions', {
-                attempt: claimedAnswers.job.attempt,
-                taskId: claimedAnswers.job.taskId,
-                workerId,
-              })
-              await processAnsweredQuestions(claimedAnswers.job.taskId, { finalAttempt })
-              if (answersAttemptId) {
-                await finishTaskAttempt({ attemptId: answersAttemptId, status: 'completed' })
-              }
-              await answersQueue.ack(claimedAnswers.raw)
-              ackedAnswers = true
-            }
-          } catch (err) {
-            const message = retainedErrorMessage(err)
-            const nextRetryAt = finalAttempt
-              ? null
-              : new Date(Date.now() + backoffDelayMs(claimedAnswers.job.attempt))
-            if (answersAttemptId) {
-              await finishTaskAttempt({
-                attemptId: answersAttemptId,
-                errorMessage: message,
-                nextRetryAt,
-                status: finalAttempt ? 'dead_lettered' : 'failed',
-              })
-            }
-            if (finalAttempt) {
-              await answersQueue.deadLetter(claimedAnswers.raw, claimedAnswers.job)
-            } else {
-              await answersQueue.retry(
-                claimedAnswers.raw,
-                claimedAnswers.job,
-                backoffDelayMs(claimedAnswers.job.attempt),
-              )
-            }
-            ackedAnswers = true
-            console.error('[worker] Answered-questions re-plan failed', {
-              attempt: claimedAnswers.job.attempt,
-              finalAttempt,
-              taskId: claimedAnswers.job.taskId,
-              workerId,
-            })
-          } finally {
-            if (!ackedAnswers) {
-              try {
-                await answersQueue.ack(claimedAnswers.raw)
-              } catch {
-                console.error('[worker] Failed to acknowledge answers job', {
-                  taskId: claimedAnswers.job.taskId,
-                  workerId,
-                })
-              }
-            }
-          }
+          await processClaimedJob({
+            attemptQueueName: 'answers',
+            claimed: claimedAnswers,
+            processBusiness: async (finalAttempt) =>
+              await processAnsweredQuestions(claimedAnswers.job.taskId, { finalAttempt }),
+            queue: answersQueue,
+            queueName: 'answers',
+          })
         }
 
         let claimedTask = null as Awaited<ReturnType<InstanceType<typeof TaskQueue>['claim']>>
@@ -516,79 +535,14 @@ async function startWorkerOnce(
 
         if (claimedTask === null) continue
 
-        let ackedTask = false
-        let taskAttemptId: string | null = null
-        try {
-          const finalAttempt = claimedTask.job.attempt >= maxAttempts
-          if (await acknowledgeMissingTaskJob(
-            'task',
-            claimedTask.job.taskId,
-            () => taskQueue.ack(claimedTask.raw),
-          )) {
-            ackedTask = true
-          } else {
-            taskAttemptId = await startTaskAttempt({
-              attemptNumber: claimedTask.job.attempt,
-              jobPayload: claimedTask.job,
-              queueName: 'tasks',
-              taskId: claimedTask.job.taskId,
-              workerId,
-            })
-            console.info('[worker] Processing task', {
-              attempt: claimedTask.job.attempt,
-              finalAttempt,
-              taskId: claimedTask.job.taskId,
-              workerId,
-            })
-            await processTask(claimedTask.job.taskId, { finalAttempt })
-            if (taskAttemptId) {
-              await finishTaskAttempt({ attemptId: taskAttemptId, status: 'completed' })
-            }
-            await taskQueue.ack(claimedTask.raw)
-            ackedTask = true
-          }
-        } catch (err) {
-          const message = retainedErrorMessage(err)
-          const finalAttempt = claimedTask.job.attempt >= maxAttempts
-          const nextRetryAt = finalAttempt
-            ? null
-            : new Date(Date.now() + backoffDelayMs(claimedTask.job.attempt))
-          if (taskAttemptId) {
-            await finishTaskAttempt({
-              attemptId: taskAttemptId,
-              errorMessage: message,
-              nextRetryAt,
-              status: finalAttempt ? 'dead_lettered' : 'failed',
-            })
-          }
-          if (finalAttempt) {
-            await taskQueue.deadLetter(claimedTask.raw, claimedTask.job)
-          } else {
-            await taskQueue.retry(
-              claimedTask.raw,
-              claimedTask.job,
-              backoffDelayMs(claimedTask.job.attempt),
-            )
-          }
-          ackedTask = true
-          console.error('[worker] Task failed', {
-            attempt: claimedTask.job.attempt,
-            finalAttempt,
-            taskId: claimedTask.job.taskId,
-            workerId,
-          })
-        } finally {
-          if (!ackedTask) {
-            try {
-              await taskQueue.ack(claimedTask.raw)
-            } catch {
-              console.error('[worker] Failed to acknowledge task', {
-                taskId: claimedTask.job.taskId,
-                workerId,
-              })
-            }
-          }
-        }
+        await processClaimedJob({
+          attemptQueueName: 'tasks',
+          claimed: claimedTask,
+          processBusiness: (finalAttempt) =>
+            processTask(claimedTask.job.taskId, { finalAttempt }),
+          queue: taskQueue,
+          queueName: 'task',
+        })
       }
     } finally {
       if (providerHealthTimer !== null) {
