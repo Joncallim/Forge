@@ -761,8 +761,8 @@ describe.skipIf(!enabled)('queue occurrence adoption with production runtimes', 
             usage: Promise.resolve({ inputTokens: 1, outputTokens: 1 }),
           }
         }
-        if (providerCalls === 2) {
-          recoveredProviderStarted()
+        if (providerCalls === 2 || (kind === 'answers' && providerCalls > 2)) {
+          if (providerCalls === 2) recoveredProviderStarted()
           return {
             textStream: {
               async *[Symbol.asyncIterator]() {
