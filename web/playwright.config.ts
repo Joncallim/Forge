@@ -3,7 +3,7 @@ import { resolveDestructiveE2EEnvironment } from './e2e/destructive-environment'
 import { EPIC_172_STEP0_E2E_BRIDGE_ENV } from './e2e/epic-172-step0-bridge'
 
 const trustedHostBoundary = process.env.FORGE_TRUSTED_HOST_BOUNDARY === '1'
-const dedicatedMcpTags = /@mcp-postgres|@mcp-issuance|@mcp-operator|@mcp-host-boundary/
+const dedicatedMcpTags = /@mcp-postgres|@mcp-operator|@mcp-host-boundary/
 const noMcpArtifacts = Object.freeze({ trace: 'off', screenshot: 'off', video: 'off' } as const)
 
 const inheritedEnvironment = { ...process.env }
@@ -86,13 +86,6 @@ export default defineConfig({
     {
       name: 'mcp-postgres',
       grep: /@mcp-postgres/,
-      fullyParallel: false,
-      retries: 0,
-      use: { ...devices['Desktop Chrome'], ...noMcpArtifacts },
-    },
-    {
-      name: 'mcp-issuance',
-      grep: /@mcp-issuance/,
       fullyParallel: false,
       retries: 0,
       use: { ...devices['Desktop Chrome'], ...noMcpArtifacts },

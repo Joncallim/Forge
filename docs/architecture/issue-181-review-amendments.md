@@ -109,19 +109,13 @@ findings that are absent from the S6 head alone are re-introduced by the base
 branch, because the same files are edited on both sides. Dispositions below are
 stated against the merged tree, which is what actually ships:
 
-- **Duplicate `test:mcp:issuance` script key.** Not stale — this was a real
-  finding and it recurs on merge. The S6 head defines the name once, but the
-  #180 base also defines `test:mcp:issuance` as an S4 Vitest alias. Because a
-  later JSON key silently wins, a naive merge makes `npm run test:mcp:issuance`
-  run the S4 Vitest command and never collect the issuance partition — exactly
-  the original defect. The merge resolves it by keeping the manifest-backed
-  Playwright command as the single owner of that name and dropping the base's
-  alias; no coverage is lost, because `epic-172-s4-postgres.test.ts` is run by
-  `test:mcp:s4-postgres` and the other two files by `test:unit:zero-skip`.
-  Verified after merging: `playwright test --list` collects exactly the
-  manifest counts (3 issuance, 2 postgres, 1+1 operator, 7 host-boundary under
-  `FORGE_TRUSTED_HOST_BOUNDARY=1`), and `web/package.json` parses with no
-  duplicate keys.
+- **Duplicate `test:mcp:issuance` script key.** Not stale, and the duplicate
+  turned out to be a symptom of a deeper ownership error rather than a naming
+  accident. See "Packet issuance belongs to #179/S4" below for the full
+  analysis and the resolution. `web/package.json` now parses with no duplicate
+  keys, and every remaining partition collects exactly its manifest count
+  (2 postgres, 1+1 operator, 7 host-boundary under
+  `FORGE_TRUSTED_HOST_BOUNDARY=1`).
 - **S6 release-adapter callbacks.** The adapter no longer accepts injected
   `recordOwnedEvidence`/`consumeOwnedTransition` callbacks; it wraps a single
   concrete `executeEpic172S6AtomicTransition` implementation that opens the
@@ -192,7 +186,7 @@ at the S6↔S4/S5 seam:
 
 | File | Resolution |
 |---|---|
-| `web/package.json` | Keep base's `test:unit:zero-skip` and `test:mcp:s4-postgres`; keep S6's manifest-backed `test:mcp:issuance`; drop base's duplicate alias of that name. |
+| `web/package.json` | Keep base's `test:unit:zero-skip` and `test:mcp:s4-postgres`. Both definitions of `test:mcp:issuance` are removed — see the issuance-ownership section below. |
 | `.github/workflows/web-ci.yml` | Keep both sides: base's local-run-evidence reader env, audit-observer env, and mandatory S4 PostgreSQL proof, plus S6's `test:mcp:contract` and the push whitespace check. Drop the raw artifact upload. |
 | `web/e2e/filesystem-grant-lifecycle-concurrency.spec.ts` | Take base's file (16 tests, including its two new operator-hold tests) and replay S6's five hunks, which add the authenticated route assertions and the `@mcp-postgres` tags/`scenarioId` annotations. |
 | `web/e2e/epic-172-step0-bridge.ts` | Rebuild the exact-inventory list so all 16 merged test titles appear exactly once, with S6's renamed `real-approval-route` title. |
@@ -233,3 +227,54 @@ is reduced to a `unexpected_suppressed=<count>` tally, so a hostile or
 malformed test title cannot ride the diagnostic channel out of the runner.
 `__tests__/epic-172-s6-contract-wrapper-diagnostics.test.ts` pins both the
 reason codes and the shape filter.
+
+### Packet issuance belongs to #179/S4, not #181/S6
+
+The duplicate `test:mcp:issuance` key was the visible symptom of a real
+ownership error, and the first resolution of that conflict was wrong.
+
+`web/e2e/mcp-issuance.spec.ts` drove
+`forge.insert_packet_authorization_snapshot_v2` directly as the
+`forge_packet_issuer` login. Three separate changes in the #198→#199 stack made
+that impossible, and each one is deliberate:
+
+1. `7876621` dropped `public.epic_172_s4_protocol_state`. S4 activation is now
+   derived by `forge.s4_protected_paths_enabled_v1()` from Step 0's
+   `forge_epic_172_enablement_state` singleton.
+2. The routine gained a seventh parameter, `p_local_claim_token`, splitting the
+   local run-evidence token from the packet claim token.
+3. Most importantly, the routine became an **internal helper that the packet
+   issuer is forbidden to call**. `__tests__/epic-172-s4-context.test.ts`
+   asserts `GRANT EXECUTE ... TO forge_packet_issuer` is absent for it, and
+   confirms the issuer's only lifecycle entry points are
+   `claim_work_package_lifecycle_v2`, the two heartbeat routines, and
+   `recover_linked_s4_lifecycle_v2`. Verified against a live database:
+   `has_function_privilege('forge_packet_issuer', ...)` is false for the
+   snapshot routine and true for the entry point.
+
+Porting the suite would therefore mean re-authoring it against a twenty-argument
+entry point in order to reproduce coverage that **already exists and passes**.
+`__tests__/epic-172-s4-postgres.test.ts` implements the same three scenarios
+under the same names — `allow-once-single-winner: atomically keeps one audit and
+one nonce claim`, `failure-recovery-atomicity: rolls back both audit and nonce on
+invalid coverage`, and `always-allow-single-run-claim: fails closed without the
+immutable S3 project pointer` — all three confirmed passing against real
+PostgreSQL 16.
+
+That is precisely what this document's Coverage ownership section forbids: #179
+owns packet claims for both grant modes and nonce fencing, while #181 "owns only
+representative cross-slice sentinels ... it imports lower-slice fixtures without
+copying their policy matrices."
+
+Resolution: the `issuance` partition is removed from S6 entirely — the spec
+file, the Playwright project and tag, the manifest partition, the bridge
+inventory entries, the wrapper and suite-contract partition maps, the controller
+budget, and the ordinary-CI step. Neither definition of `test:mcp:issuance`
+survives; the base's alias is also dropped because the base's own CI never
+invoked it and the three files it named are already covered by
+`test:unit:zero-skip` and `test:mcp:s4-postgres`. The S6 manifest is now a
+five-partition contract (contract, postgres, operator-desktop, operator-mobile,
+host-boundary) driven by four suite commands.
+
+Round 24's original recommendation — "keep one unique S6-owned issuance script"
+— predates #179 taking ownership of issuance and is superseded by it.

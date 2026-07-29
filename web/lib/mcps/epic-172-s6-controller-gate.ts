@@ -26,7 +26,6 @@ const ENABLED_BUILD_SLOTS = Object.freeze([
 const SUITE_BUDGET_SECONDS = Object.freeze({
   'test:mcp:contract': 60,
   'test:mcp:postgres': 240,
-  'test:mcp:issuance': 300,
   'e2e:mcp-operator': 240,
   'test:mcp:host-boundary': 420,
 } as const)

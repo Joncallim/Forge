@@ -57,7 +57,6 @@ function bundle(): Epic172S6ExternalEvidenceBundle {
     suites: [
       { command: 'test:mcp:contract', durationSeconds: 60, firstAttempt: true, retryCount: 0, skippedCount: 0, status: 'passed' },
       { command: 'test:mcp:postgres', durationSeconds: 240, firstAttempt: true, retryCount: 0, skippedCount: 0, status: 'passed' },
-      { command: 'test:mcp:issuance', durationSeconds: 300, firstAttempt: true, retryCount: 0, skippedCount: 0, status: 'passed' },
       { command: 'e2e:mcp-operator', durationSeconds: 240, firstAttempt: true, retryCount: 0, skippedCount: 0, status: 'passed' },
       { command: 'test:mcp:host-boundary', durationSeconds: 420, firstAttempt: true, retryCount: 0, skippedCount: 0, status: 'passed' },
     ],

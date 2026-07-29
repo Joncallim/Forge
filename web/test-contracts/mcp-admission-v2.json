@@ -30,16 +30,6 @@
       ]
     },
     {
-      "id": "issuance",
-      "runner": "playwright",
-      "expectedCount": 3,
-      "executionKeys": [
-        "mcp-issuance::mcp-admission.allow-once-single-winner",
-        "mcp-issuance::mcp-admission.always-allow-single-run-claim",
-        "mcp-issuance::mcp-admission.failure-recovery-atomicity"
-      ]
-    },
-    {
       "id": "operator-desktop",
       "runner": "playwright",
       "expectedCount": 1,

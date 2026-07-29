@@ -1660,7 +1660,7 @@ without retry, with the slowest bounded at 420 seconds; output scan, teardown,
 out-of-band destruction/reimage, and their signed evidence complete in at most 120
 seconds; controller verification, signing, evidence recording, and the final
 readiness transaction complete in at most 30 seconds. The controller heartbeats
-every 10 seconds throughout all five phases. It may not serialize the five suite
+every 10 seconds throughout all five phases. It may not serialize the four suite
 ceilings, borrow unused time from the safety margin, extend either deadline, or
 retry a partition. A phase-budget miss invokes the authoritative failure-disable
 transition. S6 proves a near-cap 660-second success and deterministic failure for
@@ -1758,7 +1758,6 @@ different layer:
   "preflight:mcp:host-boundary": "node scripts/run-with-deadline.mjs 30 -- node scripts/verify-mcp-host-boundary-attestation.mjs --harness-socket /run/forge-host-boundary/attest.sock --controller-challenge /run/forge-host-boundary/controller-challenge.json --public-key /usr/share/forge-host-boundary/attestation.pub --signed-envelope-out .artifacts/mcp-host-boundary-preflight.signed.json",
   "test:mcp:contract": "node scripts/run-with-deadline.mjs 60 -- node scripts/run-vitest-contract.mjs --manifest test-contracts/mcp-admission-v2.json --partition contract -- vitest run __tests__/mcp-admission-invariant.test.ts --testTimeout=10000",
   "test:mcp:postgres": "node scripts/run-with-deadline.mjs 240 -- node scripts/run-playwright-contract.mjs --manifest test-contracts/mcp-admission-v2.json --partition postgres --forbid-skips --forbid-retries -- --project=mcp-postgres --grep @mcp-postgres --timeout=45000",
-  "test:mcp:issuance": "node scripts/run-with-deadline.mjs 300 -- node scripts/run-playwright-contract.mjs --manifest test-contracts/mcp-admission-v2.json --partition issuance --forbid-skips --forbid-retries -- --project=mcp-issuance --grep @mcp-issuance --timeout=60000",
   "e2e:mcp-operator": "node scripts/run-with-deadline.mjs 240 -- node scripts/run-playwright-contract.mjs --manifest test-contracts/mcp-admission-v2.json --partition operator-desktop --partition operator-mobile --forbid-skips --forbid-retries -- --project=mcp-operator-desktop --project=mcp-operator-mobile --grep @mcp-operator --timeout=60000",
   "test:mcp:host-boundary": "node scripts/run-with-deadline.mjs 420 -- node scripts/run-playwright-contract.mjs --manifest test-contracts/mcp-admission-v2.json --partition host-boundary --preflight-attestation .artifacts/mcp-host-boundary-preflight.signed.json --attestation-public-key /usr/share/forge-host-boundary/attestation.pub --require-attestation-signature --forbid-skips --forbid-retries -- --project=mcp-host-boundary --grep @mcp-host-boundary --timeout=90000"
 }
@@ -1866,17 +1865,16 @@ It does not copy policy logic into tests; an intentional
 change updates the owning production source and the affected subset of all five
 architecture fixtures in one reviewed PR.
 
-Database scenarios carry exactly one of `@mcp-postgres` or `@mcp-issuance` in
-their title or Playwright `tag` property—never a free-form annotation that
-`--grep` cannot select. Visible browser scenarios carry `@mcp-operator`; they do
+Database scenarios carry `@mcp-postgres` in their title or Playwright `tag`
+property—never a free-form annotation that `--grep` cannot select. Visible browser scenarios carry `@mcp-operator`; they do
 not carry either database-only tag. Host-containment scenarios carry only
 `@mcp-host-boundary`; they are not admitted to a generic or database project.
 
-`playwright.config.ts` defines dedicated single-desktop `mcp-postgres` and
-`mcp-issuance` projects, desktop/mobile `mcp-operator-*` projects, and the
+`playwright.config.ts` defines a dedicated single-desktop `mcp-postgres`
+project, desktop/mobile `mcp-operator-*` projects, and the
 Linux-only serial `mcp-host-boundary` project. The generic
 desktop/mobile projects set
-`grepInvert: /@mcp-postgres|@mcp-issuance|@mcp-operator|@mcp-host-boundary/`, so unqualified
+`grepInvert: /@mcp-postgres|@mcp-operator|@mcp-host-boundary/`, so unqualified
 `npm run e2e` runs each dedicated MCP scenario only through its owning project and
 never duplicates a database race or operator scenario in the generic viewports.
 Dedicated projects use matching `grep`/`testMatch` rules, `retries:0`, and serial
@@ -1895,11 +1893,10 @@ because the expected side is checked in, not derived from `--list`.
 | `npm run preflight:mcp:host-boundary` | signed-image/kernel/identity/service/PostgreSQL-TLS prerequisite attestation | n/a | 30 s |
 | `npm run test:mcp:contract` | Vitest canonical/parity/mutation sentinels | 10 s | 60 s |
 | `npm run test:mcp:postgres` | desktop-only real-route, grants, lock-order, Redis recovery | 45 s | 240 s |
-| `npm run test:mcp:issuance` | desktop-only nonce/claim/lease/failure-point races | 60 s | 300 s |
 | `npm run e2e:mcp-operator` | Chromium desktop + mobile visible flow/accessibility | 60 s | 240 s |
 | `npm run test:mcp:host-boundary` | Ubuntu 24.04 cgroup/UID/socket containment and descendant-escape sentinels | 90 s | 420 s |
 
-For the post-enable proof these five suite commands run concurrently in isolated
+For the post-enable proof these four suite commands run concurrently in isolated
 database, Redis, filesystem, and host-fixture namespaces; their 420-second maximum
 is one DAG phase, not a 1,260-second serial allowance. The 60-second controller-
 orchestration phase, 30-second preflight, 420-second concurrent suite phase,
@@ -2036,7 +2033,7 @@ fails if a suite is skipped unexpectedly or exceeds its budget;
 increasing a budget requires an explicit review note. Generic `npm test` and
 `npm run e2e` must still pass under repository-wide defaults, but their result is
 smoke compatibility, not a substitute for manifest-bound release evidence. The
-strict no-skip/no-retry policy is scoped to the five suite commands; the separate
+strict no-skip/no-retry policy is scoped to the four suite commands; the separate
 preflight command is a same-job trust/attestation gate and must pass first.
 
 ## Coverage ownership
@@ -2099,7 +2096,7 @@ preflight command is a same-job trust/attestation gate and must pass first.
     matrices, including the no-local-ACP-replay sentinel.
 12. Add persistence-wide leakage sentinels, raw-plan direct-SQL/principal attacks,
     and failure diagnostics.
-13. Wire the five named suite commands plus the separate same-job host-boundary
+13. Wire the four named suite commands plus the separate same-job host-boundary
     preflight client, immutable root harness, external signed-attestation verifier,
     exact-App-pinned controller-owned required Check Run, signed suite-result
     envelope, controller-enforced zero-egress namespace/destruction TTL, no-tee

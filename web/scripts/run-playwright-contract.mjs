@@ -6,11 +6,10 @@ import os from 'node:os'
 import path from 'node:path'
 import process from 'node:process'
 
-const PARTITIONS = new Set(['postgres', 'issuance', 'operator-desktop', 'operator-mobile', 'host-boundary'])
+const PARTITIONS = new Set(['postgres', 'operator-desktop', 'operator-mobile', 'host-boundary'])
 const MANIFEST_PARTITIONS = Object.freeze({
   contract: { runner: 'vitest', prefix: 'vitest::' },
   'host-boundary': { runner: 'playwright', prefix: 'mcp-host-boundary::' },
-  issuance: { runner: 'playwright', prefix: 'mcp-issuance::' },
   'operator-desktop': { runner: 'playwright', prefix: 'mcp-operator-desktop::' },
   'operator-mobile': { runner: 'playwright', prefix: 'mcp-operator-mobile::' },
   postgres: { runner: 'playwright', prefix: 'mcp-postgres::' },

@@ -6,11 +6,12 @@ import {
 } from '@/lib/mcps/epic-172-s6-suite-contract'
 
 describe('Epic 172 S6 suite contract', () => {
-  it('[scenarioId=epic-172.suite-manifest-exact] validates the exact six-partition manifest', () => {
+  it('[scenarioId=epic-172.suite-manifest-exact] validates the exact five-partition manifest', () => {
+    // Packet issuance is deliberately absent from this manifest: #179/S4 owns
+    // those scenarios and proves them in __tests__/epic-172-s4-postgres.test.ts.
     expect(epic172S6SuiteManifest.partitions.map((partition) => partition.id).sort()).toEqual([
       'contract',
       'host-boundary',
-      'issuance',
       'operator-desktop',
       'operator-mobile',
       'postgres',

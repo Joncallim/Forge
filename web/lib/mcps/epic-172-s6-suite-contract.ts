@@ -3,7 +3,6 @@ import suiteManifestJson from '@/test-contracts/mcp-admission-v2.json'
 export const EPIC_172_S6_SUITE_COMMANDS = Object.freeze({
   contract: 'test:mcp:contract',
   postgres: 'test:mcp:postgres',
-  issuance: 'test:mcp:issuance',
   'operator-desktop': 'e2e:mcp-operator',
   'operator-mobile': 'e2e:mcp-operator',
   'host-boundary': 'test:mcp:host-boundary',
@@ -28,7 +27,6 @@ export type Epic172S6SuiteManifest = Readonly<{
 const PARTITION_IDS = Object.freeze(Object.keys(EPIC_172_S6_SUITE_COMMANDS).sort())
 const PLAYWRIGHT_PROJECT_BY_PARTITION = Object.freeze({
   'host-boundary': 'mcp-host-boundary',
-  issuance: 'mcp-issuance',
   'operator-desktop': 'mcp-operator-desktop',
   'operator-mobile': 'mcp-operator-mobile',
   postgres: 'mcp-postgres',

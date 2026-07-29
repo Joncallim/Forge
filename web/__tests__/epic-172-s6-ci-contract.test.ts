@@ -6,12 +6,11 @@ import packageJson from '@/package.json'
 const repositoryRoot = path.resolve(process.cwd(), '..')
 
 describe('Epic 172 S6 trusted CI wiring', () => {
-  it('keeps the six exact timeout-bearing command interfaces', () => {
+  it('keeps the five exact timeout-bearing command interfaces', () => {
     expect(packageJson.scripts['preflight:mcp:host-boundary']).toBe(
       'node scripts/run-with-deadline.mjs 30 -- node scripts/verify-mcp-host-boundary-attestation.mjs --harness-socket /run/forge-host-boundary/attest.sock --controller-challenge /run/forge-host-boundary/controller-challenge.json --public-key /usr/share/forge-host-boundary/attestation.pub --signed-envelope-out .artifacts/mcp-host-boundary-preflight.signed.json',
     )
     expect(packageJson.scripts['test:mcp:postgres']).toContain('run-with-deadline.mjs 240')
-    expect(packageJson.scripts['test:mcp:issuance']).toContain('run-with-deadline.mjs 300')
     expect(packageJson.scripts['e2e:mcp-operator']).toContain('run-with-deadline.mjs 240')
     expect(packageJson.scripts['test:mcp:host-boundary']).toContain('run-with-deadline.mjs 420')
     expect(packageJson.scripts['test:mcp:contract']).toContain('run-with-deadline.mjs 60')
@@ -36,7 +35,6 @@ describe('Epic 172 S6 trusted CI wiring', () => {
     for (const command of [
       'npm run test:mcp:contract',
       'npm run test:mcp:postgres',
-      'npm run test:mcp:issuance',
       'npm run e2e:mcp-operator',
     ]) expect(workflow).toContain(command)
     expect(workflow).not.toContain('npm run test:mcp:host-boundary')
@@ -51,7 +49,6 @@ describe('Epic 172 S6 trusted CI wiring', () => {
     )
     for (const project of [
       'mcp-postgres',
-      'mcp-issuance',
       'mcp-operator-desktop',
       'mcp-operator-mobile',
       'mcp-host-boundary',
@@ -85,6 +82,6 @@ describe('Epic 172 S6 trusted CI wiring', () => {
     expect(config).toContain("screenshot: 'off'")
     expect(config).toContain("video: 'off'")
     expect(config).toContain("const noMcpArtifacts = Object.freeze({ trace: 'off', screenshot: 'off', video: 'off' } as const)")
-    expect(config.match(/\.\.\.noMcpArtifacts/g)).toHaveLength(6)
+    expect(config.match(/\.\.\.noMcpArtifacts/g)).toHaveLength(5)
   })
 })

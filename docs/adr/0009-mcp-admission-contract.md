@@ -2795,9 +2795,9 @@ contract. This split must match the per-step release manifest metadata above.
 
   After durable `ingress_and_issuance_enabled`, the controller runs the separate
   host preflight plus exact `test:mcp:contract`, `test:mcp:postgres`,
-  `test:mcp:issuance`, `e2e:mcp-operator`, and `test:mcp:host-boundary` suites for
+  `e2e:mcp-operator`, and `test:mcp:host-boundary` suites for
   the enabled S4/S5 builds and epoch. The no-retry enabled DAG is bounded to 660
-  seconds: 60 orchestration/scheduling, 30 preflight, all five suites concurrently
+  seconds: 60 orchestration/scheduling, 30 preflight, all four suites concurrently
   in isolated namespaces within 420, 120 teardown/out-of-band destruction-reimage/
   authoritative Checks conclusion, and 30 evidence/final transition. Ten-second
   heartbeats continue throughout; the 1,560-second deadline leaves 900 seconds of
@@ -3617,7 +3617,7 @@ contract. This split must match the per-step release manifest metadata above.
   containment claim.
 - CI has five timeout-bearing suite commands enforced by a process-tree deadline
   wrapper: `test:mcp:contract` (60 seconds), `test:mcp:postgres` (240),
-  `test:mcp:issuance` (300), `e2e:mcp-operator` (240), and
+  `e2e:mcp-operator` (240), and
   `test:mcp:host-boundary` (420). The reviewed manifest has six partitions:
   contract, PostgreSQL, issuance, operator desktop, operator mobile, and host
   boundary. The four-layer mapping is contract → contract command/partition,
@@ -3630,7 +3630,7 @@ contract. This split must match the per-step release manifest metadata above.
   attempt executed identity, detecting deletion, untagged tests, overlap, omission,
   runtime skips, and retries.
   In the enabled proof, orchestration is a 60-second phase, preflight is a 30-second
-  phase, and all five suites run
+  phase, and all four suites run
   concurrently in isolated database/Redis/filesystem/host namespaces, so 420
   seconds is the suite-DAG maximum rather than a serial sum. Teardown/output/
   destruction has 120 seconds and signing/evidence/final readiness 30 seconds, for
