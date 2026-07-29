@@ -17,6 +17,9 @@ const redisUrl = configuredRedisUrl ?? (process.env.CI === 'true'
   : undefined)
 const databaseUrl = process.env.FORGE_QUEUE_ADOPTION_POSTGRES_TEST_URL
   ?? process.env.DATABASE_URL
+const fixtureAdminUrl = process.env.FORGE_QUEUE_ADOPTION_POSTGRES_ADMIN_TEST_URL
+const fixtureWriterUrl = process.env.FORGE_QUEUE_ADOPTION_WRITER_DATABASE_URL
+const fixtureHistoryReaderUrl = process.env.FORGE_QUEUE_ADOPTION_HISTORY_READER_DATABASE_URL
 
 function validatedRedisUrl(value: string): string {
   let parsed: URL
@@ -34,13 +37,15 @@ function validatedRedisUrl(value: string): string {
   return value
 }
 
-if (required && (!destructive || !redisUrl || !databaseUrl)) {
+if (required && (!destructive || !redisUrl || !databaseUrl
+  || !fixtureAdminUrl || !fixtureWriterUrl || !fixtureHistoryReaderUrl)) {
   throw new Error(
-    'Mandatory queue adoption proof requires dedicated Redis, PostgreSQL, and destructive-test authorization.',
+    'Mandatory queue adoption proof requires dedicated Redis, app/admin/writer/history PostgreSQL URLs, and destructive-test authorization.',
   )
 }
 
-const enabled = Boolean(destructive && redisUrl && databaseUrl)
+const enabled = Boolean(destructive && redisUrl && databaseUrl
+  && fixtureAdminUrl && fixtureWriterUrl && fixtureHistoryReaderUrl)
 const proofRedisUrl = enabled ? validatedRedisUrl(redisUrl!) : null
 
 // DB and queue modules cache their connections at import time. Bind the
@@ -49,6 +54,8 @@ const proofRedisUrl = enabled ? validatedRedisUrl(redisUrl!) : null
 if (enabled) {
   process.env.DATABASE_URL = databaseUrl!
   process.env.REDIS_URL = proofRedisUrl!
+  process.env.FORGE_ARCHITECT_PLAN_WRITER_DATABASE_URL = fixtureWriterUrl!
+  process.env.FORGE_ARCHITECT_PLAN_HISTORY_READER_DATABASE_URL = fixtureHistoryReaderUrl!
 }
 const QUEUE_KEYS = [
   'forge:tasks',
@@ -175,8 +182,14 @@ async function eventually<T>(
 describe.skipIf(!enabled)('queue occurrence adoption with production runtimes', () => {
   let redis: Redis
   let sql: ReturnType<typeof postgres>
+  let admin: ReturnType<typeof postgres>
   let projectId: string
   let providerId: string
+  const authority = {
+    enablementReceipt: randomUUID(),
+    readinessReceipt: randomUUID(),
+    signerKey: randomUUID(),
+  }
   const handles = new Set<WorkerHandle>()
   const priorEnv = new Map<string, string | undefined>()
   const envNames = [
@@ -189,6 +202,8 @@ describe.skipIf(!enabled)('queue occurrence adoption with production runtimes', 
     'FORGE_WORKER_MOCK_ARCHITECT',
     'FORGE_WORKER_STUCK_JOB_RECOVERY_SECONDS',
     'FORGE_WORKFORCE_MATERIALIZATION',
+    'FORGE_ARCHITECT_PLAN_HISTORY_READER_DATABASE_URL',
+    'FORGE_ARCHITECT_PLAN_WRITER_DATABASE_URL',
     'DATABASE_URL',
     'REDIS_URL',
   ] as const
@@ -451,8 +466,6 @@ describe.skipIf(!enabled)('queue occurrence adoption with production runtimes', 
         entries: [
           { agent: null, bindingFingerprint: null, content: 'Queue adoption plan.', entryId: 'plan_body:000000', entryKind: 'plan_body', projectionEligible: false, requirementKey: null },
           { agent: null, bindingFingerprint: null, content: JSON.stringify({ requirementKey: 'plan-policy', schemaVersion: 1 }), entryId: 'requirement:plan-policy', entryKind: 'requirement', projectionEligible: false, requirementKey: 'plan-policy' },
-          { agent: 'backend', bindingFingerprint: `sha256:${'a'.repeat(64)}`, content: JSON.stringify({ capabilityBindings: [{ capability: 'filesystem.project.read', requirementKey: 'filesystem-context' }], schemaVersion: 1 }), entryId: 'subtask:000001:backend', entryKind: 'subtask', projectionEligible: true, requirementKey: 'filesystem-context' },
-          { agent: 'backend', bindingFingerprint: `sha256:${'a'.repeat(64)}`, content: JSON.stringify({ agent: 'backend', requirementKey: 'filesystem-context', schemaVersion: 1 }), entryId: 'routing:filesystem-context:backend', entryKind: 'routing', projectionEligible: false, requirementKey: 'filesystem-context' },
           { agent: null, bindingFingerprint: null, content: JSON.stringify({ schemaVersion: 1, questionId, question: 'Resume the queue adoption plan?', suggestions: [] }), entryId: `clarification_question:${questionId}`, entryKind: 'clarification_question', projectionEligible: false, requirementKey: null },
         ],
         planVersion: '1', taskId,
@@ -465,6 +478,60 @@ describe.skipIf(!enabled)('queue occurrence adoption with production runtimes', 
         answer: 'yes', answerId, digestKey, digestKeyId: 'queue-adoption-key', questionId,
         sessionCredential, sourcePlanArtifactId: source.artifactId, sourcePlanVersion: '1', taskId,
       })
+  }
+
+  async function activateS4Authority(): Promise<void> {
+    const [state] = await admin<{ state: string; ownerOperationId: string | null }[]>`
+      SELECT state, owner_operation_id AS "ownerOperationId"
+      FROM forge_epic_172_enablement_state WHERE singleton_id = 'epic-172'
+    `
+    if (state?.state !== 'disabled' || state.ownerOperationId !== null) {
+      throw new Error('Queue adoption proof requires a canonically disabled isolated S4 authority.')
+    }
+    const builds = JSON.stringify([
+      `issue_179_s4@${'a'.repeat(40)}`,
+      `issue_180_s5@${'a'.repeat(40)}`,
+      `issue_181_s6@${'a'.repeat(40)}`,
+    ])
+    await admin`
+      INSERT INTO forge_release_signer_keys (id, generation, public_key_spki, github_app_id, ruleset_fingerprint, status, valid_from, valid_until)
+      VALUES (${authority.signerKey}::uuid, 1, decode('00', 'hex'), 'queue-adoption-fixture', ${'b'.repeat(64)}, 'staged', clock_timestamp() - interval '1 minute', clock_timestamp() + interval '1 hour')
+    `
+    for (const [id, kind, slice, digest, signature] of [
+      [authority.enablementReceipt, 'ingress_and_issuance_enabled', 's4', 'c'.repeat(64), 'aa'],
+      [authority.readinessReceipt, 's5_s6_release_ready', 's6', 'd'.repeat(64), 'bb'],
+    ] as const) {
+      await admin`
+        INSERT INTO forge_epic_172_release_evidence (id, evidence_kind, owner_issue, owner_slice, exact_builds, required_evidence, reviewed_sha, epoch, predecessor_receipt_ids, predecessor_set_digest, transition_identity_digest, signer_key_id, signer_generation, github_app_id, controller_run_id, controller_job_id, envelope_digest, detached_signature, nonce, issued_at, envelope)
+        VALUES (${id}::uuid, ${kind}, 179, ${slice}, ${builds}::jsonb,
+          '[{"name":"postgres_fixture","measurementDigest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]'::jsonb,
+          ${'a'.repeat(40)}, 2, '[]'::jsonb, ${'0'.repeat(64)}, ${digest}, ${authority.signerKey}::uuid, 1,
+          'queue-adoption-fixture', 'queue-adoption-fixture', ${kind}, ${'e'.repeat(64)}, decode(repeat(${signature}, 64), 'hex'), ${randomUUID()}::uuid, transaction_timestamp(), '{}'::jsonb)
+      `
+    }
+    await admin`
+      UPDATE forge_epic_172_enablement_state
+      SET state = 'active', owner_operation_id = 'queue-adoption-fixture', exact_builds = ${builds}::jsonb,
+          reviewed_sha = ${'a'.repeat(40)}, epoch = 2, enablement_receipt_id = ${authority.enablementReceipt}::uuid,
+          final_readiness_receipt_id = ${authority.readinessReceipt}::uuid, state_fingerprint = ${'9'.repeat(64)}, updated_at = clock_timestamp()
+      WHERE singleton_id = 'epic-172'
+    `
+    const [enabledState] = await admin<{ enabled: boolean }[]>`SELECT forge.s4_protected_paths_enabled_v1() AS enabled`
+    if (!enabledState?.enabled) throw new Error('Queue adoption proof could not activate its isolated S4 authority.')
+  }
+
+  async function deactivateS4Authority(): Promise<void> {
+    await admin`
+      UPDATE forge_epic_172_enablement_state
+      SET state = 'disabled', owner_operation_id = null, exact_builds = null, reviewed_sha = null, epoch = null,
+          started_at = null, expires_at = null, enablement_receipt_id = null, final_readiness_receipt_id = null,
+          opening_authorization_id = null, controller_login_id = null, controller_run_id = null, controller_token_digest = null,
+          lease_generation = null, last_heartbeat_at = null, lease_expires_at = null,
+          state_fingerprint = 'b0789177e07f4a9307f3397a938999b6fcc8c835a97e03d2770f83e4978c2585', updated_at = clock_timestamp()
+      WHERE singleton_id = 'epic-172'
+    `
+    await admin`DELETE FROM forge_epic_172_release_evidence WHERE id IN (${authority.enablementReceipt}::uuid, ${authority.readinessReceipt}::uuid)`
+    await admin`DELETE FROM forge_release_signer_keys WHERE id = ${authority.signerKey}::uuid`
   }
 
   async function insertRunningTaskAttempt(taskId: string, jobPayload: unknown): Promise<void> {
@@ -502,6 +569,8 @@ describe.skipIf(!enabled)('queue occurrence adoption with production runtimes', 
     }
     sql = postgres(databaseUrl!, { max: 8 })
     await sql`SELECT 1`
+    admin = postgres(fixtureAdminUrl!, { max: 1, onnotice: () => {} })
+    await activateS4Authority()
 
     providerId = randomUUID()
     projectId = randomUUID()
@@ -576,8 +645,10 @@ describe.skipIf(!enabled)('queue occurrence adoption with production runtimes', 
     try {
       await cleanRedis()
     } finally {
+      await deactivateS4Authority()
       await redis?.quit()
       await sql?.end({ timeout: 5 })
+      await admin?.end({ timeout: 5 })
     }
   })
 

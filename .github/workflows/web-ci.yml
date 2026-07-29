@@ -509,6 +509,10 @@ jobs:
           FORGE_ARCHITECT_PLAN_RESOLVER_DATABASE_URL: postgresql://forge_architect_plan_resolver:forge_plan_resolver_test@localhost:5432/forge_epic_172_ci_test
           FORGE_ARCHITECT_PLAN_HISTORY_READER_DATABASE_URL: postgresql://forge_architect_plan_history_reader:forge_plan_history_reader_test@localhost:5432/forge_epic_172_ci_test
           FORGE_PACKET_ISSUER_DATABASE_URL: postgresql://forge_packet_issuer:forge_packet_issuer_test@localhost:5432/forge_epic_172_ci_test
+          FORGE_QUEUE_ADOPTION_POSTGRES_TEST_URL: postgresql://forge_app_test:forge_app_test@localhost:5432/forge_s4_ci_test
+          FORGE_QUEUE_ADOPTION_POSTGRES_ADMIN_TEST_URL: postgresql://forge_e2e:forge@localhost:5432/forge_s4_ci_test
+          FORGE_QUEUE_ADOPTION_WRITER_DATABASE_URL: postgresql://forge_architect_plan_writer:forge_plan_writer_test@localhost:5432/forge_s4_ci_test
+          FORGE_QUEUE_ADOPTION_HISTORY_READER_DATABASE_URL: postgresql://forge_architect_plan_history_reader:forge_plan_history_reader_test@localhost:5432/forge_s4_ci_test
       - name: Run mandatory S4 PostgreSQL zero-skip proof
         env:
           FORGE_S4_REQUIRE_POSTGRES_TEST: '1'
