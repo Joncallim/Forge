@@ -850,16 +850,22 @@ async function loadTaskProjectForMcpBroker(taskId: string) {
   return row?.project ?? null
 }
 
-async function recoverStaleRunningPackage(taskId: string, pkg: HandoffPackage): Promise<boolean> {
+async function recoverStaleRunningPackage(taskId: string, pkg: HandoffPackage, options: HandoffOptions): Promise<boolean> {
+  assertQueueClaimOwned(options)
   if (!isStaleRunningPackage(pkg)) return false
 
-  if (await readS4RuntimeModeV1() === 'protected') {
+  const runtimeMode = await readS4RuntimeModeV1()
+  assertQueueClaimOwned(options)
+  if (runtimeMode === 'protected') {
     const pendingHandoff = await discoverS4CompletionHandoffV1({ workPackageId: pkg.id })
+    assertQueueClaimOwned(options)
     if (pendingHandoff) {
+      assertQueueClaimOwned(options)
       await materializeS4CompletionHandoffV1({
         agentRunId: pendingHandoff.agentRunId,
         requiredGateTypes: requiredGateTypesForRequirement(pkg.reviewRequirement ?? 'both'),
       })
+      assertQueueClaimOwned(options)
       return true
     }
   }
@@ -892,14 +898,17 @@ async function recoverStaleRunningPackage(taskId: string, pkg: HandoffPackage): 
     )
     .orderBy(desc(agentRuns.startedAt), desc(agentRuns.createdAt))
     .limit(1)
+  assertQueueClaimOwned(options)
 
   if (run) {
     const s4Recovery = await recoverLinkedS4LifecycleV2({ agentRunId: run.id })
+    assertQueueClaimOwned(options)
     if (s4Recovery.result === 'terminal_success_pending_handoff') {
       if (!s4Recovery.completionArtifactId) {
         throw new Error('Protected S4 success recovery is missing its completion artifact identity.')
       }
       const materialized = await materializeReviewGatesForWorkPackageCompletion({
+        assertOwned: () => assertQueueClaimOwned(options),
         requireExecutionLease: true,
         sourceAgentRunId: run.id,
         sourceArtifactId: s4Recovery.completionArtifactId,
@@ -1848,11 +1857,13 @@ function evaluateWorkPackageHandoffAdmission(input: {
 }
 
 async function persistWorkPackageHandoffBlock(input: {
+  assertOwned?: () => void
   decision: HandoffBlockDecision
   pkg: HandoffPackage
   project: McpProjectFreshnessSnapshot
   taskId: string
 }): Promise<HandoffAdmissionResult> {
+  input.assertOwned?.()
   const common = { pkg: input.pkg, project: input.project, taskId: input.taskId }
   switch (input.decision.kind) {
     case 'broker':
@@ -1926,7 +1937,9 @@ async function admitWorkPackageForHandoff(
   if ('status' in decision) {
     return { pkg: fresh.pkg, project: fresh.project, status: 'allowed' }
   }
+  assertQueueClaimOwned(options)
   return persistWorkPackageHandoffBlock({
+    assertOwned: () => assertQueueClaimOwned(options),
     decision,
     pkg: fresh.pkg,
     project: fresh.project,
@@ -1952,7 +1965,7 @@ export async function progressWorkforce(
   }
   if (result.status === 'no_ready_packages' || result.status === 'no_work_packages') {
     assertQueueClaimOwned(options)
-    await completeTaskIfReviewGatesSatisfied(taskId)
+    await completeTaskIfReviewGatesSatisfied(taskId, { assertOwned: () => assertQueueClaimOwned(options) })
   }
   return result
 }
@@ -2019,7 +2032,7 @@ export async function handoffApprovedWorkPackages(
   }
   if (state.alreadyRunningPackage && !options.staleRecoveryAttempted) {
     assertQueueClaimOwned(options)
-    const recovered = await recoverStaleRunningPackage(taskId, state.alreadyRunningPackage)
+    const recovered = await recoverStaleRunningPackage(taskId, state.alreadyRunningPackage, options)
     assertQueueClaimOwned(options)
     if (recovered) {
       return handoffApprovedWorkPackages(taskId, {
@@ -2326,6 +2339,7 @@ export async function handoffApprovedWorkPackages(
   })
   assertQueueClaimOwned(options)
   const reviewGates = await materializeReviewGatesForWorkPackageCompletion({
+    assertOwned: () => assertQueueClaimOwned(options),
     completeSourceRun: {
       artifactType: 'log_output',
       completedAt: handoffCompletedAt,
@@ -3150,6 +3164,7 @@ async function executeReadyWorkPackage(
     } satisfies S4CompletionArtifact
     let protectedSourceArtifactId: string | null = null
     if (s4Lifecycle) {
+      assertQueueClaimOwned(options)
       protectedSourceArtifactId = await finalizeWorkPackageS4Success(
         s4Lifecycle,
         completionArtifact,
@@ -3160,15 +3175,19 @@ async function executeReadyWorkPackage(
     }
 
     const reviewGates = s4Lifecycle
-      ? await materializeS4CompletionHandoffV1({
+      ? (assertQueueClaimOwned(options), await materializeS4CompletionHandoffV1({
           agentRunId: run.id,
           requiredGateTypes: requiredGateTypesForRequirement(nextPackage.reviewRequirement ?? 'both'),
         }).then((result) => ({
           status: 'materialized' as const,
           packageStatus: result.packageStatus,
           sourceArtifact: null,
+        })).then((result) => {
+          assertQueueClaimOwned(options)
+          return result
         }))
       : await materializeReviewGatesForWorkPackageCompletion({
+          assertOwned: () => assertQueueClaimOwned(options),
           completeSourceRun: { ...completionArtifact, completedAt },
           requireExecutionLease: true,
           sourceAgentRunId: run.id,
