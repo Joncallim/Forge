@@ -10,6 +10,8 @@ const TASK_DEAD_QUEUE_KEY = 'forge:tasks:dead'
 const TASK_CLAIMS_KEY = 'forge:tasks:claims'
 const TASK_ACK_RECEIPTS_KEY = 'forge:tasks:ack-receipts'
 const TASK_RELEASE_RECEIPTS_KEY = 'forge:tasks:release-receipts'
+const TASK_MALFORMED_RECOVERY_RECEIPTS_KEY =
+  'forge:tasks:malformed-recovery-receipts'
 const TASK_PROMOTION_DISPOSITIONS_KEY = 'forge:tasks:promotion-dispositions'
 const TASK_PROMOTION_DISPOSITION_EXPIRY_KEY = 'forge:tasks:promotion-disposition-expiry'
 const APPROVAL_QUEUE_KEY = 'forge:approvals'
@@ -19,6 +21,8 @@ const APPROVAL_DEAD_QUEUE_KEY = 'forge:approvals:dead'
 const APPROVAL_CLAIMS_KEY = 'forge:approvals:claims'
 const APPROVAL_ACK_RECEIPTS_KEY = 'forge:approvals:ack-receipts'
 const APPROVAL_RELEASE_RECEIPTS_KEY = 'forge:approvals:release-receipts'
+const APPROVAL_MALFORMED_RECOVERY_RECEIPTS_KEY =
+  'forge:approvals:malformed-recovery-receipts'
 const APPROVAL_PROMOTION_DISPOSITIONS_KEY = 'forge:approvals:promotion-dispositions'
 const APPROVAL_PROMOTION_DISPOSITION_EXPIRY_KEY =
   'forge:approvals:promotion-disposition-expiry'
@@ -29,6 +33,8 @@ const ANSWERS_DEAD_QUEUE_KEY = 'forge:answers:dead'
 const ANSWERS_CLAIMS_KEY = 'forge:answers:claims'
 const ANSWERS_ACK_RECEIPTS_KEY = 'forge:answers:ack-receipts'
 const ANSWERS_RELEASE_RECEIPTS_KEY = 'forge:answers:release-receipts'
+const ANSWERS_MALFORMED_RECOVERY_RECEIPTS_KEY =
+  'forge:answers:malformed-recovery-receipts'
 const ANSWERS_PROMOTION_DISPOSITIONS_KEY = 'forge:answers:promotion-dispositions'
 const ANSWERS_PROMOTION_DISPOSITION_EXPIRY_KEY = 'forge:answers:promotion-disposition-expiry'
 
@@ -43,6 +49,10 @@ const RETRY_PROMOTION_LIMIT_MAX = 100
 const PROMOTION_DISPOSITION_TTL_MS = 15 * 60 * 1000
 const PROMOTION_DISPOSITION_CAP = 50_000
 const PROMOTION_DISPOSITION_PRUNE_LIMIT = 100
+const MALFORMED_RECOVERY_RECEIPT_MIN_TTL_MS = 15 * 60 * 1000
+const MALFORMED_RECOVERY_RECEIPT_RECONNECT_HEADROOM_MS = 1_000
+const MALFORMED_RECOVERY_RECEIPT_CAP = 50_000
+const MALFORMED_RECOVERY_RECEIPT_PRUNE_LIMIT = 100
 const RETRY_PROMOTION_FINGERPRINT_DOMAIN =
   'forge:queue:retry-promotion-disposition:v1'
 const DEFAULT_QUEUE_REDIS_COMMAND_TIMEOUT_MS = 10_000
@@ -681,6 +691,67 @@ redis.call('LPUSH', KEYS[3], ARGV[2])
 return 1
 `
 
+const RECOVER_MALFORMED_JOB_SCRIPT = `
+-- forge:queue:recover-malformed-v1
+${LUA_TYPE_HELPER}
+${LUA_MARKER_HELPERS}
+assert_type(KEYS[1], 'list')
+assert_type(KEYS[2], 'zset')
+local now_ms = redis_now_ms()
+local operation_token = ARGV[2]
+local receipt_ttl_ms = tonumber(ARGV[3])
+local receipt_cap = tonumber(ARGV[4])
+local prune_limit = tonumber(ARGV[5])
+if not valid_uuid(operation_token)
+    or not receipt_ttl_ms
+    or receipt_ttl_ms < 1
+    or math.floor(receipt_ttl_ms) ~= receipt_ttl_ms
+    or not receipt_cap
+    or receipt_cap < 1
+    or math.floor(receipt_cap) ~= receipt_cap
+    or not prune_limit
+    or prune_limit < 1
+    or math.floor(prune_limit) ~= prune_limit then
+  error('forge_queue_malformed_recovery_bounds_invalid')
+end
+local receipt_score = redis.call('ZSCORE', KEYS[2], operation_token)
+if receipt_score then
+  local receipt_timestamp = tonumber(receipt_score)
+  if receipt_timestamp
+      and receipt_timestamp == receipt_timestamp
+      and receipt_timestamp ~= math.huge
+      and receipt_timestamp ~= -math.huge
+      and receipt_timestamp <= now_ms
+      and receipt_timestamp > (now_ms - receipt_ttl_ms) then
+    return 2
+  end
+  return 0
+end
+if not redis.call('LPOS', KEYS[1], ARGV[1]) then
+  return 0
+end
+local expired = redis.call(
+  'ZRANGEBYSCORE',
+  KEYS[2],
+  '-inf',
+  now_ms - receipt_ttl_ms,
+  'LIMIT',
+  0,
+  prune_limit
+)
+if #expired > 0 then
+  redis.call('ZREM', KEYS[2], unpack(expired))
+end
+if redis.call('ZCARD', KEYS[2]) >= receipt_cap then
+  error('forge_queue_malformed_recovery_receipt_capacity_exhausted')
+end
+if redis.call('LREM', KEYS[1], 1, ARGV[1]) ~= 1 then
+  return 0
+end
+redis.call('ZADD', KEYS[2], now_ms, operation_token)
+return 1
+`
+
 export interface TaskJob {
   taskId: string
   attempt: number
@@ -768,6 +839,7 @@ function promotionFingerprint(
 abstract class RedisListQueue<TJob extends RetryableJob> {
   protected readonly client: Redis
   private readonly activeClaims = new Map<string, ActiveClaim>()
+  private readonly malformedRecoveryReceiptTtlMs: number
   private disconnected = false
 
   constructor(
@@ -778,6 +850,7 @@ abstract class RedisListQueue<TJob extends RetryableJob> {
     private readonly claimsKey: string,
     private readonly ackReceiptsKey: string,
     private readonly releaseReceiptsKey: string,
+    private readonly malformedRecoveryReceiptsKey: string,
     private readonly promotionDispositionsKey: string,
     private readonly promotionDispositionExpiryKey: string,
     redisUrl = getRequiredEnv('REDIS_URL'),
@@ -792,6 +865,10 @@ abstract class RedisListQueue<TJob extends RetryableJob> {
         'Queue Redis command timeout must be a positive safe integer within the Node timer range',
       )
     }
+    this.malformedRecoveryReceiptTtlMs = Math.max(
+      MALFORMED_RECOVERY_RECEIPT_MIN_TTL_MS,
+      (commandTimeoutMs * 2) + MALFORMED_RECOVERY_RECEIPT_RECONNECT_HEADROOM_MS,
+    )
     this.client = new Redis(redisUrl, {
       autoResendUnfulfilledCommands: false,
       commandTimeout: commandTimeoutMs,
@@ -919,6 +996,32 @@ abstract class RedisListQueue<TJob extends RetryableJob> {
     } catch {
       throw new Error(failureMessage)
     }
+  }
+
+  private async removeMalformedRecoveryMember(raw: string): Promise<void> {
+    const operationToken = randomUUID()
+    const invoke = () => this.evalClosed(
+      'Queue malformed recovery removal failed',
+      RECOVER_MALFORMED_JOB_SCRIPT,
+      [this.processingQueueKey, this.malformedRecoveryReceiptsKey],
+      [
+        raw,
+        operationToken,
+        String(this.malformedRecoveryReceiptTtlMs),
+        String(MALFORMED_RECOVERY_RECEIPT_CAP),
+        String(MALFORMED_RECOVERY_RECEIPT_PRUNE_LIMIT),
+      ],
+    )
+    let result: unknown
+    try {
+      result = await invoke()
+    } catch {
+      result = await invoke()
+    }
+    if (result !== 1 && result !== 2) {
+      throw new Error('Queue malformed recovery removal failed')
+    }
+    console.warn('[worker/queue] Removed invalid processing payload')
   }
 
   private decodeRetryPromotionTransition(result: unknown): RetryPromotionTransition {
@@ -1299,7 +1402,8 @@ abstract class RedisListQueue<TJob extends RetryableJob> {
           try {
             job = this.parse(raw)
           } catch {
-            throw new Error('Queue recovery found an invalid occurrence envelope')
+            await this.removeMalformedRecoveryMember(raw)
+            continue
           }
           const occurrenceId = randomUUID()
           const legacyResult = await this.evalClosed(
@@ -1378,6 +1482,7 @@ export class TaskQueue extends RedisListQueue<TaskJob> {
       TASK_CLAIMS_KEY,
       TASK_ACK_RECEIPTS_KEY,
       TASK_RELEASE_RECEIPTS_KEY,
+      TASK_MALFORMED_RECOVERY_RECEIPTS_KEY,
       TASK_PROMOTION_DISPOSITIONS_KEY,
       TASK_PROMOTION_DISPOSITION_EXPIRY_KEY,
       redisUrl,
@@ -1408,6 +1513,7 @@ export class ApprovalQueue extends RedisListQueue<ApprovalJob> {
       APPROVAL_CLAIMS_KEY,
       APPROVAL_ACK_RECEIPTS_KEY,
       APPROVAL_RELEASE_RECEIPTS_KEY,
+      APPROVAL_MALFORMED_RECOVERY_RECEIPTS_KEY,
       APPROVAL_PROMOTION_DISPOSITIONS_KEY,
       APPROVAL_PROMOTION_DISPOSITION_EXPIRY_KEY,
       redisUrl,
@@ -1445,6 +1551,7 @@ export class AnswersQueue extends RedisListQueue<AnswersJob> {
       ANSWERS_CLAIMS_KEY,
       ANSWERS_ACK_RECEIPTS_KEY,
       ANSWERS_RELEASE_RECEIPTS_KEY,
+      ANSWERS_MALFORMED_RECOVERY_RECEIPTS_KEY,
       ANSWERS_PROMOTION_DISPOSITIONS_KEY,
       ANSWERS_PROMOTION_DISPOSITION_EXPIRY_KEY,
       redisUrl,
