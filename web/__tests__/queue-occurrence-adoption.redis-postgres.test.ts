@@ -31,17 +31,64 @@ const originalModuleEndpointEnvironment = new Map(
   moduleEndpointEnvNames.map((name) => [name, process.env[name]]),
 )
 
-function restoreOriginalModuleEndpointEnvironment(): void {
-  for (const name of moduleEndpointEnvNames) {
-    const value = originalModuleEndpointEnvironment.get(name)
-    if (value === undefined) delete process.env[name]
-    else process.env[name] = value
+function restoreEnvironment(
+  names: readonly string[],
+  original: ReadonlyMap<string, string | undefined>,
+): void {
+  let failed = false
+  for (const name of names) {
+    const value = original.get(name)
+    try {
+      if (value === undefined) delete process.env[name]
+      else process.env[name] = value
+    } catch {
+      failed = true
+    }
+  }
+  if (failed) throw new Error('Endpoint environment restoration failed.')
+}
+
+function verifyEnvironmentRestored(
+  names: readonly string[],
+  original: ReadonlyMap<string, string | undefined>,
+): void {
+  if (names.some((name) => process.env[name] !== original.get(name))) {
+    throw new Error('Endpoint environment restoration verification failed.')
   }
 }
 
+function restoreOriginalModuleEndpointEnvironment(): void {
+  restoreEnvironment(moduleEndpointEnvNames, originalModuleEndpointEnvironment)
+}
+
 function assertOriginalModuleEndpointEnvironment(): void {
-  for (const name of moduleEndpointEnvNames) {
-    expect(process.env[name]).toBe(originalModuleEndpointEnvironment.get(name))
+  verifyEnvironmentRestored(moduleEndpointEnvNames, originalModuleEndpointEnvironment)
+}
+
+type CleanupCategory =
+  | 'redis_cleanup'
+  | 's4_deactivate'
+  | 'redis_quit'
+  | 'sql_close'
+  | 'admin_close'
+  | 'endpoint_restore'
+
+type CleanupStage = {
+  category: CleanupCategory
+  run: () => void | Promise<void>
+}
+
+async function runCleanupStages(stages: readonly CleanupStage[]): Promise<void> {
+  const failures: CleanupCategory[] = []
+  for (const stage of stages) {
+    try {
+      await stage.run()
+    } catch {
+      failures.push(stage.category)
+    }
+  }
+  if (failures.length > 0) {
+    throw new Error(`Queue adoption cleanup failed: ${failures.join(',')}`)
   }
 }
 
@@ -256,6 +303,52 @@ describe('queue occurrence adoption diagnostic redaction', () => {
       providerCallCount: 9,
       task: { hasError: true, status: 'failed' },
     })
+  })
+})
+
+describe('queue occurrence adoption cleanup discipline', () => {
+  it('aggregates fixed failures, runs every stage, and restores endpoints', async () => {
+    const original = new Map(moduleEndpointEnvNames.map((name) => [name, process.env[name]]))
+    const hostileRedisFailure = 'HOSTILE_REDIS_CLEANUP_TEXT'
+    const hostileS4Failure = 'HOSTILE_S4_DEACTIVATION_TEXT'
+    const ran: CleanupCategory[] = []
+    process.env.DATABASE_URL = 'HOSTILE_DATABASE_ENDPOINT'
+    delete process.env.REDIS_URL
+
+    try {
+      let report = ''
+      try {
+        await runCleanupStages([
+          { category: 'redis_cleanup', run: () => { ran.push('redis_cleanup'); throw new Error(hostileRedisFailure) } },
+          { category: 's4_deactivate', run: () => { ran.push('s4_deactivate'); throw new Error(hostileS4Failure) } },
+          { category: 'redis_quit', run: () => { ran.push('redis_quit') } },
+          { category: 'sql_close', run: () => { ran.push('sql_close') } },
+          { category: 'admin_close', run: () => { ran.push('admin_close') } },
+          {
+            category: 'endpoint_restore',
+            run: () => {
+              ran.push('endpoint_restore')
+              restoreEnvironment(moduleEndpointEnvNames, original)
+              verifyEnvironmentRestored(moduleEndpointEnvNames, original)
+            },
+          },
+        ])
+      } catch (error) {
+        report = error instanceof Error ? error.message : 'unexpected_cleanup_failure'
+      }
+
+      expect(report).toBe('Queue adoption cleanup failed: redis_cleanup,s4_deactivate')
+      expect(ran).toEqual([
+        'redis_cleanup', 's4_deactivate', 'redis_quit', 'sql_close', 'admin_close', 'endpoint_restore',
+      ])
+      expect(report).not.toContain(hostileRedisFailure)
+      expect(report).not.toContain(hostileS4Failure)
+      expect(report).not.toMatch(/digest|hash|length|sha/i)
+      expect(() => verifyEnvironmentRestored(moduleEndpointEnvNames, original)).not.toThrow()
+    } finally {
+      restoreEnvironment(moduleEndpointEnvNames, original)
+      verifyEnvironmentRestored(moduleEndpointEnvNames, original)
+    }
   })
 })
 
@@ -784,28 +877,23 @@ describe.skipIf(!enabled)('queue occurrence adoption with production runtimes', 
   })
 
   afterAll(async () => {
-    try {
-      if (redisInitialized) await cleanRedis()
-    } finally {
-      try {
-        if (adminInitialized) await deactivateS4Authority()
-      } finally {
-        try {
-          await redis?.quit()
-        } finally {
+    await runCleanupStages([
+      { category: 'redis_cleanup', run: async () => { if (redisInitialized) await cleanRedis() } },
+      { category: 's4_deactivate', run: async () => { if (adminInitialized) await deactivateS4Authority() } },
+      { category: 'redis_quit', run: async () => { await redis?.quit() } },
+      { category: 'sql_close', run: async () => { await sql?.end({ timeout: 5 }) } },
+      { category: 'admin_close', run: async () => { await admin?.end({ timeout: 5 }) } },
+      {
+        category: 'endpoint_restore',
+        run: () => {
           try {
-            await sql?.end({ timeout: 5 })
+            restoreOriginalModuleEndpointEnvironment()
           } finally {
-            try {
-              await admin?.end({ timeout: 5 })
-            } finally {
-              restoreOriginalModuleEndpointEnvironment()
-              assertOriginalModuleEndpointEnvironment()
-            }
+            assertOriginalModuleEndpointEnvironment()
           }
-        }
-      }
-    }
+        },
+      },
+    ])
   })
 
   for (const kind of ['task', 'answers'] as const) {
