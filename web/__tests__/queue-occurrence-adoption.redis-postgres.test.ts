@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import Redis from 'ioredis'
 import postgres from 'postgres'
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
@@ -380,15 +380,70 @@ describe.skipIf(!enabled)('queue occurrence adoption with production runtimes', 
     return { handle, marker }
   }
 
-  async function waitForFinalState(taskId: string, expected: string): Promise<void> {
-    await eventually(
-      async () => (await sql<{ status: string }[]>`
+  function boundedDiagnosticError(value: string | null): string {
+    if (value === null) return 'none'
+    const digest = createHash('sha256').update(value).digest('hex')
+    return `redacted:length=${Math.min(value.length, 9999)};sha256=${digest}`
+  }
+
+  async function answerFailureDiagnostic(taskId: string, providerCalls: number): Promise<string> {
+    const [task] = await sql<{ errorMessage: string | null; status: string }[]>`
+      SELECT status, error_message AS "errorMessage"
+      FROM tasks
+      WHERE id = ${taskId}::uuid
+    `
+    const [run] = await sql<{ errorMessage: string | null; status: string }[]>`
+      SELECT status, error_message AS "errorMessage"
+      FROM agent_runs
+      WHERE task_id = ${taskId}::uuid
+        AND agent_type = 'architect'
+      ORDER BY created_at DESC, id DESC
+      LIMIT 1
+    `
+    const attempts = await sql<{ status: string }[]>`
+      SELECT status
+      FROM task_attempts
+      WHERE task_id = ${taskId}::uuid
+        AND queue_name = 'answers'
+      ORDER BY created_at, id
+    `
+    return JSON.stringify({
+      attempts: attempts.map(({ status }) => status),
+      latestArchitectRun: run
+        ? { error: boundedDiagnosticError(run.errorMessage), status: run.status }
+        : null,
+      providerCalls,
+      task: task
+        ? { error: boundedDiagnosticError(task.errorMessage), status: task.status }
+        : null,
+    })
+  }
+
+  async function waitForFinalState(taskId: string, expected: string, answerProviderCalls?: () => number): Promise<void> {
+    if (answerProviderCalls === undefined) {
+      await eventually(
+        async () => (await sql<{ status: string }[]>`
+          SELECT status FROM tasks WHERE id = ${taskId}::uuid
+        `)[0]?.status ?? null,
+        (value) => value === expected,
+        'Queue adoption proof did not reach its expected durable task state.',
+        25_000,
+      )
+      return
+    }
+
+    const deadline = Date.now() + 25_000
+    while (Date.now() < deadline) {
+      const [task] = await sql<{ status: string }[]>`
         SELECT status FROM tasks WHERE id = ${taskId}::uuid
-      `)[0]?.status ?? null,
-      (value) => value === expected,
-      'Queue adoption proof did not reach its expected durable task state.',
-      25_000,
-    )
+      `
+      if (task?.status === expected) return
+      if (task?.status === 'failed') {
+        throw new Error(`Queue adoption answers proof failed: ${await answerFailureDiagnostic(taskId, answerProviderCalls())}`)
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    }
+    throw new Error(`Queue adoption answers proof timed out: ${await answerFailureDiagnostic(taskId, answerProviderCalls())}`)
   }
 
   async function assertOnlyRecoveredOwnerCompleted(input: {
@@ -747,7 +802,7 @@ describe.skipIf(!enabled)('queue occurrence adoption with production runtimes', 
       expect(lossReason).toEqual(expect.objectContaining({ code: 'claim_lease_lost' }))
       releaseRecoveredProvider()
 
-      await waitForFinalState(taskId, 'awaiting_approval')
+      await waitForFinalState(taskId, 'awaiting_approval', kind === 'answers' ? () => providerCalls : undefined)
       await assertOnlyRecoveredOwnerCompleted({
         kind,
         newMarker: transferred.marker,
