@@ -936,6 +936,16 @@ from or display reason text.
 
 ## Reader normalization
 
+Every projection re-materializes its rows through explicit field lists at the
+serialization boundary. Constructing presenters correctly is not sufficient:
+passing an array by reference to the JSON response means any field that ever
+reaches that array reaches the wire. Route tests scan every response recursively
+for ownership credentials, one-time authority, and internal pointer fields.
+
+A submitted packet delivery is exactly `{ state, submittedAt }`; every other
+delivery outcome is exactly `{ state }`. Both shapes are accepted; anything else
+normalizes to `unavailable`.
+
 Extend `execution-design-metadata.ts` to read and validate persisted:
 
 - `mode`;
@@ -1321,7 +1331,95 @@ cause.
 
 ### Grant controls
 
-Each package grant control has a stable DOM target. The copy helper’s approve CTA points to it. First-time, denied, revoked, and consumed states are visually and textually distinct.
+Each package grant control has a stable DOM target. The copy helper's approve CTA points to it. First-time, denied, revoked, and consumed states are visually and textually distinct.
+
+Every grant mutation carries the exact expected pointer — current decision id,
+current decision revision, pointer fingerprint, and pointer version — loaded
+from the authoritative grant-state reader, never reconstructed from rendered
+copy. The server compares that tuple under lock. A stale `409` reloads the
+pointer, refreshes the task, shows the operator what replaced their view, and
+stops. The client never auto-resubmits a changed grant; a second deliberate
+activation is required.
+
+### Retention and deletion
+
+The retention contract answers `409` to `DELETE ?mode=delete` for every task
+status, terminal included. S5 therefore never renders a delete control. Terminal
+tasks present retained-history semantics only.
+
+### Operator action endpoint
+
+One authenticated endpoint, `POST /api/mcps/actions/:taskId`, accepts the closed
+action union: `review_local_changes`, `acknowledge_possible_local_invocation`,
+`retry_local_execution`, `decline_local_retry`, `acknowledge_possible_submission`,
+`retry_execution`, `decline_packet_recovery`, and
+`approve_project_filesystem_context`.
+
+A request carries exactly one action, the exact immutable evidence identity
+(local run evidence id plus evidence fingerprint, or prior runtime audit id plus
+marker fingerprint, or the project decision id/revision pair), and the freshness
+fingerprint of the state the operator saw. It carries no capabilities, no
+invented revisions, and no authority fields; extra keys fail the parse closed.
+The work package is derived server-side from the marker that owns the evidence.
+
+The server, in order: authenticates; applies the Step 0 ingress gate; resolves
+ownership through the shared accessible-task loader; parses the closed union;
+re-reads the authoritative state and refuses `409 stale_state` on any fingerprint
+drift; and proves the persisted marker is *current*, of the matching kind, bound
+to that exact evidence and fingerprint, and currently naming that exact
+disposition — otherwise `409 stale_action`. Every refusal mutates nothing.
+
+`approve_project_filesystem_context` then runs the canonical locked project grant
+mutation and enqueues recovery wake-ups only after commit; a queue failure
+returns `202` and never un-commits the decision. The six recovery dispositions
+are applied by the S4 transition routines from #179. Until those routines are
+released, the endpoint answers `503 recovery_transition_unreleased` after full
+authorization, with zero mutation, so an authorized-but-unexecutable step is
+reported rather than silently dropped.
+
+### Freshness identity
+
+The freshness fingerprint is a deterministic digest of the exact mutable rows
+the reader presented. It contains no nonce, no secret, and no caller identity,
+so it is not an authorization token and cannot be replayed into one. There is no
+browser-minted recheck token and no client-side freshness arithmetic: the
+freshness route reports the real server-measured elapsed age since the rows were
+observed, and currency is proven only by the server re-reading the same rows and
+recomputing the digest.
+
+### Protected local run evidence
+
+`work_package_local_run_evidence` is owned by the S4 routines owner and the
+ordinary application login is denied every privilege on it. S5 reads it only
+through a dedicated fixed-principal connection
+(`FORGE_LOCAL_RUN_EVIDENCE_READER_DATABASE_URL`) that selects an explicit safe
+column list and never selects a claim token or lease digest. When that principal
+is unconfigured or denied, the read fails closed to "unprovable": terminal
+audits normalize to `unavailable`, evidence-dependent recovery markers normalize
+to `invalid`, and `localEvidenceAvailable:false` is carried on every projection.
+S5 never falls back to the ordinary application connection for this table.
+
+That principal is `forge_local_evidence_reader`, bootstrapped alongside the
+other dedicated S4 logins and granted a **column-scoped** `SELECT` after
+migrations by `protocol:provision-epic-172-local-evidence-reader`. The grant
+names only `id`, `task_id`, `work_package_id`, `agent_run_id`, `state`,
+`lease_expires_at`, `terminal_at`, and `created_at`. PostgreSQL — not
+application code — refuses a query that reaches for `claim_token`, so the
+redaction is a property of the database boundary and a future careless SELECT
+fails closed rather than leaking. The principal holds no write privilege and no
+`CREATE` on `public`. CI proves all three: the safe columns read, the token
+select fails, and the delete fails.
+
+### Browser coverage
+
+The pointer compare-and-set cases are fully route-mocked and never call an
+ingress-gated endpoint, so they are classified `run-disabled-safe` and run in CI
+while Step 0 keeps project-management ingress disabled. They prove D1→D2 pointer
+carry, the stale-409 reload, and that a changed grant requires a second explicit
+confirmation — the control relabels to `Confirm allow once`/`Confirm always
+allow`/`Confirm deny` and submits nothing until the operator acts again. The
+grant control refuses to submit at all until the authoritative pointer has
+loaded, and distinguishes a pointer that actually moved from any other 409.
 
 ### Packet evidence
 

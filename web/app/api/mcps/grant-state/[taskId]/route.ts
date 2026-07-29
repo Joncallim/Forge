@@ -1,5 +1,6 @@
 import 'server-only'
 import { NextResponse, type NextRequest } from 'next/server'
+import { safeDecisionPresenter, safeProjectGrantPresenter } from '@/lib/mcps/s5-server-reader'
 import { readAuthorizedS5State, S5RouteAuthorizationError } from '@/lib/mcps/s5-route'
 
 export async function GET(request: NextRequest, { params }: { params: Promise<{ taskId: string }> }) {
@@ -10,12 +11,12 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
       computedAt: state.computedAt,
       freshnessFingerprint: state.freshnessFingerprint,
       taskId,
-      projectGrant: state.projectGrant,
+      projectGrant: safeProjectGrantPresenter(state.projectGrant),
       grants: state.packages.map((pkg) => ({
         workPackageId: pkg.workPackageId,
         title: pkg.title,
-        currentDecision: pkg.currentDecision,
-        decisionHistory: pkg.decisionHistory,
+        currentDecision: pkg.currentDecision ? safeDecisionPresenter(pkg.currentDecision) : null,
+        decisionHistory: pkg.decisionHistory.map(safeDecisionPresenter),
         pointerFingerprint: pkg.pointerFingerprint,
         pointerVersion: pkg.pointerVersion,
       })),

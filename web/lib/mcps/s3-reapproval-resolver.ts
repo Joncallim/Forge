@@ -11,6 +11,7 @@ import { requiresFilesystemGrantApproval } from './filesystem-grants'
 import {
   loadCurrentProjectFilesystemDecision,
 } from './filesystem-grant-reconciliation'
+import { casPacketReapprovalV2 } from './s4-lease'
 
 export type S3ReapprovalPresence =
   | { kind: 'none' }
@@ -151,4 +152,19 @@ export async function requiresS3Reapproval(input: {
 }): Promise<boolean> {
   const state = await resolveS3ReapprovalState(input)
   return state.length > 0
+}
+
+/**
+ * Completes only the exact packet-recovery marker named by the caller. The SQL
+ * routine repeats the project, task, sibling, decision, run, lease, and audit
+ * lock order before it compare-and-sets the marker.
+ */
+export async function resolveS3PacketReapproval(input: {
+  taskId: string
+  workPackageId: string
+  priorRuntimeAuditId: string
+  expectedMarkerFingerprint: string
+  newDecisionId: string
+}): Promise<boolean> {
+  return casPacketReapprovalV2(input)
 }

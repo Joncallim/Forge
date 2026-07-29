@@ -228,22 +228,28 @@ describe('S3: legacy adapter contract', () => {
 })
 
 describe('S3: generic logged 500 responses', () => {
-  it('logs errors with route context', () => {
+  it('logs only allowlisted error identity with route context', () => {
     const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
     try {
+      const sensitive = 'nonce=/tmp/secret prompt=SYSTEM sql=SELECT * FROM secrets\ncontrol=\u0000'
       generic500Response(
-        new Error('Database connection lost'),
+        Object.assign(new TypeError(sensitive), {
+          code: 'ENOENT',
+          detail: sensitive,
+          nonce: sensitive,
+        }),
         'GET /api/projects/:id/filesystem-grant',
       )
       expect(consoleError).toHaveBeenCalledTimes(1)
       const call = consoleError.mock.calls[0]
       expect(call[0]).toContain('[GET /api/projects/:id/filesystem-grant]')
-      expect(call[1]).toBeDefined()
-      if (call[1] && typeof call[1] === 'object') {
-        const payload = call[1] as Record<string, unknown>
-        expect(payload.error).toBe('Database connection lost')
-        expect(payload.route).toContain('/api/projects/:id/filesystem-grant')
-      }
+      expect(call[1]).toEqual({
+        route: 'GET /api/projects/:id/filesystem-grant',
+        errorClass: 'TypeError',
+        code: 'ENOENT',
+      })
+      expect(JSON.stringify(consoleError.mock.calls)).not.toContain('/tmp/secret')
+      expect(JSON.stringify(consoleError.mock.calls)).not.toContain('SELECT * FROM secrets')
     } finally {
       consoleError.mockRestore()
     }
@@ -266,16 +272,38 @@ describe('S3: generic logged 500 responses', () => {
     }
   })
 
-  it('returns generic error in production mode', () => {
-    vi.stubEnv('NODE_ENV', 'production')
-    const result = generic500Response(
-      new Error('Sensitive details'),
-      '/api/test',
-    )
-    vi.unstubAllEnvs()
-    expect(result.error).toBe('Internal server error')
-    expect(result.status).toBe(500)
-    expect(result.logged).toBe(true)
+  it('drops error codes and correlation ids that fail the safe format', () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      logged500Error(
+        '/api/test',
+        Object.assign(new Error('sensitive'), { code: 'ENOENT\nsecret' }),
+        { correlationId: 'request-id\nsecret' },
+      )
+      expect(consoleError.mock.calls[0][1]).toEqual({
+        route: '/api/test',
+        errorClass: 'Error',
+      })
+    } finally {
+      consoleError.mockRestore()
+    }
+  })
+
+  it.each(['production', 'development'])('returns a generic error in %s mode', (nodeEnv) => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      vi.stubEnv('NODE_ENV', nodeEnv)
+      const result = generic500Response(
+        new Error('Sensitive details must never be echoed'),
+        '/api/test',
+      )
+      expect(result.error).toBe('Internal server error')
+      expect(result.status).toBe(500)
+      expect(result.logged).toBe(true)
+    } finally {
+      vi.unstubAllEnvs()
+      consoleError.mockRestore()
+    }
   })
 })
 

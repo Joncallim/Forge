@@ -76,12 +76,9 @@ describe('task page retry handoff controls', () => {
     expect(canStopTaskStatus('approved')).toBe(true)
     expect(canStopTaskStatus('failed')).toBe(false)
     expect(canStopTaskStatus('cancelled')).toBe(false)
-    expect(canDeleteTaskStatus('running')).toBe(false)
-    expect(canDeleteTaskStatus('approved')).toBe(false)
-    // Terminal tasks (including failed/cancelled) are deletable in S5
-    expect(canDeleteTaskStatus('failed')).toBe(true)
-    expect(canDeleteTaskStatus('cancelled')).toBe(true)
-    expect(canDeleteTaskStatus('completed')).toBe(true)
+    // Deletion is never offered, for any status: the retention contract answers
+    // 409 for terminal tasks too, so a Delete control could only ever fail.
+    expect(canDeleteTaskStatus()).toBe(false)
   })
 
   it('finds required filesystem grants that still need explicit approval', () => {
@@ -296,6 +293,8 @@ describe('task page Workforce beta presentation helpers', () => {
         commandResults: [{ command: ['npm', 'test'], exitCode: 0 }],
         files: ['src/app.tsx'],
         generatedBy: 'work-package-executor',
+        hostRepositoryWritePaths: ['src/app.tsx'],
+        hostRepositoryWrites: true,
         sandboxPath: '/repo/.forge/task-runs/task-1/pkg-1',
         validationStatus: 'passed',
         workPackageId: 'pkg-1',
@@ -308,16 +307,18 @@ describe('task page Workforce beta presentation helpers', () => {
       commandCount: 1,
       fileCount: 1,
       files: ['src/app.tsx'],
-      hostRepositoryWritePaths: [],
-      hostRepositoryWrites: false,
       sandboxPath: '/repo/.forge/task-runs/task-1/pkg-1',
       validationStatus: 'passed',
     }])
-    expect(workforceExecutionSummary({
+    const summary = workforceExecutionSummary({
       artifacts: [sandboxArtifact],
       runs: [],
       workPackages: [packageBase],
-    }).mode).toBe('sandbox_output')
+    })
+    expect(summary.mode).toBe('sandbox_output')
+    expect(summary.detail).toContain('apply accepted changes manually')
+    expect(summary.detail).not.toContain('host-write')
+    expect(summary.detail).not.toContain('applied')
   })
 
   it('merges streamed runs with initial DB runs while preserving package execution fields', () => {

@@ -26,6 +26,7 @@ const {
   mockDbTransaction,
   mockDbUpdate,
   mockRedisGet,
+  mockRedisEval,
   mockRedisGetdel,
   mockRedisSet,
   mockRedisDel,
@@ -47,6 +48,7 @@ const {
   })),
   mockDbUpdate: vi.fn(),
   mockRedisGet: vi.fn(),
+  mockRedisEval: vi.fn(),
   mockRedisGetdel: vi.fn(),
   mockRedisSet: vi.fn(),
   mockRedisDel: vi.fn(),
@@ -76,6 +78,7 @@ vi.mock('@/db', () => ({
 vi.mock('@/lib/redis', () => ({
   redis: {
     get: mockRedisGet,
+    eval: mockRedisEval,
     getdel: mockRedisGetdel,
     set: mockRedisSet,
     del: mockRedisDel,
@@ -139,6 +142,10 @@ function createdSessionChain() {
   }])
 }
 
+function transactionClient() {
+  return { select: mockDbSelect, insert: mockDbInsert, update: mockDbUpdate }
+}
+
 // ---------------------------------------------------------------------------
 // Fake request builder
 // ---------------------------------------------------------------------------
@@ -154,6 +161,7 @@ function fakeRequest(cookieValue?: string): Request {
 beforeEach(() => {
   delete process.env.FORGE_PASSKEYS_ENABLED
   delete process.env.FORGE_DISABLE_PASSKEYS
+  delete process.env.FORGE_SESSION_CREDENTIAL_MODE
 })
 
 // ---------------------------------------------------------------------------
@@ -219,6 +227,7 @@ describe('register/start — registration gating', () => {
 describe('createSession', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    mockDbSelect.mockReturnValue(chain([{ state: 'strict' }]))
     mockRedisSet.mockResolvedValue('OK')
     mockDbInsert.mockReturnValue(createdSessionChain())
   })
@@ -255,6 +264,54 @@ describe('createSession', () => {
     const id = await createSession('user-1', null, {})
     expect(typeof id).toBe('string')
     expect(id.length).toBeGreaterThan(0)
+  })
+
+  it('dual-writes the legacy Redis key with the same absolute expiry when explicitly enabled', async () => {
+    process.env.FORGE_SESSION_CREDENTIAL_MODE = 'dual'
+    mockDbSelect.mockReturnValue(chain([{ state: 'expansion' }]))
+    const credential = await createSession('user-1', null, {})
+
+    expect(mockRedisSet).toHaveBeenCalledTimes(2)
+    expect(mockRedisSet).toHaveBeenCalledWith(
+      `session:${credential}`,
+      expect.any(String),
+      'PXAT',
+      new Date('2026-07-25T00:00:00.000Z').getTime(),
+    )
+    expect(mockDbInsert.mock.results[0].value.values).toHaveBeenCalledWith(
+      expect.objectContaining({ id: credential, credentialStorageVersion: 1 }),
+    )
+  })
+
+  it('does not write either Redis session key when the database commit fails', async () => {
+    process.env.FORGE_SESSION_CREDENTIAL_MODE = 'dual'
+    mockDbSelect.mockReturnValue(chain([{ state: 'expansion' }]))
+    mockDbTransaction.mockImplementationOnce(async (callback: (tx: unknown) => unknown) => {
+      await callback(transactionClient())
+      throw new Error('commit failed')
+    })
+
+    await expect(createSession('user-1', null, {})).rejects.toThrow('commit failed')
+    expect(mockDbInsert).toHaveBeenCalledOnce()
+    expect(mockRedisSet).not.toHaveBeenCalled()
+  })
+
+  it('writes the dual legacy cache only after the transaction has committed', async () => {
+    process.env.FORGE_SESSION_CREDENTIAL_MODE = 'dual'
+    mockDbSelect.mockReturnValue(chain([{ state: 'expansion' }]))
+    let committed = false
+    mockDbTransaction.mockImplementationOnce(async (callback: (tx: unknown) => unknown) => {
+      const result = await callback(transactionClient())
+      committed = true
+      return result
+    })
+    mockRedisSet.mockImplementation(async () => {
+      expect(committed).toBe(true)
+      return 'OK'
+    })
+
+    await createSession('user-1', null, {})
+    expect(mockRedisSet).toHaveBeenCalledTimes(2)
   })
 })
 
@@ -410,6 +467,78 @@ describe('getSession', () => {
     expect(mockRedisDel).toHaveBeenCalledOnce()
     expect(mockDbUpdate).not.toHaveBeenCalled()
   })
+
+  it('backfills a legacy session from its exact Redis PEXPIRETIME authority', async () => {
+    const redisNowMs = Date.now()
+    const expiresAtMs = redisNowMs + 90_000
+    const credential = '00000000-0000-4000-8000-000000000000'
+    mockRedisEval.mockResolvedValue([
+      JSON.stringify({ userId: 'user-abc', lastSeenAt: redisNowMs - 1_000 }),
+      expiresAtMs,
+      Math.floor(redisNowMs / 1000),
+      (redisNowMs % 1000) * 1000,
+    ])
+    mockRedisSet.mockResolvedValue('OK')
+    mockDbSelect
+      .mockReturnValueOnce(chain([{ state: 'expansion' }]))
+      .mockReturnValueOnce(chain([{
+      sessionId: credential,
+      userId: 'user-abc',
+      lastSeenAt: new Date(redisNowMs - 1_000),
+      expiresAt: null,
+      revokedAt: null,
+      credentialDigestV1: null,
+      credentialStorageVersion: 0,
+      databaseNow: new Date(redisNowMs),
+    }]))
+    mockDbUpdate.mockReturnValue(chain([{ id: credential }]))
+
+    await expect(getSession(fakeRequest(credential))).resolves.toEqual({
+      sessionId: credential,
+      userId: 'user-abc',
+    })
+    expect(mockRedisEval).toHaveBeenCalledOnce()
+    const backfill = mockDbUpdate.mock.results[0].value.set.mock.calls[0][0]
+    expect(backfill).toEqual(expect.objectContaining({
+      credentialStorageVersion: 1,
+      expiresAt: new Date(expiresAtMs),
+    }))
+    expect(mockRedisSet).toHaveBeenCalledWith(
+      expect.stringMatching(/^session:v2:/), expect.any(String), 'PXAT', expiresAtMs,
+    )
+    expect(mockRedisSet).toHaveBeenCalledWith(
+      `session:${credential}`, expect.any(String), 'PXAT', expiresAtMs,
+    )
+  })
+
+  it('fails closed and queues purge for a non-expiring legacy Redis session', async () => {
+    const redisNowMs = Date.now()
+    const credential = '00000000-0000-4000-8000-000000000000'
+    mockRedisEval.mockResolvedValue([
+      JSON.stringify({ userId: 'user-abc', lastSeenAt: redisNowMs - 1_000 }),
+      -1,
+      Math.floor(redisNowMs / 1000),
+      (redisNowMs % 1000) * 1000,
+    ])
+    mockRedisDel.mockResolvedValue(1)
+    mockDbSelect.mockReturnValue(chain([{
+      sessionId: credential,
+      userId: 'user-abc',
+      lastSeenAt: new Date(redisNowMs - 1_000),
+      expiresAt: null,
+      revokedAt: null,
+      credentialDigestV1: null,
+      credentialStorageVersion: 0,
+      databaseNow: new Date(redisNowMs),
+    }]))
+    mockDbUpdate.mockReturnValue(chain([]))
+
+    await expect(getSession(fakeRequest(credential))).resolves.toBeNull()
+    expect(mockDbUpdate).toHaveBeenCalledOnce()
+    expect(mockRedisDel).toHaveBeenCalledWith(
+      expect.stringMatching(/^session:v2:/), `session:${credential}`,
+    )
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -464,6 +593,66 @@ describe('getSession — write-behind logic', () => {
     // Redis was also refreshed
     expect(mockRedisSet).toHaveBeenCalledOnce()
   })
+
+  it('does not write a legacy cache when the sliding-refresh transaction fails to commit', async () => {
+    const now = Date.now()
+    vi.setSystemTime(now)
+    process.env.FORGE_SESSION_CREDENTIAL_MODE = 'dual'
+    mockDbSelect
+      .mockReturnValueOnce(chain([{ state: 'expansion' }]))
+      .mockReturnValueOnce(chain([{
+        sessionId: '00000000-0000-4000-8000-000000000010',
+        userId: 'user-1',
+        lastSeenAt: new Date(now - 61_000),
+        expiresAt: new Date(now + 60_000),
+        revokedAt: null,
+        credentialStorageVersion: 1,
+        databaseNow: new Date(now),
+      }]))
+    mockDbTransaction.mockImplementationOnce(async (callback: (tx: unknown) => unknown) => {
+      await callback(transactionClient())
+      throw new Error('commit failed')
+    })
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+
+    await expect(getSession(fakeRequest('00000000-0000-4000-8000-000000000000'))).resolves.toBeNull()
+    expect(mockDbUpdate).toHaveBeenCalledOnce()
+    expect(mockRedisSet).not.toHaveBeenCalled()
+    consoleError.mockRestore()
+  })
+
+  it('writes the sliding-refresh legacy cache only after commit', async () => {
+    const now = Date.now()
+    vi.setSystemTime(now)
+    process.env.FORGE_SESSION_CREDENTIAL_MODE = 'dual'
+    mockDbSelect
+      .mockReturnValueOnce(chain([{ state: 'expansion' }]))
+      .mockReturnValueOnce(chain([{
+        sessionId: '00000000-0000-4000-8000-000000000010',
+        userId: 'user-1',
+        lastSeenAt: new Date(now - 61_000),
+        expiresAt: new Date(now + 60_000),
+        revokedAt: null,
+        credentialStorageVersion: 1,
+        databaseNow: new Date(now),
+      }]))
+    let committed = false
+    mockDbTransaction.mockImplementationOnce(async (callback: (tx: unknown) => unknown) => {
+      const result = await callback(transactionClient())
+      committed = true
+      return result
+    })
+    mockRedisSet.mockImplementation(async () => {
+      expect(committed).toBe(true)
+      return 'OK'
+    })
+
+    await expect(getSession(fakeRequest('00000000-0000-4000-8000-000000000000'))).resolves.toEqual({
+      sessionId: '00000000-0000-4000-8000-000000000010',
+      userId: 'user-1',
+    })
+    expect(mockRedisSet).toHaveBeenCalledTimes(2)
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -477,9 +666,12 @@ describe('destroySession', () => {
     mockDbUpdate.mockReturnValue(chain(undefined))
   })
 
-  it('deletes only the digest-keyed Redis cache after DB revocation', async () => {
+  it('deletes both digest and legacy Redis keys after DB revocation', async () => {
     await destroySession('00000000-0000-4000-8000-000000000000')
-    expect(mockRedisDel).toHaveBeenCalledWith(expect.stringMatching(/^session:v2:[0-9a-f]{64}$/))
+    expect(mockRedisDel).toHaveBeenCalledWith(
+      expect.stringMatching(/^session:v2:[0-9a-f]{64}$/),
+      'session:00000000-0000-4000-8000-000000000000',
+    )
     expect(mockDbUpdate.mock.invocationCallOrder[0]).toBeLessThan(mockRedisDel.mock.invocationCallOrder[0])
   })
 

@@ -1,6 +1,7 @@
 import { createAnthropic } from '@ai-sdk/anthropic'
 import { createOpenAI } from '@ai-sdk/openai'
 import { createGoogleGenerativeAI } from '@ai-sdk/google'
+import { createHash, timingSafeEqual } from 'node:crypto'
 import type { LanguageModel } from 'ai'
 import { db } from '@/db'
 import { providerConfigs } from '@/db/schema'
@@ -43,6 +44,62 @@ export type ProviderResult = {
 
 export type GetModelOptions = {
   cwd?: string | null
+  expectedExecutionSnapshot?: ProviderExecutionSnapshot
+  signal?: AbortSignal
+}
+
+export type AcpExecutionMode = 'not_applicable' | 'unconfined_host_process'
+
+export type ProviderExecutionSnapshot = {
+  acpExecutionMode: AcpExecutionMode
+  configId: string
+  fingerprint: string
+  isLocal: boolean
+  modelId: string
+  providerType: string
+  updatedAt: Date
+}
+
+function executionFingerprint(config: ProviderConfig): string {
+  const canonical = JSON.stringify([
+    config.id,
+    config.displayName,
+    config.providerType,
+    config.modelId,
+    config.baseUrl,
+    config.apiKeyEnvVar,
+    config.apiKeyCiphertext,
+    config.isLocal,
+    config.isActive,
+    config.createdAt.toISOString(),
+    config.updatedAt.toISOString(),
+  ])
+  return createHash('sha256').update('forge:provider-execution-snapshot:v1\0').update(canonical).digest('hex')
+}
+
+export function providerExecutionSnapshot(config: ProviderConfig): ProviderExecutionSnapshot {
+  return {
+    acpExecutionMode: config.providerType === 'acp' ? 'unconfined_host_process' : 'not_applicable',
+    configId: config.id,
+    fingerprint: executionFingerprint(config),
+    isLocal: config.isLocal,
+    modelId: config.modelId,
+    providerType: config.providerType,
+    updatedAt: new Date(config.updatedAt),
+  }
+}
+
+function snapshotsMatch(expected: ProviderExecutionSnapshot, actual: ProviderExecutionSnapshot): boolean {
+  const expectedDigest = Buffer.from(expected.fingerprint, 'hex')
+  const actualDigest = Buffer.from(actual.fingerprint, 'hex')
+  return expected.configId === actual.configId
+    && expected.modelId === actual.modelId
+    && expected.providerType === actual.providerType
+    && expected.isLocal === actual.isLocal
+    && expected.acpExecutionMode === actual.acpExecutionMode
+    && expected.updatedAt.getTime() === actual.updatedAt.getTime()
+    && expectedDigest.length === actualDigest.length
+    && timingSafeEqual(expectedDigest, actualDigest)
 }
 
 // ---------------------------------------------------------------------------
@@ -171,7 +228,7 @@ function isLoopbackHttpUrl(rawUrl: string | undefined): boolean {
   }
 }
 
-async function ensureLmStudioModelLoaded(config: ProviderConfig): Promise<void> {
+async function ensureLmStudioModelLoaded(config: ProviderConfig, externalSignal?: AbortSignal): Promise<void> {
   if (!config.isLocal) return
   const nativeBaseUrl = normalizeLmStudioNativeApiBaseUrl(
     config.baseUrl ?? PROVIDER_CATALOG.lmstudio.defaultBaseUrl ?? null,
@@ -190,6 +247,9 @@ async function ensureLmStudioModelLoaded(config: ProviderConfig): Promise<void> 
 
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), 120_000)
+  const abortFromExternal = () => controller.abort(externalSignal?.reason)
+  if (externalSignal?.aborted) abortFromExternal()
+  else externalSignal?.addEventListener('abort', abortFromExternal, { once: true })
   try {
     const headers: Record<string, string> = { 'Content-Type': 'application/json' }
     if (apiKey) headers.Authorization = `Bearer ${apiKey}`
@@ -205,6 +265,7 @@ async function ensureLmStudioModelLoaded(config: ProviderConfig): Promise<void> 
     }
   } finally {
     clearTimeout(timer)
+    externalSignal?.removeEventListener('abort', abortFromExternal)
   }
 }
 
@@ -236,11 +297,17 @@ export async function getModel(configId: string, options: GetModelOptions = {}):
   if (!result) return null
 
   const { provider, config } = result
+  if (options.expectedExecutionSnapshot) {
+    const actual = providerExecutionSnapshot(config)
+    if (!snapshotsMatch(options.expectedExecutionSnapshot, actual)) {
+      throw new Error('Provider configuration changed after the protected work-package claim. Execution failed closed.')
+    }
+  }
   if (config.providerType === 'acp') {
     return new AcpLanguageModel(config.modelId, { cwd: options.cwd })
   }
   if (config.providerType === 'lmstudio') {
-    await ensureLmStudioModelLoaded(config)
+    await ensureLmStudioModelLoaded(config, options.signal)
   }
   if (CHAT_COMPLETIONS_PROVIDER_TYPES.has(config.providerType as ProviderType)) {
     return (provider as { chat: (modelId: string) => LanguageModel }).chat(config.modelId)

@@ -3,14 +3,19 @@ import { createHmac, timingSafeEqual } from 'node:crypto'
 export const ARCHITECT_PLAN_HEADER = 'Architect plan available in protected history'
 export const ARCHITECT_PLAN_ENTRY_DOMAIN_V1 = Buffer.from('forge:architect-plan-entry:v1\0', 'utf8')
 export const ARCHITECT_PLAN_SET_DOMAIN_V1 = Buffer.from('forge:architect-plan-entry-set:v1\0', 'utf8')
+export const ARCHITECT_PLAN_STRUCTURAL_SET_DOMAIN_V1 = Buffer.from('forge:architect-plan-structural-set:v1\0', 'utf8')
+export const ARCHITECT_CLARIFICATION_ANSWER_DOMAIN_V1 = Buffer.from('forge:architect-clarification-answer:v1\0', 'utf8')
 export const MAX_ARCHITECT_PLAN_ENTRIES = 256
 export const MAX_ARCHITECT_PLAN_ENTRY_BYTES = 64 * 1024
 
 export type ArchitectPlanEntryKind =
   | 'plan_body'
   | 'requirement'
+  | 'routing'
   | 'overlay'
   | 'subtask'
+  | 'clarification_question'
+  | 'clarification_answer'
   | 'legacy_full_plan'
 
 export type ArchitectPlanEntryInput = {
@@ -112,11 +117,31 @@ function validateEntryIdentity(input: ArchitectPlanEntryInput): void {
   if (input.entryKind === 'requirement' && input.entryId !== `requirement:${requirementKey}`) {
     throw new Error('Architect requirement entry ID does not match its requirement key')
   }
+  if (input.entryKind === 'routing') {
+    if (
+      input.entryId !== `routing:${requirementKey}:${agent}`
+      || agent === null
+      || requirementKey === null
+      || input.bindingFingerprint === null
+      || input.projectionEligible
+    ) {
+      throw new Error('Architect routing entry does not match its executable binding')
+    }
+  }
   if (input.entryKind === 'overlay' && input.entryId !== `overlay:${requirementKey}:${agent}`) {
     throw new Error('Architect overlay entry ID does not match its binding')
   }
   if (input.entryKind === 'subtask' && !input.entryId.endsWith(`:${agent}`)) {
     throw new Error('Architect subtask entry ID does not match its agent')
+  }
+  if (input.entryKind === 'clarification_question' || input.entryKind === 'clarification_answer') {
+    const expectedPrefix = `${input.entryKind}:`
+    if (!input.entryId.startsWith(expectedPrefix)
+      || !UUID.test(input.entryId.slice(expectedPrefix.length))
+      || input.agent !== null || input.requirementKey !== null
+      || input.bindingFingerprint !== null || input.projectionEligible) {
+      throw new Error('Architect clarification entry does not match its protected identity')
+    }
   }
   if (input.entryKind === 'legacy_full_plan') {
     if (!/^legacy_full_plan:[0-9]{6}$/.test(input.entryId) || input.projectionEligible) {
@@ -132,7 +157,7 @@ function entryDigestPayload(input: {
   taskId: string
 }): Record<string, unknown> {
   return {
-    schemaVersion: 1,
+    schemaVersion: 1 as const,
     taskId: input.taskId,
     planArtifactId: input.planArtifactId,
     planVersion: input.planVersion,
@@ -150,6 +175,49 @@ function hmacDigest(domain: Buffer, key: Buffer, value: unknown): string {
   return `hmac-sha256:${createHmac('sha256', key).update(domain).update(canonicalArchitectPlanJson(value), 'utf8').digest('hex')}`
 }
 
+export type ArchitectClarificationAnswerEnvelope = {
+  schemaVersion: 1
+  taskId: string
+  answerId: string
+  questionId: string
+  sourcePlanArtifactId: string
+  sourcePlanVersion: string
+  answer: string
+  digestKeyId: string
+  contentDigest: string
+}
+
+export function materializeArchitectClarificationAnswer(input: Omit<ArchitectClarificationAnswerEnvelope, 'contentDigest' | 'schemaVersion'> & { digestKey: Buffer }): ArchitectClarificationAnswerEnvelope {
+  if (!UUID.test(input.taskId) || !UUID.test(input.answerId) || !UUID.test(input.questionId)
+    || !UUID.test(input.sourcePlanArtifactId) || !canonicalPlanVersion(input.sourcePlanVersion)
+    || !COMPONENT.test(input.digestKeyId)) {
+    throw new Error('Architect clarification answer identity is invalid')
+  }
+  const answer = input.answer.normalize('NFC')
+  if (Buffer.byteLength(answer, 'utf8') === 0 || Buffer.byteLength(answer, 'utf8') > MAX_ARCHITECT_PLAN_ENTRY_BYTES) {
+    throw new Error('Architect clarification answer is outside the bounded size')
+  }
+  const payload = {
+    schemaVersion: 1 as const,
+    taskId: input.taskId,
+    answerId: input.answerId,
+    questionId: input.questionId,
+    sourcePlanArtifactId: input.sourcePlanArtifactId,
+    sourcePlanVersion: input.sourcePlanVersion,
+    answer,
+  }
+  return { ...payload, digestKeyId: input.digestKeyId, contentDigest: hmacDigest(ARCHITECT_CLARIFICATION_ANSWER_DOMAIN_V1, input.digestKey, payload) }
+}
+
+export function verifyArchitectClarificationAnswer(input: ArchitectClarificationAnswerEnvelope & { digestKey: Buffer }): boolean {
+  try {
+    const materialized = materializeArchitectClarificationAnswer(input)
+    const left = Buffer.from(materialized.contentDigest, 'utf8')
+    const right = Buffer.from(input.contentDigest, 'utf8')
+    return left.length === right.length && timingSafeEqual(left, right)
+  } catch { return false }
+}
+
 export function materializeArchitectPlanEntries(input: {
   digestKey: Buffer
   digestKeyId: string
@@ -157,7 +225,7 @@ export function materializeArchitectPlanEntries(input: {
   planArtifactId: string
   planVersion: string
   taskId: string
-}): { entries: ArchitectPlanEntryEnvelope[]; entrySetDigest: string } {
+}): { entries: ArchitectPlanEntryEnvelope[]; entrySetDigest: string; structuralSetDigest: string } {
   if (!UUID.test(input.taskId) || !UUID.test(input.planArtifactId)) {
     throw new Error('Architect plan task and artifact IDs must be canonical UUIDs')
   }
@@ -170,10 +238,12 @@ export function materializeArchitectPlanEntries(input: {
   const ids = new Set<string>()
   const entries = input.entries.map((rawEntry) => {
     const entry: ArchitectPlanEntryInput = {
-      ...rawEntry,
       agent: rawEntry.agent?.normalize('NFC') ?? null,
+      bindingFingerprint: rawEntry.bindingFingerprint,
       content: rawEntry.content.normalize('NFC'),
       entryId: rawEntry.entryId.normalize('NFC'),
+      entryKind: rawEntry.entryKind,
+      projectionEligible: rawEntry.projectionEligible,
       requirementKey: rawEntry.requirementKey?.normalize('NFC') ?? null,
     }
     validateEntryIdentity(entry)
@@ -200,7 +270,61 @@ export function materializeArchitectPlanEntries(input: {
     input.digestKey,
     entries.map(({ entryId, contentDigest }) => ({ entryId, contentDigest })),
   )
-  return { entries, entrySetDigest }
+  const structuralEntries = entries.filter((entry) => [
+    'plan_body', 'requirement', 'routing', 'overlay', 'subtask',
+  ].includes(entry.entryKind))
+  const routingByRequirementAgent = new Map(structuralEntries.flatMap((entry) =>
+    entry.entryKind === 'routing' && entry.requirementKey && entry.agent && entry.bindingFingerprint
+      ? [[`${entry.requirementKey}\0${entry.agent}`, entry.bindingFingerprint] as const]
+      : [],
+  ))
+  const completeBindings = structuralEntries.flatMap((entry) => {
+    if (entry.entryKind !== 'subtask') {
+      return entry.bindingFingerprint && entry.agent && entry.requirementKey
+        ? [{ entryId: entry.entryId, agent: entry.agent, requirementKey: entry.requirementKey, bindingFingerprint: entry.bindingFingerprint }]
+        : []
+    }
+    try {
+      const parsed = JSON.parse(entry.content) as { capabilityBindings?: unknown }
+      if (!Array.isArray(parsed.capabilityBindings) || !entry.agent) throw new Error('missing bindings')
+      return parsed.capabilityBindings.map((binding) => {
+        if (!isRecord(binding) || typeof binding.capability !== 'string' || typeof binding.requirementKey !== 'string') {
+          throw new Error('invalid binding')
+        }
+        const bindingFingerprint = routingByRequirementAgent.get(`${binding.requirementKey}\0${entry.agent}`)
+        if (!bindingFingerprint) throw new Error('missing routing')
+        return {
+          entryId: entry.entryId,
+          agent: entry.agent!,
+          requirementKey: binding.requirementKey,
+          capability: binding.capability,
+          bindingFingerprint,
+        }
+      })
+    } catch {
+      throw new Error(`Architect subtask ${entry.entryId} has an incomplete structural binding set`)
+    }
+  }).sort((left, right) => canonicalArchitectPlanJson(left).localeCompare(canonicalArchitectPlanJson(right), 'en'))
+  const structuralSetDigest = hmacDigest(
+    ARCHITECT_PLAN_STRUCTURAL_SET_DOMAIN_V1,
+    input.digestKey,
+    {
+      entries: structuralEntries.map(({
+        agent, bindingFingerprint, content, entryId, entryKind,
+        projectionEligible, requirementKey,
+      }) => ({
+        agent,
+        bindingFingerprint,
+        content,
+        entryId,
+        entryKind,
+        projectionEligible,
+        requirementKey,
+      })),
+      completeBindings,
+    },
+  )
+  return { entries, entrySetDigest, structuralSetDigest }
 }
 
 export function verifyArchitectPlanEntry(input: {
@@ -228,6 +352,10 @@ export function verifyArchitectPlanEntry(input: {
 
 export function architectPlanEntryReference(entry: ArchitectPlanEntryEnvelope): ArchitectPlanEntryReference {
   if (!entry.projectionEligible) throw new Error('Ineligible Architect history cannot become an executable reference')
+  return referenceFromEntry(entry)
+}
+
+function referenceFromEntry(entry: ArchitectPlanEntryEnvelope): ArchitectPlanEntryReference {
   return {
     schemaVersion: 1,
     planArtifactId: entry.planArtifactId,
@@ -238,6 +366,32 @@ export function architectPlanEntryReference(entry: ArchitectPlanEntryEnvelope): 
     requirementKey: entry.requirementKey,
     bindingFingerprint: entry.bindingFingerprint,
   }
+}
+
+/**
+ * Creates the purpose-bound reference used only to let a later Architect run
+ * read the prior protected plan body once. This is deliberately separate from
+ * executable package references: plan_body remains projection-ineligible.
+ */
+export function architectReplanReferenceForEntry(
+  entry: ArchitectPlanEntryEnvelope,
+): ArchitectPlanEntryReference {
+  validateEntryIdentity(entry)
+  if (
+    entry.entryKind !== 'plan_body'
+    || entry.entryId !== 'plan_body:000000'
+    || entry.agent !== null
+    || entry.requirementKey !== null
+    || entry.bindingFingerprint !== null
+    || entry.projectionEligible
+    || !DIGEST.test(entry.contentDigest)
+    || !COMPONENT.test(entry.digestKeyId)
+    || !UUID.test(entry.planArtifactId)
+    || !canonicalPlanVersion(entry.planVersion)
+  ) {
+    throw new Error('Only a protected non-projection plan body can become an Architect replan reference')
+  }
+  return referenceFromEntry(entry)
 }
 
 export function parseArchitectPlanEntryReference(value: unknown): ArchitectPlanEntryReference | null {

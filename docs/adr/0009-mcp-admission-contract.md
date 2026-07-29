@@ -1501,8 +1501,8 @@ contract. This split must match the per-step release manifest metadata above.
   `status:'allowed'` and mode `planning_only|bounded_context_approved`, or is the
   explicit pure-planning exception: `status:'warning'`, mode `planning_only`,
   `capabilityClasses.length > 0`, and **every** capability class `planning_only` (for example
-  `filesystem.project.write`, which is an instruction for Forge's sandbox JSON
-  path, not permission). No missing-context, unhealthy, deferred, unknown, or mixed
+  `filesystem.project.write`, which would be an instruction for a future
+  confined execution JSON path, not permission). No missing-context, unhealthy, deferred, unknown, or mixed
   warning qualifies. The runtime package contains only normalized policy/bindings
   plus eligible references into the one ACL-protected versioned Architect plan
   artifact; the task-bound internal resolver obtains requirement/overlay/subtask
@@ -1532,8 +1532,8 @@ contract. This split must match the per-step release manifest metadata above.
   erasure.
 - **Security boundary: MCP-channel admission is not an ACP sandbox.** An Agent
   Client Protocol (ACP) adapter is a local process and Forge explicitly does not
-  OS-confine it (`FORGE_ACP_WORK_PACKAGE_EXECUTION=1` is operator acceptance of
-  that risk). It may inherit `HOME`, `CODEX_HOME`, `PATH`, and XDG configuration,
+  OS-confine it. The reserved `FORGE_ACP_WORK_PACKAGE_EXECUTION` setting cannot
+  enable the currently unavailable specialist path. It may inherit `HOME`, `CODEX_HOME`, `PATH`, and XDG configuration,
   and prompt instructions cannot prevent shell, network, or credential access.
   Therefore `deferred_live_mcp`, “no live MCP handle”, and the S5 badges describe
   only capabilities issued through Forge's MCP channel; they must not claim that
@@ -1542,8 +1542,8 @@ contract. This split must match the per-step release manifest metadata above.
   text for every deferred, unknown, blocked, or non-deliverable warning decision—not only its
   structured capability name—from the executable prompt (retaining only a static,
   Forge-authored boundary warning), and S5 displays
-  “MCP access deferred — ACP runtimes are not a security sandbox” wherever ACP
-  execution is enabled. Real process/network/credential/filesystem isolation is a
+  “MCP access deferred — ACP runtimes are not a security sandbox” wherever a
+  future ACP execution surface is enabled. Real process/network/credential/filesystem isolation is a
   prerequisite of any later security-bound capability guarantee and remains in
   the #40/#60 security epic. Tests prove that no deferred tool is issued or
   rendered as an allowed MCP instruction. A positive fixture proves a pure

@@ -10,6 +10,7 @@ const mocks = vi.hoisted(() => ({
   dbUpdate: vi.fn(),
   convergeRecognizedOperatorHoldTask: vi.fn().mockResolvedValue({ status: 'not_recognized' }),
   publishTaskEvent: vi.fn(),
+  resolveS4ReviewSourceV1: vi.fn(),
   updateTaskStatusIfCurrent: vi.fn(),
 }))
 
@@ -27,6 +28,10 @@ vi.mock('@/worker/events', () => ({
 
 vi.mock('@/lib/mcps/filesystem-grant-reconciliation', () => ({
   convergeRecognizedOperatorHoldTask: mocks.convergeRecognizedOperatorHoldTask,
+}))
+
+vi.mock('@/lib/mcps/review-source-resolver', () => ({
+  resolveS4ReviewSourceV1: mocks.resolveS4ReviewSourceV1,
 }))
 
 vi.mock('@/worker/task-state', () => ({

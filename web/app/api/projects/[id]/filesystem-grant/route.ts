@@ -13,6 +13,7 @@ import {
   projectFilesystemGrantFromAuthority,
 } from '@/lib/mcps/filesystem-grants'
 import { respondToRouteError } from '@/lib/http/route-error'
+import { logged500Error } from '@/lib/logged-500'
 import {
   loadCurrentProjectFilesystemDecision,
   mutateProjectFilesystemGrant,
@@ -114,7 +115,7 @@ export async function PUT(request: NextRequest, { params }: { params: Promise<{ 
       try {
         await redis.lpush('forge:approvals', JSON.stringify({ taskId, action: 'approve' }))
       } catch (err) {
-        console.error('[PUT /api/projects/:id/filesystem-grant] Failed to enqueue recovery', err)
+        logged500Error('PUT /api/projects/:id/filesystem-grant', err)
         queueFailures.push(taskId)
       }
     }

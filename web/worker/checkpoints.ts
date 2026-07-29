@@ -38,6 +38,7 @@ export type ArchitectCheckpointInput = {
   runStatus: RunStatus
   taskStatus: TaskStatus
   artifactId?: string
+  protectedHistory?: boolean
   openQuestionCount: number
   openQuestions: string[]
   revisedFromAnswers: boolean
@@ -107,6 +108,7 @@ function frontmatter(input: ArchitectCheckpointInput, workspace: WorkspaceSettin
     ['workspaceRoot', workspace.workspaceRoot],
     ['projectLocalPath', input.project.localPath],
     ['artifactId', input.artifactId ?? null],
+    ['protectedHistory', input.protectedHistory ?? false],
     ['openQuestionCount', input.openQuestionCount],
     ['revisedFromAnswers', input.revisedFromAnswers],
     ['revisedFromPlan', input.revisedFromPlan],
@@ -134,7 +136,9 @@ export function renderArchitectCheckpoint(
   workspace: WorkspaceSettings,
 ): string {
   const createdAt = input.createdAt ?? new Date()
-  const planText = input.planText?.trim() || 'No plan artifact was produced before this checkpoint.'
+  const planText = input.protectedHistory
+    ? 'Protected Architect content is available only through its authenticated, audited history reference.'
+    : input.planText?.trim() || 'No plan artifact was produced before this checkpoint.'
   const summary = input.runStatus === 'failed'
     ? 'The Architect run failed. Resume by inspecting the failure details and rerunning the task once the root cause is fixed.'
     : input.openQuestionCount > 0
@@ -173,7 +177,7 @@ export function renderArchitectCheckpoint(
     '',
     renderOpenQuestions(input.openQuestions),
     ...renderOptionalSection('Failure', input.errorMessage),
-    ...renderOptionalSection('Partial Output', input.partialOutput),
+    ...renderOptionalSection('Partial Output', input.protectedHistory ? undefined : input.partialOutput),
     '',
   ].join('\n')
 }

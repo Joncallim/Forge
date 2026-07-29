@@ -3,10 +3,16 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { prepareArchitectArtifact, type PreparedArchitectArtifact } from '@/worker/architect-artifact'
 import {
+  buildProtectedPackageEntryRegistrations,
   buildWorkforceMaterializationRows,
   isWorkforceMaterializationEnabled,
 } from '@/worker/workforce-materializer'
 import { evaluateWorkPackageMcpBroker } from '@/worker/mcp-execution-design'
+import {
+  materializeArchitectPlanEntries,
+  type ArchitectPlanEntryEnvelope,
+} from '@/lib/mcps/architect-plan-entries'
+import { buildProtectedArchitectPlanEntries } from '@/worker/protected-architect-plan'
 
 const prepared: PreparedArchitectArtifact = {
   planText: '# Plan',
@@ -158,6 +164,36 @@ function deterministicIds(): () => string {
   return () => `00000000-0000-4000-8000-${String(++next).padStart(12, '0')}`
 }
 
+function protectedEntriesFor(
+  agent: string,
+  taskId = '00000000-0000-4000-8000-000000000100',
+  planArtifactId = '00000000-0000-4000-8000-000000000101',
+): ArchitectPlanEntryEnvelope[] {
+  const base = {
+    schemaVersion: 1 as const,
+    taskId,
+    planArtifactId,
+    planVersion: '1',
+    digestKeyId: 'plan-key-1',
+    bindingFingerprint: `sha256:${'a'.repeat(64)}`,
+    contentDigest: `hmac-sha256:${'a'.repeat(64)}`,
+    projectionEligible: true,
+    agent,
+    requirementKey: 'mcp-requirement-v1-test-1',
+  }
+  return [{
+    ...base,
+    entryId: `overlay:mcp-requirement-v1-test-1:${agent}`,
+    entryKind: 'overlay',
+    content: 'RAW-PROTECTED-OVERLAY-SENTINEL',
+  }, {
+    ...base,
+    entryId: `subtask:000001:${agent}`,
+    entryKind: 'subtask',
+    content: 'RAW-PROTECTED-SUBTASK-SENTINEL',
+  }]
+}
+
 describe('workforce materializer', () => {
   it('persists invalid-design normalization blockers for package admission', () => {
     const invalidPrepared = structuredClone(prepared)
@@ -251,16 +287,25 @@ describe('workforce materializer', () => {
     expect(pkg).toBeDefined()
     expect(pkg!.metadata).toMatchObject({
       mcpGrants: [expect.objectContaining({ decisionId: 'grant-1', mcpId: 'github', agent: 'backend-dev' })],
-      requirementContexts: [expect.objectContaining({ agent: 'backend-dev' })],
-      mcpAwareSubtasks: [expect.objectContaining({ agent: 'backend-dev' })],
+      mcpPromptContextPolicy: {
+        schemaVersion: 1,
+        state: 'safe_policy_only',
+        promptOverlayPresent: true,
+        requirementContextCount: 1,
+        mcpAwareSubtaskCount: 1,
+        eligibleReferenceCount: 0,
+        protectedCoverageComplete: false,
+      },
     })
+    expect(pkg!.metadata).not.toHaveProperty('requirementContexts')
+    expect(pkg!.metadata).not.toHaveProperty('mcpAwareSubtasks')
     expect(pkg!.mcpRequirements).toEqual([expect.objectContaining({ mcpId: 'github', agent: 'backend-dev' })])
     expect(evaluateWorkPackageMcpBroker({
       assignedRole: pkg!.assignedRole,
       mcpRequirements: pkg!.mcpRequirements,
       metadata: pkg!.metadata,
       title: pkg!.title,
-    }).status).toBe('allowed')
+    }).status).toBe('blocked')
   })
 
   it('materializes separator aliases into one deny-wins package policy', () => {
@@ -345,7 +390,7 @@ describe('workforce materializer', () => {
       mcpRequirements: backend.mcpRequirements,
       metadata: backend.metadata,
       title: backend.title,
-    }).status).toBe('allowed')
+    }).status).toBe('blocked')
     expect(evaluateWorkPackageMcpBroker({
       assignedRole: frontend.assignedRole,
       mcpRequirements: frontend.mcpRequirements,
@@ -409,9 +454,10 @@ describe('workforce materializer', () => {
     )
     const pkg = rows.workPackages[0]
     expect(pkg.metadata).toMatchObject({
-      mcpAwareSubtasks: [],
+      mcpPromptContextPolicy: expect.objectContaining({ mcpAwareSubtaskCount: 0 }),
       mcpNormalizationEvidence: [expect.objectContaining({ code: 'mcp_design_nested_policy_invalid' })],
     })
+    expect(pkg.metadata).not.toHaveProperty('mcpAwareSubtasks')
     expect((pkg.metadata as { mcpNormalizationErrors: string[] }).mcpNormalizationErrors).toEqual(expect.arrayContaining([
       expect.stringMatching(/mcpCapabilities exceeds the maximum raw count of 30/),
     ]))
@@ -553,17 +599,16 @@ describe('workforce materializer', () => {
         }),
       }),
       source: 'architect-artifact',
-      promptOverlay: 'Use GitHub read tools only.',
-      requirementContexts: [expect.objectContaining({ requirementKey: 'mcp-requirement-v1-test-1', agent: 'backend' })],
-      mcpAwareSubtasks: [
-        expect.objectContaining({
-          id: 'inspect-issue',
-          agent: 'backend',
-          mcpCapabilities: ['github.issues.read'],
-          capabilityBindings: [{ capability: 'github.issues.read', requirementKey: 'mcp-requirement-v1-test-1' }],
-        }),
-      ],
+      mcpPromptContextPolicy: expect.objectContaining({
+        state: 'safe_policy_only',
+        promptOverlayPresent: true,
+        requirementContextCount: 1,
+        mcpAwareSubtaskCount: 1,
+      }),
     })
+    expect(rows.workPackages[0].metadata).not.toHaveProperty('promptOverlay')
+    expect(rows.workPackages[0].metadata).not.toHaveProperty('requirementContexts')
+    expect(rows.workPackages[0].metadata).not.toHaveProperty('mcpAwareSubtasks')
     expect(rows.workPackages[0].requiredCapabilities).toEqual({
       schemaVersion: 1,
       required: ['database-migration', 'business-logic'],
@@ -589,6 +634,116 @@ describe('workforce materializer', () => {
       sourceAgentRunId: 'run-1',
       sourceArtifactId: 'artifact-1',
     })
+  })
+
+  it('does not store mutable protected content locators before fixed-path registration', () => {
+    const taskId = '00000000-0000-4000-8000-000000000100'
+    const artifactId = '00000000-0000-4000-8000-000000000101'
+    const rows = buildWorkforceMaterializationRows({
+      taskId,
+      architectRunId: '00000000-0000-4000-8000-000000000102',
+      artifactId,
+      prepared,
+      protectedArchitectPlanEntries: [
+        ...protectedEntriesFor('backend', taskId, artifactId),
+        ...protectedEntriesFor('frontend', taskId, artifactId),
+        ...protectedEntriesFor('backend', taskId, '00000000-0000-4000-8000-000000000999'),
+      ],
+    }, { idFactory: deterministicIds() })
+
+    const metadata = rows.workPackages[0].metadata as Record<string, unknown>
+    expect(metadata.mcpPromptContextPolicy).toMatchObject({
+      state: 'protected_references_available',
+      protectedCoverageComplete: true,
+      eligibleReferenceCount: 2,
+    })
+    expect(metadata).not.toHaveProperty('architectPlanEntryReferences')
+    expect(metadata).not.toHaveProperty('architectPlanEntryRegistrations')
+    expect(metadata).not.toHaveProperty('architectPlanEntryRegistrationIds')
+    expect(JSON.stringify(metadata)).not.toContain('RAW-PROTECTED-')
+    expect(metadata).not.toHaveProperty('promptOverlay')
+    expect(metadata).not.toHaveProperty('requirementContexts')
+    expect(metadata).not.toHaveProperty('mcpAwareSubtasks')
+  })
+
+  it('registers every protected capability binding across package agents and rejects a missing route', () => {
+    const multi = structuredClone(prepared)
+    const design = multi.mcpExecutionDesign.proposed!
+    const first = design.requirements[0]
+    const backendSecond = {
+      ...structuredClone(first),
+      requirementKey: 'mcp-requirement-v1-backend-2',
+      sourceRequirementIndex: 1,
+      mcpId: 'filesystem',
+      agentPermissions: { backend: ['filesystem.project.read'] },
+    }
+    const frontend = {
+      ...structuredClone(first),
+      requirementKey: 'mcp-requirement-v1-frontend-1',
+      sourceRequirementIndex: 2,
+      assignment: { ...first.assignment, targetAgents: ['frontend'] },
+      agentPermissions: { frontend: ['github.issues.read'] },
+    }
+    design.requirements.push(backendSecond, frontend)
+    design.mcpAwareSubtasks[0].mcpCapabilities.push('filesystem.project.read')
+    design.mcpAwareSubtasks[0].capabilityBindings!.push({
+      capability: 'filesystem.project.read',
+      requirementKey: backendSecond.requirementKey,
+    })
+    design.mcpAwareSubtasks.push({
+      ...structuredClone(design.mcpAwareSubtasks[0]),
+      id: 'inspect-frontend',
+      agent: 'frontend',
+      mcpCapabilities: ['github.issues.read'],
+      capabilityBindings: [{
+        capability: 'github.issues.read',
+        requirementKey: frontend.requirementKey,
+      }],
+    })
+    const taskId = '00000000-0000-4000-8000-000000000100'
+    const artifactId = '00000000-0000-4000-8000-000000000101'
+    const digestKey = Buffer.alloc(32, 9)
+    const protectedEntries = materializeArchitectPlanEntries({
+      digestKey,
+      digestKeyId: 'test-v1',
+      entries: buildProtectedArchitectPlanEntries({ planText: '# Plan', prepared: multi }),
+      planArtifactId: artifactId,
+      planVersion: '1',
+      taskId,
+    }).entries
+    const packages = ([{
+      id: '00000000-0000-4000-8000-000000000201', assignedRole: 'backend',
+    }, {
+      id: '00000000-0000-4000-8000-000000000202', assignedRole: 'frontend',
+    }] as unknown) as Parameters<typeof buildProtectedPackageEntryRegistrations>[0]['packages']
+
+    const registrations = buildProtectedPackageEntryRegistrations({
+      taskId,
+      sourceArtifactId: artifactId,
+      sourcePlanVersion: '1',
+      digestKey,
+      packages,
+      entries: protectedEntries,
+      prepared: multi,
+    })
+    expect(registrations.find((entry) => entry.entryId === 'subtask:inspect-issue:backend')?.capabilities)
+      .toEqual(expect.arrayContaining([
+        expect.objectContaining({ requirementKey: first.requirementKey, capability: 'github.issues.read' }),
+        expect.objectContaining({ requirementKey: backendSecond.requirementKey, capability: 'filesystem.project.read' }),
+      ]))
+    expect(registrations.find((entry) => entry.entryId === 'subtask:inspect-frontend:frontend')?.capabilities)
+      .toEqual([expect.objectContaining({ requirementKey: frontend.requirementKey })])
+
+    expect(() => buildProtectedPackageEntryRegistrations({
+      taskId,
+      sourceArtifactId: artifactId,
+      sourcePlanVersion: '1',
+      digestKey,
+      packages,
+      entries: protectedEntries.filter((entry) =>
+        entry.entryId !== `routing:${backendSecond.requirementKey}:backend`),
+      prepared: multi,
+    })).toThrow(new RegExp(`missing routing for ${backendSecond.requirementKey}`, 'i'))
   })
 
   it('does not materialize an unscoped legacy prompt overlay after context normalization rejects it', () => {
@@ -630,9 +785,14 @@ describe('workforce materializer', () => {
 
     expect(rows.workPackages[0].metadata).toMatchObject({
       mcpNormalizationErrors: ['Legacy MCP prompt overlay is ambiguous.'],
-      promptOverlay: null,
-      requirementContexts: [],
+      mcpPromptContextPolicy: expect.objectContaining({
+        state: 'safe_policy_only',
+        promptOverlayPresent: true,
+        requirementContextCount: 0,
+      }),
     })
+    expect(rows.workPackages[0].metadata).not.toHaveProperty('promptOverlay')
+    expect(rows.workPackages[0].metadata).not.toHaveProperty('requirementContexts')
   })
 
   it('materializes reviewer-only raw policy and derived envelope with the same identity', () => {
@@ -716,8 +876,7 @@ describe('workforce materializer', () => {
       metadata: rows.workPackages[0].metadata,
       title: rows.workPackages[0].title,
     })
-    expect(broker.evaluations).toHaveLength(1)
-    expect(broker.evaluations[0].decision.mode).not.toBe('unknown_legacy')
+    expect(broker).toMatchObject({ status: 'blocked', primaryRecoveryAction: 'revise_plan' })
   })
 
   it('keeps manual review gates even when executable QA and Reviewer packages exist', () => {
@@ -887,9 +1046,13 @@ describe('workforce materializer', () => {
     expect(rows.harnesses[0].toolPolicy).toEqual({})
     expect(rows.workPackages[0].metadata).toMatchObject({
       mcpGrants: [expect.objectContaining({ mcpId: 'github' })],
-      promptOverlay: 'Use GitHub read tools only.',
-      mcpAwareSubtasks: [expect.objectContaining({ id: 'inspect-issue' })],
+      mcpPromptContextPolicy: expect.objectContaining({
+        promptOverlayPresent: true,
+        mcpAwareSubtaskCount: 1,
+      }),
     })
+    expect(rows.workPackages[0].metadata).not.toHaveProperty('promptOverlay')
+    expect(rows.workPackages[0].metadata).not.toHaveProperty('mcpAwareSubtasks')
     expect(rows.workPackages[0].mcpRequirements).toEqual([
       expect.objectContaining({
         mcpId: 'github',

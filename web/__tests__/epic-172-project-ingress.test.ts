@@ -279,6 +279,7 @@ describe('Epic 172 project route ingress sentinel', () => {
     }
 
     expect([...guardedHandlers].sort()).toEqual([
+      '../app/api/mcps/actions/[taskId]/route.ts:POST',
       '../app/api/projects/[id]/filesystem-grant/route.ts:PUT',
       '../app/api/projects/[id]/route.ts:DELETE',
       '../app/api/projects/[id]/route.ts:PUT',
@@ -295,6 +296,8 @@ describe('Epic 172 project route ingress sentinel', () => {
       '../app/api/tasks/[id]/replan/route.ts:POST',
       '../app/api/tasks/[id]/retry-handoff/route.ts:POST',
       '../app/api/tasks/[id]/retry/route.ts:POST',
+      '../app/api/tasks/[id]/work-packages/[packageId]/local-effect-recovery/route.ts:POST',
+      '../app/api/tasks/[id]/work-packages/[packageId]/packet-issuance-recovery/route.ts:POST',
     ].sort())
     expect(observedMutations.some((mutation) => mutation.includes("redis.lpush('forge:tasks'"))).toBe(true)
     expect(observedMutations.some((mutation) => mutation.includes("redis.lpush('forge:approvals'"))).toBe(true)

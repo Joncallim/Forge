@@ -4,10 +4,15 @@ import { z } from 'zod'
 import { db } from '@/db'
 import { taskQuestions } from '@/db/schema'
 import { and, asc, eq, inArray } from 'drizzle-orm'
-import { getSession } from '@/lib/session'
+import { getSession, readSessionCredential } from '@/lib/session'
 import { redis } from '@/lib/redis'
 import { getAccessibleTask } from '@/lib/task-access'
 import { guardEpic172ProjectManagementIngress } from '@/lib/projects/epic-172-project-ingress'
+import { publishTaskEvent } from '@/worker/events'
+import { taskQuestionSummary } from '@/lib/mcps/clarification-projection'
+import { appendArchitectClarificationAnswer } from '@/lib/mcps/history-reader'
+import { architectPlanStorageConfiguration } from '@/lib/mcps/s4-protocol-store'
+import { readS4RuntimeModeV1 } from '@/lib/mcps/s4-lease'
 
 // ---------------------------------------------------------------------------
 // Validation schema
@@ -47,12 +52,17 @@ export async function GET(
     }
 
     const questions = await db
-      .select()
+      .select({
+        id: taskQuestions.id,
+        status: taskQuestions.status,
+        createdAt: taskQuestions.createdAt,
+        answeredAt: taskQuestions.answeredAt,
+      })
       .from(taskQuestions)
       .where(eq(taskQuestions.taskId, taskId))
       .orderBy(asc(taskQuestions.createdAt))
 
-    return NextResponse.json({ questions })
+    return NextResponse.json({ questions: questions.map(taskQuestionSummary) })
   } catch (err) {
     console.error('[GET /api/tasks/:id/questions] Unexpected error', err)
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
@@ -110,7 +120,7 @@ export async function POST(
     const questionIds = answers.map((a) => a.id)
 
     const existingQuestions = await db
-      .select()
+      .select({ id: taskQuestions.id, sourcePlanArtifactId: taskQuestions.sourcePlanArtifactId, sourcePlanVersion: taskQuestions.sourcePlanVersion })
       .from(taskQuestions)
       .where(and(eq(taskQuestions.taskId, taskId), inArray(taskQuestions.id, questionIds)))
 
@@ -123,46 +133,32 @@ export async function POST(
       )
     }
 
-    const now = new Date()
-    const updated = await Promise.all(
-      answers.map(({ id, answer }) =>
-        db
-          .update(taskQuestions)
-          .set({
-            answer,
-            status: 'answered',
-            answeredAt: now,
-            answeredBy: session.userId,
-          })
-          .where(eq(taskQuestions.id, id))
-          .returning(),
-      ),
-    )
-    const updatedQuestions = updated.flat()
+    const credential = readSessionCredential(request)
+    const storage = architectPlanStorageConfiguration(process.env, await readS4RuntimeModeV1())
+    if (!credential || storage.mode !== 'protected') {
+      return NextResponse.json({ error: 'Protected clarification history is unavailable.' }, { status: 409 })
+    }
+    const sourceById = new Map(existingQuestions.map((question) => [question.id, question]))
+    if ([...sourceById.values()].some((question) => !question.sourcePlanArtifactId || !question.sourcePlanVersion)) {
+      return NextResponse.json({ error: 'Clarification source is unavailable.' }, { status: 409 })
+    }
+    const appended = []
+    for (const answer of answers) {
+      const source = sourceById.get(answer.id)!
+      appended.push(await appendArchitectClarificationAnswer({
+        answer: answer.answer, digestKey: storage.digestKey, digestKeyId: storage.digestKeyId,
+        questionId: answer.id, sessionCredential: credential,
+        sourcePlanArtifactId: source.sourcePlanArtifactId!, sourcePlanVersion: String(source.sourcePlanVersion), taskId,
+      }))
+    }
+    const updatedQuestions = await db.select({ id: taskQuestions.id, status: taskQuestions.status, createdAt: taskQuestions.createdAt, answeredAt: taskQuestions.answeredAt })
+      .from(taskQuestions).where(and(eq(taskQuestions.taskId, taskId), inArray(taskQuestions.id, questionIds)))
+    const allAnswered = appended.at(-1)?.allAnswered === true
 
-    await redis.publish(
-      'forge:task:' + taskId,
-      JSON.stringify({
-        type: 'questions:answered',
-        questions: updatedQuestions.map((q) => ({
-          id: q.id,
-          question: q.question,
-          suggestions: q.suggestions,
-          answer: q.answer,
-          status: q.status,
-        })),
-      }),
-    )
-
-    // Check whether every question for this task is now answered. If so,
-    // enqueue a re-plan job so the architect re-runs with the answers in
-    // context and the task can move on to awaiting_approval.
-    const allQuestions = await db
-      .select({ status: taskQuestions.status })
-      .from(taskQuestions)
-      .where(eq(taskQuestions.taskId, taskId))
-
-    const allAnswered = allQuestions.length > 0 && allQuestions.every((q) => q.status === 'answered')
+    await publishTaskEvent(taskId, 'questions:answered', {
+      answeredCount: updatedQuestions.length,
+      allAnswered,
+    })
 
     if (allAnswered) {
       await redis.lpush('forge:answers', JSON.stringify({ taskId }))
@@ -175,7 +171,10 @@ export async function POST(
       allAnswered,
     })
 
-    return NextResponse.json({ questions: updatedQuestions, allAnswered })
+    return NextResponse.json({
+      questions: updatedQuestions.map(taskQuestionSummary),
+      allAnswered,
+    })
   } catch (err) {
     console.error('[POST /api/tasks/:id/questions] Unexpected error', err)
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })

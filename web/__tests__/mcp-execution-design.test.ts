@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { MCP_CATALOG } from '@/lib/mcps/catalog'
+import { materializeArchitectPlanEntries } from '@/lib/mcps/architect-plan-entries'
 import type { ProjectMcpOverview } from '@/lib/mcps/types'
 import { prepareArchitectArtifact } from '@/worker/architect-artifact'
 import {
@@ -887,11 +888,32 @@ describe('MCP execution design normalization', () => {
       const preview = deriveMcpGrantDecisions(parsed, mcpOverview)
       const prepared = prepareArchitectArtifact(plan, mcpOverview)
       let nextId = 0
+      const taskId = '00000000-0000-4000-8000-000000000201'
+      const artifactId = '00000000-0000-4000-8000-000000000202'
+      const protectedArchitectPlanEntries = blocked
+        ? []
+        : materializeArchitectPlanEntries({
+            digestKey: Buffer.alloc(32, 7),
+            digestKeyId: 'test-key-v1',
+            entries: parsed.requirementContexts!.map((context) => ({
+              agent: context.agent,
+              bindingFingerprint: `sha256:${'a'.repeat(64)}`,
+              content: context.promptOverlay,
+              entryId: `overlay:${context.requirementKey}:${context.agent}`,
+              entryKind: 'overlay' as const,
+              projectionEligible: true,
+              requirementKey: context.requirementKey,
+            })),
+            planArtifactId: artifactId,
+            planVersion: '1',
+            taskId,
+          }).entries
       const rows = buildWorkforceMaterializationRows({
-        taskId: 'task-overlay-boundary',
-        architectRunId: 'run-overlay-boundary',
-        artifactId: 'artifact-overlay-boundary',
+        taskId,
+        architectRunId: '00000000-0000-4000-8000-000000000203',
+        artifactId,
         prepared,
+        protectedArchitectPlanEntries,
       }, {
         activeAgents: [{ agentType: 'backend', displayName: 'Backend' }],
         idFactory: () => `overlay-boundary-${++nextId}`,
@@ -899,9 +921,12 @@ describe('MCP execution design normalization', () => {
       const pkg = rows.workPackages.find((candidate) => candidate.assignedRole === 'backend')
       expect(pkg).toBeDefined()
       const metadata = pkg!.metadata as Record<string, unknown>
-      const executorOverlay = typeof metadata.promptOverlay === 'string'
-        ? metadata.promptOverlay.trim().replace(/\s+/g, ' ')
-        : ''
+      if (!blocked) {
+        metadata.architectPlanEntryRegistrationIds = [
+          '00000000-0000-4000-8000-000000000204',
+          '00000000-0000-4000-8000-000000000205',
+        ]
+      }
       const broker = evaluateWorkPackageMcpBroker({
         assignedRole: pkg!.assignedRole,
         mcpOverview,
@@ -920,11 +945,13 @@ describe('MCP execution design normalization', () => {
         expect(preview).toMatchObject({ admissionStatus: 'blocked', primaryRecoveryAction: 'revise_plan' })
         expect(prepared.mcpExecutionDesign.proposed?.normalizationErrors).toContain(normalizationError)
         expect(metadata).toMatchObject({
-          promptOverlay: null,
-          requirementContexts: [],
+          mcpPromptContextPolicy: expect.objectContaining({ state: 'not_required' }),
           mcpNormalizationErrors: expect.arrayContaining([normalizationError]),
           mcpNormalizationEvidence: [expect.objectContaining({ code: 'mcp_design_nested_policy_invalid' })],
         })
+        expect(metadata).not.toHaveProperty('promptOverlay')
+        expect(metadata).not.toHaveProperty('requirementContexts')
+        expect(metadata).not.toHaveProperty('architectPlanEntryReferences')
         expect(broker).toMatchObject({
           status: 'blocked',
           blocked: expect.arrayContaining([normalizationError]),
@@ -936,8 +963,19 @@ describe('MCP execution design normalization', () => {
         expect(parsed.normalizationErrors).toEqual([])
         expect(parsed.requirementContexts).toHaveLength(2)
         expect(preview.admissionStatus).toBe('allowed')
-        expect(metadata.requirementContexts).toHaveLength(2)
-        expect(executorOverlay).toHaveLength(expectedLength)
+        expect(metadata.mcpPromptContextPolicy).toMatchObject({
+          state: 'protected_references_available',
+          promptOverlayPresent: true,
+          requirementContextCount: 2,
+          eligibleReferenceCount: 2,
+          protectedCoverageComplete: true,
+        })
+        expect(metadata).not.toHaveProperty('architectPlanEntryReferences')
+        expect(metadata.architectPlanEntryRegistrationIds).toHaveLength(2)
+        expect(metadata).not.toHaveProperty('promptOverlay')
+        expect(metadata).not.toHaveProperty('requirementContexts')
+        expect(firstOverlay.length + 1 + secondOverlay.length).toBe(expectedLength)
+        expect(broker.blocked).toEqual([])
         expect(broker.status).toBe('allowed')
       }
     },

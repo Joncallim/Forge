@@ -109,8 +109,6 @@ describe('Epic 172 Step 0 E2E bridge', () => {
       'mcp-plan-review-concurrency.spec.ts::serializes concurrent review saves to one contiguous history revision',
       'orchestrator-stage.spec.ts::setup, task execution, artifact review, and approval handoff',
       'project-task-composer.spec.ts::minimizes draft on outside interaction, restores it, and submits with Control+Enter',
-      'task-detail-controls.spec.ts::loads the package pointer and carries D1 into an explicit D2 reapproval',
-      'task-detail-controls.spec.ts::refreshes a stale pointer and waits for a second explicit confirmation',
       'task-detail-controls.spec.ts::shows retry submitted feedback while collapsing the retry form',
       'task-detail-controls.spec.ts::stops an active task while retaining its execution history',
     ])
