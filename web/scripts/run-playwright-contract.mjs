@@ -38,15 +38,19 @@ function parseArgs(argv) {
 
 function parseManifest(value, requestedPartitions) {
   if (!value || typeof value !== 'object' || Array.isArray(value) || value.schemaVersion !== 2 || value.contractVersion !== 'mcp-admission-v2') {
-    throw new Error('Invalid MCP admission suite manifest.')
+    throw rejection('invalid_manifest')
   }
   if (Object.keys(value).sort().join('\n') !== ['contractVersion', 'partitions', 'schemaVersion'].join('\n')) {
-    throw new Error('Suite manifest has an unexpected field.')
+    throw rejection('invalid_manifest')
   }
-  if (!Array.isArray(value.partitions) || value.partitions.length !== 6) throw new Error('Suite manifest must have six partitions.')
+  // Derived from MANIFEST_PARTITIONS rather than hardcoded, so adding or
+  // retiring a partition cannot leave a stale literal behind.
+  if (!Array.isArray(value.partitions) || value.partitions.length !== Object.keys(MANIFEST_PARTITIONS).length) {
+    throw rejection('invalid_manifest')
+  }
   const manifestIds = value.partitions.map((partition) => partition?.id).sort()
   const expectedIds = Object.keys(MANIFEST_PARTITIONS).sort()
-  if (manifestIds.some((id, index) => id !== expectedIds[index])) throw new Error('Suite manifest partition set is invalid.')
+  if (manifestIds.some((id, index) => id !== expectedIds[index])) throw rejection('invalid_manifest')
   const allKeys = []
   for (const partition of value.partitions) {
     const contract = MANIFEST_PARTITIONS[partition.id]
@@ -66,19 +70,19 @@ function parseManifest(value, requestedPartitions) {
       ))
       || partition.executionKeys.some((key, index) => key !== [...partition.executionKeys].sort()[index])
       || new Set(partition.executionKeys).size !== partition.executionKeys.length
-    ) throw new Error(`Invalid ${partition.id} partition contract.`)
+    ) throw rejection('invalid_manifest', `partition=${partition.id}`)
     allKeys.push(...partition.executionKeys)
   }
-  if (new Set(allKeys).size !== allKeys.length) throw new Error('Duplicate execution key across manifest partitions.')
+  if (new Set(allKeys).size !== allKeys.length) throw rejection('invalid_manifest')
   const selected = value.partitions.filter((partition) => requestedPartitions.includes(partition.id))
-  if (selected.length !== requestedPartitions.length) throw new Error('Requested partition is missing from the suite manifest.')
+  if (selected.length !== requestedPartitions.length) throw rejection('invalid_manifest')
   for (const partition of selected) {
     if (partition.runner !== 'playwright') {
-      throw new Error('Invalid Playwright partition contract.')
+      throw rejection('invalid_manifest')
     }
   }
   const expected = selected.flatMap((partition) => partition.executionKeys).sort()
-  if (new Set(expected).size !== expected.length) throw new Error('Duplicate expected execution key.')
+  if (new Set(expected).size !== expected.length) throw rejection('invalid_manifest')
   return expected
 }
 

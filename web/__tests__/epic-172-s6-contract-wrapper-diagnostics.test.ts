@@ -1,9 +1,11 @@
 import { execFile } from 'node:child_process'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { promisify } from 'node:util'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+
+import manifest from '../test-contracts/mcp-admission-v2.json'
 
 const execFileAsync = promisify(execFile)
 
@@ -93,5 +95,26 @@ describe('Epic 172 S6 contract wrapper diagnostics', () => {
         expect(key).toMatch(/^vitest::[a-z0-9][a-z0-9.-]*$/)
       }
     }
+  })
+
+  // The Playwright wrapper validates the manifest before spawning anything, so
+  // a partition added or retired in one place and not the other fails the whole
+  // partition at startup with no test output. This drifted once already: the
+  // wrapper carried a hardcoded six-partition literal after issuance moved to
+  // #179/S4, which failed every partition in under a second.
+  it('keeps the wrapper partition map in step with the checked-in manifest', async () => {
+    const wrapper = await readFile(
+      path.resolve(process.cwd(), 'scripts/run-playwright-contract.mjs'),
+      'utf8',
+    )
+    const block = wrapper.match(/const MANIFEST_PARTITIONS = Object\.freeze\(\{([\s\S]*?)\}\)/)
+    expect(block, 'MANIFEST_PARTITIONS block must be present').not.toBeNull()
+    const wrapperIds = [...block![1].matchAll(/^\s*'?([a-z-]+)'?:\s*\{/gm)].map((m) => m[1]).sort()
+    const manifestIds = manifest.partitions.map((partition) => partition.id).sort()
+    expect(wrapperIds).toEqual(manifestIds)
+
+    // And the count must be derived, never a literal that can go stale.
+    expect(wrapper).toContain('Object.keys(MANIFEST_PARTITIONS).length')
+    expect(wrapper).not.toMatch(/value\.partitions\.length !== \d+/)
   })
 })
