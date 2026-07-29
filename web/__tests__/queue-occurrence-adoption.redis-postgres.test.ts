@@ -611,6 +611,47 @@ describe.skipIf(!enabled)('queue occurrence adoption with production runtimes', 
     occurrenceId: string
     taskId: string
   }): Promise<void> {
+    const coordinates = COORDINATES[input.kind]
+    const queueName = input.kind === 'approval' ? 'approvals' : input.kind === 'task' ? 'tasks' : 'answers'
+    const hasCompleteDurablePostcondition = async (): Promise<boolean> => {
+      const attempts = await sql<{
+        job_payload: unknown
+        status: string
+      }[]>`
+        SELECT job_payload, status
+        FROM task_attempts
+        WHERE task_id = ${input.taskId}::uuid
+          AND queue_name = ${queueName}
+        ORDER BY created_at, id
+      `
+      if (attempts.length !== 2
+        || attempts[0]?.status !== 'indeterminate'
+        || attempts[1]?.status !== 'completed'
+        || attempts.some((attempt) => {
+          const payload = attempt.job_payload
+          return typeof payload !== 'object' || payload === null
+            || (payload as { schemaVersion?: unknown }).schemaVersion !== 1
+            || (payload as { occurrenceId?: unknown }).occurrenceId !== input.occurrenceId
+            || JSON.stringify(payload).includes('nonce')
+        })) {
+        return false
+      }
+      if (await redis.llen(coordinates.ready) !== 0
+        || await redis.llen(coordinates.processing) !== 0
+        || await redis.hget(coordinates.claims, input.occurrenceId) !== null) {
+        return false
+      }
+      const newNonce = markerNonce(input.newMarker)
+      return (await redis.zscore(coordinates.ackReceipts, `${input.occurrenceId}:${newNonce}`)) !== null
+    }
+
+    await eventually(
+      hasCompleteDurablePostcondition,
+      Boolean,
+      'Queue adoption proof did not reach the complete durable recovered-owner postcondition.',
+      25_000,
+    )
+
     const attempts = await sql<{
       job_payload: unknown
       status: string
@@ -618,7 +659,7 @@ describe.skipIf(!enabled)('queue occurrence adoption with production runtimes', 
       SELECT job_payload, status
       FROM task_attempts
       WHERE task_id = ${input.taskId}::uuid
-        AND queue_name = ${input.kind === 'approval' ? 'approvals' : input.kind === 'task' ? 'tasks' : 'answers'}
+        AND queue_name = ${queueName}
       ORDER BY created_at, id
     `
     expect(attempts.map((attempt) => attempt.status)).toEqual(['indeterminate', 'completed'])
@@ -630,7 +671,6 @@ describe.skipIf(!enabled)('queue occurrence adoption with production runtimes', 
       expect(JSON.stringify(attempt.job_payload)).not.toContain('nonce')
     }
 
-    const coordinates = COORDINATES[input.kind]
     expect(await redis.llen(coordinates.ready)).toBe(0)
     expect(await redis.llen(coordinates.processing)).toBe(0)
     expect(await redis.hget(coordinates.claims, input.occurrenceId)).toBeNull()
