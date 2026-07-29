@@ -46,6 +46,7 @@ import {
   materializeReviewGatesForWorkPackageCompletion,
   normalizeSecurityReviewPayload,
 } from '@/worker/review-gates'
+import { ClaimLeaseLostError } from '@/worker/claim-lease-fence'
 
 function chain(resolveValue: unknown) {
   const thenable: Record<string, unknown> = {
@@ -755,6 +756,23 @@ describe('review gate contract', () => {
 
     expect(result).toEqual({ status: 'completed' })
     expect(mocks.updateTaskStatusIfCurrent).toHaveBeenCalledWith('task-1', 'running', 'completed')
+  })
+
+  it('propagates the exact claim-loss object before terminal completion', async () => {
+    mocks.dbSelect
+      .mockReturnValueOnce(chain([{ id: 'pkg-1', status: 'completed' }]))
+      .mockReturnValueOnce(chain([]))
+    const loss = new ClaimLeaseLostError()
+    let calls = 0
+
+    await expect(completeTaskIfReviewGatesSatisfied('task-1', {
+      assertOwned: () => {
+        calls += 1
+        if (calls === 3) throw loss
+      },
+    })).rejects.toBe(loss)
+    expect(mocks.updateTaskStatusIfCurrent).not.toHaveBeenCalled()
+    expect(mocks.publishTaskEvent).not.toHaveBeenCalled()
   })
 
   it('ignores a stale cancelled gate from an earlier rework cycle when the latest attempt is completed', async () => {
