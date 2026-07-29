@@ -87,6 +87,34 @@ function sameArray(left, right) {
   return left.length === right.length && left.every((value, index) => value === right[index])
 }
 
+// The output-quarantine contract permits fixed schema-free status codes and
+// canonical scenario IDs on the live runner channel, but never child bytes.
+// rejection() therefore carries a fixed code from this enum only, and the
+// identity diff is restricted to IDs that match the canonical key shape.
+const CANONICAL_EXECUTION_KEY = /^[a-z0-9][a-z0-9-]*::[a-z0-9][a-z0-9.-]*$/
+
+function rejection(code, detail) {
+  const error = new Error(code)
+  error.reasonCode = code
+  if (detail) error.reasonDetail = detail
+  return error
+}
+
+function identityDetail(expected, actual) {
+  const expectedSet = new Set(expected)
+  const actualSet = new Set(actual)
+  const missing = expected.filter((key) => !actualSet.has(key))
+  const unexpected = actual
+    .filter((key) => !expectedSet.has(key))
+    .filter((key) => typeof key === 'string' && CANONICAL_EXECUTION_KEY.test(key))
+  const parts = []
+  if (missing.length) parts.push(`missing=${missing.join(',')}`)
+  if (unexpected.length) parts.push(`unexpected=${unexpected.join(',')}`)
+  const suppressed = actual.filter((key) => !expectedSet.has(key)).length - unexpected.length
+  if (suppressed > 0) parts.push(`unexpected_suppressed=${suppressed}`)
+  return parts.join(' ')
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2))
   const manifest = JSON.parse(await readFile(args.manifest, 'utf8'))
@@ -100,7 +128,7 @@ async function main() {
     }
     if (args.partitions.includes('host-boundary')) {
       if (!args.requireAttestationSignature || !args['preflight-attestation'] || !args['attestation-public-key']) {
-        throw new Error('Host-boundary execution requires its preflight attestation and public key.')
+        throw rejection('missing_attestation_inputs')
       }
       environment.FORGE_TRUSTED_HOST_BOUNDARY = '1'
       environment.FORGE_HOST_BOUNDARY_PREFLIGHT_ATTESTATION = args['preflight-attestation']
@@ -118,10 +146,15 @@ async function main() {
     const report = JSON.parse(await readFile(resultFile, 'utf8'))
     const collected = [...report.collected].sort()
     const executed = report.executed.map((entry) => entry.executionKey).sort()
-    if (!sameArray(expected, collected) || !sameArray(expected, executed)) throw new Error('Manifest execution identity mismatch.')
-    if (args.forbidRetries && report.executed.some((entry) => entry.retry !== 0)) throw new Error('A required scenario retried.')
-    if (args.forbidSkips && report.executed.some((entry) => entry.status === 'skipped')) throw new Error('A required scenario skipped.')
-    if (report.executed.some((entry) => entry.status !== 'passed') || exitCode !== 0) throw new Error('A required scenario failed.')
+    if (!sameArray(expected, collected)) {
+      throw rejection('collected_identity_mismatch', identityDetail(expected, collected))
+    }
+    if (!sameArray(expected, executed)) {
+      throw rejection('executed_identity_mismatch', identityDetail(expected, executed))
+    }
+    if (args.forbidRetries && report.executed.some((entry) => entry.retry !== 0)) throw rejection('scenario_retried')
+    if (args.forbidSkips && report.executed.some((entry) => entry.status === 'skipped')) throw rejection('scenario_skipped')
+    if (report.executed.some((entry) => entry.status !== 'passed') || exitCode !== 0) throw rejection('scenario_failed')
     process.stdout.write('MCP_PLAYWRIGHT_CONTRACT_PASSED\n')
   } finally {
     await rm(temporaryDirectory, { recursive: true, force: true })
@@ -129,7 +162,8 @@ async function main() {
 }
 
 main().catch((error) => {
-  void error
-  process.stderr.write('MCP_PLAYWRIGHT_CONTRACT_REJECTED\n')
+  const code = typeof error?.reasonCode === 'string' ? error.reasonCode : 'wrapper_error'
+  const detail = typeof error?.reasonDetail === 'string' && error.reasonDetail ? ` ${error.reasonDetail}` : ''
+  process.stderr.write(`MCP_PLAYWRIGHT_CONTRACT_REJECTED reason=${code}${detail}\n`)
   process.exitCode = 1
 })

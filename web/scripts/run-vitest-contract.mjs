@@ -44,6 +44,32 @@ function hasScenarioId(assertion) {
   return /\[scenarioId=[^\]]+\]/.test(assertion.fullName)
 }
 
+// The output-quarantine contract permits fixed schema-free status codes and
+// canonical scenario IDs on the live runner channel, but never child bytes.
+const CANONICAL_EXECUTION_KEY = /^vitest::[a-z0-9][a-z0-9.-]*$/
+
+function rejection(code, detail) {
+  const error = new Error(code)
+  error.reasonCode = code
+  if (detail) error.reasonDetail = detail
+  return error
+}
+
+function identityDetail(expected, actual) {
+  const expectedSet = new Set(expected)
+  const actualSet = new Set(actual)
+  const missing = expected.filter((key) => !actualSet.has(key))
+  const unexpected = actual
+    .filter((key) => !expectedSet.has(key))
+    .filter((key) => typeof key === 'string' && CANONICAL_EXECUTION_KEY.test(key))
+  const parts = []
+  if (missing.length) parts.push(`missing=${missing.join(',')}`)
+  if (unexpected.length) parts.push(`unexpected=${unexpected.join(',')}`)
+  const suppressed = actual.filter((key) => !expectedSet.has(key)).length - unexpected.length
+  if (suppressed > 0) parts.push(`unexpected_suppressed=${suppressed}`)
+  return parts.join(' ')
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2))
   const expected = expectedFromManifest(JSON.parse(await readFile(args.manifest, 'utf8')))
@@ -52,7 +78,7 @@ async function main() {
   try {
     const [command, ...commandArgs] = args.command
     if (commandArgs.some((argument) => argument === '--retry' || argument.startsWith('--retry='))) {
-      throw new Error('The manifest-bound Vitest command cannot override retry policy.')
+      throw rejection('retry_override_forbidden')
     }
     const child = spawn(command, [
       ...commandArgs,
@@ -68,15 +94,15 @@ async function main() {
     const report = JSON.parse(await readFile(resultFile, 'utf8'))
     const assertions = report.testResults.flatMap((result) => result.assertionResults)
     if (assertions.some((assertion) => !hasScenarioId(assertion) && assertion.status !== 'skipped')) {
-      throw new Error('An unmanifested Vitest test executed inside the contract partition.')
+      throw rejection('unmanifested_test_executed')
     }
     const manifestAssertions = assertions.filter(hasScenarioId)
     const executed = manifestAssertions.map(executionKey).sort()
     if (expected.length !== executed.length || expected.some((key, index) => key !== executed[index])) {
-      throw new Error('Vitest manifest execution identity mismatch.')
+      throw rejection('executed_identity_mismatch', identityDetail(expected, executed))
     }
     if (manifestAssertions.some((assertion) => assertion.status !== 'passed') || exitCode !== 0) {
-      throw new Error('A manifest-bound Vitest scenario failed or skipped.')
+      throw rejection('scenario_failed_or_skipped')
     }
     process.stdout.write('MCP_VITEST_CONTRACT_PASSED\n')
   } finally {
@@ -85,7 +111,8 @@ async function main() {
 }
 
 main().catch((error) => {
-  void error
-  process.stderr.write('MCP_VITEST_CONTRACT_REJECTED\n')
+  const code = typeof error?.reasonCode === 'string' ? error.reasonCode : 'wrapper_error'
+  const detail = typeof error?.reasonDetail === 'string' && error.reasonDetail ? ` ${error.reasonDetail}` : ''
+  process.stderr.write(`MCP_VITEST_CONTRACT_REJECTED reason=${code}${detail}\n`)
   process.exitCode = 1
 })
