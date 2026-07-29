@@ -1,5 +1,4 @@
 import { randomUUID } from 'node:crypto'
-import { randomBytes } from 'node:crypto'
 import Redis from 'ioredis'
 import postgres from 'postgres'
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
@@ -190,6 +189,8 @@ describe.skipIf(!enabled)('queue occurrence adoption with production runtimes', 
     readinessReceipt: randomUUID(),
     signerKey: randomUUID(),
   }
+  const protectedDigestKeyHex = 'c'.repeat(64)
+  const protectedDigestKeyId = 'queue-adoption-key'
   const handles = new Set<WorkerHandle>()
   const priorEnv = new Map<string, string | undefined>()
   const envNames = [
@@ -203,6 +204,8 @@ describe.skipIf(!enabled)('queue occurrence adoption with production runtimes', 
     'FORGE_WORKER_STUCK_JOB_RECOVERY_SECONDS',
     'FORGE_WORKFORCE_MATERIALIZATION',
     'FORGE_ARCHITECT_PLAN_HISTORY_READER_DATABASE_URL',
+    'FORGE_ARCHITECT_PLAN_DIGEST_KEY_HEX',
+    'FORGE_ARCHITECT_PLAN_DIGEST_KEY_ID',
     'FORGE_ARCHITECT_PLAN_WRITER_DATABASE_URL',
     'DATABASE_URL',
     'REDIS_URL',
@@ -232,6 +235,8 @@ describe.skipIf(!enabled)('queue occurrence adoption with production runtimes', 
     process.env.FORGE_WORKER_MAX_ATTEMPTS = '3'
     process.env.FORGE_WORKER_STUCK_JOB_RECOVERY_SECONDS = '1'
     process.env.FORGE_WORKFORCE_MATERIALIZATION = '1'
+    process.env.FORGE_ARCHITECT_PLAN_DIGEST_KEY_HEX = protectedDigestKeyHex
+    process.env.FORGE_ARCHITECT_PLAN_DIGEST_KEY_ID = protectedDigestKeyId
     delete process.env.FORGE_WORKER_MOCK_ARCHITECT
   }
 
@@ -282,7 +287,7 @@ describe.skipIf(!enabled)('queue occurrence adoption with production runtimes', 
     }))
     vi.doMock('@/lib/mcps/s4-lease', async (importOriginal) => ({
       ...await importOriginal<typeof import('@/lib/mcps/s4-lease')>(),
-      readS4RuntimeModeV1: vi.fn().mockResolvedValue('legacy'),
+      readS4RuntimeModeV1: vi.fn().mockResolvedValue('protected'),
     }))
     vi.doMock('@/worker/events', () => ({
       publishTaskEvent: vi.fn().mockResolvedValue(undefined),
@@ -442,7 +447,7 @@ describe.skipIf(!enabled)('queue occurrence adoption with production runtimes', 
     const runId = randomUUID()
     const questionId = randomUUID()
     const answerId = randomUUID()
-    const digestKey = randomBytes(32)
+    const digestKey = Buffer.from(protectedDigestKeyHex, 'hex')
       await sql`
         INSERT INTO users (id, display_name) VALUES (${userId}::uuid, 'Queue adoption answer user')
       `
@@ -462,7 +467,7 @@ describe.skipIf(!enabled)('queue occurrence adoption with production runtimes', 
       const source = await recordArchitectPlanVersion({
         agentRunId: runId,
         digestKey,
-        digestKeyId: 'queue-adoption-key',
+        digestKeyId: protectedDigestKeyId,
         entries: [
           { agent: null, bindingFingerprint: null, content: 'Queue adoption plan.', entryId: 'plan_body:000000', entryKind: 'plan_body', projectionEligible: false, requirementKey: null },
           { agent: null, bindingFingerprint: null, content: JSON.stringify({ requirementKey: 'plan-policy', schemaVersion: 1 }), entryId: 'requirement:plan-policy', entryKind: 'requirement', projectionEligible: false, requirementKey: 'plan-policy' },
@@ -475,7 +480,7 @@ describe.skipIf(!enabled)('queue occurrence adoption with production runtimes', 
         VALUES (${questionId}::uuid, ${taskId}::uuid, ${`clarification_question:${questionId}`}, ${source.artifactId}::uuid, 1, 'open')
       `
       await appendArchitectClarificationAnswer({
-        answer: 'yes', answerId, digestKey, digestKeyId: 'queue-adoption-key', questionId,
+        answer: 'yes', answerId, digestKey, digestKeyId: protectedDigestKeyId, questionId,
         sessionCredential, sourcePlanArtifactId: source.artifactId, sourcePlanVersion: '1', taskId,
       })
   }
