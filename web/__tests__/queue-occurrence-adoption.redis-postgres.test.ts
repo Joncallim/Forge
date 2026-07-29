@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from 'node:crypto'
+import { randomUUID } from 'node:crypto'
 import Redis from 'ioredis'
 import postgres from 'postgres'
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
@@ -20,6 +20,30 @@ const fixtureAdminUrl = process.env.FORGE_QUEUE_ADOPTION_POSTGRES_ADMIN_TEST_URL
 const fixtureWriterUrl = process.env.FORGE_QUEUE_ADOPTION_WRITER_DATABASE_URL
 const fixtureHistoryReaderUrl = process.env.FORGE_QUEUE_ADOPTION_HISTORY_READER_DATABASE_URL
 const fixtureResolverUrl = process.env.FORGE_QUEUE_ADOPTION_RESOLVER_DATABASE_URL
+const moduleEndpointEnvNames = [
+  'DATABASE_URL',
+  'REDIS_URL',
+  'FORGE_ARCHITECT_PLAN_HISTORY_READER_DATABASE_URL',
+  'FORGE_ARCHITECT_PLAN_RESOLVER_DATABASE_URL',
+  'FORGE_ARCHITECT_PLAN_WRITER_DATABASE_URL',
+] as const
+const originalModuleEndpointEnvironment = new Map(
+  moduleEndpointEnvNames.map((name) => [name, process.env[name]]),
+)
+
+function restoreOriginalModuleEndpointEnvironment(): void {
+  for (const name of moduleEndpointEnvNames) {
+    const value = originalModuleEndpointEnvironment.get(name)
+    if (value === undefined) delete process.env[name]
+    else process.env[name] = value
+  }
+}
+
+function assertOriginalModuleEndpointEnvironment(): void {
+  for (const name of moduleEndpointEnvNames) {
+    expect(process.env[name]).toBe(originalModuleEndpointEnvironment.get(name))
+  }
+}
 
 function validatedRedisUrl(value: string): string {
   let parsed: URL
@@ -180,10 +204,67 @@ async function eventually<T>(
   throw new Error(message)
 }
 
+const MAX_FAILURE_DIAGNOSTIC_ITEMS = 9
+
+function answerFailureDiagnosticSnapshot(input: {
+  attempts: Array<{ status: string }>
+  latestArchitectRun: { errorMessage: string | null; status: string } | undefined
+  providerCalls: number
+  task: { errorMessage: string | null; status: string } | undefined
+}): string {
+  return JSON.stringify({
+    attemptStatusCount: Math.min(input.attempts.length, MAX_FAILURE_DIAGNOSTIC_ITEMS),
+    attemptStatuses: input.attempts.slice(0, MAX_FAILURE_DIAGNOSTIC_ITEMS).map(({ status }) => status),
+    latestArchitectRun: input.latestArchitectRun
+      ? { hasError: input.latestArchitectRun.errorMessage !== null, status: input.latestArchitectRun.status }
+      : null,
+    providerCallCount: Math.min(input.providerCalls, MAX_FAILURE_DIAGNOSTIC_ITEMS),
+    task: input.task
+      ? { hasError: input.task.errorMessage !== null, status: input.task.status }
+      : null,
+  })
+}
+
+describe('queue occurrence adoption diagnostic redaction', () => {
+  it('never emits hostile failure values or value-derived surrogates', () => {
+    const hostilePlan = 'HOSTILE_PLAN_TEXT'
+    const hostileAnswer = 'HOSTILE_ANSWER_TEXT'
+    const hostilePayload = 'HOSTILE_PAYLOAD_TEXT'
+    const hostileCredential = 'HOSTILE_CREDENTIAL_TEXT'
+    const hostileMarker = 'HOSTILE_MARKER_TEXT'
+    const hostileNonce = 'HOSTILE_NONCE_TEXT'
+    const hostileProvider = 'HOSTILE_PROVIDER_TEXT'
+    const hostileError = 'HOSTILE_ERROR_TEXT'
+    const diagnostic = answerFailureDiagnosticSnapshot({
+      attempts: Array.from({ length: 20 }, () => ({ status: 'failed' })),
+      latestArchitectRun: { errorMessage: `${hostilePlan}:${hostileAnswer}:${hostileProvider}:${hostileError}`, status: 'failed' },
+      providerCalls: 20,
+      task: { errorMessage: `${hostilePayload}:${hostileCredential}:${hostileMarker}:${hostileNonce}`, status: 'failed' },
+    })
+
+    for (const value of [
+      hostilePlan, hostileAnswer, hostilePayload, hostileCredential,
+      hostileMarker, hostileNonce, hostileProvider, hostileError,
+    ]) {
+      expect(diagnostic).not.toContain(value)
+    }
+    expect(diagnostic).not.toMatch(/digest|hash|length|sha/i)
+    expect(JSON.parse(diagnostic)).toEqual({
+      attemptStatusCount: 9,
+      attemptStatuses: Array.from({ length: 9 }, () => 'failed'),
+      latestArchitectRun: { hasError: true, status: 'failed' },
+      providerCallCount: 9,
+      task: { hasError: true, status: 'failed' },
+    })
+  })
+})
+
 describe.skipIf(!enabled)('queue occurrence adoption with production runtimes', () => {
   let redis: Redis
   let sql: ReturnType<typeof postgres>
   let admin: ReturnType<typeof postgres>
+  let redisInitialized = false
+  let adminInitialized = false
   let projectId: string
   let providerId: string
   const authority = {
@@ -380,12 +461,6 @@ describe.skipIf(!enabled)('queue occurrence adoption with production runtimes', 
     return { handle, marker }
   }
 
-  function boundedDiagnosticError(value: string | null): string {
-    if (value === null) return 'none'
-    const digest = createHash('sha256').update(value).digest('hex')
-    return `redacted:length=${Math.min(value.length, 9999)};sha256=${digest}`
-  }
-
   async function answerFailureDiagnostic(taskId: string, providerCalls: number): Promise<string> {
     const [task] = await sql<{ errorMessage: string | null; status: string }[]>`
       SELECT status, error_message AS "errorMessage"
@@ -407,16 +482,7 @@ describe.skipIf(!enabled)('queue occurrence adoption with production runtimes', 
         AND queue_name = 'answers'
       ORDER BY created_at, id
     `
-    return JSON.stringify({
-      attempts: attempts.map(({ status }) => status),
-      latestArchitectRun: run
-        ? { error: boundedDiagnosticError(run.errorMessage), status: run.status }
-        : null,
-      providerCalls,
-      task: task
-        ? { error: boundedDiagnosticError(task.errorMessage), status: task.status }
-        : null,
-    })
+    return answerFailureDiagnosticSnapshot({ attempts, latestArchitectRun: run, providerCalls, task })
   }
 
   async function waitForFinalState(taskId: string, expected: string, answerProviderCalls?: () => number): Promise<void> {
@@ -637,6 +703,7 @@ describe.skipIf(!enabled)('queue occurrence adoption with production runtimes', 
       lazyConnect: true,
       maxRetriesPerRequest: 1,
     })
+    redisInitialized = true
     await redis.connect()
     if (await redis.dbsize() !== 0) {
       throw new Error('Queue adoption proof requires an empty disposable Redis database.')
@@ -644,6 +711,7 @@ describe.skipIf(!enabled)('queue occurrence adoption with production runtimes', 
     sql = postgres(databaseUrl!, { max: 8 })
     await sql`SELECT 1`
     admin = postgres(fixtureAdminUrl!, { max: 1, onnotice: () => {} })
+    adminInitialized = true
     await activateS4Authority()
 
     providerId = randomUUID()
@@ -717,12 +785,26 @@ describe.skipIf(!enabled)('queue occurrence adoption with production runtimes', 
 
   afterAll(async () => {
     try {
-      await cleanRedis()
+      if (redisInitialized) await cleanRedis()
     } finally {
-      await deactivateS4Authority()
-      await redis?.quit()
-      await sql?.end({ timeout: 5 })
-      await admin?.end({ timeout: 5 })
+      try {
+        if (adminInitialized) await deactivateS4Authority()
+      } finally {
+        try {
+          await redis?.quit()
+        } finally {
+          try {
+            await sql?.end({ timeout: 5 })
+          } finally {
+            try {
+              await admin?.end({ timeout: 5 })
+            } finally {
+              restoreOriginalModuleEndpointEnvironment()
+              assertOriginalModuleEndpointEnvironment()
+            }
+          }
+        }
+      }
     }
   })
 
