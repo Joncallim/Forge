@@ -19,6 +19,7 @@ const databaseUrl = process.env.FORGE_QUEUE_ADOPTION_POSTGRES_TEST_URL
 const fixtureAdminUrl = process.env.FORGE_QUEUE_ADOPTION_POSTGRES_ADMIN_TEST_URL
 const fixtureWriterUrl = process.env.FORGE_QUEUE_ADOPTION_WRITER_DATABASE_URL
 const fixtureHistoryReaderUrl = process.env.FORGE_QUEUE_ADOPTION_HISTORY_READER_DATABASE_URL
+const fixtureResolverUrl = process.env.FORGE_QUEUE_ADOPTION_RESOLVER_DATABASE_URL
 
 function validatedRedisUrl(value: string): string {
   let parsed: URL
@@ -37,14 +38,14 @@ function validatedRedisUrl(value: string): string {
 }
 
 if (required && (!destructive || !redisUrl || !databaseUrl
-  || !fixtureAdminUrl || !fixtureWriterUrl || !fixtureHistoryReaderUrl)) {
+  || !fixtureAdminUrl || !fixtureWriterUrl || !fixtureResolverUrl || !fixtureHistoryReaderUrl)) {
   throw new Error(
-    'Mandatory queue adoption proof requires dedicated Redis, app/admin/writer/history PostgreSQL URLs, and destructive-test authorization.',
+    'Mandatory queue adoption proof requires dedicated Redis, app/admin/writer/resolver/history PostgreSQL URLs, and destructive-test authorization.',
   )
 }
 
 const enabled = Boolean(destructive && redisUrl && databaseUrl
-  && fixtureAdminUrl && fixtureWriterUrl && fixtureHistoryReaderUrl)
+  && fixtureAdminUrl && fixtureWriterUrl && fixtureResolverUrl && fixtureHistoryReaderUrl)
 const proofRedisUrl = enabled ? validatedRedisUrl(redisUrl!) : null
 
 // DB and queue modules cache their connections at import time. Bind the
@@ -54,6 +55,7 @@ if (enabled) {
   process.env.DATABASE_URL = databaseUrl!
   process.env.REDIS_URL = proofRedisUrl!
   process.env.FORGE_ARCHITECT_PLAN_WRITER_DATABASE_URL = fixtureWriterUrl!
+  process.env.FORGE_ARCHITECT_PLAN_RESOLVER_DATABASE_URL = fixtureResolverUrl!
   process.env.FORGE_ARCHITECT_PLAN_HISTORY_READER_DATABASE_URL = fixtureHistoryReaderUrl!
 }
 const QUEUE_KEYS = [
@@ -204,6 +206,7 @@ describe.skipIf(!enabled)('queue occurrence adoption with production runtimes', 
     'FORGE_WORKER_STUCK_JOB_RECOVERY_SECONDS',
     'FORGE_WORKFORCE_MATERIALIZATION',
     'FORGE_ARCHITECT_PLAN_HISTORY_READER_DATABASE_URL',
+    'FORGE_ARCHITECT_PLAN_RESOLVER_DATABASE_URL',
     'FORGE_ARCHITECT_PLAN_DIGEST_KEY_HEX',
     'FORGE_ARCHITECT_PLAN_DIGEST_KEY_ID',
     'FORGE_ARCHITECT_PLAN_WRITER_DATABASE_URL',
