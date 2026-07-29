@@ -370,6 +370,31 @@ vi.mock('ioredis', () => {
         } else {
           result = 2
         }
+      } else if (script.includes('forge:queue:recover-malformed-v1')) {
+        const [raw, operationToken, receiptTtlMsRaw, receiptCapRaw, pruneLimitRaw] = args
+        const receipts = zset(keys[1])
+        const receiptTtlMs = Number(receiptTtlMsRaw)
+        const receiptScore = receipts.get(operationToken)
+        if (receiptScore !== undefined) {
+          result = Number.isFinite(receiptScore)
+            && receiptScore <= redisHarness.nowMs
+            && receiptScore > redisHarness.nowMs - receiptTtlMs
+            ? 2
+            : 0
+        } else {
+          const expired = [...receipts.entries()]
+            .filter(([, score]) => score <= redisHarness.nowMs - receiptTtlMs)
+            .sort((left, right) => left[1] - right[1])
+            .slice(0, Number(pruneLimitRaw))
+          for (const [expiredToken] of expired) receipts.delete(expiredToken)
+          if (receipts.size >= Number(receiptCapRaw)) {
+            throw new Error('forge_queue_malformed_recovery_receipt_capacity_exhausted')
+          }
+          if (removeFirst(list(keys[0]), raw)) {
+            receipts.set(operationToken, redisHarness.nowMs)
+            result = 1
+          }
+        }
       } else {
         throw new Error('unknown_queue_script')
       }
@@ -531,6 +556,9 @@ describe('core operational output closure', () => {
       commandTimeout: NODE_TIMER_MAX_MS,
       connectTimeout: NODE_TIMER_MAX_MS,
     })
+    expect((queue as unknown as { malformedRecoveryReceiptTtlMs: number })
+      .malformedRecoveryReceiptTtlMs)
+      .toBe((NODE_TIMER_MAX_MS * 2) + 1_000)
     queue.disconnect()
 
     const invalidValues = [
@@ -1902,6 +1930,172 @@ describe('core operational output closure', () => {
     expect(dead).toHaveLength(2)
     expect(new Set(dead.map((record) => record.occurrenceId)))
       .toEqual(new Set(deadClaims.map((claim) => claim.occurrenceId)))
+  })
+
+  it('removes malformed processing members without disclosing bytes or blocking later recovery', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const { AnswersQueue, ApprovalQueue, TaskQueue } = await import('@/worker/queue')
+    const malformedClaimId = '99999999-9999-4999-8999-999999999999'
+    const claimMarker =
+      `${redisHarness.nowMs}:11111111-1111-4111-8111-111111111111`
+    const oversized =
+      `${' '.repeat(1_000_001)}${JSON.stringify({ taskId: TASK_ID, attempt: 1 })}`
+    const malformedCases = [
+      `{"hidden":"${SENTINELS[0]}"`,
+      oversized,
+      String.raw`{"taskId":"${TASK_ID}","task\u0049d":"${SENTINELS[0]}"}`,
+      JSON.stringify({
+        schemaVersion: 1,
+        occurrenceId: malformedClaimId,
+        job: { taskId: TASK_ID, attempt: 1 },
+        hidden: SENTINELS[0],
+      }),
+    ]
+    const queueCases = [
+      {
+        create: () => new TaskQueue('redis://localhost:6379/0'),
+        processing: 'forge:tasks:processing',
+        ready: 'forge:tasks',
+        claims: 'forge:tasks:claims',
+        receipts: 'forge:tasks:malformed-recovery-receipts',
+        job: { taskId: TASK_ID, attempt: 1 },
+      },
+      {
+        create: () => new ApprovalQueue('redis://localhost:6379/0'),
+        processing: 'forge:approvals:processing',
+        ready: 'forge:approvals',
+        claims: 'forge:approvals:claims',
+        receipts: 'forge:approvals:malformed-recovery-receipts',
+        job: { taskId: TASK_ID, action: 'approve' as const, attempt: 1 },
+      },
+      {
+        create: () => new AnswersQueue('redis://localhost:6379/0'),
+        processing: 'forge:answers:processing',
+        ready: 'forge:answers',
+        claims: 'forge:answers:claims',
+        receipts: 'forge:answers:malformed-recovery-receipts',
+        job: { taskId: TASK_ID, attempt: 1 },
+      },
+    ]
+
+    for (const [queueIndex, queueCase] of queueCases.entries()) {
+      for (const [malformedIndex, malformed] of malformedCases.entries()) {
+        warn.mockClear()
+        const validOccurrenceId =
+          `00000000-0000-4000-8000-${String(8_000 + (queueIndex * 100) + malformedIndex)
+            .padStart(12, '0')}`
+        const valid = JSON.stringify({
+          schemaVersion: 1,
+          occurrenceId: validOccurrenceId,
+          job: queueCase.job,
+        })
+        redisHarness.lists.set(queueCase.processing, [malformed, valid])
+        redisHarness.lists.set(queueCase.ready, [])
+        redisHarness.hashes.set(queueCase.claims, new Map([
+          [malformedClaimId, claimMarker],
+          [validOccurrenceId, claimMarker],
+        ]))
+        redisHarness.zsets.set(queueCase.receipts, new Map())
+
+        const queue = queueCase.create()
+        await expect(queue.recoverStuckJobs(0)).resolves.toBe(1)
+
+        expect(redisHarness.lists.get(queueCase.processing)).toEqual([])
+        expect(redisHarness.lists.get(queueCase.ready)).toEqual([valid])
+        expect(redisHarness.hashes.get(queueCase.claims))
+          .toEqual(new Map([[malformedClaimId, claimMarker]]))
+        const receipts = redisHarness.zsets.get(queueCase.receipts)
+        expect(receipts?.size).toBe(1)
+        expect([...receipts!.keys()]).toEqual([
+          expect.stringMatching(
+            /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+          ),
+        ])
+        expect(JSON.stringify([...receipts!])).not.toContain(malformed)
+        expect(JSON.stringify([...receipts!])).not.toContain(SENTINELS[0])
+        expect(warn.mock.calls).toEqual([
+          ['[worker/queue] Removed invalid processing payload'],
+        ])
+        assertNoSentinels(warn.mock.calls)
+        queue.disconnect()
+      }
+    }
+  })
+
+  it('replays one malformed removal token without consuming an identical later member', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const { TaskQueue } = await import('@/worker/queue')
+    const malformed = `{"hidden":"${SENTINELS[0]}"`
+    const validOccurrenceId = '00000000-0000-4000-8000-000000009000'
+    const valid = JSON.stringify({
+      schemaVersion: 1,
+      occurrenceId: validOccurrenceId,
+      job: { taskId: TASK_ID, attempt: 1 },
+    })
+    const processingKey = 'forge:tasks:processing'
+    const claimsKey = 'forge:tasks:claims'
+    const receiptsKey = 'forge:tasks:malformed-recovery-receipts'
+    redisHarness.lists.set(processingKey, [malformed, valid])
+    redisHarness.hashes.set(claimsKey, new Map([[
+      validOccurrenceId,
+      `${redisHarness.nowMs}:11111111-1111-4111-8111-111111111111`,
+    ]]))
+    const queue = new TaskQueue('redis://localhost:6379/0')
+    const client = redisHarness.instances.at(-1)
+    if (!client) throw new Error('Expected the malformed recovery Redis client.')
+    const originalCall = client.call.getMockImplementation() as
+      | ((...args: unknown[]) => Promise<unknown>)
+      | undefined
+    if (!originalCall) throw new Error('Expected the malformed recovery Redis call.')
+    let lostResponse = true
+    client.call.mockImplementation(async (...args: unknown[]) => {
+      try {
+        return await originalCall(...args)
+      } catch (error) {
+        if (lostResponse
+          && String(args[1]).includes('forge:queue:recover-malformed-v1')) {
+          lostResponse = false
+          redisHarness.lists.get(processingKey)?.push(malformed)
+        }
+        throw error
+      }
+    })
+    redisHarness.failures.push({
+      marker: 'forge:queue:recover-malformed-v1',
+      stage: 'after',
+    })
+
+    await expect(queue.recoverStuckJobs(0)).resolves.toBe(1)
+    expect(redisHarness.lists.get(processingKey)).toEqual([malformed])
+    expect(redisHarness.lists.get('forge:tasks')).toEqual([valid])
+    expect(redisHarness.hashes.get(claimsKey)?.has(validOccurrenceId)).toBe(false)
+    expect(redisHarness.zsets.get(receiptsKey)?.size).toBe(1)
+    expect(warn.mock.calls).toEqual([
+      ['[worker/queue] Removed invalid processing payload'],
+    ])
+    assertNoSentinels(warn.mock.calls)
+
+    redisHarness.lists.set(processingKey, [malformed])
+    redisHarness.failures.push(
+      { marker: 'forge:queue:recover-malformed-v1', stage: 'before' },
+      { marker: 'forge:queue:recover-malformed-v1', stage: 'before' },
+    )
+    await expect(queue.recoverStuckJobs(0))
+      .rejects.toThrow('Queue malformed recovery removal failed')
+    expect(redisHarness.lists.get(processingKey)).toEqual([malformed])
+    expect(redisHarness.zsets.get(receiptsKey)?.size).toBe(1)
+
+    const liveReceipts = new Map(
+      Array.from({ length: 50_000 }, (_, index) => [
+        `live-operation-${index}`,
+        redisHarness.nowMs,
+      ] as const),
+    )
+    redisHarness.zsets.set(receiptsKey, liveReceipts)
+    await expect(queue.recoverStuckJobs(0))
+      .rejects.toThrow('Queue malformed recovery removal failed')
+    expect(redisHarness.lists.get(processingKey)).toEqual([malformed])
+    expect(redisHarness.zsets.get(receiptsKey)?.size).toBe(50_000)
   })
 
   it('rotates bounded recovery pages and rejects stale ownership and malformed markers', async () => {
@@ -4381,6 +4575,10 @@ describe('core output source sentinel', () => {
     const runtimeSource = fs.readFileSync(path.join(repoRoot, 'worker/runtime.ts'), 'utf8')
     const schemaSource = fs.readFileSync(path.join(repoRoot, 'db/schema.ts'), 'utf8')
     const taskAttemptsSource = fs.readFileSync(path.join(repoRoot, 'worker/task-attempts.ts'), 'utf8')
+    const jsonKeyScanSource = fs.readFileSync(
+      path.join(repoRoot, 'lib/json-object-key-scan.ts'),
+      'utf8',
+    )
     const taskPageSource = fs.readFileSync(
       path.join(repoRoot, 'app/dashboard/tasks/[id]/page.tsx'),
       'utf8',
@@ -4393,6 +4591,12 @@ describe('core output source sentinel', () => {
     )?.[1] ?? ''
     const retryMethod = queueSource.match(
       /  async retry\([\s\S]*?\n  async deadLetter\(/,
+    )?.[0] ?? ''
+    const malformedRecoveryScript = queueSource.match(
+      /const RECOVER_MALFORMED_JOB_SCRIPT = `([\s\S]*?)`\n\nexport interface TaskJob/,
+    )?.[1] ?? ''
+    const malformedRecoveryMethod = queueSource.match(
+      /  private async removeMalformedRecoveryMember\([\s\S]*?\n  private decodeRetryPromotionTransition/,
     )?.[0] ?? ''
 
     expect(queueSource).toContain("failureCategory: DEAD_LETTER_FAILURE_CATEGORY")
@@ -4634,6 +4838,57 @@ describe('core output source sentinel', () => {
     )
     expect(queueSource).toContain("redis.call('RPUSH', KEYS[1], ARGV[1])")
     expect(queueSource).toContain('const STUCK_RECOVERY_SCAN_LIMIT = 100')
+    expect(jsonKeyScanSource).toContain('const MAX_JSON_CODE_UNITS = 1_000_000')
+    expect(queueSource).toContain('-- forge:queue:recover-malformed-v1')
+    expect(queueSource).toContain(
+      'const MALFORMED_RECOVERY_RECEIPT_MIN_TTL_MS = 15 * 60 * 1000',
+    )
+    expect(queueSource).toContain(
+      '(commandTimeoutMs * 2) + MALFORMED_RECOVERY_RECEIPT_RECONNECT_HEADROOM_MS',
+    )
+    expect(queueSource).toContain('String(this.malformedRecoveryReceiptTtlMs)')
+    expect(queueSource).toContain('const MALFORMED_RECOVERY_RECEIPT_CAP = 50_000')
+    expect(queueSource).toContain('const MALFORMED_RECOVERY_RECEIPT_PRUNE_LIMIT = 100')
+    expect(malformedRecoveryScript).toContain(
+      "local receipt_score = redis.call('ZSCORE', KEYS[2], operation_token)",
+    )
+    expect(malformedRecoveryScript).toContain('receipt_timestamp > (now_ms - receipt_ttl_ms)')
+    expect(malformedRecoveryScript).toContain("return 2")
+    expect(malformedRecoveryScript).toContain(
+      "if not redis.call('LPOS', KEYS[1], ARGV[1]) then",
+    )
+    expect(malformedRecoveryScript).toContain("'ZRANGEBYSCORE'")
+    expect(malformedRecoveryScript).toContain("redis.call('ZCARD', KEYS[2]) >= receipt_cap")
+    expect(malformedRecoveryScript).toContain(
+      "redis.call('LREM', KEYS[1], 1, ARGV[1]) ~= 1",
+    )
+    expect(malformedRecoveryScript).toContain(
+      "redis.call('ZADD', KEYS[2], now_ms, operation_token)",
+    )
+    expect(malformedRecoveryScript).not.toContain("redis.call('HDEL'")
+    expect(malformedRecoveryScript).not.toContain("redis.call('HSET'")
+    expect(malformedRecoveryScript).not.toContain("redis.call('LPUSH'")
+    expect(malformedRecoveryScript).not.toContain("redis.call('ZPOPMIN'")
+    expect(malformedRecoveryScript).not.toContain("redis.call('ZREMRANGEBYRANK'")
+    expect(malformedRecoveryScript).not.toContain("redis.call('ZADD', KEYS[2], now_ms, ARGV[1])")
+    expect(malformedRecoveryScript.indexOf("redis.call('ZCARD', KEYS[2])"))
+      .toBeLessThan(malformedRecoveryScript.indexOf("redis.call('LREM', KEYS[1], 1, ARGV[1])"))
+    expect(malformedRecoveryScript.indexOf("redis.call('LREM', KEYS[1], 1, ARGV[1])"))
+      .toBeLessThan(
+        malformedRecoveryScript.indexOf(
+          "redis.call('ZADD', KEYS[2], now_ms, operation_token)",
+        ),
+      )
+    expect(malformedRecoveryMethod.match(/const operationToken = randomUUID\(\)/g))
+      .toHaveLength(1)
+    expect(malformedRecoveryMethod.match(/result = await invoke\(\)/g)).toHaveLength(2)
+    expect(malformedRecoveryMethod).toContain(
+      '[this.processingQueueKey, this.malformedRecoveryReceiptsKey]',
+    )
+    expect(malformedRecoveryMethod).not.toContain('this.claimsKey')
+    expect(queueSource).toMatch(
+      /catch \{\s+await this\.removeMalformedRecoveryMember\(raw\)\s+continue\s+\}/,
+    )
     expect(queueSource).not.toMatch(/this\.client\.lpush\(this\.deadQueueKey,[\s\S]{0,300}\braw,/)
     expect(queueSource).not.toMatch(/this\.client\.lpush\(this\.deadQueueKey,[\s\S]{0,300}\berrorMessage\b/)
     expect(runtimeSource).toContain('errorMessage: message')

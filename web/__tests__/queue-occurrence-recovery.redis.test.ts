@@ -40,6 +40,7 @@ const QUEUE_KEYS = [
   'forge:tasks:claims',
   'forge:tasks:ack-receipts',
   'forge:tasks:release-receipts',
+  'forge:tasks:malformed-recovery-receipts',
   'forge:tasks:promotion-dispositions',
   'forge:tasks:promotion-disposition-expiry',
   'forge:approvals',
@@ -49,6 +50,7 @@ const QUEUE_KEYS = [
   'forge:approvals:claims',
   'forge:approvals:ack-receipts',
   'forge:approvals:release-receipts',
+  'forge:approvals:malformed-recovery-receipts',
   'forge:approvals:promotion-dispositions',
   'forge:approvals:promotion-disposition-expiry',
   'forge:answers',
@@ -58,6 +60,7 @@ const QUEUE_KEYS = [
   'forge:answers:claims',
   'forge:answers:ack-receipts',
   'forge:answers:release-receipts',
+  'forge:answers:malformed-recovery-receipts',
   'forge:answers:promotion-dispositions',
   'forge:answers:promotion-disposition-expiry',
 ] as const
@@ -1909,6 +1912,115 @@ describe.skipIf(!enabled)('queue occurrence and recovery real Redis proof', () =
         )).toBeNull()
       }
     }
+
+    type RecoveryQueue = {
+      recoverStuckJobs: (staleMs: number) => Promise<number>
+    }
+    const malformedClaimId = '99999999-9999-4999-8999-999999999999'
+    const malformedRecoveryCases = [
+      {
+        claims: 'forge:tasks:claims',
+        create: () => queue() as RecoveryQueue,
+        malformed: '{"private":"QUEUE_QUARANTINE_SENTINEL_TASK"',
+        processing: 'forge:tasks:processing',
+        ready: 'forge:tasks',
+        receipts: 'forge:tasks:malformed-recovery-receipts',
+        validJob: { taskId: TASK_ID, attempt: 1 },
+      },
+      {
+        claims: 'forge:approvals:claims',
+        create: () => approvalQueue() as RecoveryQueue,
+        malformed:
+          String.raw`{"taskId":"${TASK_ID}","task\u0049d":"QUEUE_QUARANTINE_SENTINEL_APPROVAL","action":"approve","attempt":1}`,
+        processing: 'forge:approvals:processing',
+        ready: 'forge:approvals',
+        receipts: 'forge:approvals:malformed-recovery-receipts',
+        validJob: { taskId: TASK_ID, action: 'approve', attempt: 1 },
+      },
+      {
+        claims: 'forge:answers:claims',
+        create: () => answersQueue() as RecoveryQueue,
+        malformed: JSON.stringify({
+          schemaVersion: 1,
+          occurrenceId: malformedClaimId,
+          job: { taskId: TASK_ID, attempt: 1 },
+          private: 'QUEUE_QUARANTINE_SENTINEL_ANSWERS',
+        }),
+        processing: 'forge:answers:processing',
+        ready: 'forge:answers',
+        receipts: 'forge:answers:malformed-recovery-receipts',
+        validJob: { taskId: TASK_ID, attempt: 1 },
+      },
+    ] as const
+    for (const [caseIndex, recoveryCase] of malformedRecoveryCases.entries()) {
+      await admin.del(...QUEUE_KEYS)
+      const validOccurrenceId =
+        `00000000-0000-4000-8000-${String(9_000 + caseIndex).padStart(12, '0')}`
+      const valid = JSON.stringify({
+        schemaVersion: 1,
+        occurrenceId: validOccurrenceId,
+        job: recoveryCase.validJob,
+      })
+      const marker =
+        `${await redisTimeMs()}:11111111-1111-4111-8111-111111111111`
+      await admin.rpush(recoveryCase.processing, recoveryCase.malformed, valid)
+      await admin.hset(
+        recoveryCase.claims,
+        malformedClaimId,
+        marker,
+        validOccurrenceId,
+        marker,
+      )
+      const recoveryQueue = recoveryCase.create()
+      const recoveryClient = (recoveryQueue as unknown as { client: Redis }).client
+      const recoveryCall = recoveryClient.call.bind(recoveryClient)
+      let loseRemovalResponse = caseIndex === 0
+      const removalCall = vi.spyOn(recoveryClient, 'call').mockImplementation(async (
+        ...args: Parameters<Redis['call']>
+      ) => {
+        const result = await recoveryCall(...args)
+        if (loseRemovalResponse
+          && String(args[1]).includes('forge:queue:recover-malformed-v1')) {
+          loseRemovalResponse = false
+          await admin.rpush(recoveryCase.processing, recoveryCase.malformed)
+          throw new Error('simulated malformed recovery response loss')
+        }
+        return result
+      })
+
+      await expect(recoveryQueue.recoverStuckJobs(0)).resolves.toBe(1)
+      removalCall.mockRestore()
+
+      expect(await admin.lrange(recoveryCase.ready, 0, -1)).toEqual([valid])
+      expect(await admin.hexists(recoveryCase.claims, malformedClaimId)).toBe(1)
+      expect(await admin.hexists(recoveryCase.claims, validOccurrenceId)).toBe(0)
+      expect(await admin.hlen(recoveryCase.claims)).toBe(1)
+      expect(await admin.llen(recoveryCase.processing)).toBe(caseIndex === 0 ? 1 : 0)
+      if (caseIndex === 0) {
+        expect(await admin.lpos(recoveryCase.processing, recoveryCase.malformed)).toBe(0)
+      }
+      const receipts = await admin.zrange(recoveryCase.receipts, 0, -1)
+      expect(receipts).toEqual([
+        expect.stringMatching(
+          /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+        ),
+      ])
+      expect(JSON.stringify(receipts)).not.toContain('QUEUE_QUARANTINE_SENTINEL')
+    }
+
+    await admin.del(...QUEUE_KEYS)
+    const failedMalformed = '{"private":"QUEUE_QUARANTINE_SENTINEL_FAILURE"'
+    const failedMarker =
+      `${await redisTimeMs()}:11111111-1111-4111-8111-111111111111`
+    await admin.rpush('forge:answers:processing', failedMalformed)
+    await admin.hset('forge:answers:claims', malformedClaimId, failedMarker)
+    await admin.set('forge:answers:malformed-recovery-receipts', 'wrong-type')
+    await expect(answersQueue().recoverStuckJobs(0))
+      .rejects.toThrow('Queue malformed recovery removal failed')
+    expect(await admin.llen('forge:answers:processing')).toBe(1)
+    expect(await admin.hexists('forge:answers:claims', malformedClaimId)).toBe(1)
+    expect(await admin.get('forge:answers:malformed-recovery-receipts')).toBe('wrong-type')
+    console.info('QUEUE_OCCURRENCE_REDIS_QUARANTINE_OK')
 
     const markerCases = [
       '0:11111111-1111-4111-8111-111111111111',
