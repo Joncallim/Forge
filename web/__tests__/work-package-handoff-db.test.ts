@@ -161,9 +161,27 @@ import {
 import { prepareArchitectArtifact } from '@/worker/architect-artifact'
 import { evaluateWorkPackageMcpBroker } from '@/worker/mcp-execution-design'
 import { buildWorkforceMaterializationRows } from '@/worker/workforce-materializer'
+import { ClaimLeaseFence, ClaimLeaseLostError } from '@/worker/claim-lease-fence'
 
 const originalExecutionFlag = process.env.FORGE_WORK_PACKAGE_EXECUTION
 let latestFreshAdmission: Record<string, unknown> | null = null
+
+class CountingClaimLeaseFence extends ClaimLeaseFence {
+  calls = 0
+  loseAt = Number.POSITIVE_INFINITY
+  readonly loss = new ClaimLeaseLostError()
+
+  arm(loseAt: number) {
+    this.calls = 0
+    this.loseAt = loseAt
+  }
+
+  override assertOwned(): void {
+    this.calls += 1
+    if (this.calls === this.loseAt) throw this.loss
+    super.assertOwned()
+  }
+}
 
 function chain(resolveValue: unknown) {
   const captureFreshAdmission = () => {
@@ -904,6 +922,38 @@ describe('handoffApprovedWorkPackages', () => {
     }))
   })
 
+  it('rolls back a reserved-role block when ownership is lost inside its transaction', async () => {
+    const pkg = {
+      id: 'pkg-fence-reserved', assignedRole: 'security', harnessId: 'harness-security',
+      mcpRequirements: [], metadata: { source: 'architect-artifact' }, sequence: 1,
+      status: 'pending', title: 'Security package',
+    }
+    mocks.dbSelect
+      .mockReturnValueOnce(chain([pkg]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([{ project: { id: 'project-1' } }]))
+      .mockReturnValueOnce(chain([freshAdmissionRow(pkg)]))
+    const packageUpdate = updateChain([{ id: pkg.id }])
+    mocks.dbUpdate.mockReturnValueOnce(packageUpdate)
+    let committed = false
+    mocks.dbTransaction.mockImplementationOnce(async (callback: (tx: unknown) => unknown) => {
+      const result = await callback({ insert: vi.fn(), select: freshLockSelectMock(), update: mocks.dbUpdate })
+      committed = true
+      return result
+    })
+    const fence = new CountingClaimLeaseFence()
+
+    await expect(handoffApprovedWorkPackages('task-1', {
+      claimLeaseFence: fence,
+      afterMcpAdmissionEvaluated: async () => fence.arm(8),
+    })).rejects.toBe(fence.loss)
+
+    expect(packageUpdate.set).toHaveBeenCalledWith(expect.objectContaining({ status: 'failed' }))
+    expect(committed).toBe(false)
+    expect(mocks.publishTaskEvent).not.toHaveBeenCalled()
+    expect(mocks.recordTaskLogBestEffort).not.toHaveBeenCalled()
+  })
+
   it('holds a required filesystem package for grant approval before claiming or running it', async () => {
     const pkg = {
       id: 'pkg-fs', assignedRole: 'backend', harnessId: 'harness-1',
@@ -1019,6 +1069,83 @@ describe('handoffApprovedWorkPackages', () => {
       metadata: expect.anything(),
     }))
     expect(mocks.dbTransaction).toHaveBeenCalledTimes(1)
+  })
+
+  it('rolls back a filesystem grant hold when the claim fence is lost after its package update', async () => {
+    const pkg = {
+      id: 'pkg-fence-fs', assignedRole: 'backend', harnessId: 'harness-1',
+      mcpRequirements: [{ mcpId: 'filesystem', requirement: 'required', capabilities: ['filesystem.project.read'] }],
+      metadata: {}, sequence: 1, status: 'pending', title: 'Read project files',
+    }
+    mocks.dbSelect
+      .mockReturnValueOnce(chain([pkg]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([{ project: { id: 'project-1' } }]))
+      .mockReturnValueOnce(chain([freshAdmissionRow(pkg)]))
+    const packageUpdate = updateChain([{ id: pkg.id }])
+    mocks.dbUpdate.mockReturnValueOnce(packageUpdate)
+    let committed = false
+    mocks.dbTransaction.mockImplementationOnce(async (callback: (tx: unknown) => unknown) => {
+      const result = await callback({
+        execute: vi.fn().mockResolvedValue([{ now: '2026-07-17 00:00:00+00' }]),
+        insert: vi.fn(), select: freshLockSelectMock(), update: mocks.dbUpdate,
+      })
+      committed = true
+      return result
+    })
+    const fence = new CountingClaimLeaseFence()
+
+    await expect(progressWorkforce('task-1', {
+      claimLeaseFence: fence,
+      afterMcpAdmissionEvaluated: async () => fence.arm(11),
+    })).rejects.toBe(fence.loss)
+
+    expect(fence.calls).toBe(11)
+    expect(packageUpdate.set).toHaveBeenCalledWith(expect.objectContaining({ status: 'blocked' }))
+    expect(committed).toBe(false)
+    expect(mocks.projectionContributions).toEqual([])
+    expect(mocks.convergeRecognizedOperatorHoldTask).not.toHaveBeenCalled()
+    expect(mocks.publishTaskEvent).not.toHaveBeenCalled()
+    expect(mocks.recordTaskLogBestEffort).not.toHaveBeenCalled()
+  })
+
+  it('does not emit filesystem grant hold side effects when the claim fence is lost after commit', async () => {
+    const pkg = {
+      id: 'pkg-fence-fs-post', assignedRole: 'backend', harnessId: 'harness-1',
+      mcpRequirements: [{ mcpId: 'filesystem', requirement: 'required', capabilities: ['filesystem.project.read'] }],
+      metadata: {}, sequence: 1, status: 'pending', title: 'Read project files',
+    }
+    mocks.dbSelect
+      .mockReturnValueOnce(chain([pkg]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([{ project: { id: 'project-1' } }]))
+      .mockReturnValueOnce(chain([freshAdmissionRow(pkg)]))
+    const packageUpdate = updateChain([{ id: pkg.id }])
+    mocks.dbUpdate.mockReturnValueOnce(packageUpdate)
+    let committed = false
+    mocks.dbTransaction.mockImplementationOnce(async (callback: (tx: unknown) => unknown) => {
+      let executeCount = 0
+      const result = await callback({
+        execute: vi.fn().mockImplementation(async () => {
+          executeCount += 1
+          return executeCount === 1 ? [{ now: '2026-07-17 00:00:00+00' }] : [{ advanced: true }]
+        }),
+        insert: vi.fn(), select: freshLockSelectMock(), update: mocks.dbUpdate,
+      })
+      committed = true
+      return result
+    })
+    const fence = new CountingClaimLeaseFence()
+
+    await expect(progressWorkforce('task-1', {
+      claimLeaseFence: fence,
+      afterMcpAdmissionEvaluated: async () => fence.arm(14),
+    })).rejects.toBe(fence.loss)
+
+    expect(fence.calls).toBe(14)
+    expect(committed).toBe(true)
+    expect(mocks.publishTaskEvent).not.toHaveBeenCalled()
+    expect(mocks.recordTaskLogBestEffort).not.toHaveBeenCalled()
   })
 
   it('uses a current approved project filesystem grant even when the package has no persisted project-effective phase', async () => {
