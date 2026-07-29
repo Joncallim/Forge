@@ -751,7 +751,9 @@ describe('handoffApprovedWorkPackages', () => {
       readyPackageIds: ['pkg-1'],
       claimedPackageId: 'pkg-1',
     })
-    expect(mocks.completeTaskIfReviewGatesSatisfied).toHaveBeenCalledWith('task-1')
+    expect(mocks.completeTaskIfReviewGatesSatisfied).toHaveBeenCalledWith('task-1', expect.objectContaining({
+      assertOwned: expect.any(Function),
+    }))
   })
 
   it('blocks a required unavailable MCP before claiming the package', async () => {

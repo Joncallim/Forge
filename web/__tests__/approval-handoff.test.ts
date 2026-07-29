@@ -257,7 +257,9 @@ describe('processApproval handoff', () => {
 
     expect(mocks.dbUpdate).not.toHaveBeenCalled()
     expect(mocks.handoffApprovedWorkPackages).not.toHaveBeenCalled()
-    expect(mocks.completeTaskIfReviewGatesSatisfied).toHaveBeenCalledWith('task-1')
+    expect(mocks.completeTaskIfReviewGatesSatisfied).toHaveBeenCalledWith('task-1', expect.objectContaining({
+      assertOwned: expect.any(Function),
+    }))
     expect(mocks.publishTaskEvent).toHaveBeenCalledWith('task-1', 'task:handoff', expect.objectContaining({
       claimedPackageId: null,
       readyPackageIds: [],
@@ -278,7 +280,9 @@ describe('processApproval handoff', () => {
 
     await processApproval('task-1')
 
-    expect(mocks.completeTaskIfReviewGatesSatisfied).toHaveBeenCalledWith('task-1')
+    expect(mocks.completeTaskIfReviewGatesSatisfied).toHaveBeenCalledWith('task-1', expect.objectContaining({
+      assertOwned: expect.any(Function),
+    }))
     expect(mocks.publishTaskEvent).not.toHaveBeenCalledWith('task-1', 'task:handoff', expect.anything())
   })
 
