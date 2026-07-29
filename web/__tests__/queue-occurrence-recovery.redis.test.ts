@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
+import { createServer, type Socket } from 'node:net'
 import Redis from 'ioredis'
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import {
@@ -2178,6 +2179,44 @@ describe.skipIf(!enabled)('queue occurrence and recovery real Redis proof', () =
         } else if (position === 'answers') {
           expect(claimCounts.task).toBe(0)
         }
+      }
+
+      const blackholeSockets = new Set<Socket>()
+      const blackholeServer = createServer((socket) => {
+        blackholeSockets.add(socket)
+        socket.on('close', () => blackholeSockets.delete(socket))
+        socket.pause()
+      })
+      await new Promise<void>((resolve, reject) => {
+        blackholeServer.once('error', reject)
+        blackholeServer.listen(0, '127.0.0.1', () => resolve())
+      })
+      const address = blackholeServer.address()
+      if (!address || typeof address === 'string') {
+        throw new Error('Queue black-hole proof did not bind a local socket.')
+      }
+      const blackholeQueue = new TaskQueue(
+        `redis://127.0.0.1:${address.port}/13`,
+        { commandTimeoutMs: 100 },
+      )
+      try {
+        const blackholeClaim = blackholeQueue.claim(1)
+        await vi.waitFor(() => expect(blackholeSockets.size).toBeGreaterThan(0))
+        await expect(blackholeClaim).rejects.toBeDefined()
+        expect(blackholeSockets.size).toBeGreaterThan(0)
+        blackholeQueue.disconnect()
+        for (const socket of blackholeSockets) socket.resume()
+        await vi.waitFor(() => expect(blackholeSockets.size).toBe(0))
+        expect((blackholeQueue as unknown as { client: Redis }).client.status).toBe('end')
+      } finally {
+        blackholeQueue.disconnect()
+        for (const socket of blackholeSockets) socket.destroy()
+        await new Promise<void>((resolve, reject) => {
+          blackholeServer.close((error) => {
+            if (error) reject(error)
+            else resolve()
+          })
+        })
       }
       console.info('QUEUE_OCCURRENCE_REDIS_SHUTDOWN_OK')
     } finally {
