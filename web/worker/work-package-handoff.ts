@@ -946,6 +946,7 @@ async function recoverStaleRunningPackage(taskId: string, pkg: HandoffPackage, o
     ))
     .returning({ id: workPackages.id })
 
+  assertQueueClaimOwned(options)
   if (!recovered) return false
 
   if (run) {
@@ -958,6 +959,7 @@ async function recoverStaleRunningPackage(taskId: string, pkg: HandoffPackage, o
       })
       .where(and(eq(agentRuns.id, run.id), eq(agentRuns.status, 'running')))
 
+    assertQueueClaimOwned(options)
     await publishTaskEvent(taskId, 'run:failed', {
       attemptNumber: run.attemptNumber,
       errorMessage: blockedReason,
@@ -967,6 +969,7 @@ async function recoverStaleRunningPackage(taskId: string, pkg: HandoffPackage, o
     })
   }
 
+  assertQueueClaimOwned(options)
   await publishTaskEvent(taskId, 'work_package:status', {
     blockedReason,
     staleRunningRecovery,

@@ -176,6 +176,10 @@ class CountingClaimLeaseFence extends ClaimLeaseFence {
     this.loseAt = loseAt
   }
 
+  loseOnNextAssertion() {
+    this.loseAt = this.calls + 1
+  }
+
   override assertOwned(): void {
     this.calls += 1
     if (this.calls === this.loseAt) throw this.loss
@@ -2002,6 +2006,46 @@ describe('handoffApprovedWorkPackages', () => {
         process.env.FORGE_WORK_PACKAGE_EXECUTION = previousExecutionFlag
       }
     }
+  })
+
+  it('does not mutate the stale run or publish events when claim ownership is lost during package recovery', async () => {
+    const staleUpdatedAt = new Date(Date.now() - 60 * 60 * 1000)
+    mocks.dbSelect
+      .mockReturnValueOnce(chain([{
+        id: 'pkg-stale-fence', assignedRole: 'backend', blockedReason: null, harnessId: 'harness-1',
+        mcpRequirements: [], metadata: {}, sequence: 1, status: 'running', title: 'Backend package', updatedAt: staleUpdatedAt,
+      }]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([{ id: 'run-stale', attemptNumber: 1, stage: 'implementation' }]))
+
+    let resolvePackageUpdate!: (value: unknown) => void
+    const packageUpdateCompleted = new Promise<unknown>((resolve) => {
+      resolvePackageUpdate = resolve
+    })
+    const recoveredPackageUpdate = updateChain(packageUpdateCompleted)
+    let packageUpdateStarted!: () => void
+    const packageUpdateStartedPromise = new Promise<void>((resolve) => {
+      packageUpdateStarted = resolve
+    })
+    recoveredPackageUpdate.set = vi.fn(() => {
+      packageUpdateStarted()
+      return recoveredPackageUpdate
+    })
+    const recoveredRunUpdate = updateChain([{ id: 'run-stale' }])
+    mocks.dbUpdate
+      .mockReturnValueOnce(recoveredPackageUpdate)
+      .mockReturnValueOnce(recoveredRunUpdate)
+    const fence = new CountingClaimLeaseFence()
+
+    const result = handoffApprovedWorkPackages('task-1', { claimEnabled: false, claimLeaseFence: fence })
+    await packageUpdateStartedPromise
+    fence.loseOnNextAssertion()
+    resolvePackageUpdate([{ id: 'pkg-stale-fence' }])
+
+    await expect(result).rejects.toBe(fence.loss)
+    expect(recoveredPackageUpdate.set).toHaveBeenCalledWith(expect.objectContaining({ status: 'blocked' }))
+    expect(recoveredRunUpdate.set).not.toHaveBeenCalled()
+    expect(mocks.publishTaskEvent).not.toHaveBeenCalled()
   })
 
   it('recovers a previously broker-blocked package once MCP access is available', async () => {
