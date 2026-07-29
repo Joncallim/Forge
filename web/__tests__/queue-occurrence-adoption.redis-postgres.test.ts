@@ -495,23 +495,23 @@ describe.skipIf(!enabled)('queue occurrence adoption with production runtimes', 
     ])
     await admin`
       INSERT INTO forge_release_signer_keys (id, generation, public_key_spki, github_app_id, ruleset_fingerprint, status, valid_from, valid_until)
-      VALUES (${authority.signerKey}::uuid, 1, decode('00', 'hex'), 'queue-adoption-fixture', ${'b'.repeat(64)}, 'staged', clock_timestamp() - interval '1 minute', clock_timestamp() + interval '1 hour')
+      VALUES (${authority.signerKey}::uuid, 991, decode('00', 'hex'), 'queue-adoption-fixture', ${'7'.repeat(64)}, 'staged', clock_timestamp() - interval '1 minute', clock_timestamp() + interval '1 hour')
     `
-    for (const [id, kind, slice, digest, signature] of [
-      [authority.enablementReceipt, 'ingress_and_issuance_enabled', 's4', 'c'.repeat(64), 'aa'],
-      [authority.readinessReceipt, 's5_s6_release_ready', 's6', 'd'.repeat(64), 'bb'],
+    for (const [id, kind, slice, transitionDigest, envelopeDigest, signature] of [
+      [authority.enablementReceipt, 'ingress_and_issuance_enabled', 's4', '8'.repeat(64), 'a'.repeat(64), 'aa'],
+      [authority.readinessReceipt, 's5_s6_release_ready', 's6', '9'.repeat(64), 'b'.repeat(64), 'bb'],
     ] as const) {
       await admin`
         INSERT INTO forge_epic_172_release_evidence (id, evidence_kind, owner_issue, owner_slice, exact_builds, required_evidence, reviewed_sha, epoch, predecessor_receipt_ids, predecessor_set_digest, transition_identity_digest, signer_key_id, signer_generation, github_app_id, controller_run_id, controller_job_id, envelope_digest, detached_signature, nonce, issued_at, envelope)
-        VALUES (${id}::uuid, ${kind}, 179, ${slice}, ${builds}::jsonb,
+        VALUES (${id}::uuid, ${kind}, 179, ${slice}, ${builds}::text::jsonb,
           '[{"name":"postgres_fixture","measurementDigest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]'::jsonb,
-          ${'a'.repeat(40)}, 2, '[]'::jsonb, ${'0'.repeat(64)}, ${digest}, ${authority.signerKey}::uuid, 1,
-          'queue-adoption-fixture', 'queue-adoption-fixture', ${kind}, ${'e'.repeat(64)}, decode(repeat(${signature}, 64), 'hex'), ${randomUUID()}::uuid, transaction_timestamp(), '{}'::jsonb)
+          ${'a'.repeat(40)}, 2, '[]'::jsonb, ${'0'.repeat(64)}, ${transitionDigest}, ${authority.signerKey}::uuid, 991,
+          'queue-adoption-fixture', 'queue-adoption-fixture', ${kind}, ${envelopeDigest}, decode(repeat(${signature}, 64), 'hex'), ${randomUUID()}::uuid, transaction_timestamp(), '{}'::jsonb)
       `
     }
     await admin`
       UPDATE forge_epic_172_enablement_state
-      SET state = 'active', owner_operation_id = 'queue-adoption-fixture', exact_builds = ${builds}::jsonb,
+      SET state = 'active', owner_operation_id = 'queue-adoption-fixture', exact_builds = ${builds}::text::jsonb,
           reviewed_sha = ${'a'.repeat(40)}, epoch = 2, enablement_receipt_id = ${authority.enablementReceipt}::uuid,
           final_readiness_receipt_id = ${authority.readinessReceipt}::uuid, state_fingerprint = ${'9'.repeat(64)}, updated_at = clock_timestamp()
       WHERE singleton_id = 'epic-172'
@@ -530,8 +530,8 @@ describe.skipIf(!enabled)('queue occurrence adoption with production runtimes', 
           state_fingerprint = 'b0789177e07f4a9307f3397a938999b6fcc8c835a97e03d2770f83e4978c2585', updated_at = clock_timestamp()
       WHERE singleton_id = 'epic-172'
     `
-    await admin`DELETE FROM forge_epic_172_release_evidence WHERE id IN (${authority.enablementReceipt}::uuid, ${authority.readinessReceipt}::uuid)`
-    await admin`DELETE FROM forge_release_signer_keys WHERE id = ${authority.signerKey}::uuid`
+    const [disabledState] = await admin<{ enabled: boolean }[]>`SELECT forge.s4_protected_paths_enabled_v1() AS enabled`
+    if (disabledState?.enabled) throw new Error('Queue adoption proof could not restore its isolated S4 authority.')
   }
 
   async function insertRunningTaskAttempt(taskId: string, jobPayload: unknown): Promise<void> {
