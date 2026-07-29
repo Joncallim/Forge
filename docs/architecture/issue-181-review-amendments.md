@@ -210,3 +210,26 @@ imported only by their own unit tests. No route, worker, CLI, or component in
 the application references them. The S6 controller surface therefore cannot
 change application behaviour in this beta; that is the basis on which the P2
 SQL defect above is accepted as deferred rather than release-blocking.
+
+### Contract-wrapper failure diagnosability
+
+Round 25 raised a practical objection to the output quarantine: because both
+manifest wrappers run their test child with `stdio: ['ignore', 'ignore',
+'ignore']` and ordinary CI uploads no report tree, a failing partition printed
+`MCP_PLAYWRIGHT_CONTRACT_REJECTED` (or the Vitest equivalent) and nothing else.
+That is correct for leak-safety and unusable for debugging.
+
+The wrappers now emit a fixed reason code from a closed enum
+(`collected_identity_mismatch`, `executed_identity_mismatch`,
+`scenario_retried`, `scenario_skipped`, `scenario_failed`,
+`unmanifested_test_executed`, `retry_override_forbidden`,
+`missing_attestation_inputs`, `wrapper_error`), and for an identity mismatch
+they additionally name the canonical scenario IDs that were missing or
+unexpected. This stays inside the quarantine contract, which permits fixed
+schema-free status codes and canonical IDs on the live runner channel and
+forbids child bytes — no child output is emitted. Reported identifiers are
+filtered to the canonical execution-key shape and anything failing that shape
+is reduced to a `unexpected_suppressed=<count>` tally, so a hostile or
+malformed test title cannot ride the diagnostic channel out of the runner.
+`__tests__/epic-172-s6-contract-wrapper-diagnostics.test.ts` pins both the
+reason codes and the shape filter.
