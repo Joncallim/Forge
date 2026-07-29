@@ -50,7 +50,7 @@
     "e2e:epic-172-disabled-ingress": "playwright test e2e/mcp-handoff-concurrency.spec.ts --project=chromium-desktop --grep @epic172-disabled-ingress",
     "e2e:ui": "playwright test --ui",
     "test": "vitest run",
-    "test:unit:zero-skip": "vitest run --exclude __tests__/epic-172-s4-postgres.test.ts --exclude __tests__/legacy-leakage-scrub.redis.test.ts --exclude __tests__/task-event-redis-acl.redis.test.ts",
+    "test:unit:zero-skip": "vitest run --exclude __tests__/epic-172-s4-postgres.test.ts --exclude __tests__/legacy-leakage-scrub.redis.test.ts --exclude __tests__/task-event-redis-acl.redis.test.ts --exclude __tests__/cross-sink-production-sentinel.postgres-redis.test.ts",
     "test:mcp:s4-postgres": "FORGE_S4_REQUIRE_POSTGRES_TEST=1 vitest run __tests__/epic-172-s4-postgres.test.ts",
     "test:mcp:s4-redis": "node scripts/ci/run-mandatory-s4-redis-proof.mjs",
     "test:mcp:s4-redis-acl": "node scripts/ci/run-mandatory-s4-redis-acl-proof.mjs",

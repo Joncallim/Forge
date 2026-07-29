@@ -558,6 +558,29 @@ jobs:
             echo 'The mandatory S4 PostgreSQL proof did not report a passing test.' >&2
             exit 1
           fi
+      - name: Create a pristine cross-sink proof database
+        working-directory: .
+        env:
+          PGPASSWORD: forge
+        run: |
+          set -o errexit -o nounset -o pipefail
+          psql --host localhost --username forge_e2e --dbname postgres --set ON_ERROR_STOP=1 <<'SQL'
+          DO $clone_cross_sink_database$
+          BEGIN
+            IF EXISTS (
+              SELECT 1
+              FROM pg_stat_activity
+              WHERE datname = 'forge_s4_ci_test'
+                AND pid <> pg_backend_pid()
+            ) THEN
+              RAISE EXCEPTION 'forge_s4_ci_test still has active connections';
+            END IF;
+          END;
+          $clone_cross_sink_database$;
+          CREATE DATABASE forge_cross_sink_ci_test
+            OWNER forge_migration_test
+            TEMPLATE forge_s4_ci_test;
+          SQL
       - name: Run mandatory S4 Redis zero-skip proof
         env:
           FORGE_S4_REQUIRE_REDIS_TEST: '1'
@@ -572,6 +595,45 @@ jobs:
           FORGE_S4_REDIS_ACL_TEST_ADMIN_URL: redis://localhost:6380/14
         run: |
           npm run test:mcp:s4-redis-acl
+      - name: Run mandatory S4 cross-sink production sentinel proof
+        env:
+          DATABASE_URL: postgresql://forge_app_test:forge_app_test@localhost:5432/forge_cross_sink_ci_test
+          FORGE_CROSS_SINK_REQUIRE_TEST: '1'
+          FORGE_CROSS_SINK_DESTRUCTIVE_TEST: '1'
+          FORGE_CROSS_SINK_POSTGRES_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_cross_sink_ci_test
+          FORGE_CROSS_SINK_POSTGRES_APP_URL: postgresql://forge_app_test:forge_app_test@localhost:5432/forge_cross_sink_ci_test
+          FORGE_CROSS_SINK_REDIS_ADMIN_URL: redis://localhost:6380/12
+        run: |
+          set -o errexit -o nounset -o pipefail
+          report="$(mktemp)"
+          output="$(mktemp)"
+          trap 'rm -f "$report" "$output"' EXIT
+          npx vitest run __tests__/cross-sink-production-sentinel.postgres-redis.test.ts \
+            --reporter=default --reporter=json --outputFile="$report" | tee "$output"
+          node - "$report" "$output" <<'NODE'
+          const fs = require('node:fs')
+          const [reportPath, outputPath] = process.argv.slice(2)
+          const report = JSON.parse(fs.readFileSync(reportPath, 'utf8'))
+          const output = fs.readFileSync(outputPath, 'utf8')
+          const marker = 'S4_CROSS_SINK_PRODUCTION_SENTINEL_OK'
+          const markerCount = output.split(marker).length - 1
+          const result = report.testResults?.[0]
+          if (
+            report.testResults?.length !== 1
+            || result?.status !== 'passed'
+            || result?.assertionResults?.length !== 1
+            || report.numTotalTests !== 1
+            || report.numPassedTests !== 1
+            || report.numFailedTests !== 0
+            || report.numPendingTests !== 0
+            || report.numTodoTests !== 0
+            || report.numFailedTestSuites !== 0
+            || report.numPendingTestSuites !== 0
+            || markerCount !== 1
+          ) {
+            throw new Error('The mandatory cross-sink proof must run exactly one file and one passing test with one terminal marker and no skips.')
+          }
+          NODE
       - run: npm run build
       - run: npx playwright install chromium
       - name: Run mandatory S3 PostgreSQL concurrency proof
