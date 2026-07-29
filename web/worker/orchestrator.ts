@@ -1628,7 +1628,9 @@ export async function processApproval(
   }
 
   if (preview.status === 'no_ready_packages') {
-    const completion = await completeTaskIfReviewGatesSatisfied(taskId)
+    const completion = await completeTaskIfReviewGatesSatisfied(taskId, {
+      assertOwned: () => claimLeaseFence.assertOwned(),
+    })
     claimLeaseFence.assertOwned()
     if (completion.status === 'completed') return 'completed'
 

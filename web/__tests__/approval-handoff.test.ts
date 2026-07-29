@@ -34,6 +34,7 @@ vi.mock('@/worker/review-gates', () => ({
 }))
 
 import { processApproval } from '@/worker/orchestrator'
+import { ClaimLeaseFence, ClaimLeaseLostError } from '@/worker/claim-lease-fence'
 
 function chain(resolveValue: unknown) {
   const thenable: Record<string, unknown> = {
@@ -257,7 +258,9 @@ describe('processApproval handoff', () => {
 
     expect(mocks.dbUpdate).not.toHaveBeenCalled()
     expect(mocks.handoffApprovedWorkPackages).not.toHaveBeenCalled()
-    expect(mocks.completeTaskIfReviewGatesSatisfied).toHaveBeenCalledWith('task-1')
+    expect(mocks.completeTaskIfReviewGatesSatisfied).toHaveBeenCalledWith('task-1', expect.objectContaining({
+      assertOwned: expect.any(Function),
+    }))
     expect(mocks.publishTaskEvent).toHaveBeenCalledWith('task-1', 'task:handoff', expect.objectContaining({
       claimedPackageId: null,
       readyPackageIds: [],
@@ -265,6 +268,24 @@ describe('processApproval handoff', () => {
       reviewStatus: 'blocked',
       status: 'no_ready_packages',
     }))
+  })
+
+  it('propagates approval callback claim loss without ordinary failure persistence', async () => {
+    const fence = new ClaimLeaseFence()
+    mocks.dbSelect.mockReturnValue(chain([{ status: 'approved' }]))
+    mocks.previewWorkPackageHandoff.mockResolvedValue({
+      status: 'no_ready_packages', readyPackageIds: [], claimedPackageId: null,
+    })
+    mocks.completeTaskIfReviewGatesSatisfied.mockImplementation(async (_taskId, options) => {
+      fence.markLost()
+      options.assertOwned()
+      return { status: 'blocked' }
+    })
+
+    await expect(processApproval('task-1', { claimLeaseFence: fence })).rejects.toBeInstanceOf(ClaimLeaseLostError)
+
+    expect(mocks.dbUpdate).not.toHaveBeenCalled()
+    expect(mocks.publishTaskEvent).not.toHaveBeenCalled()
   })
 
   it('completes the task when no packages are ready because all review gates are satisfied', async () => {
@@ -278,7 +299,9 @@ describe('processApproval handoff', () => {
 
     await processApproval('task-1')
 
-    expect(mocks.completeTaskIfReviewGatesSatisfied).toHaveBeenCalledWith('task-1')
+    expect(mocks.completeTaskIfReviewGatesSatisfied).toHaveBeenCalledWith('task-1', expect.objectContaining({
+      assertOwned: expect.any(Function),
+    }))
     expect(mocks.publishTaskEvent).not.toHaveBeenCalledWith('task-1', 'task:handoff', expect.anything())
   })
 
