@@ -2,6 +2,9 @@ import { randomUUID } from 'node:crypto'
 import Redis from 'ioredis'
 import postgres from 'postgres'
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
+import { recordArchitectPlanVersion } from '@/lib/mcps/s4-protocol-store'
+import { appendArchitectClarificationAnswer } from '@/lib/mcps/history-reader'
+import { computeCredentialDigest } from '@/lib/session-credential-digest'
 
 const required = process.env.CI === 'true'
   || process.env.FORGE_QUEUE_ADOPTION_TEST_REQUIRED === '1'
@@ -13,6 +16,81 @@ const redisUrl = configuredRedisUrl ?? (process.env.CI === 'true'
   : undefined)
 const databaseUrl = process.env.FORGE_QUEUE_ADOPTION_POSTGRES_TEST_URL
   ?? process.env.DATABASE_URL
+const fixtureAdminUrl = process.env.FORGE_QUEUE_ADOPTION_POSTGRES_ADMIN_TEST_URL
+const fixtureWriterUrl = process.env.FORGE_QUEUE_ADOPTION_WRITER_DATABASE_URL
+const fixtureHistoryReaderUrl = process.env.FORGE_QUEUE_ADOPTION_HISTORY_READER_DATABASE_URL
+const fixtureResolverUrl = process.env.FORGE_QUEUE_ADOPTION_RESOLVER_DATABASE_URL
+const moduleEndpointEnvNames = [
+  'DATABASE_URL',
+  'REDIS_URL',
+  'FORGE_ARCHITECT_PLAN_HISTORY_READER_DATABASE_URL',
+  'FORGE_ARCHITECT_PLAN_RESOLVER_DATABASE_URL',
+  'FORGE_ARCHITECT_PLAN_WRITER_DATABASE_URL',
+] as const
+const originalModuleEndpointEnvironment = new Map(
+  moduleEndpointEnvNames.map((name) => [name, process.env[name]]),
+)
+
+function restoreEnvironment(
+  names: readonly string[],
+  original: ReadonlyMap<string, string | undefined>,
+): void {
+  let failed = false
+  for (const name of names) {
+    const value = original.get(name)
+    try {
+      if (value === undefined) delete process.env[name]
+      else process.env[name] = value
+    } catch {
+      failed = true
+    }
+  }
+  if (failed) throw new Error('Endpoint environment restoration failed.')
+}
+
+function verifyEnvironmentRestored(
+  names: readonly string[],
+  original: ReadonlyMap<string, string | undefined>,
+): void {
+  if (names.some((name) => process.env[name] !== original.get(name))) {
+    throw new Error('Endpoint environment restoration verification failed.')
+  }
+}
+
+function restoreOriginalModuleEndpointEnvironment(): void {
+  restoreEnvironment(moduleEndpointEnvNames, originalModuleEndpointEnvironment)
+}
+
+function assertOriginalModuleEndpointEnvironment(): void {
+  verifyEnvironmentRestored(moduleEndpointEnvNames, originalModuleEndpointEnvironment)
+}
+
+type CleanupCategory =
+  | 'redis_cleanup'
+  | 's4_deactivate'
+  | 'redis_quit'
+  | 'sql_close'
+  | 'admin_close'
+  | 'endpoint_restore'
+
+type CleanupStage = {
+  category: CleanupCategory
+  run: () => void | Promise<void>
+}
+
+async function runCleanupStages(stages: readonly CleanupStage[]): Promise<void> {
+  const failures: CleanupCategory[] = []
+  for (const stage of stages) {
+    try {
+      await stage.run()
+    } catch {
+      failures.push(stage.category)
+    }
+  }
+  if (failures.length > 0) {
+    throw new Error(`Queue adoption cleanup failed: ${failures.join(',')}`)
+  }
+}
 
 function validatedRedisUrl(value: string): string {
   let parsed: URL
@@ -30,13 +108,15 @@ function validatedRedisUrl(value: string): string {
   return value
 }
 
-if (required && (!destructive || !redisUrl || !databaseUrl)) {
+if (required && (!destructive || !redisUrl || !databaseUrl
+  || !fixtureAdminUrl || !fixtureWriterUrl || !fixtureResolverUrl || !fixtureHistoryReaderUrl)) {
   throw new Error(
-    'Mandatory queue adoption proof requires dedicated Redis, PostgreSQL, and destructive-test authorization.',
+    'Mandatory queue adoption proof requires dedicated Redis, app/admin/writer/resolver/history PostgreSQL URLs, and destructive-test authorization.',
   )
 }
 
-const enabled = Boolean(destructive && redisUrl && databaseUrl)
+const enabled = Boolean(destructive && redisUrl && databaseUrl
+  && fixtureAdminUrl && fixtureWriterUrl && fixtureResolverUrl && fixtureHistoryReaderUrl)
 const proofRedisUrl = enabled ? validatedRedisUrl(redisUrl!) : null
 
 // DB and queue modules cache their connections at import time. Bind the
@@ -45,6 +125,9 @@ const proofRedisUrl = enabled ? validatedRedisUrl(redisUrl!) : null
 if (enabled) {
   process.env.DATABASE_URL = databaseUrl!
   process.env.REDIS_URL = proofRedisUrl!
+  process.env.FORGE_ARCHITECT_PLAN_WRITER_DATABASE_URL = fixtureWriterUrl!
+  process.env.FORGE_ARCHITECT_PLAN_RESOLVER_DATABASE_URL = fixtureResolverUrl!
+  process.env.FORGE_ARCHITECT_PLAN_HISTORY_READER_DATABASE_URL = fixtureHistoryReaderUrl!
 }
 const QUEUE_KEYS = [
   'forge:tasks',
@@ -168,11 +251,122 @@ async function eventually<T>(
   throw new Error(message)
 }
 
+const MAX_FAILURE_DIAGNOSTIC_ITEMS = 9
+
+function answerFailureDiagnosticSnapshot(input: {
+  attempts: Array<{ status: string }>
+  latestArchitectRun: { errorMessage: string | null; status: string } | undefined
+  providerCalls: number
+  task: { errorMessage: string | null; status: string } | undefined
+}): string {
+  return JSON.stringify({
+    attemptStatusCount: Math.min(input.attempts.length, MAX_FAILURE_DIAGNOSTIC_ITEMS),
+    attemptStatuses: input.attempts.slice(0, MAX_FAILURE_DIAGNOSTIC_ITEMS).map(({ status }) => status),
+    latestArchitectRun: input.latestArchitectRun
+      ? { hasError: input.latestArchitectRun.errorMessage !== null, status: input.latestArchitectRun.status }
+      : null,
+    providerCallCount: Math.min(input.providerCalls, MAX_FAILURE_DIAGNOSTIC_ITEMS),
+    task: input.task
+      ? { hasError: input.task.errorMessage !== null, status: input.task.status }
+      : null,
+  })
+}
+
+describe('queue occurrence adoption diagnostic redaction', () => {
+  it('never emits hostile failure values or value-derived surrogates', () => {
+    const hostilePlan = 'HOSTILE_PLAN_TEXT'
+    const hostileAnswer = 'HOSTILE_ANSWER_TEXT'
+    const hostilePayload = 'HOSTILE_PAYLOAD_TEXT'
+    const hostileCredential = 'HOSTILE_CREDENTIAL_TEXT'
+    const hostileMarker = 'HOSTILE_MARKER_TEXT'
+    const hostileNonce = 'HOSTILE_NONCE_TEXT'
+    const hostileProvider = 'HOSTILE_PROVIDER_TEXT'
+    const hostileError = 'HOSTILE_ERROR_TEXT'
+    const diagnostic = answerFailureDiagnosticSnapshot({
+      attempts: Array.from({ length: 20 }, () => ({ status: 'failed' })),
+      latestArchitectRun: { errorMessage: `${hostilePlan}:${hostileAnswer}:${hostileProvider}:${hostileError}`, status: 'failed' },
+      providerCalls: 20,
+      task: { errorMessage: `${hostilePayload}:${hostileCredential}:${hostileMarker}:${hostileNonce}`, status: 'failed' },
+    })
+
+    for (const value of [
+      hostilePlan, hostileAnswer, hostilePayload, hostileCredential,
+      hostileMarker, hostileNonce, hostileProvider, hostileError,
+    ]) {
+      expect(diagnostic).not.toContain(value)
+    }
+    expect(diagnostic).not.toMatch(/digest|hash|length|sha/i)
+    expect(JSON.parse(diagnostic)).toEqual({
+      attemptStatusCount: 9,
+      attemptStatuses: Array.from({ length: 9 }, () => 'failed'),
+      latestArchitectRun: { hasError: true, status: 'failed' },
+      providerCallCount: 9,
+      task: { hasError: true, status: 'failed' },
+    })
+  })
+})
+
+describe('queue occurrence adoption cleanup discipline', () => {
+  it('aggregates fixed failures, runs every stage, and restores endpoints', async () => {
+    const original = new Map(moduleEndpointEnvNames.map((name) => [name, process.env[name]]))
+    const hostileRedisFailure = 'HOSTILE_REDIS_CLEANUP_TEXT'
+    const hostileS4Failure = 'HOSTILE_S4_DEACTIVATION_TEXT'
+    const ran: CleanupCategory[] = []
+    process.env.DATABASE_URL = 'HOSTILE_DATABASE_ENDPOINT'
+    delete process.env.REDIS_URL
+
+    try {
+      let report = ''
+      try {
+        await runCleanupStages([
+          { category: 'redis_cleanup', run: () => { ran.push('redis_cleanup'); throw new Error(hostileRedisFailure) } },
+          { category: 's4_deactivate', run: () => { ran.push('s4_deactivate'); throw new Error(hostileS4Failure) } },
+          { category: 'redis_quit', run: () => { ran.push('redis_quit') } },
+          { category: 'sql_close', run: () => { ran.push('sql_close') } },
+          { category: 'admin_close', run: () => { ran.push('admin_close') } },
+          {
+            category: 'endpoint_restore',
+            run: () => {
+              ran.push('endpoint_restore')
+              restoreEnvironment(moduleEndpointEnvNames, original)
+              verifyEnvironmentRestored(moduleEndpointEnvNames, original)
+            },
+          },
+        ])
+      } catch (error) {
+        report = error instanceof Error ? error.message : 'unexpected_cleanup_failure'
+      }
+
+      expect(report).toBe('Queue adoption cleanup failed: redis_cleanup,s4_deactivate')
+      expect(ran).toEqual([
+        'redis_cleanup', 's4_deactivate', 'redis_quit', 'sql_close', 'admin_close', 'endpoint_restore',
+      ])
+      expect(report).not.toContain(hostileRedisFailure)
+      expect(report).not.toContain(hostileS4Failure)
+      expect(report).not.toMatch(/digest|hash|length|sha/i)
+      expect(() => verifyEnvironmentRestored(moduleEndpointEnvNames, original)).not.toThrow()
+    } finally {
+      restoreEnvironment(moduleEndpointEnvNames, original)
+      verifyEnvironmentRestored(moduleEndpointEnvNames, original)
+    }
+  })
+})
+
 describe.skipIf(!enabled)('queue occurrence adoption with production runtimes', () => {
   let redis: Redis
   let sql: ReturnType<typeof postgres>
+  let admin: ReturnType<typeof postgres>
+  let redisInitialized = false
+  let adminInitialized = false
   let projectId: string
   let providerId: string
+  const authority = {
+    enablementReceipt: randomUUID(),
+    readinessReceipt: randomUUID(),
+    signerKey: randomUUID(),
+  }
+  const protectedDigestKeyHex = 'c'.repeat(64)
+  const protectedDigestKeyId = 'queue-adoption-key'
   const handles = new Set<WorkerHandle>()
   const priorEnv = new Map<string, string | undefined>()
   const envNames = [
@@ -185,6 +379,11 @@ describe.skipIf(!enabled)('queue occurrence adoption with production runtimes', 
     'FORGE_WORKER_MOCK_ARCHITECT',
     'FORGE_WORKER_STUCK_JOB_RECOVERY_SECONDS',
     'FORGE_WORKFORCE_MATERIALIZATION',
+    'FORGE_ARCHITECT_PLAN_HISTORY_READER_DATABASE_URL',
+    'FORGE_ARCHITECT_PLAN_RESOLVER_DATABASE_URL',
+    'FORGE_ARCHITECT_PLAN_DIGEST_KEY_HEX',
+    'FORGE_ARCHITECT_PLAN_DIGEST_KEY_ID',
+    'FORGE_ARCHITECT_PLAN_WRITER_DATABASE_URL',
     'DATABASE_URL',
     'REDIS_URL',
   ] as const
@@ -213,6 +412,8 @@ describe.skipIf(!enabled)('queue occurrence adoption with production runtimes', 
     process.env.FORGE_WORKER_MAX_ATTEMPTS = '3'
     process.env.FORGE_WORKER_STUCK_JOB_RECOVERY_SECONDS = '1'
     process.env.FORGE_WORKFORCE_MATERIALIZATION = '1'
+    process.env.FORGE_ARCHITECT_PLAN_DIGEST_KEY_HEX = protectedDigestKeyHex
+    process.env.FORGE_ARCHITECT_PLAN_DIGEST_KEY_ID = protectedDigestKeyId
     delete process.env.FORGE_WORKER_MOCK_ARCHITECT
   }
 
@@ -235,9 +436,14 @@ describe.skipIf(!enabled)('queue occurrence adoption with production runtimes', 
       getModel: vi.fn().mockResolvedValue({ modelId: 'queue-adoption-model' }),
       getProvider: vi.fn().mockResolvedValue({
         config: {
+          apiKeyCiphertext: null,
+          apiKeyEnvVar: null,
+          baseUrl: null,
+          createdAt: new Date('2026-07-29T00:00:00.000Z'),
           displayName: 'Queue adoption provider',
           id: providerId,
           isLocal: false,
+          isActive: true,
           modelId: 'queue-adoption-model',
           providerType: 'openai',
           updatedAt: new Date('2026-07-29T00:00:00.000Z'),
@@ -258,7 +464,7 @@ describe.skipIf(!enabled)('queue occurrence adoption with production runtimes', 
     }))
     vi.doMock('@/lib/mcps/s4-lease', async (importOriginal) => ({
       ...await importOriginal<typeof import('@/lib/mcps/s4-lease')>(),
-      readS4RuntimeModeV1: vi.fn().mockResolvedValue('legacy'),
+      readS4RuntimeModeV1: vi.fn().mockResolvedValue('protected'),
     }))
     vi.doMock('@/worker/events', () => ({
       publishTaskEvent: vi.fn().mockResolvedValue(undefined),
@@ -348,15 +554,55 @@ describe.skipIf(!enabled)('queue occurrence adoption with production runtimes', 
     return { handle, marker }
   }
 
-  async function waitForFinalState(taskId: string, expected: string): Promise<void> {
-    await eventually(
-      async () => (await sql<{ status: string }[]>`
+  async function answerFailureDiagnostic(taskId: string, providerCalls: number): Promise<string> {
+    const [task] = await sql<{ errorMessage: string | null; status: string }[]>`
+      SELECT status, error_message AS "errorMessage"
+      FROM tasks
+      WHERE id = ${taskId}::uuid
+    `
+    const [run] = await sql<{ errorMessage: string | null; status: string }[]>`
+      SELECT status, error_message AS "errorMessage"
+      FROM agent_runs
+      WHERE task_id = ${taskId}::uuid
+        AND agent_type = 'architect'
+      ORDER BY created_at DESC, id DESC
+      LIMIT 1
+    `
+    const attempts = await sql<{ status: string }[]>`
+      SELECT status
+      FROM task_attempts
+      WHERE task_id = ${taskId}::uuid
+        AND queue_name = 'answers'
+      ORDER BY created_at, id
+    `
+    return answerFailureDiagnosticSnapshot({ attempts, latestArchitectRun: run, providerCalls, task })
+  }
+
+  async function waitForFinalState(taskId: string, expected: string, answerProviderCalls?: () => number): Promise<void> {
+    if (answerProviderCalls === undefined) {
+      await eventually(
+        async () => (await sql<{ status: string }[]>`
+          SELECT status FROM tasks WHERE id = ${taskId}::uuid
+        `)[0]?.status ?? null,
+        (value) => value === expected,
+        'Queue adoption proof did not reach its expected durable task state.',
+        25_000,
+      )
+      return
+    }
+
+    const deadline = Date.now() + 25_000
+    while (Date.now() < deadline) {
+      const [task] = await sql<{ status: string }[]>`
         SELECT status FROM tasks WHERE id = ${taskId}::uuid
-      `)[0]?.status ?? null,
-      (value) => value === expected,
-      'Queue adoption proof did not reach its expected durable task state.',
-      25_000,
-    )
+      `
+      if (task?.status === expected) return
+      if (task?.status === 'failed') {
+        throw new Error(`Queue adoption answers proof failed: ${await answerFailureDiagnostic(taskId, answerProviderCalls())}`)
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    }
+    throw new Error(`Queue adoption answers proof timed out: ${await answerFailureDiagnostic(taskId, answerProviderCalls())}`)
   }
 
   async function assertOnlyRecoveredOwnerCompleted(input: {
@@ -411,6 +657,116 @@ describe.skipIf(!enabled)('queue occurrence adoption with production runtimes', 
     return taskId
   }
 
+  async function insertCanonicalAnsweredQuestion(taskId: string): Promise<void> {
+    const userId = randomUUID()
+    const sessionCredential = randomUUID()
+    const sessionId = randomUUID()
+    const runId = randomUUID()
+    const questionId = randomUUID()
+    const answerId = randomUUID()
+    const digestKey = Buffer.from(protectedDigestKeyHex, 'hex')
+      await sql`
+        INSERT INTO users (id, display_name) VALUES (${userId}::uuid, 'Queue adoption answer user')
+      `
+      await sql`
+        UPDATE tasks SET submitted_by = ${userId}::uuid WHERE id = ${taskId}::uuid
+      `
+      await sql`
+        INSERT INTO sessions (id, user_id, credential_digest_v1, expires_at, credential_storage_version)
+        VALUES (${sessionId}::uuid, ${userId}::uuid,
+          ${computeCredentialDigest(sessionCredential).digest}::bytea,
+          clock_timestamp() + interval '1 hour', 2)
+      `
+      await sql`
+        INSERT INTO agent_runs (id, task_id, agent_type, model_id_used, status)
+        VALUES (${runId}::uuid, ${taskId}::uuid, 'architect', 'queue-adoption', 'completed')
+      `
+      const source = await recordArchitectPlanVersion({
+        agentRunId: runId,
+        digestKey,
+        digestKeyId: protectedDigestKeyId,
+        entries: [
+          { agent: null, bindingFingerprint: null, content: 'Queue adoption plan.', entryId: 'plan_body:000000', entryKind: 'plan_body', projectionEligible: false, requirementKey: null },
+          { agent: null, bindingFingerprint: null, content: JSON.stringify({ requirementKey: 'plan-policy', schemaVersion: 1 }), entryId: 'requirement:plan-policy', entryKind: 'requirement', projectionEligible: false, requirementKey: 'plan-policy' },
+          { agent: null, bindingFingerprint: null, content: JSON.stringify({ schemaVersion: 1, questionId, question: 'Resume the queue adoption plan?', suggestions: [] }), entryId: `clarification_question:${questionId}`, entryKind: 'clarification_question', projectionEligible: false, requirementKey: null },
+        ],
+        planVersion: '1', taskId,
+      })
+      await sql`
+        UPDATE artifacts
+        SET metadata = ${JSON.stringify({
+          entryCount: 3,
+          historyAvailable: true,
+          planVersion: '1',
+          schemaVersion: 1,
+          stage: 'architect_plan',
+        })}::jsonb
+        WHERE id = ${source.artifactId}::uuid
+      `
+      await sql`
+        INSERT INTO task_questions (id, task_id, question_entry_id, source_plan_artifact_id, source_plan_version, status)
+        VALUES (${questionId}::uuid, ${taskId}::uuid, ${`clarification_question:${questionId}`}, ${source.artifactId}::uuid, 1, 'open')
+      `
+      await appendArchitectClarificationAnswer({
+        answer: 'yes', answerId, digestKey, digestKeyId: protectedDigestKeyId, questionId,
+        sessionCredential, sourcePlanArtifactId: source.artifactId, sourcePlanVersion: '1', taskId,
+      })
+  }
+
+  async function activateS4Authority(): Promise<void> {
+    const [state] = await admin<{ state: string; ownerOperationId: string | null }[]>`
+      SELECT state, owner_operation_id AS "ownerOperationId"
+      FROM forge_epic_172_enablement_state WHERE singleton_id = 'epic-172'
+    `
+    if (state?.state !== 'disabled' || state.ownerOperationId !== null) {
+      throw new Error('Queue adoption proof requires a canonically disabled isolated S4 authority.')
+    }
+    const builds = JSON.stringify([
+      `issue_179_s4@${'a'.repeat(40)}`,
+      `issue_180_s5@${'a'.repeat(40)}`,
+      `issue_181_s6@${'a'.repeat(40)}`,
+    ])
+    await admin`
+      INSERT INTO forge_release_signer_keys (id, generation, public_key_spki, github_app_id, ruleset_fingerprint, status, valid_from, valid_until)
+      VALUES (${authority.signerKey}::uuid, 991, decode('00', 'hex'), 'queue-adoption-fixture', ${'7'.repeat(64)}, 'staged', clock_timestamp() - interval '1 minute', clock_timestamp() + interval '1 hour')
+    `
+    for (const [id, kind, slice, transitionDigest, envelopeDigest, signature] of [
+      [authority.enablementReceipt, 'ingress_and_issuance_enabled', 's4', '8'.repeat(64), 'a'.repeat(64), 'aa'],
+      [authority.readinessReceipt, 's5_s6_release_ready', 's6', '9'.repeat(64), 'b'.repeat(64), 'bb'],
+    ] as const) {
+      await admin`
+        INSERT INTO forge_epic_172_release_evidence (id, evidence_kind, owner_issue, owner_slice, exact_builds, required_evidence, reviewed_sha, epoch, predecessor_receipt_ids, predecessor_set_digest, transition_identity_digest, signer_key_id, signer_generation, github_app_id, controller_run_id, controller_job_id, envelope_digest, detached_signature, nonce, issued_at, envelope)
+        VALUES (${id}::uuid, ${kind}, 179, ${slice}, ${builds}::text::jsonb,
+          '[{"name":"postgres_fixture","measurementDigest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]'::jsonb,
+          ${'a'.repeat(40)}, 2, '[]'::jsonb, ${'0'.repeat(64)}, ${transitionDigest}, ${authority.signerKey}::uuid, 991,
+          'queue-adoption-fixture', 'queue-adoption-fixture', ${kind}, ${envelopeDigest}, decode(repeat(${signature}, 64), 'hex'), ${randomUUID()}::uuid, transaction_timestamp(), '{}'::jsonb)
+      `
+    }
+    await admin`
+      UPDATE forge_epic_172_enablement_state
+      SET state = 'active', owner_operation_id = 'queue-adoption-fixture', exact_builds = ${builds}::text::jsonb,
+          reviewed_sha = ${'a'.repeat(40)}, epoch = 2, enablement_receipt_id = ${authority.enablementReceipt}::uuid,
+          final_readiness_receipt_id = ${authority.readinessReceipt}::uuid, state_fingerprint = ${'9'.repeat(64)}, updated_at = clock_timestamp()
+      WHERE singleton_id = 'epic-172'
+    `
+    const [enabledState] = await admin<{ enabled: boolean }[]>`SELECT forge.s4_protected_paths_enabled_v1() AS enabled`
+    if (!enabledState?.enabled) throw new Error('Queue adoption proof could not activate its isolated S4 authority.')
+  }
+
+  async function deactivateS4Authority(): Promise<void> {
+    await admin`
+      UPDATE forge_epic_172_enablement_state
+      SET state = 'disabled', owner_operation_id = null, exact_builds = null, reviewed_sha = null, epoch = null,
+          started_at = null, expires_at = null, enablement_receipt_id = null, final_readiness_receipt_id = null,
+          opening_authorization_id = null, controller_login_id = null, controller_run_id = null, controller_token_digest = null,
+          lease_generation = null, last_heartbeat_at = null, lease_expires_at = null,
+          state_fingerprint = 'b0789177e07f4a9307f3397a938999b6fcc8c835a97e03d2770f83e4978c2585', updated_at = clock_timestamp()
+      WHERE singleton_id = 'epic-172'
+    `
+    const [disabledState] = await admin<{ enabled: boolean }[]>`SELECT forge.s4_protected_paths_enabled_v1() AS enabled`
+    if (disabledState?.enabled) throw new Error('Queue adoption proof could not restore its isolated S4 authority.')
+  }
+
   async function insertRunningTaskAttempt(taskId: string, jobPayload: unknown): Promise<void> {
     await sql`
       INSERT INTO task_attempts (
@@ -440,12 +796,16 @@ describe.skipIf(!enabled)('queue occurrence adoption with production runtimes', 
       lazyConnect: true,
       maxRetriesPerRequest: 1,
     })
+    redisInitialized = true
     await redis.connect()
     if (await redis.dbsize() !== 0) {
       throw new Error('Queue adoption proof requires an empty disposable Redis database.')
     }
     sql = postgres(databaseUrl!, { max: 8 })
     await sql`SELECT 1`
+    admin = postgres(fixtureAdminUrl!, { max: 1, onnotice: () => {} })
+    adminInitialized = true
+    await activateS4Authority()
 
     providerId = randomUUID()
     projectId = randomUUID()
@@ -517,12 +877,23 @@ describe.skipIf(!enabled)('queue occurrence adoption with production runtimes', 
   })
 
   afterAll(async () => {
-    try {
-      await cleanRedis()
-    } finally {
-      await redis?.quit()
-      await sql?.end({ timeout: 5 })
-    }
+    await runCleanupStages([
+      { category: 'redis_cleanup', run: async () => { if (redisInitialized) await cleanRedis() } },
+      { category: 's4_deactivate', run: async () => { if (adminInitialized) await deactivateS4Authority() } },
+      { category: 'redis_quit', run: async () => { await redis?.quit() } },
+      { category: 'sql_close', run: async () => { await sql?.end({ timeout: 5 }) } },
+      { category: 'admin_close', run: async () => { await admin?.end({ timeout: 5 }) } },
+      {
+        category: 'endpoint_restore',
+        run: () => {
+          try {
+            restoreOriginalModuleEndpointEnvironment()
+          } finally {
+            assertOriginalModuleEndpointEnvironment()
+          }
+        },
+      },
+    ])
   })
 
   for (const kind of ['task', 'answers'] as const) {
@@ -530,10 +901,7 @@ describe.skipIf(!enabled)('queue occurrence adoption with production runtimes', 
       configureRuntimeEnvironment()
       const taskId = await insertTask(kind === 'task' ? 'pending' : 'awaiting_answers')
       if (kind === 'answers') {
-        await sql`
-          INSERT INTO task_questions (id, task_id, status, answered_at)
-          VALUES (${randomUUID()}::uuid, ${taskId}::uuid, 'answered', clock_timestamp())
-        `
+        await insertCanonicalAnsweredQuestion(taskId)
       }
 
       let providerCalls = 0
@@ -615,7 +983,7 @@ describe.skipIf(!enabled)('queue occurrence adoption with production runtimes', 
       expect(lossReason).toEqual(expect.objectContaining({ code: 'claim_lease_lost' }))
       releaseRecoveredProvider()
 
-      await waitForFinalState(taskId, 'awaiting_approval')
+      await waitForFinalState(taskId, 'awaiting_approval', kind === 'answers' ? () => providerCalls : undefined)
       await assertOnlyRecoveredOwnerCompleted({
         kind,
         newMarker: transferred.marker,
@@ -630,6 +998,14 @@ describe.skipIf(!enabled)('queue occurrence adoption with production runtimes', 
   it('lets only the recovered production approval runtime complete running work', async () => {
     configureRuntimeEnvironment()
     const taskId = await insertTask('running')
+    await sql`
+      INSERT INTO work_packages (id, task_id, assigned_role, title, summary, sequence, status, review_requirement)
+      VALUES (
+        ${randomUUID()}::uuid, ${taskId}::uuid, 'backend',
+        'Recovered approval package', 'A completed package for continuation recovery.',
+        1, 'completed', 'none'
+      )
+    `
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
     const streamText = vi.fn(() => {
       throw new Error('Approval adoption proof must not launch an Architect provider.')
