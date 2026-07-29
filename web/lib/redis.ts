@@ -4,16 +4,6 @@ import { getRequiredEnv } from '@/lib/env'
 const globalForRedis = globalThis as unknown as { redis: Redis | undefined }
 let redisProxy: Redis | undefined
 
-function redisErrorMessage(err: Error): string {
-  const aggregate = err as Error & { code?: string; errors?: { code?: string; message?: string }[] }
-  return (
-    err.message ||
-    aggregate.code ||
-    aggregate.errors?.map((nested) => nested.code ?? nested.message).filter(Boolean).join(', ') ||
-    err.name
-  )
-}
-
 function createRedisClient(): Redis {
   const client = new Redis(getRequiredEnv('REDIS_URL'), {
     lazyConnect: true,
@@ -21,8 +11,8 @@ function createRedisClient(): Redis {
     retryStrategy: (times) => Math.min(times * 100, 3000),
   })
 
-  client.on('error', (err) => {
-    console.warn('[redis] connection error:', redisErrorMessage(err))
+  client.on('error', () => {
+    console.warn('[redis] Connection unavailable')
   })
 
   return client

@@ -108,6 +108,44 @@ npm run worker
 Use split runtime only when you intentionally want the web app and worker as
 separate processes. Running `npm run worker` alone does not serve the dashboard.
 
+### Upgrade workers that may have legacy retry entries
+
+This rollout needs a full worker stop between versions. A version 2 (v2) worker
+expects every retry entry to use the newer queue envelope. It cannot understand
+an older, plain-JSON retry entry and may exit when it reaches one. The current
+worker can upgrade a legacy retry entry while promoting it, but Forge does not
+detect worker versions, drain replicas, or run a separate queue migration for
+you.
+
+When upgrading from any version that may have written legacy retry entries:
+
+1. Assume legacy entries are present. Do not dump or log raw Redis queue members
+   to check; they may contain task data.
+2. Stop and drain every v2 worker instance. Wait for each worker to finish its
+   in-flight work and exit cleanly.
+3. Use the deployment's real service manager or container platform to verify
+   that no v2 process or replica remains. The guide cannot give one universal
+   command because Forge supports both local and split deployments.
+4. Only after that verification, start the current workers.
+
+If a deployment accidentally overlaps versions and v2 wins the canonical
+promotion of the same retry entry, the current worker records the fixed, nonfatal
+`mixed_version_retry_promotion` category and continues its loop. That result is
+not a successful promotion by the current worker, and Forge does not fabricate
+a receipt. This containment does not let v2 read legacy plain-JSON entries and
+does not remove the full stop-and-drain requirement.
+
+The compatibility window is the drain period while a v2 worker may still be
+finishing work. It ends when every v2 worker has stopped. There is no
+compatibility key or manual receipt cleanup. The normal opaque disposition
+receipts expire after 15 minutes and remain subject to bounded pruning.
+
+For rollback, first stop and drain the current workers. If legacy retry entries
+may remain, do not restart v2 workers; resume the current version or follow the
+deployment's existing documented restore path. Do not invent a destructive
+queue-cleanup procedure, edit receipts, or assume that rollback is automatically
+safe.
+
 ## First Login And Providers
 
 The first account creates a password and, by default, a passkey. For password

@@ -135,8 +135,8 @@ export function taskEventPublisherRedis(configuration: TaskEventRedisConfigurati
     maxRetriesPerRequest: 3,
     retryStrategy: (times) => Math.min(times * 100, 3000),
   })
-  client.on('error', (error) => {
-    console.warn('[task-events] publisher connection error:', error.message)
+  client.on('error', () => {
+    console.warn('[task-events] Publisher connection unavailable')
   })
   if (process.env.NODE_ENV !== 'production') {
     globalForTaskEvents.forgeTaskEventPublisherRedis = client

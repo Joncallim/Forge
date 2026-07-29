@@ -34,6 +34,7 @@ vi.mock('@/worker/review-gates', () => ({
 }))
 
 import { processApproval } from '@/worker/orchestrator'
+import { ClaimLeaseFence, ClaimLeaseLostError } from '@/worker/claim-lease-fence'
 
 function chain(resolveValue: unknown) {
   const thenable: Record<string, unknown> = {
@@ -109,7 +110,10 @@ describe('processApproval handoff', () => {
     await processApproval('task-1')
 
     expect(mocks.previewWorkPackageHandoff).toHaveBeenCalledWith('task-1')
-    expect(mocks.handoffApprovedWorkPackages).toHaveBeenCalledWith('task-1', { claimEnabled: true, finalAttempt: true })
+    expect(mocks.handoffApprovedWorkPackages).toHaveBeenCalledWith(
+      'task-1',
+      expect.objectContaining({ claimEnabled: true, finalAttempt: true }),
+    )
     expect(update.set).toHaveBeenCalledWith(expect.objectContaining({ status: 'running' }))
     expect(mocks.publishTaskEvent).toHaveBeenCalledWith('task-1', 'task:handoff', expect.objectContaining({
       claimedPackageId: 'pkg-1',
@@ -139,7 +143,10 @@ describe('processApproval handoff', () => {
       errorMessage: 'Retrying handoff after error: handoff insert failed',
       status: 'approved',
     }))
-    expect(mocks.handoffApprovedWorkPackages).toHaveBeenCalledWith('task-1', { claimEnabled: true, finalAttempt: false })
+    expect(mocks.handoffApprovedWorkPackages).toHaveBeenCalledWith(
+      'task-1',
+      expect.objectContaining({ claimEnabled: true, finalAttempt: false }),
+    )
   })
 
   it('fails the task when package handoff fails on the final approval attempt', async () => {
@@ -163,7 +170,10 @@ describe('processApproval handoff', () => {
       errorMessage: 'handoff insert failed',
       status: 'failed',
     }))
-    expect(mocks.handoffApprovedWorkPackages).toHaveBeenCalledWith('task-1', { claimEnabled: true, finalAttempt: true })
+    expect(mocks.handoffApprovedWorkPackages).toHaveBeenCalledWith(
+      'task-1',
+      expect.objectContaining({ claimEnabled: true, finalAttempt: true }),
+    )
   })
 
   it('keeps broker-blocked handoff recoverable instead of failing the task', async () => {
@@ -248,7 +258,9 @@ describe('processApproval handoff', () => {
 
     expect(mocks.dbUpdate).not.toHaveBeenCalled()
     expect(mocks.handoffApprovedWorkPackages).not.toHaveBeenCalled()
-    expect(mocks.completeTaskIfReviewGatesSatisfied).toHaveBeenCalledWith('task-1')
+    expect(mocks.completeTaskIfReviewGatesSatisfied).toHaveBeenCalledWith('task-1', expect.objectContaining({
+      assertOwned: expect.any(Function),
+    }))
     expect(mocks.publishTaskEvent).toHaveBeenCalledWith('task-1', 'task:handoff', expect.objectContaining({
       claimedPackageId: null,
       readyPackageIds: [],
@@ -256,6 +268,24 @@ describe('processApproval handoff', () => {
       reviewStatus: 'blocked',
       status: 'no_ready_packages',
     }))
+  })
+
+  it('propagates approval callback claim loss without ordinary failure persistence', async () => {
+    const fence = new ClaimLeaseFence()
+    mocks.dbSelect.mockReturnValue(chain([{ status: 'approved' }]))
+    mocks.previewWorkPackageHandoff.mockResolvedValue({
+      status: 'no_ready_packages', readyPackageIds: [], claimedPackageId: null,
+    })
+    mocks.completeTaskIfReviewGatesSatisfied.mockImplementation(async (_taskId, options) => {
+      fence.markLost()
+      options.assertOwned()
+      return { status: 'blocked' }
+    })
+
+    await expect(processApproval('task-1', { claimLeaseFence: fence })).rejects.toBeInstanceOf(ClaimLeaseLostError)
+
+    expect(mocks.dbUpdate).not.toHaveBeenCalled()
+    expect(mocks.publishTaskEvent).not.toHaveBeenCalled()
   })
 
   it('completes the task when no packages are ready because all review gates are satisfied', async () => {
@@ -269,7 +299,9 @@ describe('processApproval handoff', () => {
 
     await processApproval('task-1')
 
-    expect(mocks.completeTaskIfReviewGatesSatisfied).toHaveBeenCalledWith('task-1')
+    expect(mocks.completeTaskIfReviewGatesSatisfied).toHaveBeenCalledWith('task-1', expect.objectContaining({
+      assertOwned: expect.any(Function),
+    }))
     expect(mocks.publishTaskEvent).not.toHaveBeenCalledWith('task-1', 'task:handoff', expect.anything())
   })
 
@@ -290,7 +322,10 @@ describe('processApproval handoff', () => {
     await processApproval('task-1')
 
     expect(mocks.dbUpdate).not.toHaveBeenCalled()
-    expect(mocks.handoffApprovedWorkPackages).toHaveBeenCalledWith('task-1', { claimEnabled: false })
+    expect(mocks.handoffApprovedWorkPackages).toHaveBeenCalledWith(
+      'task-1',
+      expect.objectContaining({ claimEnabled: false }),
+    )
     expect(mocks.publishTaskEvent).toHaveBeenCalledWith('task-1', 'task:handoff', expect.objectContaining({
       claimedPackageId: null,
       readyPackageIds: ['pkg-1'],
@@ -311,7 +346,10 @@ describe('processApproval handoff', () => {
     expect(mocks.previewWorkPackageHandoff).not.toHaveBeenCalled()
     expect(mocks.handoffApprovedWorkPackages).not.toHaveBeenCalled()
     expect(mocks.dbUpdate).not.toHaveBeenCalled()
-    expect(mocks.progressWorkforce).toHaveBeenCalledWith('task-1', { claimEnabled: true, finalAttempt: true })
+    expect(mocks.progressWorkforce).toHaveBeenCalledWith(
+      'task-1',
+      expect.objectContaining({ claimEnabled: true, finalAttempt: true }),
+    )
     expect(mocks.publishTaskEvent).toHaveBeenCalledWith('task-1', 'task:handoff', expect.objectContaining({
       claimedPackageId: 'pkg-2',
       readyPackageIds: ['pkg-2'],
@@ -326,7 +364,10 @@ describe('processApproval handoff', () => {
     await expect(processApproval('task-1', { finalAttempt: false })).rejects.toThrow('handoff insert failed')
 
     expect(mocks.dbUpdate).not.toHaveBeenCalled()
-    expect(mocks.progressWorkforce).toHaveBeenCalledWith('task-1', { claimEnabled: true, finalAttempt: false })
+    expect(mocks.progressWorkforce).toHaveBeenCalledWith(
+      'task-1',
+      expect.objectContaining({ claimEnabled: true, finalAttempt: false }),
+    )
   })
 
   it('parks a running task back at approved when continuation hits a recoverable broker block', async () => {
@@ -366,7 +407,10 @@ describe('processApproval handoff', () => {
       errorMessage: 'handoff insert failed',
       status: 'failed',
     }))
-    expect(mocks.progressWorkforce).toHaveBeenCalledWith('task-1', { claimEnabled: true, finalAttempt: true })
+    expect(mocks.progressWorkforce).toHaveBeenCalledWith(
+      'task-1',
+      expect.objectContaining({ claimEnabled: true, finalAttempt: true }),
+    )
   })
 
   it('fails the task for terminal handoff safety blocks when handoff execution is disabled', async () => {
@@ -393,7 +437,10 @@ describe('processApproval handoff', () => {
       errorMessage: 'Architect-assigned "security" work packages are reserved for review gates and cannot execute.',
       status: 'failed',
     }))
-    expect(mocks.handoffApprovedWorkPackages).toHaveBeenCalledWith('task-1', { claimEnabled: false })
+    expect(mocks.handoffApprovedWorkPackages).toHaveBeenCalledWith(
+      'task-1',
+      expect.objectContaining({ claimEnabled: false }),
+    )
     expect(mocks.publishTaskEvent).toHaveBeenCalledWith('task-1', 'task:handoff', expect.objectContaining({
       blockedReason: 'Architect-assigned "security" work packages are reserved for review gates and cannot execute.',
       claimedPackageId: null,
