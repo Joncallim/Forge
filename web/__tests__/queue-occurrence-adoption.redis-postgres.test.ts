@@ -220,12 +220,53 @@ function architectPlan(): string {
   ].join('\n')
 }
 
-function parseOccurrence(raw: string): { occurrenceId: string } {
-  const value = JSON.parse(raw) as { occurrenceId?: unknown }
-  if (typeof value.occurrenceId !== 'string') {
-    throw new Error('Queue adoption proof observed an invalid occurrence envelope.')
+const CANONICAL_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+
+function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  const actual = Object.keys(value).sort()
+  const expected = [...keys].sort()
+  return actual.length === expected.length && actual.every((key, index) => key === expected[index])
+}
+
+function parseClaimedOccurrence(
+  raw: string,
+  kind: QueueKind,
+  expectedTaskId: string,
+): { occurrenceId: string } | null {
+  try {
+    const value = JSON.parse(raw) as unknown
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+    const envelope = value as Record<string, unknown>
+    if (!hasExactKeys(envelope, ['schemaVersion', 'occurrenceId', 'job'])
+      || envelope.schemaVersion !== 1
+      || typeof envelope.occurrenceId !== 'string'
+      || !CANONICAL_UUID_PATTERN.test(envelope.occurrenceId)
+      || !envelope.job || typeof envelope.job !== 'object' || Array.isArray(envelope.job)) {
+      return null
+    }
+    const job = envelope.job as Record<string, unknown>
+    const expectedJobKeys = kind === 'approval'
+      ? ['taskId', 'action', 'attempt']
+      : ['taskId', 'attempt']
+    const attempt = job.attempt
+    if (!hasExactKeys(job, expectedJobKeys)
+      || job.taskId !== expectedTaskId
+      || typeof attempt !== 'number' || !Number.isSafeInteger(attempt) || attempt < 1
+      || (kind === 'approval' && job.action !== 'approve')) {
+      return null
+    }
+    const canonicalJob = kind === 'approval'
+      ? { taskId: job.taskId, action: job.action, attempt: job.attempt }
+      : { taskId: job.taskId, attempt: job.attempt }
+    const canonical = JSON.stringify({
+      schemaVersion: 1,
+      occurrenceId: envelope.occurrenceId,
+      job: canonicalJob,
+    })
+    return canonical === raw ? { occurrenceId: envelope.occurrenceId } : null
+  } catch {
+    return null
   }
-  return { occurrenceId: value.occurrenceId }
 }
 
 function markerNonce(marker: string): string {
@@ -273,6 +314,20 @@ function answerFailureDiagnosticSnapshot(input: {
 }
 
 describe('queue occurrence adoption diagnostic redaction', () => {
+  it('ignores a transient legacy processing payload until the canonical target envelope arrives', () => {
+    const taskId = '11111111-1111-4111-8111-111111111111'
+    const occurrenceId = '22222222-2222-4222-8222-222222222222'
+    const transientLegacy = JSON.stringify({ attempt: 1, taskId })
+    const canonical = JSON.stringify({
+      schemaVersion: 1,
+      occurrenceId,
+      job: { taskId, attempt: 1 },
+    })
+
+    expect(parseClaimedOccurrence(transientLegacy, 'task', taskId)).toBeNull()
+    expect(parseClaimedOccurrence(canonical, 'task', taskId)).toEqual({ occurrenceId })
+  })
+
   it('never emits hostile failure values or value-derived surrogates', () => {
     const hostilePlan = 'HOSTILE_PLAN_TEXT'
     const hostileAnswer = 'HOSTILE_ANSWER_TEXT'
@@ -501,19 +556,24 @@ describe.skipIf(!enabled)('queue occurrence adoption with production runtimes', 
     return (row?.count ?? 0) > 0
   }
 
-  async function claimedOccurrence(kind: QueueKind): Promise<{
+  async function claimedOccurrence(kind: QueueKind, expectedTaskId: string): Promise<{
     marker: string
     occurrenceId: string
     raw: string
   }> {
     const coordinates = COORDINATES[kind]
     const raw = await eventually(
-      () => redis.lindex(coordinates.processing, 0),
+      async () => {
+        const entries = await redis.lrange(coordinates.processing, 0, 15)
+        return entries.find((entry) => parseClaimedOccurrence(entry, kind, expectedTaskId) !== null) ?? null
+      },
       (value): value is string => typeof value === 'string',
-      'Queue adoption proof did not observe the first processing occurrence.',
+      'Queue adoption proof did not observe the canonical processing occurrence.',
     )
-    if (raw === null) throw new Error('Queue adoption proof lost its processing occurrence.')
-    const { occurrenceId } = parseOccurrence(raw)
+    if (raw === null) throw new Error('Queue adoption proof lost its canonical processing occurrence.')
+    const occurrence = parseClaimedOccurrence(raw, kind, expectedTaskId)
+    if (!occurrence) throw new Error('Queue adoption proof lost its canonical processing occurrence.')
+    const { occurrenceId } = occurrence
     const marker = await eventually(
       () => redis.hget(coordinates.claims, occurrenceId),
       (value): value is string => typeof value === 'string',
@@ -1009,7 +1069,7 @@ describe.skipIf(!enabled)('queue occurrence adoption with production runtimes', 
         Boolean,
         'Queue adoption proof did not persist the first running attempt.',
       )
-      const first = await claimedOccurrence(kind)
+      const first = await claimedOccurrence(kind, taskId)
 
       const runtimeB = await importRuntime()
       delete (globalThis as typeof globalThis & { forgeWorkerRuntime?: unknown }).forgeWorkerRuntime
@@ -1089,7 +1149,7 @@ describe.skipIf(!enabled)('queue occurrence adoption with production runtimes', 
         (count) => count > 0,
         'Approval adoption proof did not observe the first production handler boundary.',
       )
-      const first = await claimedOccurrence('approval')
+      const first = await claimedOccurrence('approval', taskId)
 
       const runtimeB = await importRuntime()
       delete (globalThis as typeof globalThis & { forgeWorkerRuntime?: unknown }).forgeWorkerRuntime
@@ -1149,7 +1209,7 @@ describe.skipIf(!enabled)('queue occurrence adoption with production runtimes', 
     const handleA = await runtimeA.startWorker('standalone')
     handles.add(handleA)
     await enqueue('task', taskId)
-    const first = await claimedOccurrence('task')
+    const first = await claimedOccurrence('task', taskId)
     await eventually(
       () => occurrenceAttempts(taskId, first.occurrenceId),
       (statuses) => statuses.length === 1 && statuses[0] === 'indeterminate',
