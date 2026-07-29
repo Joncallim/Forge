@@ -534,6 +534,17 @@ describe.skipIf(!enabled)('queue occurrence adoption with production runtimes', 
         planVersion: '1', taskId,
       })
       await sql`
+        UPDATE artifacts
+        SET metadata = ${JSON.stringify({
+          entryCount: 3,
+          historyAvailable: true,
+          planVersion: '1',
+          schemaVersion: 1,
+          stage: 'architect_plan',
+        })}::jsonb
+        WHERE id = ${source.artifactId}::uuid
+      `
+      await sql`
         INSERT INTO task_questions (id, task_id, question_entry_id, source_plan_artifact_id, source_plan_version, status)
         VALUES (${questionId}::uuid, ${taskId}::uuid, ${`clarification_question:${questionId}`}, ${source.artifactId}::uuid, 1, 'open')
       `
@@ -761,8 +772,8 @@ describe.skipIf(!enabled)('queue occurrence adoption with production runtimes', 
             usage: Promise.resolve({ inputTokens: 1, outputTokens: 1 }),
           }
         }
-        if (providerCalls === 2 || (kind === 'answers' && providerCalls > 2)) {
-          if (providerCalls === 2) recoveredProviderStarted()
+        if (providerCalls === 2) {
+          recoveredProviderStarted()
           return {
             textStream: {
               async *[Symbol.asyncIterator]() {
