@@ -21,6 +21,7 @@ type RedisHarnessInstance = {
   zrangebyscore: ReturnType<typeof vi.fn>
   zrem: ReturnType<typeof vi.fn>
   emit: (event: string, value: unknown) => boolean
+  options?: Record<string, unknown>
 }
 
 type InjectedRedisFailure = {
@@ -53,6 +54,13 @@ type AtomicQueue = {
 }
 
 class TestRetryPromotionConflictError extends Error {}
+class TestQueueStaleOwnerError extends Error {
+  readonly code = 'queue_stale_not_owner'
+}
+
+const testQueueRuntimeExports = {
+  NODE_TIMER_MAX_MS: 2_147_483_647,
+}
 
 const redisHarness = vi.hoisted(() => ({
   claimPayloads: [] as Array<string | null>,
@@ -103,6 +111,7 @@ vi.mock('ioredis', () => {
 
   class RedisMock {
     private readonly listeners = new Map<string, Array<(value: unknown) => void>>()
+    readonly options?: Record<string, unknown>
     brpoplpush = vi.fn(async (source: string, destination: string) => {
       const queued = redisHarness.claimPayloads.length > 0
         ? redisHarness.claimPayloads.shift() ?? null
@@ -421,7 +430,8 @@ vi.mock('ioredis', () => {
     zrem = vi.fn().mockResolvedValue(1)
     disconnect = vi.fn()
 
-    constructor() {
+    constructor(_url?: string, options?: Record<string, unknown>) {
+      this.options = options
       redisHarness.instances.push(this)
     }
 
@@ -510,6 +520,38 @@ afterEach(() => {
 })
 
 describe('core operational output closure', () => {
+  it('rejects unsupported queue timer values before constructing Redis', async () => {
+    const { NODE_TIMER_MAX_MS, TaskQueue } = await import('@/worker/queue')
+    const before = redisHarness.instances.length
+    const queue = new TaskQueue('redis://localhost:6379/0', {
+      commandTimeoutMs: NODE_TIMER_MAX_MS,
+    })
+    expect(redisHarness.instances).toHaveLength(before + 1)
+    expect(redisHarness.instances.at(-1)?.options).toMatchObject({
+      commandTimeout: NODE_TIMER_MAX_MS,
+      connectTimeout: NODE_TIMER_MAX_MS,
+    })
+    queue.disconnect()
+
+    const invalidValues = [
+      0,
+      -1,
+      1.5,
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+      NODE_TIMER_MAX_MS + 1,
+      Number.MAX_SAFE_INTEGER,
+    ]
+    for (const commandTimeoutMs of invalidValues) {
+      const countBeforeFailure = redisHarness.instances.length
+      expect(() => new TaskQueue('redis://localhost:6379/0', { commandTimeoutMs }))
+        .toThrow(
+          'Queue Redis command timeout must be a positive safe integer within the Node timer range',
+        )
+      expect(redisHarness.instances).toHaveLength(countBeforeFailure)
+    }
+  })
+
   it('turns Redis connection errors into fixed, non-disclosing categories', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
     const { redis } = await import('@/lib/redis')
@@ -2044,6 +2086,7 @@ describe('core operational output closure', () => {
         }
 
         vi.doMock('@/worker/queue', () => ({
+          ...testQueueRuntimeExports,
           AnswersQueue: queueClass('answers'),
           ApprovalQueue: queueClass('approvals'),
           RetryPromotionConflictError: TestRetryPromotionConflictError,
@@ -2092,6 +2135,7 @@ describe('core operational output closure', () => {
         }
 
         vi.doMock('@/worker/queue', () => ({
+          ...testQueueRuntimeExports,
           AnswersQueue: FatalPromotionQueue,
           ApprovalQueue: FatalPromotionQueue,
           RetryPromotionConflictError: TestRetryPromotionConflictError,
@@ -2225,6 +2269,7 @@ describe('core operational output closure', () => {
           }
         }
         vi.doMock('@/worker/queue', () => ({
+          ...testQueueRuntimeExports,
           AnswersQueue: queueClass('answers'),
           ApprovalQueue: queueClass('approval'),
           RetryPromotionConflictError: TestRetryPromotionConflictError,
@@ -2368,6 +2413,7 @@ describe('core operational output closure', () => {
           retry = kind === position ? targetRetry : vi.fn()
         }
         vi.doMock('@/worker/queue', () => ({
+          ...testQueueRuntimeExports,
           AnswersQueue: queueClass('answers'),
           ApprovalQueue: queueClass('approval'),
           RetryPromotionConflictError: TestRetryPromotionConflictError,
@@ -2545,6 +2591,7 @@ describe('core operational output closure', () => {
             retry = kind === position ? queueOperations.retry : vi.fn()
           }
           vi.doMock('@/worker/queue', () => ({
+            ...testQueueRuntimeExports,
             AnswersQueue: queueClass('answers'),
             ApprovalQueue: queueClass('approval'),
             RetryPromotionConflictError: TestRetryPromotionConflictError,
@@ -2666,6 +2713,252 @@ describe('core operational output closure', () => {
     }
   }, 30_000)
 
+  it('keeps the authority watchdog armed through terminal reconciliation and typed stale loss', async () => {
+    const workerEnvNames = [
+      'FORGE_WORKER_CLAIM_TIMEOUT_SECONDS',
+      'FORGE_WORKER_MAX_ATTEMPTS',
+      'FORGE_WORKER_REDIS_COMMAND_TIMEOUT_MS',
+      'FORGE_WORKER_SHUTDOWN_TIMEOUT_MS',
+      'FORGE_WORKER_STUCK_JOB_RECOVERY_SECONDS',
+      'FORGE_PROVIDER_HEALTH_INTERVAL_SECONDS',
+      'FORGE_BLOCKED_HANDOFF_SWEEP_INTERVAL_SECONDS',
+      'FORGE_SESSION_CACHE_PURGE_INTERVAL_SECONDS',
+    ] as const
+    const workerEnv = Object.fromEntries(workerEnvNames.map((name) => [name, process.env[name]]))
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    vi.spyOn(console, 'info').mockImplementation(() => {})
+    const consoleWarn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const scenarios = [
+      { operation: 'ack', position: 'task', typedStale: false },
+      { operation: 'dead_letter', position: 'approval', typedStale: false },
+      { operation: 'retry_reconciliation', position: 'answers', typedStale: false },
+      { operation: 'ack', position: 'approval', typedStale: true },
+    ] as const
+    const query = (rows: unknown[]) => {
+      const chain: Record<string, unknown> = {
+        then: (resolve: (value: unknown[]) => unknown, reject?: (reason: unknown) => unknown) =>
+          Promise.resolve(rows).then(resolve, reject),
+      }
+      for (const method of ['from', 'innerJoin', 'where', 'limit']) chain[method] = () => chain
+      return chain
+    }
+
+    process.env.FORGE_WORKER_CLAIM_TIMEOUT_SECONDS = '1'
+    process.env.FORGE_WORKER_MAX_ATTEMPTS = '3'
+    process.env.FORGE_WORKER_REDIS_COMMAND_TIMEOUT_MS = '2000'
+    process.env.FORGE_WORKER_SHUTDOWN_TIMEOUT_MS = '200'
+    process.env.FORGE_WORKER_STUCK_JOB_RECOVERY_SECONDS = '1'
+    process.env.FORGE_PROVIDER_HEALTH_INTERVAL_SECONDS = '0'
+    process.env.FORGE_BLOCKED_HANDOFF_SWEEP_INTERVAL_SECONDS = '0'
+    process.env.FORGE_SESSION_CACHE_PURGE_INTERVAL_SECONDS = '0'
+
+    try {
+      for (const scenario of scenarios) {
+        vi.resetModules()
+        delete (globalThis as typeof globalThis & { forgeWorkerRuntime?: unknown })
+          .forgeWorkerRuntime
+        consoleError.mockClear()
+        consoleWarn.mockClear()
+
+        const job = scenario.position === 'approval'
+          ? {
+              action: 'approve' as const,
+              attempt: scenario.operation === 'dead_letter' ? 3 : 1,
+              taskId: TASK_ID,
+            }
+          : { attempt: 1, taskId: TASK_ID }
+        const raw = JSON.stringify({
+          schemaVersion: 1,
+          occurrenceId: randomUUID(),
+          job,
+        })
+        let claimCount = 0
+        let markTerminalEntered!: () => void
+        const terminalEntered = new Promise<void>((resolve) => {
+          markTerminalEntered = resolve
+        })
+        let rejectTerminal!: (error: Error) => void
+        const stalledTerminal = vi.fn(async () => await new Promise<never>((_resolve, reject) => {
+          rejectTerminal = reject
+          markTerminalEntered()
+        }))
+        const staleTerminal = vi.fn(async () => {
+          markTerminalEntered()
+          throw new TestQueueStaleOwnerError()
+        })
+        const selectedTerminal = scenario.typedStale ? staleTerminal : stalledTerminal
+        const terminalOperations = {
+          ack: scenario.operation === 'ack'
+            ? selectedTerminal
+            : vi.fn().mockResolvedValue('applied'),
+          deadLetter: scenario.operation === 'dead_letter'
+            ? selectedTerminal
+            : vi.fn().mockResolvedValue('applied'),
+          retry: scenario.operation === 'retry_reconciliation'
+            ? vi.fn()
+                .mockRejectedValueOnce(hostileError())
+                .mockImplementationOnce(stalledTerminal)
+            : vi.fn().mockResolvedValue({
+                nextRetryAt: new Date(1_800_000_000_000),
+                outcome: 'applied',
+              }),
+        }
+        const renewClaim = vi.fn().mockResolvedValue('renewed')
+        const queueInstances: Array<{ disconnect: ReturnType<typeof vi.fn> }> = []
+        const queueClass = (kind: typeof scenario.position) => class {
+          ack = kind === scenario.position ? terminalOperations.ack : vi.fn()
+          claim = vi.fn(async () => {
+            if (kind !== scenario.position) return null
+            claimCount += 1
+            if (claimCount === 1) {
+              return {
+                job,
+                occurrenceId: JSON.parse(raw).occurrenceId as string,
+                raw,
+              }
+            }
+            return await new Promise<null>((resolve) => setTimeout(() => resolve(null), 5))
+          })
+          deadLetter = kind === scenario.position
+            ? terminalOperations.deadLetter
+            : vi.fn()
+          disconnect = vi.fn()
+          promoteDueRetries = vi.fn().mockResolvedValue(0)
+          recoverStuckJobs = vi.fn().mockResolvedValue(0)
+          release = vi.fn().mockResolvedValue('applied')
+          renewClaim = kind === scenario.position
+            ? renewClaim
+            : vi.fn().mockResolvedValue('renewed')
+          retry = kind === scenario.position ? terminalOperations.retry : vi.fn()
+
+          constructor() {
+            queueInstances.push({ disconnect: this.disconnect })
+          }
+        }
+        vi.doMock('@/worker/queue', () => ({
+          ...testQueueRuntimeExports,
+          AnswersQueue: queueClass('answers'),
+          ApprovalQueue: queueClass('approval'),
+          RetryPromotionConflictError: TestRetryPromotionConflictError,
+          TaskQueue: queueClass('task'),
+        }))
+
+        let observedFence: { lost: boolean } | null = null
+        const business = vi.fn(async (
+          _taskId: string,
+          options: { claimLeaseFence: { lost: boolean } },
+        ) => {
+          observedFence = options.claimLeaseFence
+          if (scenario.operation === 'dead_letter'
+            || scenario.operation === 'retry_reconciliation') {
+            throw new Error('retained business failure')
+          }
+          return 'completed' as const
+        })
+        vi.doMock('@/worker/orchestrator', () => ({
+          processAnsweredQuestions: scenario.position === 'answers' ? business : vi.fn(),
+          processApproval: scenario.position === 'approval' ? business : vi.fn(),
+          processTask: scenario.position === 'task' ? business : vi.fn(),
+        }))
+        const finishTaskAttempt = vi.fn().mockResolvedValue(undefined)
+        const startTaskAttempt = vi.fn().mockResolvedValue({
+          attemptId: `${scenario.position}-${scenario.operation}-attempt`,
+          recoveredOccurrence: false,
+        })
+        vi.doMock('@/worker/task-attempts', () => ({
+          finishTaskAttempt,
+          startTaskAttempt,
+        }))
+        vi.doMock('@/db', () => ({
+          db: { select: vi.fn(() => query([{ id: TASK_ID }])) },
+        }))
+        vi.doMock('@/db/schema', () => ({
+          tasks: { id: 'tasks.id', status: 'tasks.status' },
+          workPackages: {
+            metadata: 'work_packages.metadata',
+            status: 'work_packages.status',
+            taskId: 'work_packages.task_id',
+          },
+        }))
+        vi.doMock('drizzle-orm', () => ({ and: vi.fn(), eq: vi.fn() }))
+        vi.doMock('@/worker/blocked-handoff-retry', () => ({
+          enqueueDueBlockedHandoffRetries: vi.fn().mockResolvedValue(0),
+        }))
+        vi.doMock('@/lib/mcps/filesystem-grant-reconciliation', () => ({
+          convergeRecognizedOperatorHolds: vi.fn().mockResolvedValue(0),
+        }))
+        vi.doMock('@/worker/work-package-handoff', () => ({
+          reconcilePendingS4CompletionHandoffs: vi.fn().mockResolvedValue(0),
+        }))
+        vi.doMock('@/lib/session', () => ({
+          reconcilePendingSessionCacheInvalidations: vi.fn().mockResolvedValue({
+            claimed: 0,
+            completed: 0,
+            deferred: 0,
+            stale: 0,
+          }),
+        }))
+
+        const { startWorker } = await import('@/worker/runtime')
+        const handle = await startWorker('standalone')
+        await terminalEntered
+
+        if (scenario.typedStale) {
+          await vi.waitFor(() => {
+            expect(consoleWarn).toHaveBeenCalledWith(
+              '[worker] Queue claim lease lost',
+              expect.objectContaining({
+                phase: 'claim_lease_lost',
+                queueName: scenario.position,
+              }),
+            )
+          })
+          expect(consoleError).not.toHaveBeenCalledWith(
+            '[worker] Queue infrastructure failure',
+            expect.objectContaining({ phase: 'ack_after_success' }),
+          )
+        } else {
+          await vi.waitFor(() => {
+            expect(consoleError).toHaveBeenCalledWith(
+              '[worker] Queue infrastructure failure',
+              expect.objectContaining({
+                phase: 'claim_renewal_deadline',
+                queueName: scenario.position,
+              }),
+            )
+          }, { timeout: 2_000 })
+          rejectTerminal(hostileError())
+        }
+
+        await vi.waitFor(() => {
+          expect((observedFence as { lost: boolean } | null)?.lost).toBe(true)
+        })
+        const finishCountAfterLoss = finishTaskAttempt.mock.calls.length
+        await new Promise((resolve) => setTimeout(resolve, 20))
+        expect(finishTaskAttempt).toHaveBeenCalledTimes(finishCountAfterLoss)
+        if (scenario.operation === 'retry_reconciliation') {
+          expect(finishTaskAttempt).not.toHaveBeenCalledWith(
+            expect.objectContaining({ status: 'indeterminate' }),
+          )
+          expect(terminalOperations.retry).toHaveBeenCalledTimes(2)
+        }
+        expect(renewClaim).toHaveBeenCalledOnce()
+        assertNoSentinels(consoleError.mock.calls)
+        assertNoSentinels(consoleWarn.mock.calls)
+        await handle.stop()
+        await expect(handle.done).resolves.toBeUndefined()
+        expect(queueInstances.every((entry) => entry.disconnect.mock.calls.length === 1))
+          .toBe(true)
+      }
+    } finally {
+      for (const name of workerEnvNames) {
+        const value = workerEnv[name]
+        if (value === undefined) delete process.env[name]
+        else process.env[name] = value
+      }
+    }
+  }, 20_000)
+
   it('reconciles one ambiguous retry before persisting the queue-authoritative deadline', async () => {
     const workerEnvNames = [
       'FORGE_WORKER_MAX_ATTEMPTS',
@@ -2786,6 +3079,7 @@ describe('core operational output closure', () => {
     vi.resetModules()
     delete (globalThis as typeof globalThis & { forgeWorkerRuntime?: unknown }).forgeWorkerRuntime
     vi.doMock('@/worker/queue', () => ({
+      ...testQueueRuntimeExports,
       AnswersQueue: RuntimeAnswersQueue,
       ApprovalQueue: RuntimeApprovalQueue,
       RetryPromotionConflictError: TestRetryPromotionConflictError,
@@ -3096,6 +3390,7 @@ describe('core operational output closure', () => {
     vi.resetModules()
     delete (globalThis as typeof globalThis & { forgeWorkerRuntime?: unknown }).forgeWorkerRuntime
     vi.doMock('@/worker/queue', () => ({
+      ...testQueueRuntimeExports,
       AnswersQueue: RuntimeAnswersQueue,
       ApprovalQueue: RuntimeApprovalQueue,
       RetryPromotionConflictError: TestRetryPromotionConflictError,
@@ -3302,6 +3597,7 @@ describe('core operational output closure', () => {
         }
 
         vi.doMock('@/worker/queue', () => ({
+          ...testQueueRuntimeExports,
           AnswersQueue: queueClass('answers'),
           ApprovalQueue: queueClass('approval'),
           RetryPromotionConflictError: TestRetryPromotionConflictError,
@@ -3553,6 +3849,7 @@ describe('core operational output closure', () => {
           }
         }
         vi.doMock('@/worker/queue', () => ({
+          ...testQueueRuntimeExports,
           AnswersQueue: queueClass('answers'),
           ApprovalQueue: queueClass('approval'),
           RetryPromotionConflictError: TestRetryPromotionConflictError,
@@ -3669,11 +3966,208 @@ describe('core operational output closure', () => {
     }
   }, 20_000)
 
-  it('rejects incompatible queue-command and shutdown boundaries before clients start', async () => {
+  it('retires renewal scheduling when forced shutdown finds an already-lost non-cooperative claim', async () => {
     const workerEnvNames = [
       'FORGE_WORKER_CLAIM_TIMEOUT_SECONDS',
       'FORGE_WORKER_REDIS_COMMAND_TIMEOUT_MS',
       'FORGE_WORKER_SHUTDOWN_TIMEOUT_MS',
+      'FORGE_WORKER_STUCK_JOB_RECOVERY_SECONDS',
+      'FORGE_PROVIDER_HEALTH_INTERVAL_SECONDS',
+      'FORGE_BLOCKED_HANDOFF_SWEEP_INTERVAL_SECONDS',
+      'FORGE_SESSION_CACHE_PURGE_INTERVAL_SECONDS',
+    ] as const
+    const workerEnv = Object.fromEntries(workerEnvNames.map((name) => [name, process.env[name]]))
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    vi.spyOn(console, 'info').mockImplementation(() => {})
+    const consoleWarn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout')
+    const clearTimeoutSpy = vi.spyOn(globalThis, 'clearTimeout')
+    const query = (rows: unknown[]) => {
+      const chain: Record<string, unknown> = {
+        then: (resolve: (value: unknown[]) => unknown, reject?: (reason: unknown) => unknown) =>
+          Promise.resolve(rows).then(resolve, reject),
+      }
+      for (const method of ['from', 'innerJoin', 'where', 'limit']) chain[method] = () => chain
+      return chain
+    }
+
+    process.env.FORGE_WORKER_CLAIM_TIMEOUT_SECONDS = '1'
+    process.env.FORGE_WORKER_REDIS_COMMAND_TIMEOUT_MS = '2000'
+    process.env.FORGE_WORKER_SHUTDOWN_TIMEOUT_MS = '50'
+    process.env.FORGE_WORKER_STUCK_JOB_RECOVERY_SECONDS = '2'
+    process.env.FORGE_PROVIDER_HEALTH_INTERVAL_SECONDS = '0'
+    process.env.FORGE_BLOCKED_HANDOFF_SWEEP_INTERVAL_SECONDS = '0'
+    process.env.FORGE_SESSION_CACHE_PURGE_INTERVAL_SECONDS = '0'
+
+    try {
+      vi.resetModules()
+      delete (globalThis as typeof globalThis & { forgeWorkerRuntime?: unknown })
+        .forgeWorkerRuntime
+      const job = { attempt: 1, taskId: TASK_ID }
+      const raw = JSON.stringify({
+        schemaVersion: 1,
+        occurrenceId: randomUUID(),
+        job,
+      })
+      let claimCount = 0
+      const renewClaim = vi.fn()
+        .mockResolvedValueOnce('renewed')
+        .mockResolvedValueOnce('stale_not_owner')
+      const ack = vi.fn()
+      const disconnects: Array<ReturnType<typeof vi.fn>> = []
+      const queueClass = (kind: 'approval' | 'answers' | 'task') => class {
+        ack = kind === 'task' ? ack : vi.fn()
+        claim = vi.fn(async () => {
+          if (kind !== 'task') return null
+          claimCount += 1
+          if (claimCount === 1) {
+            return {
+              job,
+              occurrenceId: JSON.parse(raw).occurrenceId as string,
+              raw,
+            }
+          }
+          return await new Promise<null>((resolve) => setTimeout(() => resolve(null), 5))
+        })
+        deadLetter = vi.fn()
+        disconnect = vi.fn()
+        promoteDueRetries = vi.fn().mockResolvedValue(0)
+        recoverStuckJobs = vi.fn().mockResolvedValue(0)
+        release = vi.fn()
+        renewClaim = kind === 'task'
+          ? renewClaim
+          : vi.fn().mockResolvedValue('renewed')
+        retry = vi.fn()
+
+        constructor() {
+          disconnects.push(this.disconnect)
+        }
+      }
+      vi.doMock('@/worker/queue', () => ({
+        ...testQueueRuntimeExports,
+        AnswersQueue: queueClass('answers'),
+        ApprovalQueue: queueClass('approval'),
+        RetryPromotionConflictError: TestRetryPromotionConflictError,
+        TaskQueue: queueClass('task'),
+      }))
+      let releaseBusiness!: () => void
+      const businessGate = new Promise<void>((resolve) => {
+        releaseBusiness = resolve
+      })
+      const processTask = vi.fn(async () => {
+        await businessGate
+        return 'completed' as const
+      })
+      vi.doMock('@/worker/orchestrator', () => ({
+        processAnsweredQuestions: vi.fn(),
+        processApproval: vi.fn(),
+        processTask,
+      }))
+      const finishTaskAttempt = vi.fn()
+      const startTaskAttempt = vi.fn().mockResolvedValue({
+        attemptId: 'non-cooperative-attempt',
+        recoveredOccurrence: false,
+      })
+      vi.doMock('@/worker/task-attempts', () => ({
+        finishTaskAttempt,
+        startTaskAttempt,
+      }))
+      vi.doMock('@/db', () => ({
+        db: { select: vi.fn(() => query([{ id: TASK_ID }])) },
+      }))
+      vi.doMock('@/db/schema', () => ({
+        tasks: { id: 'tasks.id', status: 'tasks.status' },
+        workPackages: {
+          metadata: 'work_packages.metadata',
+          status: 'work_packages.status',
+          taskId: 'work_packages.task_id',
+        },
+      }))
+      vi.doMock('drizzle-orm', () => ({ and: vi.fn(), eq: vi.fn() }))
+      vi.doMock('@/worker/blocked-handoff-retry', () => ({
+        enqueueDueBlockedHandoffRetries: vi.fn().mockResolvedValue(0),
+      }))
+      vi.doMock('@/lib/mcps/filesystem-grant-reconciliation', () => ({
+        convergeRecognizedOperatorHolds: vi.fn().mockResolvedValue(0),
+      }))
+      vi.doMock('@/worker/work-package-handoff', () => ({
+        reconcilePendingS4CompletionHandoffs: vi.fn().mockResolvedValue(0),
+      }))
+      vi.doMock('@/lib/session', () => ({
+        reconcilePendingSessionCacheInvalidations: vi.fn().mockResolvedValue({
+          claimed: 0,
+          completed: 0,
+          deferred: 0,
+          stale: 0,
+        }),
+      }))
+
+      const { startWorker } = await import('@/worker/runtime')
+      const handle = await startWorker('standalone')
+      await vi.waitFor(() => expect(processTask).toHaveBeenCalledOnce())
+      const watchdogCallIndex = setTimeoutSpy.mock.calls.reduce(
+        (selected, call, index) =>
+          typeof call[1] === 'number' && call[1] > 1_500 && call[1] <= 2_100
+            ? index
+            : selected,
+        -1,
+      )
+      expect(watchdogCallIndex).toBeGreaterThanOrEqual(0)
+      const watchdogHandle = setTimeoutSpy.mock.results[watchdogCallIndex]?.value
+      expect(watchdogHandle).toBeDefined()
+      await vi.waitFor(() => {
+        expect(consoleWarn).toHaveBeenCalledWith(
+          '[worker] Queue claim lease lost',
+          expect.objectContaining({
+            phase: 'claim_lease_lost',
+            queueName: 'task',
+          }),
+        )
+      }, { timeout: 2_000 })
+      expect(renewClaim).toHaveBeenCalledTimes(2)
+      expect(clearTimeoutSpy.mock.calls.some(([handle]) => handle === watchdogHandle))
+        .toBe(false)
+
+      const stopStartedAt = Date.now()
+      await handle.stop()
+      expect(Date.now() - stopStartedAt).toBeLessThan(1_000)
+      expect(clearTimeoutSpy.mock.calls.some(([handle]) => handle === watchdogHandle))
+        .toBe(true)
+      expect(disconnects).toHaveLength(3)
+      expect(disconnects.every((disconnect) => disconnect.mock.calls.length === 1))
+        .toBe(true)
+      const renewalCountAfterStop = renewClaim.mock.calls.length
+      await new Promise((resolve) => setTimeout(resolve, 1_400))
+      expect(renewClaim).toHaveBeenCalledTimes(renewalCountAfterStop)
+      expect(finishTaskAttempt).not.toHaveBeenCalled()
+      expect(ack).not.toHaveBeenCalled()
+      assertNoSentinels(consoleError.mock.calls)
+      assertNoSentinels(consoleWarn.mock.calls)
+
+      releaseBusiness()
+      await expect(handle.done).resolves.toBeUndefined()
+      expect(finishTaskAttempt).not.toHaveBeenCalled()
+      expect(ack).not.toHaveBeenCalled()
+      expect(disconnects.every((disconnect) => disconnect.mock.calls.length === 1))
+        .toBe(true)
+    } finally {
+      for (const name of workerEnvNames) {
+        const value = workerEnv[name]
+        if (value === undefined) delete process.env[name]
+        else process.env[name] = value
+      }
+    }
+  }, 10_000)
+
+  it('validates every runtime timer boundary before queue clients start', async () => {
+    const workerEnvNames = [
+      'FORGE_WORKER_CLAIM_TIMEOUT_SECONDS',
+      'FORGE_WORKER_REDIS_COMMAND_TIMEOUT_MS',
+      'FORGE_WORKER_SHUTDOWN_TIMEOUT_MS',
+      'FORGE_WORKER_STUCK_JOB_RECOVERY_SECONDS',
+      'FORGE_PROVIDER_HEALTH_INTERVAL_SECONDS',
+      'FORGE_BLOCKED_HANDOFF_SWEEP_INTERVAL_SECONDS',
+      'FORGE_SESSION_CACHE_PURGE_INTERVAL_SECONDS',
     ] as const
     const workerEnv = Object.fromEntries(workerEnvNames.map((name) => [name, process.env[name]]))
     let constructed = 0
@@ -3683,6 +4177,7 @@ describe('core operational output closure', () => {
       }
     }
     vi.doMock('@/worker/queue', () => ({
+      ...testQueueRuntimeExports,
       AnswersQueue: UnusedQueue,
       ApprovalQueue: UnusedQueue,
       RetryPromotionConflictError: TestRetryPromotionConflictError,
@@ -3702,29 +4197,105 @@ describe('core operational output closure', () => {
     vi.doMock('drizzle-orm', () => ({ eq: vi.fn() }))
 
     try {
-      vi.resetModules()
-      delete (globalThis as typeof globalThis & { forgeWorkerRuntime?: unknown })
-        .forgeWorkerRuntime
-      process.env.FORGE_WORKER_CLAIM_TIMEOUT_SECONDS = '2'
-      process.env.FORGE_WORKER_REDIS_COMMAND_TIMEOUT_MS = '2000'
-      process.env.FORGE_WORKER_SHUTDOWN_TIMEOUT_MS = '100'
-      const runtime = await import('@/worker/runtime')
-      await expect(runtime.startWorker('standalone'))
-        .rejects.toThrow(
-          'FORGE_WORKER_REDIS_COMMAND_TIMEOUT_MS must exceed the task claim timeout',
-        )
-      expect(constructed).toBe(0)
+      const baseline = {
+        FORGE_BLOCKED_HANDOFF_SWEEP_INTERVAL_SECONDS: '0',
+        FORGE_PROVIDER_HEALTH_INTERVAL_SECONDS: '0',
+        FORGE_SESSION_CACHE_PURGE_INTERVAL_SECONDS: '0',
+        FORGE_WORKER_CLAIM_TIMEOUT_SECONDS: '1',
+        FORGE_WORKER_REDIS_COMMAND_TIMEOUT_MS: '2000',
+        FORGE_WORKER_SHUTDOWN_TIMEOUT_MS: '100',
+        FORGE_WORKER_STUCK_JOB_RECOVERY_SECONDS: '1',
+      }
+      const rejectedCases = [
+        {
+          env: {
+            FORGE_WORKER_CLAIM_TIMEOUT_SECONDS: '2',
+            FORGE_WORKER_REDIS_COMMAND_TIMEOUT_MS: '2000',
+          },
+          message: 'FORGE_WORKER_REDIS_COMMAND_TIMEOUT_MS must exceed the task claim timeout',
+        },
+        {
+          env: { FORGE_WORKER_SHUTDOWN_TIMEOUT_MS: '0' },
+          message: 'FORGE_WORKER_SHUTDOWN_TIMEOUT_MS must be a positive integer',
+        },
+        {
+          env: { FORGE_WORKER_SHUTDOWN_TIMEOUT_MS: '2147483648' },
+          message: 'FORGE_WORKER_SHUTDOWN_TIMEOUT_MS must be within the Node timer range',
+        },
+        {
+          env: { FORGE_WORKER_REDIS_COMMAND_TIMEOUT_MS: '2147483648' },
+          message: 'FORGE_WORKER_REDIS_COMMAND_TIMEOUT_MS must be within the Node timer range',
+        },
+        {
+          env: { FORGE_WORKER_CLAIM_TIMEOUT_SECONDS: '2147482.648' },
+          message: 'FORGE_WORKER_CLAIM_TIMEOUT_SECONDS exceeds the supported timer range',
+        },
+        {
+          env: { FORGE_WORKER_STUCK_JOB_RECOVERY_SECONDS: '2147484' },
+          message: 'FORGE_WORKER_STUCK_JOB_RECOVERY_SECONDS must be within the Node timer range',
+        },
+        {
+          env: { FORGE_PROVIDER_HEALTH_INTERVAL_SECONDS: '2147484' },
+          message: 'FORGE_PROVIDER_HEALTH_INTERVAL_SECONDS must be within the Node timer range',
+        },
+        {
+          env: { FORGE_BLOCKED_HANDOFF_SWEEP_INTERVAL_SECONDS: '2147484' },
+          message: 'FORGE_BLOCKED_HANDOFF_SWEEP_INTERVAL_SECONDS must be within the Node timer range',
+        },
+        {
+          env: { FORGE_SESSION_CACHE_PURGE_INTERVAL_SECONDS: '2147484' },
+          message: 'FORGE_SESSION_CACHE_PURGE_INTERVAL_SECONDS must be within the Node timer range',
+        },
+        {
+          env: { FORGE_WORKER_REDIS_COMMAND_TIMEOUT_MS: '1.5' },
+          message: 'FORGE_WORKER_REDIS_COMMAND_TIMEOUT_MS must be a positive integer',
+        },
+        {
+          env: { FORGE_WORKER_STUCK_JOB_RECOVERY_SECONDS: '1.5' },
+          message: 'FORGE_WORKER_STUCK_JOB_RECOVERY_SECONDS must be a positive integer',
+        },
+        {
+          env: { FORGE_PROVIDER_HEALTH_INTERVAL_SECONDS: '1.5' },
+          message: 'FORGE_PROVIDER_HEALTH_INTERVAL_SECONDS must be a non-negative integer',
+        },
+        {
+          env: { FORGE_WORKER_CLAIM_TIMEOUT_SECONDS: 'Infinity' },
+          message: 'FORGE_WORKER_CLAIM_TIMEOUT_SECONDS must be a positive number',
+        },
+        {
+          env: { FORGE_WORKER_REDIS_COMMAND_TIMEOUT_MS: '9007199254740992' },
+          message: 'FORGE_WORKER_REDIS_COMMAND_TIMEOUT_MS must be a positive integer',
+        },
+      ] as const
 
+      for (const scenario of rejectedCases) {
+        Object.assign(process.env, baseline, scenario.env)
+        vi.resetModules()
+        delete (globalThis as typeof globalThis & { forgeWorkerRuntime?: unknown })
+          .forgeWorkerRuntime
+        constructed = 0
+        const runtime = await import('@/worker/runtime')
+        await expect(runtime.startWorker('standalone')).rejects.toThrow(scenario.message)
+        expect(constructed, scenario.message).toBe(0)
+      }
+
+      Object.assign(process.env, baseline, {
+        FORGE_BLOCKED_HANDOFF_SWEEP_INTERVAL_SECONDS: '2147483',
+        FORGE_PROVIDER_HEALTH_INTERVAL_SECONDS: '2147483',
+        FORGE_SESSION_CACHE_PURGE_INTERVAL_SECONDS: '2147483',
+        FORGE_WORKER_CLAIM_TIMEOUT_SECONDS: '2147482.647',
+        FORGE_WORKER_REDIS_COMMAND_TIMEOUT_MS: '2147483647',
+        FORGE_WORKER_SHUTDOWN_TIMEOUT_MS: '2147483647',
+        FORGE_WORKER_STUCK_JOB_RECOVERY_SECONDS: '2147483',
+      })
       vi.resetModules()
       delete (globalThis as typeof globalThis & { forgeWorkerRuntime?: unknown })
         .forgeWorkerRuntime
       constructed = 0
-      process.env.FORGE_WORKER_REDIS_COMMAND_TIMEOUT_MS = '3000'
-      process.env.FORGE_WORKER_SHUTDOWN_TIMEOUT_MS = '0'
-      const invalidShutdownRuntime = await import('@/worker/runtime')
-      await expect(invalidShutdownRuntime.startWorker('standalone'))
-        .rejects.toThrow('FORGE_WORKER_SHUTDOWN_TIMEOUT_MS must be a positive integer')
-      expect(constructed).toBe(0)
+      const maximumRuntime = await import('@/worker/runtime')
+      const maximumHandle = await maximumRuntime.startWorker('standalone')
+      await maximumHandle.done.catch(() => {})
+      expect(constructed).toBe(3)
     } finally {
       for (const name of workerEnvNames) {
         const value = workerEnv[name]
@@ -3990,15 +4561,33 @@ describe('core output source sentinel', () => {
       /Retry promotion compatibility conflict[\s\S]{0,180}\b(?:error|message|stack|raw)\b/,
     )
     expect(runtimeSource).toContain('Math.floor(stuckJobRecoveryMs / 3)')
-    expect(runtimeSource).toContain('if (stopped || inFlight) return')
+    expect(runtimeSource).toContain('if (heartbeatPaused || inFlight) return')
     expect(runtimeSource).toMatch(
       /const pending = inFlight[\s\S]{0,300}Promise\.race\(\[\s+pending,/,
+    )
+    const heartbeatPause = runtimeSource.match(
+      /const pause = \(\): Promise<void> => \{[\s\S]*?return pausePromise\s+\}/,
+    )?.[0] ?? ''
+    expect(heartbeatPause).not.toBe('')
+    expect(heartbeatPause).toContain('pauseScheduling()')
+    expect(heartbeatPause).not.toContain('clearDeadlineTimer()')
+    expect(heartbeatPause).not.toContain('activeClaimRenewals.delete')
+    expect(runtimeSource).toMatch(
+      /dispose: \(\) => \{[\s\S]{0,220}pauseScheduling\(\)[\s\S]{0,120}clearDeadlineTimer\(\)[\s\S]{0,120}activeClaimRenewals\.delete\(control\)/,
+    )
+    expect(runtimeSource).toMatch(
+      /forceUnavailable: \(\) => \{\s+pauseScheduling\(\)\s+clearDeadlineTimer\(\)\s+markLost\('shutdown'\)/,
     )
     expect(queueSource).toContain('autoResendUnfulfilledCommands: false')
     expect(queueSource).toContain('commandTimeout: commandTimeoutMs')
     expect(queueSource).toContain('maxRetriesPerRequest: 1')
     expect(queueSource).not.toContain('maxRetriesPerRequest: null')
     expect(queueSource).toContain('this.client.disconnect(false)')
+    expect(queueSource).toContain('export const NODE_TIMER_MAX_MS = 2_147_483_647')
+    expect(queueSource).toContain('commandTimeoutMs > NODE_TIMER_MAX_MS')
+    expect(runtimeSource).toContain('const NODE_TIMER_MAX_MS = 2_147_483_647')
+    expect(runtimeSource).toContain('taskClaimTimeoutMs > NODE_TIMER_MAX_MS')
+    expect(runtimeSource).toContain('seconds > Math.floor(NODE_TIMER_MAX_MS / 1000)')
     expect(runtimeSource).toContain('const requestStartedAt = performance.now()')
     expect(runtimeSource).toContain(
       'safetyDeadline = requestStartedAt + stuckJobRecoveryMs',
@@ -4024,16 +4613,19 @@ describe('core output source sentinel', () => {
       /const drained = await Promise\.race\([\s\S]{0,500}if \(drained\) return[\s\S]{0,80}forceQueueShutdown\(\)/,
     )
     expect(runtimeSource).toMatch(
-      /const claimRenewal = await startClaimRenewal[\s\S]{0,500}acknowledgeMissingTaskJob/,
+      /const claimRenewal = await startClaimRenewal[\s\S]{0,900}acknowledgeMissingTaskJob/,
     )
     expect(runtimeSource).toMatch(
-      /finally \{\s+await stopClaimRenewal\(\)\s+activeClaimFences\.delete\(claimLeaseFence\)\s+\}/,
+      /finally \{\s+await pauseClaimRenewal\(\)\s+claimRenewal\.dispose\(\)\s+activeClaimFences\.delete\(claimLeaseFence\)\s+\}/,
     )
     expect(runtimeSource).toMatch(
-      /forceQueueShutdown[\s\S]{0,300}for \(const fence of activeClaimFences\) fence\.markLost\(\)[\s\S]{0,160}disconnectQueues\(\)/,
+      /forceQueueShutdown[\s\S]{0,300}for \(const renewal of activeClaimRenewals\) renewal\.forceUnavailable\(\)[\s\S]{0,160}for \(const fence of activeClaimFences\) fence\.markLost\(\)[\s\S]{0,160}disconnectQueues\(\)/,
     )
-    expect(runtimeSource.match(/await stopClaimRenewal\(\)[\s\S]{0,180}queue\.(?:ack|retry|deadLetter)/g))
+    expect(runtimeSource.match(/await pauseClaimRenewal\(\)[\s\S]{0,180}queue\.(?:ack|retry|deadLetter)/g))
       .toHaveLength(4)
+    expect(runtimeSource).toContain('if (!isTerminalStaleOwnerError(error)) return false')
+    expect(runtimeSource).toContain("code === 'queue_stale_not_owner'")
+    expect(queueSource).toContain('export class QueueStaleOwnerError extends Error')
     expect(queueSource).not.toMatch(
       /promoteDueRetries[\s\S]{0,300}this\.client\.zrangebyscore/,
     )

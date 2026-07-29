@@ -5,6 +5,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest
 import {
   AnswersQueue,
   ApprovalQueue,
+  isQueueStaleOwnerError,
   RetryPromotionConflictError,
   TaskQueue,
   type AnswersJob,
@@ -18,6 +19,18 @@ import {
   ClaimLeaseFence,
   ClaimLeaseLostError,
 } from '@/worker/claim-lease-fence'
+
+async function expectQueueStaleOwner(operation: Promise<unknown>): Promise<void> {
+  let rejected: unknown
+  try {
+    await operation
+  } catch (error) {
+    rejected = error
+  }
+  expect(isQueueStaleOwnerError(rejected)).toBe(true)
+  expect(rejected instanceof Error ? rejected.message : '')
+    .toBe('Queue transition stale_not_owner')
+}
 
 const QUEUE_KEYS = [
   'forge:tasks',
@@ -1867,11 +1880,11 @@ describe.skipIf(!enabled)('queue occurrence and recovery real Redis proof', () =
         expect(nextOwner.occurrenceId).toBe(staleOwner.claimed.occurrenceId)
 
         if (terminalKind === 'retry') {
-          await expect(staleOwner.owner.retry(
+          await expectQueueStaleOwner(staleOwner.owner.retry(
             staleOwner.claimed.raw,
             staleOwner.claimed.job,
             60_000,
-          )).rejects.toThrow('Queue transition stale_not_owner')
+          ))
           expect(await admin.zcard(renewalCase.retry)).toBe(0)
           await expect(nextOwnerQueue.retry(
             nextOwner.raw,
@@ -1880,10 +1893,10 @@ describe.skipIf(!enabled)('queue occurrence and recovery real Redis proof', () =
           )).resolves.toMatchObject({ outcome: 'applied' })
           expect(await admin.zcard(renewalCase.retry)).toBe(1)
         } else {
-          await expect(staleOwner.owner.deadLetter(
+          await expectQueueStaleOwner(staleOwner.owner.deadLetter(
             staleOwner.claimed.raw,
             staleOwner.claimed.job,
-          )).rejects.toThrow('Queue transition stale_not_owner')
+          ))
           expect(await admin.llen(renewalCase.dead)).toBe(0)
           await expect(nextOwnerQueue.deadLetter(nextOwner.raw, nextOwner.job))
             .resolves.toBe('applied')
@@ -2085,6 +2098,8 @@ describe.skipIf(!enabled)('queue occurrence and recovery real Redis proof', () =
         vi.doMock('@/worker/queue', () => ({
           AnswersQueue: IdleAnswersQueue,
           ApprovalQueue: IdleApprovalQueue,
+          isQueueStaleOwnerError,
+          NODE_TIMER_MAX_MS: 2_147_483_647,
           RetryPromotionConflictError,
           TaskQueue: IdleTaskQueue,
         }))

@@ -18,6 +18,7 @@ const MIN_CLAIM_RENEWAL_INTERVAL_MS = 100
 const MAX_QUEUE_RECOVERY_INTERVAL_MS = 60_000
 const MIN_QUEUE_COMMAND_TIMEOUT_HEADROOM_MS = 1_000
 const DEFAULT_QUEUE_COMMAND_TIMEOUT_HEADROOM_MS = 5_000
+const NODE_TIMER_MAX_MS = 2_147_483_647
 // FORGE_WORKER_SHUTDOWN_TIMEOUT_MS defaults to 30 seconds: healthy work may
 // drain during this window before shutdown fences claims and closes Redis.
 const DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_MS = 30_000
@@ -78,11 +79,28 @@ function getNonNegativeIntegerEnv(name: string, defaultValue: number): number {
   if (!raw) return defaultValue
 
   const parsed = Number(raw)
-  if (!Number.isInteger(parsed) || parsed < 0) {
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
     throw new Error(`${name} must be a non-negative integer`)
   }
 
   return parsed
+}
+
+function getPositiveTimerMsEnv(name: string, defaultValue: number): number {
+  const value = getPositiveIntegerEnv(name, defaultValue)
+  if (value > NODE_TIMER_MAX_MS) {
+    throw new Error(`${name} must be within the Node timer range`)
+  }
+  return value
+}
+
+function timerSecondsToMs(name: string, seconds: number): number {
+  if (!Number.isSafeInteger(seconds)
+    || seconds < 0
+    || seconds > Math.floor(NODE_TIMER_MAX_MS / 1000)) {
+    throw new Error(`${name} must be within the Node timer range`)
+  }
+  return seconds * 1000
 }
 
 function backoffDelayMs(attempt: number): number {
@@ -91,6 +109,11 @@ function backoffDelayMs(attempt: number): number {
 
 function retainedErrorMessage(err: unknown): string {
   return sanitizeWorkerMessage(err instanceof Error ? err.message : String(err))
+}
+
+function isTerminalStaleOwnerError(error: unknown): boolean {
+  return error instanceof Error
+    && (error as Error & { code?: unknown }).code === 'queue_stale_not_owner'
 }
 
 export async function startWorker(source: WorkerSource = 'standalone'): Promise<WorkerHandle> {
@@ -135,32 +158,40 @@ async function startWorkerOnce(
   const claimTimeoutSeconds = getClaimTimeoutSeconds()
   const taskClaimTimeoutMs = Math.ceil(claimTimeoutSeconds * 1000)
   if (!Number.isSafeInteger(taskClaimTimeoutMs)
-    || taskClaimTimeoutMs > Number.MAX_SAFE_INTEGER - DEFAULT_QUEUE_COMMAND_TIMEOUT_HEADROOM_MS) {
-    throw new Error('FORGE_WORKER_CLAIM_TIMEOUT_SECONDS is too large')
+    || taskClaimTimeoutMs < 1
+    || taskClaimTimeoutMs > NODE_TIMER_MAX_MS - MIN_QUEUE_COMMAND_TIMEOUT_HEADROOM_MS) {
+    throw new Error(
+      'FORGE_WORKER_CLAIM_TIMEOUT_SECONDS exceeds the supported timer range',
+    )
   }
   const minimumQueueCommandTimeoutMs =
     taskClaimTimeoutMs + MIN_QUEUE_COMMAND_TIMEOUT_HEADROOM_MS
-  const queueCommandTimeoutMs = getPositiveIntegerEnv(
-    'FORGE_WORKER_REDIS_COMMAND_TIMEOUT_MS',
+  const defaultQueueCommandTimeoutMs = Math.min(
+    NODE_TIMER_MAX_MS,
     taskClaimTimeoutMs + DEFAULT_QUEUE_COMMAND_TIMEOUT_HEADROOM_MS,
+  )
+  const queueCommandTimeoutMs = getPositiveTimerMsEnv(
+    'FORGE_WORKER_REDIS_COMMAND_TIMEOUT_MS',
+    defaultQueueCommandTimeoutMs,
   )
   if (queueCommandTimeoutMs < minimumQueueCommandTimeoutMs) {
     throw new Error(
       'FORGE_WORKER_REDIS_COMMAND_TIMEOUT_MS must exceed the task claim timeout',
     )
   }
-  const gracefulShutdownTimeoutMs = getPositiveIntegerEnv(
+  const gracefulShutdownTimeoutMs = getPositiveTimerMsEnv(
     'FORGE_WORKER_SHUTDOWN_TIMEOUT_MS',
     DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_MS,
   )
-  const queueOptions = { commandTimeoutMs: queueCommandTimeoutMs }
-  const taskQueue = new TaskQueue(undefined, queueOptions)
-  const approvalQueue = new ApprovalQueue(undefined, queueOptions)
-  const answersQueue = new AnswersQueue(undefined, queueOptions)
   const maxAttempts = getPositiveIntegerEnv('FORGE_WORKER_MAX_ATTEMPTS', DEFAULT_MAX_ATTEMPTS)
-  const stuckJobRecoveryMs =
-    getPositiveIntegerEnv('FORGE_WORKER_STUCK_JOB_RECOVERY_SECONDS', DEFAULT_STUCK_JOB_RECOVERY_SECONDS) *
-    1000
+  const stuckJobRecoverySeconds = getPositiveIntegerEnv(
+    'FORGE_WORKER_STUCK_JOB_RECOVERY_SECONDS',
+    DEFAULT_STUCK_JOB_RECOVERY_SECONDS,
+  )
+  const stuckJobRecoveryMs = timerSecondsToMs(
+    'FORGE_WORKER_STUCK_JOB_RECOVERY_SECONDS',
+    stuckJobRecoverySeconds,
+  )
   const claimRenewalIntervalMs = Math.max(
     MIN_CLAIM_RENEWAL_INTERVAL_MS,
     Math.min(MAX_QUEUE_RECOVERY_INTERVAL_MS, Math.floor(stuckJobRecoveryMs / 3)),
@@ -177,6 +208,22 @@ async function startWorkerOnce(
     'FORGE_SESSION_CACHE_PURGE_INTERVAL_SECONDS',
     DEFAULT_SESSION_CACHE_PURGE_INTERVAL_SECONDS,
   )
+  const providerHealthIntervalMs = timerSecondsToMs(
+    'FORGE_PROVIDER_HEALTH_INTERVAL_SECONDS',
+    providerHealthIntervalSeconds,
+  )
+  const blockedHandoffSweepIntervalMs = timerSecondsToMs(
+    'FORGE_BLOCKED_HANDOFF_SWEEP_INTERVAL_SECONDS',
+    blockedHandoffSweepIntervalSeconds,
+  )
+  const sessionCachePurgeIntervalMs = timerSecondsToMs(
+    'FORGE_SESSION_CACHE_PURGE_INTERVAL_SECONDS',
+    sessionCachePurgeIntervalSeconds,
+  )
+  const queueOptions = { commandTimeoutMs: queueCommandTimeoutMs }
+  const taskQueue = new TaskQueue(undefined, queueOptions)
+  const approvalQueue = new ApprovalQueue(undefined, queueOptions)
+  const answersQueue = new AnswersQueue(undefined, queueOptions)
   const workerId = `${source}-${process.pid}-${Date.now().toString(36)}`
   let shuttingDown = false
   let providerHealthTimer: ReturnType<typeof setInterval> | null = null
@@ -228,7 +275,9 @@ async function startWorkerOnce(
     | 'retain_for_adoption'
     | 'start'
   type ActiveClaimRenewal = {
+    dispose: () => void
     forceUnavailable: () => void
+    pause: () => Promise<void>
   }
   const activeClaimFences = new Set<ClaimLeaseFence>()
   const activeClaimRenewals = new Set<ActiveClaimRenewal>()
@@ -302,6 +351,12 @@ async function startWorkerOnce(
       })
       return 'acknowledged'
     } catch (err) {
+      if (isTerminalStaleOwnerError(err)) {
+        if (claimLeaseFence?.markLost()) {
+          logClaimLeaseLost(queueName, taskId)
+        }
+        return 'retained'
+      }
       if (claimLeaseFence?.lost || isClaimLeaseLostError(err)) return 'retained'
       logQueueInfrastructureFailure('ack_missing_task', queueName, taskId)
       return 'retained'
@@ -314,14 +369,18 @@ async function startWorkerOnce(
     queue: RuntimeQueue<TJob>
     queueName: QueueOperation
   }): Promise<{
+    dispose: () => void
+    forceUnavailable: () => void
+    pause: () => Promise<void>
     startDisposition: 'established' | 'lost' | 'unavailable'
-    stop: () => Promise<void>
   }> => {
     const { claimed, fence, queue, queueName } = input
-    let stopped = false
+    let disposed = false
+    let heartbeatPaused = false
     let timer: ReturnType<typeof setInterval> | null = null
     let deadlineTimer: ReturnType<typeof setTimeout> | null = null
     let inFlight: Promise<'lost' | 'renewed' | 'transient_error'> | null = null
+    let pausePromise: Promise<void> | null = null
     let safetyDeadline = 0
 
     const clearRenewalTimer = (): void => {
@@ -338,15 +397,14 @@ async function startWorkerOnce(
       }
     }
 
-    const stopScheduling = (): void => {
-      stopped = true
+    const pauseScheduling = (): void => {
+      heartbeatPaused = true
       clearRenewalTimer()
-      clearDeadlineTimer()
     }
 
     const markLost = (reason: 'deadline' | 'ownership' | 'shutdown'): void => {
+      pauseScheduling()
       if (!fence.markLost()) return
-      stopScheduling()
       if (reason === 'deadline') {
         logQueueInfrastructureFailure(
           'claim_renewal_deadline',
@@ -361,7 +419,7 @@ async function startWorkerOnce(
 
     const armDeadlineWatchdog = (): void => {
       clearDeadlineTimer()
-      if (stopped || fence.lost) return
+      if (disposed || fence.lost) return
       const remainingMs = Math.max(0, safetyDeadline - performance.now())
       deadlineTimer = setTimeout(() => {
         deadlineTimer = null
@@ -372,11 +430,6 @@ async function startWorkerOnce(
         armDeadlineWatchdog()
       }, remainingMs)
     }
-
-    const control: ActiveClaimRenewal = {
-      forceUnavailable: () => markLost('shutdown'),
-    }
-    activeClaimRenewals.add(control)
 
     const renew = async (
       phase: 'claim_renewal_initial' | 'claim_renewal_periodic',
@@ -399,7 +452,7 @@ async function startWorkerOnce(
         }
         if (result === 'renewed') {
           safetyDeadline = requestStartedAt + stuckJobRecoveryMs
-          if (!stopped) armDeadlineWatchdog()
+          armDeadlineWatchdog()
           return 'renewed'
         }
         markLost('ownership')
@@ -427,39 +480,14 @@ async function startWorkerOnce(
     }
 
     const tick = (): void => {
-      if (stopped || inFlight) return
+      if (heartbeatPaused || inFlight) return
       void beginRenewal('claim_renewal_periodic')
     }
 
-    const initialRenewal = beginRenewal('claim_renewal_initial')
-    const initialDisposition = await Promise.race([
-      initialRenewal,
-      new Promise<'lost'>((resolve) => {
-        if (fence.lost) {
-          resolve('lost')
-          return
-        }
-        fence.signal.addEventListener('abort', () => resolve('lost'), { once: true })
-      }),
-    ])
-    if (initialDisposition !== 'renewed') {
-      stopScheduling()
-      activeClaimRenewals.delete(control)
-    }
-
-    if (initialDisposition === 'renewed') {
-      timer = setInterval(tick, claimRenewalIntervalMs)
-    }
-
-    return {
-      startDisposition: initialDisposition === 'renewed'
-        ? 'established'
-        : initialDisposition === 'lost'
-          ? 'lost'
-          : 'unavailable',
-      stop: async (): Promise<void> => {
-        stopped = true
-        clearRenewalTimer()
+    const pause = (): Promise<void> => {
+      if (pausePromise) return pausePromise
+      pausePromise = (async () => {
+        pauseScheduling()
         const pending = inFlight
         if (pending && !fence.lost) {
           await Promise.race([
@@ -473,9 +501,56 @@ async function startWorkerOnce(
             }),
           ])
         }
+      })()
+      return pausePromise
+    }
+
+    const control: ActiveClaimRenewal = {
+      dispose: () => {
+        if (disposed) return
+        disposed = true
+        pauseScheduling()
         clearDeadlineTimer()
         activeClaimRenewals.delete(control)
       },
+      forceUnavailable: () => {
+        pauseScheduling()
+        clearDeadlineTimer()
+        markLost('shutdown')
+      },
+      pause,
+    }
+    activeClaimRenewals.add(control)
+
+    const initialRenewal = beginRenewal('claim_renewal_initial')
+    const initialDisposition = await Promise.race([
+      initialRenewal,
+      new Promise<'lost'>((resolve) => {
+        if (fence.lost) {
+          resolve('lost')
+          return
+        }
+        fence.signal.addEventListener('abort', () => resolve('lost'), { once: true })
+      }),
+    ])
+    if (initialDisposition !== 'renewed') {
+      pauseScheduling()
+      control.dispose()
+    }
+
+    if (initialDisposition === 'renewed') {
+      timer = setInterval(tick, claimRenewalIntervalMs)
+    }
+
+    return {
+      dispose: control.dispose,
+      forceUnavailable: control.forceUnavailable,
+      pause,
+      startDisposition: initialDisposition === 'renewed'
+        ? 'established'
+        : initialDisposition === 'lost'
+          ? 'lost'
+          : 'unavailable',
     }
   }
 
@@ -505,11 +580,15 @@ async function startWorkerOnce(
       activeClaimFences.delete(claimLeaseFence)
       return
     }
-    let claimRenewalStopped = false
-    const stopClaimRenewal = async (): Promise<void> => {
-      if (claimRenewalStopped) return
-      claimRenewalStopped = true
-      await claimRenewal.stop()
+    const pauseClaimRenewal = async (): Promise<void> => {
+      await claimRenewal.pause()
+    }
+    const terminalOwnershipLost = (error: unknown): boolean => {
+      if (!isTerminalStaleOwnerError(error)) return false
+      if (claimLeaseFence.markLost()) {
+        logClaimLeaseLost(queueName, job.taskId)
+      }
+      return true
     }
 
     try {
@@ -517,7 +596,7 @@ async function startWorkerOnce(
         queueName,
         job.taskId,
         async () => {
-          await stopClaimRenewal()
+          await pauseClaimRenewal()
           claimLeaseFence.assertOwned()
           return queue.ack(raw)
         },
@@ -578,7 +657,7 @@ async function startWorkerOnce(
             if (claimLeaseFence.lost || isClaimLeaseLostError(err)) return
             logAttemptInfrastructureFailure('retain_for_adoption', queueName, job.taskId)
           }
-          await stopClaimRenewal()
+          await pauseClaimRenewal()
           return
         }
         if (businessDisposition !== 'completed') {
@@ -608,11 +687,12 @@ async function startWorkerOnce(
             if (claimLeaseFence.lost || isClaimLeaseLostError(err)) return
             logAttemptInfrastructureFailure('finish_after_failure', queueName, job.taskId)
           }
-          await stopClaimRenewal()
+          await pauseClaimRenewal()
           claimLeaseFence.assertOwned()
           try {
             await queue.deadLetter(raw, job)
           } catch (err) {
+            if (terminalOwnershipLost(err)) return
             if (claimLeaseFence.lost || isClaimLeaseLostError(err)) return
             logQueueInfrastructureFailure('dead_letter', queueName, job.taskId)
           }
@@ -620,17 +700,19 @@ async function startWorkerOnce(
         }
 
         const retryDelayMs = backoffDelayMs(job.attempt)
-        await stopClaimRenewal()
+        await pauseClaimRenewal()
         claimLeaseFence.assertOwned()
         let retryResult: QueueRetryResult
         try {
           retryResult = await queue.retry(raw, job, retryDelayMs)
         } catch (err) {
+          if (terminalOwnershipLost(err)) return
           if (claimLeaseFence.lost || isClaimLeaseLostError(err)) return
           logQueueInfrastructureFailure('retry', queueName, job.taskId)
           try {
             retryResult = await queue.retry(raw, job, retryDelayMs)
           } catch (reconciliationError) {
+            if (terminalOwnershipLost(reconciliationError)) return
             if (claimLeaseFence.lost || isClaimLeaseLostError(reconciliationError)) return
             logQueueInfrastructureFailure('retry_reconciliation', queueName, job.taskId)
             claimLeaseFence.assertOwned()
@@ -670,11 +752,12 @@ async function startWorkerOnce(
         if (claimLeaseFence.lost || isClaimLeaseLostError(err)) return
         logAttemptInfrastructureFailure('finish_after_success', queueName, job.taskId)
       }
-      await stopClaimRenewal()
+      await pauseClaimRenewal()
       claimLeaseFence.assertOwned()
       try {
         await queue.ack(raw)
       } catch (err) {
+        if (terminalOwnershipLost(err)) return
         if (claimLeaseFence.lost || isClaimLeaseLostError(err)) return
         logQueueInfrastructureFailure('ack_after_success', queueName, job.taskId)
       }
@@ -682,7 +765,8 @@ async function startWorkerOnce(
       if (claimLeaseFence.lost || isClaimLeaseLostError(err)) return
       throw err
     } finally {
-      await stopClaimRenewal()
+      await pauseClaimRenewal()
+      claimRenewal.dispose()
       activeClaimFences.delete(claimLeaseFence)
     }
   }
@@ -708,7 +792,7 @@ async function startWorkerOnce(
     providerHealthRunning = true
     try {
       const { refreshStaleProviderHealth } = await import('../lib/providers/health')
-      const checked = await refreshStaleProviderHealth(providerHealthIntervalSeconds * 1000)
+      const checked = await refreshStaleProviderHealth(providerHealthIntervalMs)
       if (checked > 0) {
         console.info('[worker] Refreshed provider health cache', { checked, workerId })
       }
@@ -855,8 +939,8 @@ async function startWorkerOnce(
     shutdownTimedOut = true
     logShutdownTimeout()
     clearWorkerTimers()
-    for (const fence of activeClaimFences) fence.markLost()
     for (const renewal of activeClaimRenewals) renewal.forceUnavailable()
+    for (const fence of activeClaimFences) fence.markLost()
     disconnectQueues()
   }
 
@@ -897,7 +981,7 @@ async function startWorkerOnce(
         void refreshProviderHealth()
         providerHealthTimer = setInterval(
           () => void refreshProviderHealth(),
-          providerHealthIntervalSeconds * 1000,
+          providerHealthIntervalMs,
         )
       }
 
@@ -905,14 +989,14 @@ async function startWorkerOnce(
       if (blockedHandoffSweepIntervalSeconds > 0) {
         blockedHandoffSweepTimer = setInterval(
           () => void sweepBlockedHandoffs(),
-          blockedHandoffSweepIntervalSeconds * 1000,
+          blockedHandoffSweepIntervalMs,
         )
       }
       void sweepSessionCachePurges({ startup: true })
       if (sessionCachePurgeIntervalSeconds > 0) {
         sessionCachePurgeTimer = setInterval(
           () => void sweepSessionCachePurges(),
-          sessionCachePurgeIntervalSeconds * 1000,
+          sessionCachePurgeIntervalMs,
         )
       }
 
@@ -1061,8 +1145,8 @@ async function startWorkerOnce(
       }
     } finally {
       clearWorkerTimers()
-      for (const fence of activeClaimFences) fence.markLost()
       for (const renewal of activeClaimRenewals) renewal.forceUnavailable()
+      for (const fence of activeClaimFences) fence.markLost()
       disconnectQueues()
       await queueRecoveryRun?.catch(() => {})
       currentState.handle = null
