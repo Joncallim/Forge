@@ -102,32 +102,48 @@ manifest.”
 ## Integrated review round 25 findings and resolutions
 
 Round 24's five `Joncallim`-authored P0/blocker findings on
-`issue-181-e2e-admission-regression.md` were re-checked against the current PR
-head and are resolved there; they are stale against earlier revisions, not
-against the code merged at head:
+`issue-181-e2e-admission-regression.md` were re-checked twice: first against the
+S6 branch head alone, and then against the **result of merging the current #180
+(S5) base into it**. That second check matters, and corrects the first: two
+findings that are absent from the S6 head alone are re-introduced by the base
+branch, because the same files are edited on both sides. Dispositions below are
+stated against the merged tree, which is what actually ships:
 
-- **Duplicate `test:mcp:issuance` script key.** `web/package.json` now defines
-  each `test:mcp:*` / `e2e:mcp-operator` script exactly once. `playwright test
-  --list` for every manifest partition (`mcp-issuance`, `mcp-postgres`,
-  `mcp-operator-desktop`/`-mobile`) collects exactly the scenario IDs declared
-  in `test-contracts/mcp-admission-v2.json` (3 issuance, 2 postgres, 1+1
-  operator) — the counts the manifest advertises.
+- **Duplicate `test:mcp:issuance` script key.** Not stale — this was a real
+  finding and it recurs on merge. The S6 head defines the name once, but the
+  #180 base also defines `test:mcp:issuance` as an S4 Vitest alias. Because a
+  later JSON key silently wins, a naive merge makes `npm run test:mcp:issuance`
+  run the S4 Vitest command and never collect the issuance partition — exactly
+  the original defect. The merge resolves it by keeping the manifest-backed
+  Playwright command as the single owner of that name and dropping the base's
+  alias; no coverage is lost, because `epic-172-s4-postgres.test.ts` is run by
+  `test:mcp:s4-postgres` and the other two files by `test:unit:zero-skip`.
+  Verified after merging: `playwright test --list` collects exactly the
+  manifest counts (3 issuance, 2 postgres, 1+1 operator, 7 host-boundary under
+  `FORGE_TRUSTED_HOST_BOUNDARY=1`), and `web/package.json` parses with no
+  duplicate keys.
 - **S6 release-adapter callbacks.** The adapter no longer accepts injected
   `recordOwnedEvidence`/`consumeOwnedTransition` callbacks; it wraps a single
   concrete `executeEpic172S6AtomicTransition` implementation that opens the
   transition database under the fixed `forge_release_transition` role. See the
   known limitation recorded below for the one remaining gap in that function.
-- **CI uploads raw Playwright artifacts.** `web/.github/workflows/web-ci.yml`
-  no longer runs `actions/upload-artifact` over `playwright-report` or
-  `test-results` in any job; there is no raw-artifact upload path left to
-  restrict.
-- **Integrated suite red despite a healthy build.** At current head,
-  `tsc --noEmit`, `npm run lint`, and `npx vitest run` are clean (the full
-  suite passes; two unrelated `api.test.ts` / `workspace-storage.test.ts`
-  cases are environment-timeout flakes, not failures, and pass individually
-  with a longer timeout). The specific files named in the round-24 finding
-  (`epic-172-release-recorder`, `epic-172-s3-release`, `epic-172-s6-ci-contract`,
-  `epic-172-step0-e2e-bridge`, `task-page-retry-handoff`) all pass.
+- **CI uploads raw Playwright artifacts.** Not stale — same pattern. The S6
+  head carries no upload step, but the #180 base adds `actions/upload-artifact`
+  with `if: always()` over the raw report and result trees, so merging
+  re-introduces it. The merge drops that step and records why inline. This is
+  not merely a policy preference: `__tests__/epic-172-s6-ci-contract.test.ts`
+  asserts the workflow contains no such upload, so keeping the base's side
+  fails the build.
+- **Integrated suite red despite a healthy build.** Resolved, and re-verified
+  on the merged tree rather than the head alone. After merging #180 and
+  resolving all five conflicts, `npx tsc --noEmit`, `npm run lint --
+  --max-warnings=0`, `npm run test:unit:zero-skip` (1738 passed, 0 failed),
+  `npm run test:mcp:contract`, and `npm run build` all pass. The finding's
+  concern that S6's CI *replaces* required Step-0/S3/S4 steps is addressed
+  directly by the merge: the resolved `web-ci.yml` keeps the ordinary-app role
+  provisioning, the mandatory S4 PostgreSQL zero-skip proof, the mandatory S3
+  PostgreSQL concurrency proof, and the Step-0 disabled-ingress and bridge
+  suites, *and* adds the four S6 manifest partitions.
 - **External trust evidence.** Still genuinely outstanding — see below. This
   is an operational/DevOps dependency (installing and configuring the
   external controller GitHub App), not something this PR's code can supply.
@@ -165,3 +181,32 @@ this architecture-and-test-scaffolding PR for a beta. The primary document's
 language describing the fully-enabled target state is left as-is; this note
 only clarifies that reaching that state is out of scope for this PR's merge
 bar.
+
+### Merge integration with #198 (S4) and #199 (S5)
+
+This PR sits at the top of a stack: #198 (`issue-179-context-packet-evidence`)
+→ #199 (`issue-180-mcp-operator-copy`) → #200 (`issue-181-e2e-admission-regression`).
+At the time of Round 25 the S6 branch was 66 commits behind its base and GitHub
+reported the pull request as `CONFLICTING`. Five files conflicted, all of them
+at the S6↔S4/S5 seam:
+
+| File | Resolution |
+|---|---|
+| `web/package.json` | Keep base's `test:unit:zero-skip` and `test:mcp:s4-postgres`; keep S6's manifest-backed `test:mcp:issuance`; drop base's duplicate alias of that name. |
+| `.github/workflows/web-ci.yml` | Keep both sides: base's local-run-evidence reader env, audit-observer env, and mandatory S4 PostgreSQL proof, plus S6's `test:mcp:contract` and the push whitespace check. Drop the raw artifact upload. |
+| `web/e2e/filesystem-grant-lifecycle-concurrency.spec.ts` | Take base's file (16 tests, including its two new operator-hold tests) and replay S6's five hunks, which add the authenticated route assertions and the `@mcp-postgres` tags/`scenarioId` annotations. |
+| `web/e2e/epic-172-step0-bridge.ts` | Rebuild the exact-inventory list so all 16 merged test titles appear exactly once, with S6's renamed `real-approval-route` title. |
+| `web/__tests__/epic-172-step0-e2e-bridge.test.ts` | Take S6's wording; the "eight flows" count is stale once S6 adds the host-boundary flows. |
+
+The bridge sentinel (`classifies every E2E test exactly once`) and the S6 CI
+contract sentinel both pass on the merged tree, which is what proves the
+inventory and workflow resolutions are correct rather than merely plausible.
+
+### Runtime reachability of the S6 surface
+
+`evaluateEpic172S6ControllerEvidence`, `executeEpic172S6AtomicTransition`,
+`parseEpic172S6ExternalEvidenceBundle`, and the release-order assertions are
+imported only by their own unit tests. No route, worker, CLI, or component in
+the application references them. The S6 controller surface therefore cannot
+change application behaviour in this beta; that is the basis on which the P2
+SQL defect above is accepted as deferred rather than release-blocking.
