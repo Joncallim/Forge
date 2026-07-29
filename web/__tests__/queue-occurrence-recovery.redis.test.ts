@@ -1,9 +1,11 @@
 import { createHash, randomUUID } from 'node:crypto'
+import { createServer, type Socket } from 'node:net'
 import Redis from 'ioredis'
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import {
   AnswersQueue,
   ApprovalQueue,
+  isQueueStaleOwnerError,
   RetryPromotionConflictError,
   TaskQueue,
   type AnswersJob,
@@ -17,6 +19,18 @@ import {
   ClaimLeaseFence,
   ClaimLeaseLostError,
 } from '@/worker/claim-lease-fence'
+
+async function expectQueueStaleOwner(operation: Promise<unknown>): Promise<void> {
+  let rejected: unknown
+  try {
+    await operation
+  } catch (error) {
+    rejected = error
+  }
+  expect(isQueueStaleOwnerError(rejected)).toBe(true)
+  expect(rejected instanceof Error ? rejected.message : '')
+    .toBe('Queue transition stale_not_owner')
+}
 
 const QUEUE_KEYS = [
   'forge:tasks',
@@ -1866,11 +1880,11 @@ describe.skipIf(!enabled)('queue occurrence and recovery real Redis proof', () =
         expect(nextOwner.occurrenceId).toBe(staleOwner.claimed.occurrenceId)
 
         if (terminalKind === 'retry') {
-          await expect(staleOwner.owner.retry(
+          await expectQueueStaleOwner(staleOwner.owner.retry(
             staleOwner.claimed.raw,
             staleOwner.claimed.job,
             60_000,
-          )).rejects.toThrow('Queue transition stale_not_owner')
+          ))
           expect(await admin.zcard(renewalCase.retry)).toBe(0)
           await expect(nextOwnerQueue.retry(
             nextOwner.raw,
@@ -1879,10 +1893,10 @@ describe.skipIf(!enabled)('queue occurrence and recovery real Redis proof', () =
           )).resolves.toMatchObject({ outcome: 'applied' })
           expect(await admin.zcard(renewalCase.retry)).toBe(1)
         } else {
-          await expect(staleOwner.owner.deadLetter(
+          await expectQueueStaleOwner(staleOwner.owner.deadLetter(
             staleOwner.claimed.raw,
             staleOwner.claimed.job,
-          )).rejects.toThrow('Queue transition stale_not_owner')
+          ))
           expect(await admin.llen(renewalCase.dead)).toBe(0)
           await expect(nextOwnerQueue.deadLetter(nextOwner.raw, nextOwner.job))
             .resolves.toBe('applied')
@@ -2084,6 +2098,8 @@ describe.skipIf(!enabled)('queue occurrence and recovery real Redis proof', () =
         vi.doMock('@/worker/queue', () => ({
           AnswersQueue: IdleAnswersQueue,
           ApprovalQueue: IdleApprovalQueue,
+          isQueueStaleOwnerError,
+          NODE_TIMER_MAX_MS: 2_147_483_647,
           RetryPromotionConflictError,
           TaskQueue: IdleTaskQueue,
         }))
@@ -2178,6 +2194,44 @@ describe.skipIf(!enabled)('queue occurrence and recovery real Redis proof', () =
         } else if (position === 'answers') {
           expect(claimCounts.task).toBe(0)
         }
+      }
+
+      const blackholeSockets = new Set<Socket>()
+      const blackholeServer = createServer((socket) => {
+        blackholeSockets.add(socket)
+        socket.on('close', () => blackholeSockets.delete(socket))
+        socket.pause()
+      })
+      await new Promise<void>((resolve, reject) => {
+        blackholeServer.once('error', reject)
+        blackholeServer.listen(0, '127.0.0.1', () => resolve())
+      })
+      const address = blackholeServer.address()
+      if (!address || typeof address === 'string') {
+        throw new Error('Queue black-hole proof did not bind a local socket.')
+      }
+      const blackholeQueue = new TaskQueue(
+        `redis://127.0.0.1:${address.port}/13`,
+        { commandTimeoutMs: 100 },
+      )
+      try {
+        const blackholeClaim = blackholeQueue.claim(1)
+        await vi.waitFor(() => expect(blackholeSockets.size).toBeGreaterThan(0))
+        await expect(blackholeClaim).rejects.toBeDefined()
+        expect(blackholeSockets.size).toBeGreaterThan(0)
+        blackholeQueue.disconnect()
+        for (const socket of blackholeSockets) socket.resume()
+        await vi.waitFor(() => expect(blackholeSockets.size).toBe(0))
+        expect((blackholeQueue as unknown as { client: Redis }).client.status).toBe('end')
+      } finally {
+        blackholeQueue.disconnect()
+        for (const socket of blackholeSockets) socket.destroy()
+        await new Promise<void>((resolve, reject) => {
+          blackholeServer.close((error) => {
+            if (error) reject(error)
+            else resolve()
+          })
+        })
       }
       console.info('QUEUE_OCCURRENCE_REDIS_SHUTDOWN_OK')
     } finally {

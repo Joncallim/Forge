@@ -45,6 +45,9 @@ const PROMOTION_DISPOSITION_CAP = 50_000
 const PROMOTION_DISPOSITION_PRUNE_LIMIT = 100
 const RETRY_PROMOTION_FINGERPRINT_DOMAIN =
   'forge:queue:retry-promotion-disposition:v1'
+const DEFAULT_QUEUE_REDIS_COMMAND_TIMEOUT_MS = 10_000
+const MAX_QUEUE_REDIS_RECONNECT_ATTEMPTS = 2
+export const NODE_TIMER_MAX_MS = 2_147_483_647
 const TASK_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 const CLAIM_MARKER_PATTERN = /^([1-9][0-9]*):([0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/
 
@@ -65,6 +68,36 @@ export type QueueClaimRenewalResult = 'renewed' | 'stale_not_owner'
 export type QueueRetryResult = {
   outcome: QueueTransitionOutcome
   nextRetryAt: Date
+}
+
+export type QueueRedisClientOptions = Readonly<{
+  commandTimeoutMs?: number
+}>
+
+export const QUEUE_STALE_OWNER_CODE = 'queue_stale_not_owner' as const
+
+export class QueueStaleOwnerError extends Error {
+  declare readonly code: typeof QUEUE_STALE_OWNER_CODE
+
+  constructor() {
+    super('Queue transition stale_not_owner')
+    Object.defineProperty(this, 'name', {
+      configurable: true,
+      enumerable: false,
+      value: 'QueueStaleOwnerError',
+      writable: true,
+    })
+    Object.defineProperty(this, 'code', {
+      configurable: false,
+      enumerable: false,
+      value: QUEUE_STALE_OWNER_CODE,
+      writable: false,
+    })
+  }
+}
+
+export function isQueueStaleOwnerError(error: unknown): error is QueueStaleOwnerError {
+  return error instanceof QueueStaleOwnerError
 }
 
 export const RETRY_PROMOTION_CONFLICT_CODE = 'queue_retry_promotion_conflict' as const
@@ -735,6 +768,7 @@ function promotionFingerprint(
 abstract class RedisListQueue<TJob extends RetryableJob> {
   protected readonly client: Redis
   private readonly activeClaims = new Map<string, ActiveClaim>()
+  private disconnected = false
 
   constructor(
     private readonly queueKey: string,
@@ -747,10 +781,26 @@ abstract class RedisListQueue<TJob extends RetryableJob> {
     private readonly promotionDispositionsKey: string,
     private readonly promotionDispositionExpiryKey: string,
     redisUrl = getRequiredEnv('REDIS_URL'),
+    options: QueueRedisClientOptions = {},
   ) {
+    const commandTimeoutMs =
+      options.commandTimeoutMs ?? DEFAULT_QUEUE_REDIS_COMMAND_TIMEOUT_MS
+    if (!Number.isSafeInteger(commandTimeoutMs)
+      || commandTimeoutMs < 1
+      || commandTimeoutMs > NODE_TIMER_MAX_MS) {
+      throw new Error(
+        'Queue Redis command timeout must be a positive safe integer within the Node timer range',
+      )
+    }
     this.client = new Redis(redisUrl, {
-      maxRetriesPerRequest: null,
-      retryStrategy: (times) => Math.min(times * 100, 3000),
+      autoResendUnfulfilledCommands: false,
+      commandTimeout: commandTimeoutMs,
+      connectTimeout: commandTimeoutMs,
+      enableOfflineQueue: true,
+      maxRetriesPerRequest: 1,
+      retryStrategy: (times) => times <= MAX_QUEUE_REDIS_RECONNECT_ATTEMPTS
+        ? Math.min(times * 100, 1_000)
+        : null,
     })
     this.client.on('error', () => {
       console.warn('[worker/queue] Redis connection unavailable')
@@ -979,7 +1029,7 @@ abstract class RedisListQueue<TJob extends RetryableJob> {
       [active.raw, active.occurrenceId, active.marker, ...args],
     ))
     if (result === 'stale_not_owner') {
-      throw new Error('Queue transition stale_not_owner')
+      throw new QueueStaleOwnerError()
     }
     this.activeClaims.delete(active.occurrenceId)
     return result
@@ -1138,7 +1188,7 @@ abstract class RedisListQueue<TJob extends RetryableJob> {
       ],
     ))
     if (result === 'stale_not_owner') {
-      throw new Error('Queue transition stale_not_owner')
+      throw new QueueStaleOwnerError()
     }
     this.activeClaims.delete(active.occurrenceId)
     return result
@@ -1285,8 +1335,10 @@ abstract class RedisListQueue<TJob extends RetryableJob> {
   }
 
   disconnect(): void {
+    if (this.disconnected) return
+    this.disconnected = true
     this.activeClaims.clear()
-    this.client.disconnect()
+    this.client.disconnect(false)
   }
 }
 
@@ -1314,7 +1366,10 @@ function parseClosedJob(raw: string, allowedKeys: readonly string[]): Record<str
 }
 
 export class TaskQueue extends RedisListQueue<TaskJob> {
-  constructor(redisUrl = getRequiredEnv('REDIS_URL')) {
+  constructor(
+    redisUrl = getRequiredEnv('REDIS_URL'),
+    options: QueueRedisClientOptions = {},
+  ) {
     super(
       TASK_QUEUE_KEY,
       TASK_PROCESSING_QUEUE_KEY,
@@ -1326,6 +1381,7 @@ export class TaskQueue extends RedisListQueue<TaskJob> {
       TASK_PROMOTION_DISPOSITIONS_KEY,
       TASK_PROMOTION_DISPOSITION_EXPIRY_KEY,
       redisUrl,
+      options,
     )
   }
 
@@ -1340,7 +1396,10 @@ export class TaskQueue extends RedisListQueue<TaskJob> {
 }
 
 export class ApprovalQueue extends RedisListQueue<ApprovalJob> {
-  constructor(redisUrl = getRequiredEnv('REDIS_URL')) {
+  constructor(
+    redisUrl = getRequiredEnv('REDIS_URL'),
+    options: QueueRedisClientOptions = {},
+  ) {
     super(
       APPROVAL_QUEUE_KEY,
       APPROVAL_PROCESSING_QUEUE_KEY,
@@ -1352,6 +1411,7 @@ export class ApprovalQueue extends RedisListQueue<ApprovalJob> {
       APPROVAL_PROMOTION_DISPOSITIONS_KEY,
       APPROVAL_PROMOTION_DISPOSITION_EXPIRY_KEY,
       redisUrl,
+      options,
     )
   }
 
@@ -1373,7 +1433,10 @@ export class ApprovalQueue extends RedisListQueue<ApprovalJob> {
 }
 
 export class AnswersQueue extends RedisListQueue<AnswersJob> {
-  constructor(redisUrl = getRequiredEnv('REDIS_URL')) {
+  constructor(
+    redisUrl = getRequiredEnv('REDIS_URL'),
+    options: QueueRedisClientOptions = {},
+  ) {
     super(
       ANSWERS_QUEUE_KEY,
       ANSWERS_PROCESSING_QUEUE_KEY,
@@ -1385,6 +1448,7 @@ export class AnswersQueue extends RedisListQueue<AnswersJob> {
       ANSWERS_PROMOTION_DISPOSITIONS_KEY,
       ANSWERS_PROMOTION_DISPOSITION_EXPIRY_KEY,
       redisUrl,
+      options,
     )
   }
 
