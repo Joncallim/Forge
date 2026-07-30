@@ -507,6 +507,8 @@ DECLARE
   v_second record;
   v_after_metadata jsonb;
   v_after_status text;
+  v_expected_result text;
+  v_expected_status text;
   v_authorizer uuid;
 BEGIN
   SELECT metadata->'packet_issuance' INTO STRICT v_base
@@ -536,6 +538,13 @@ BEGIN
         OR (v_action = 'decline_packet_recovery'
           AND v_disposition IN ('reapprove_allow_once','review_then_reapprove_allow_once',
             'retry_execution','review_submission','reviewed_submission'));
+      IF v_action = 'acknowledge_possible_submission' THEN
+        v_expected_result := 'acknowledged'; v_expected_status := 'blocked';
+      ELSIF v_action = 'retry_execution' THEN
+        v_expected_result := 'ready'; v_expected_status := 'ready';
+      ELSE
+        v_expected_result := 'cancelled'; v_expected_status := 'cancelled';
+      END IF;
       SELECT count(*)::integer, metadata, status INTO v_before_actions, v_before_metadata, v_before_status
       FROM public.filesystem_mcp_issuance_recovery_actions action
       CROSS JOIN public.work_packages package
@@ -553,10 +562,8 @@ BEGIN
         FROM public.work_packages WHERE id = '27000000-0000-4000-8000-00000000d101';
         IF (SELECT count(*) FROM public.filesystem_mcp_issuance_recovery_actions
             WHERE prior_runtime_audit_id = '27000000-0000-4000-8000-00000000d401') <> v_before_actions + 1
-           OR v_first.result IS DISTINCT FROM CASE v_action WHEN 'acknowledge_possible_submission' THEN 'acknowledged'
-             WHEN 'retry_execution' THEN 'ready' ELSE 'cancelled' END
-           OR v_first.package_status IS DISTINCT FROM CASE v_action WHEN 'acknowledge_possible_submission' THEN 'blocked'
-             WHEN 'retry_execution' THEN 'ready' ELSE 'cancelled' END
+           OR v_first.result IS DISTINCT FROM v_expected_result
+           OR v_first.package_status IS DISTINCT FROM v_expected_status
            OR v_after_status IS DISTINCT FROM v_first.package_status
            OR (v_action = 'acknowledge_possible_submission' AND (
              NOT v_after_metadata ? 'packet_issuance'
@@ -1024,6 +1031,8 @@ DECLARE
   v_second record;
   v_after_metadata jsonb;
   v_after_status text;
+  v_expected_result text;
+  v_expected_status text;
   v_actors uuid[] := ARRAY[
     '27000000-0000-4000-8000-00000000e901'::uuid,'27000000-0000-4000-8000-00000000e902'::uuid,
     '27000000-0000-4000-8000-00000000e903'::uuid,'27000000-0000-4000-8000-00000000e904'::uuid,
@@ -1055,6 +1064,15 @@ BEGIN
         OR (v_action = 'acknowledge_possible_local_invocation' AND v_disposition = 'acknowledge_possible_local_invocation')
         OR (v_action = 'retry_local_execution' AND v_disposition = 'retry_local_execution')
         OR (v_action = 'decline_local_retry' AND v_disposition IN ('acknowledge_possible_local_invocation','retry_local_execution'));
+      IF v_action = 'review_local_changes' THEN
+        v_expected_result := 'reviewed'; v_expected_status := 'blocked';
+      ELSIF v_action = 'acknowledge_possible_local_invocation' THEN
+        v_expected_result := 'acknowledged'; v_expected_status := 'blocked';
+      ELSIF v_action = 'retry_local_execution' THEN
+        v_expected_result := 'ready'; v_expected_status := 'ready';
+      ELSE
+        v_expected_result := 'cancelled'; v_expected_status := 'cancelled';
+      END IF;
       SELECT count(*)::integer, metadata, status INTO v_before_actions, v_before_metadata, v_before_status
       FROM public.local_effect_recovery_actions action CROSS JOIN public.work_packages package
       WHERE action.local_run_evidence_id = '27000000-0000-4000-8000-00000000e301'
@@ -1071,12 +1089,8 @@ BEGIN
         FROM public.work_packages WHERE id = '27000000-0000-4000-8000-00000000e101';
         IF (SELECT count(*) FROM public.local_effect_recovery_actions
             WHERE local_run_evidence_id = '27000000-0000-4000-8000-00000000e301') <> v_before_actions + 1
-           OR v_first.result IS DISTINCT FROM CASE v_action WHEN 'review_local_changes' THEN 'reviewed'
-             WHEN 'acknowledge_possible_local_invocation' THEN 'acknowledged'
-             WHEN 'retry_local_execution' THEN 'ready' ELSE 'cancelled' END
-           OR v_first.package_status IS DISTINCT FROM CASE v_action WHEN 'review_local_changes' THEN 'blocked'
-             WHEN 'acknowledge_possible_local_invocation' THEN 'blocked'
-             WHEN 'retry_local_execution' THEN 'ready' ELSE 'cancelled' END
+           OR v_first.result IS DISTINCT FROM v_expected_result
+           OR v_first.package_status IS DISTINCT FROM v_expected_status
            OR v_after_status IS DISTINCT FROM v_first.package_status
            OR (v_action IN ('review_local_changes','acknowledge_possible_local_invocation')
              AND NOT v_after_metadata ? 'local_effect_recovery')
