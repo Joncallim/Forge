@@ -278,6 +278,37 @@ describe('Epic 172 S4 PostgreSQL CI contract', () => {
     expect(s4Migration).toMatch(/RETURNS TABLE \(purpose text, source_kind text, task_id uuid/)
   })
 
+  it('certifies every protected clarification table and routine in the S4 owner finalizer', () => {
+    const ownedTableInventory = s4RoleBootstrap.match(
+      /const OWNED_TABLES = \[([\s\S]*?)\] as const/,
+    )?.[1] ?? ''
+    const routineInventory = s4RoleBootstrap.match(
+      /routine\.proname = any\(array\[([\s\S]*?)\]\)\s+and routine\.proowner/,
+    )?.[1] ?? ''
+
+    for (const table of [
+      'architect_clarification_answers',
+      'architect_clarification_answer_writes',
+    ]) {
+      expect(ownedTableInventory).toContain(`'${table}'`)
+    }
+    for (const routine of [
+      'bind_architect_replan_context_v3',
+      'resolve_architect_plan_entry_v2',
+      'append_architect_clarification_answer_v1',
+    ]) {
+      expect(routineInventory).toContain(`'${routine}'`)
+    }
+
+    expect(s4RoleBootstrap).toContain('acl.grantee <> table_row.relowner')
+    expect(s4RoleBootstrap).toContain("acl.grantee = 0 and acl.privilege_type = 'EXECUTE'")
+    expect(s4RoleBootstrap).toContain("when 'bind_architect_replan_context_v3'\n                         then 'forge_architect_plan_writer'::regrole")
+    expect(s4RoleBootstrap).toContain("when 'resolve_architect_plan_entry_v2'\n                         then 'forge_architect_plan_resolver'::regrole")
+    expect(s4RoleBootstrap).toContain("when 'append_architect_clarification_answer_v1'\n                         then 'forge_architect_plan_history_reader'::regrole")
+    expect(s4RoleBootstrap).toContain('acl.grantee <> case routine.proname')
+    expect(s4RoleBootstrap).toContain(') <> 73 then')
+  })
+
   it('audits the complete protected clarification history set without truncation', () => {
     const historyReader = s4Migration.match(
       /CREATE OR REPLACE FUNCTION forge\.read_architect_plan_history_v1\([\s\S]*?\n\$\$;/,

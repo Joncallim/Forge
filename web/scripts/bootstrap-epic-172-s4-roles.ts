@@ -19,6 +19,8 @@ const OWNED_TABLES = [
   'architect_plan_entries',
   'architect_plan_execution_references',
   'architect_plan_history_reads',
+  'architect_clarification_answers',
+  'architect_clarification_answer_writes',
   'protected_package_entry_registrations',
   'protected_entry_capability_bindings',
   'mcp_operator_review_versions',
@@ -436,6 +438,9 @@ async function main(): Promise<void> {
                 ,'apply_local_effect_recovery_action_v2'
                 ,'apply_packet_issuance_recovery_action_v2'
                 ,'bind_architect_replan_context_v2'
+                ,'bind_architect_replan_context_v3'
+                ,'resolve_architect_plan_entry_v2'
+                ,'append_architect_clarification_answer_v1'
                 ,'local_projection_archive_operation_fingerprint_v2'
                 ,'inspect_local_projection_overlimit_v2'
                 ,'apply_local_projection_overlimit_archive_v2'
@@ -452,9 +457,26 @@ async function main(): Promise<void> {
                     pg_catalog.acldefault('f', routine.proowner)
                   )
                 ) acl
-                where acl.grantee = 0 and acl.privilege_type = 'EXECUTE'
+                where (acl.grantee = 0 and acl.privilege_type = 'EXECUTE')
+                   or (
+                     routine.proname = any(array[
+                       'bind_architect_replan_context_v3',
+                       'resolve_architect_plan_entry_v2',
+                       'append_architect_clarification_answer_v1'
+                     ])
+                     and acl.privilege_type = 'EXECUTE'
+                     and acl.grantee <> routine.proowner
+                     and acl.grantee <> case routine.proname
+                       when 'bind_architect_replan_context_v3'
+                         then 'forge_architect_plan_writer'::regrole
+                       when 'resolve_architect_plan_entry_v2'
+                         then 'forge_architect_plan_resolver'::regrole
+                       when 'append_architect_clarification_answer_v1'
+                         then 'forge_architect_plan_history_reader'::regrole
+                     end
+                   )
               )
-          ) <> 70 then
+          ) <> 73 then
             raise exception 'The S4 routine owner or PUBLIC boundary is incomplete'
               using errcode = '42501';
           end if;
