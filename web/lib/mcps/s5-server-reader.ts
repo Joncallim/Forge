@@ -6,13 +6,12 @@ import { db } from '@/db'
 import {
   filesystemMcpCurrentDecisionPointers,
   filesystemMcpGrantApprovals,
-  filesystemMcpRuntimeAudits,
   projectFilesystemCurrentDecisionPointers,
   projectFilesystemGrantDecisions,
   tasks,
   workPackages,
 } from '@/db/schema'
-import { readS5ProtectedLocalRunEvidence } from '@/lib/mcps/s5-protected-reader'
+import { readS5ProtectedTerminalSnapshot } from '@/lib/mcps/s5-protected-reader'
 import { summarizeFilesystemCapabilities } from '@/lib/mcps/filesystem-grants'
 import { parseFilesystemGrantBlockMetadata } from '@/lib/mcps/filesystem-grant-lifecycle'
 import {
@@ -48,6 +47,7 @@ export type S5DecisionPresenter = Readonly<{
 }>
 
 export type S5ProjectGrantPresenter = Readonly<{
+  id: string
   enabled: boolean
   capabilities: readonly string[]
   grantDecisionRevision: string
@@ -382,7 +382,7 @@ export async function readS5AuthoritativeTaskState(
     .limit(1)
   if (!task) throw new S5TaskNotFoundError()
 
-  const [packageRows, decisions, pointers, projectPointers, projectDecisions, protectedEvidence, auditRows] = await Promise.all([
+  const [packageRows, decisions, pointers, projectPointers, projectDecisions, protectedSnapshot] = await Promise.all([
     db.select({
       id: workPackages.id,
       title: workPackages.title,
@@ -420,26 +420,16 @@ export async function readS5AuthoritativeTaskState(
     }).from(filesystemMcpCurrentDecisionPointers).where(eq(filesystemMcpCurrentDecisionPointers.taskId, taskId)),
     db.select().from(projectFilesystemCurrentDecisionPointers).where(eq(projectFilesystemCurrentDecisionPointers.projectId, task.projectId)).limit(1),
     db.select().from(projectFilesystemGrantDecisions).where(eq(projectFilesystemGrantDecisions.projectId, task.projectId)).orderBy(asc(projectFilesystemGrantDecisions.decisionGeneration)),
-    readS5ProtectedLocalRunEvidence(taskId),
-    db.select({
-      id: filesystemMcpRuntimeAudits.id,
-      workPackageId: filesystemMcpRuntimeAudits.workPackageId,
-      agentRunId: filesystemMcpRuntimeAudits.agentRunId,
-      localRunEvidenceId: filesystemMcpRuntimeAudits.localRunEvidenceId,
-      assembly: filesystemMcpRuntimeAudits.assembly,
-      delivery: filesystemMcpRuntimeAudits.delivery,
-      terminal: filesystemMcpRuntimeAudits.terminal,
-      terminalAt: filesystemMcpRuntimeAudits.terminalAt,
-      updatedAt: filesystemMcpRuntimeAudits.createdAt,
-    }).from(filesystemMcpRuntimeAudits).where(eq(filesystemMcpRuntimeAudits.taskId, taskId)).orderBy(asc(filesystemMcpRuntimeAudits.createdAt), asc(filesystemMcpRuntimeAudits.id)),
+    readS5ProtectedTerminalSnapshot(taskId),
   ])
 
   // A `null` protected read is "cannot be proven right now", not "no evidence".
   // Presenting it as an empty set is exactly right: every evidence-dependent
   // join then fails its exact-match check and degrades to the non-actionable
   // `unavailable`/`invalid` state instead of asserting an unproven fact.
-  const localEvidenceAvailable = protectedEvidence !== null
-  const evidenceRows = protectedEvidence ?? []
+  const localEvidenceAvailable = protectedSnapshot !== null
+  const evidenceRows = protectedSnapshot?.evidenceRows ?? []
+  const auditRows = protectedSnapshot?.auditRows ?? []
 
   const decisionById = new Map(decisions.map((decision) => [decision.id, decision]))
   const pointerByPackage = new Map(pointers.map((pointer) => [pointer.workPackageId, pointer]))
@@ -496,6 +486,7 @@ export async function readS5AuthoritativeTaskState(
       ? projectDecision
       : null
   const projectGrant = exactProjectDecision ? {
+    id: exactProjectDecision.id,
     enabled: exactProjectDecision.decision === 'approved',
     capabilities: exactProjectDecision.capabilities,
     grantDecisionRevision: exactProjectDecision.grantDecisionRevision.toString(),
@@ -624,6 +615,7 @@ export function safeProjectGrantPresenter(
   grant: S5ProjectGrantPresenter | null,
 ): S5ProjectGrantPresenter | null {
   return grant ? {
+    id: grant.id,
     enabled: grant.enabled,
     capabilities: [...grant.capabilities],
     grantDecisionRevision: grant.grantDecisionRevision,

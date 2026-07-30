@@ -1,7 +1,12 @@
 import type { NextRequest } from 'next/server'
 import { getSession } from '@/lib/session'
 import { getAccessibleTask } from '@/lib/task-access'
-import { taskEventRedisConfiguration } from '@/lib/task-event-redis'
+import {
+  TASK_EVENT_V2_LIVE_PATTERN,
+  taskEventRedisConfiguration,
+  taskIdFromTaskEventLiveChannel,
+} from '@/lib/task-event-redis'
+import { readS4RuntimeModeV1 } from '@/lib/mcps/s4-lease'
 import { parseTaskEventEnvelopeV2 } from '@/worker/events'
 
 // ---------------------------------------------------------------------------
@@ -25,9 +30,10 @@ export async function GET(request: NextRequest) {
       const { default: Redis } = await import('ioredis')
       let eventRedisConfiguration
       try {
-        eventRedisConfiguration = taskEventRedisConfiguration()
-      } catch (error) {
-        console.error('[SSE /api/tasks/events] Invalid task-event Redis configuration', error)
+        const runtimeMode = await readS4RuntimeModeV1()
+        eventRedisConfiguration = taskEventRedisConfiguration(runtimeMode)
+      } catch {
+        console.error('[SSE /api/tasks/events] Invalid task-event Redis configuration')
         controller.close()
         return
       }
@@ -64,28 +70,28 @@ export async function GET(request: NextRequest) {
           const data = event.data && typeof event.data === 'object' && !Array.isArray(event.data)
             ? event.data as { status?: string; updatedAt?: string }
             : {}
-          const taskId = channel.startsWith('forge:task:') ? channel.slice('forge:task:'.length) : null
+          const taskId = taskIdFromTaskEventLiveChannel(channel)
           if (!taskId || !(await getAccessibleTask(taskId, session.userId))) return
           send('task:status', {
             taskId,
             status: data.status ?? null,
             updatedAt: data.updatedAt ?? null,
           })
-          } catch (err) {
-            console.error('[SSE /api/tasks/events] Error processing task event', err)
+          } catch {
+            console.error('[SSE /api/tasks/events] Error processing task event')
           }
         })()
       })
 
-      sub.on('error', (err) => {
-        console.error('[SSE /api/tasks/events] Redis subscriber error', err)
+      sub.on('error', () => {
+        console.error('[SSE /api/tasks/events] Redis subscriber error')
         cleanup()
       })
 
       try {
-        await sub.psubscribe('forge:task:*')
-      } catch (err) {
-        console.error('[SSE /api/tasks/events] Failed to subscribe to Redis task channels', err)
+        await sub.psubscribe(TASK_EVENT_V2_LIVE_PATTERN)
+      } catch {
+        console.error('[SSE /api/tasks/events] Failed to subscribe to Redis task channels')
         cleanup()
         return
       }

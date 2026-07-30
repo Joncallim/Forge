@@ -355,7 +355,7 @@ describe('getSession', () => {
     const req = fakeRequest('00000000-0000-4000-8000-000000000000')
     const result = await getSession(req)
     expect(result).toEqual({ sessionId: '00000000-0000-4000-8000-000000000010', userId: 'user-abc' })
-    expect(mockDbTransaction).toHaveBeenCalledOnce()
+    expect(mockDbTransaction).toHaveBeenCalledTimes(2)
     expect(mockRedisSet).toHaveBeenCalledWith(expect.stringMatching(/^session:v2:/), expect.any(String), 'PXAT', expect.any(Number))
   })
 
@@ -490,7 +490,17 @@ describe('getSession', () => {
       credentialDigestV1: null,
       credentialStorageVersion: 0,
       databaseNow: new Date(redisNowMs),
-    }]))
+      }]))
+      .mockReturnValueOnce(chain([{
+        sessionId: credential,
+        userId: 'user-abc',
+        lastSeenAt: new Date(redisNowMs - 1_000),
+        expiresAt: new Date(expiresAtMs),
+        revokedAt: null,
+        credentialStorageVersion: 1,
+        databaseNow: new Date(redisNowMs),
+      }]))
+      .mockReturnValueOnce(chain([{ state: 'expansion' }]))
     mockDbUpdate.mockReturnValue(chain([{ id: credential }]))
 
     await expect(getSession(fakeRequest(credential))).resolves.toEqual({
@@ -548,6 +558,10 @@ describe('getSession', () => {
 describe('getSession — write-behind logic', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    mockDbSelect.mockReset()
+    mockDbUpdate.mockReset()
+    mockDbTransaction.mockReset()
+    mockDbTransaction.mockImplementation(async (callback: (tx: unknown) => unknown) => callback(transactionClient()))
     vi.useFakeTimers()
     mockRedisSet.mockResolvedValue('OK')
     mockDbUpdate.mockReturnValue(chain([{
@@ -557,9 +571,11 @@ describe('getSession — write-behind logic', () => {
 
   afterEach(() => {
     vi.useRealTimers()
+    mockDbTransaction.mockReset()
+    mockDbTransaction.mockImplementation(async (callback: (tx: unknown) => unknown) => callback(transactionClient()))
   })
 
-  it('does NOT trigger a DB write when lastSeenAt is less than 60 seconds old', async () => {
+  it('writes cache entries inside a second locked transaction when lastSeenAt is recent', async () => {
     const now = Date.now()
     vi.setSystemTime(now)
 
@@ -573,9 +589,11 @@ describe('getSession — write-behind logic', () => {
     await getSession(req)
 
     expect(mockDbUpdate).not.toHaveBeenCalled()
+    expect(mockDbTransaction).toHaveBeenCalledTimes(2)
+    expect(mockRedisSet).toHaveBeenCalledOnce()
   })
 
-  it('triggers a fire-and-forget DB write when lastSeenAt is older than 60 seconds', async () => {
+  it('refreshes the authoritative row before the locked cache write when lastSeenAt is older than 60 seconds', async () => {
     const now = Date.now()
     vi.setSystemTime(now)
 
@@ -588,10 +606,78 @@ describe('getSession — write-behind logic', () => {
     const req = fakeRequest('00000000-0000-4000-8000-000000000000')
     await getSession(req)
 
-    // DB update is kicked off fire-and-forget; the mock should have been invoked
     expect(mockDbUpdate).toHaveBeenCalledOnce()
-    // Redis was also refreshed
     expect(mockRedisSet).toHaveBeenCalledOnce()
+  })
+
+  it.each([
+    ['v2', 2, null],
+    ['dual-write v1', 1, '00000000-0000-4000-8000-000000000000'],
+  ])('orders a completed %s cache write before a following revocation deletion even if its transaction fails', async (
+    _label,
+    credentialStorageVersion,
+    expectedLegacyKey,
+  ) => {
+    const now = Date.now()
+    vi.setSystemTime(now)
+    const credential = '00000000-0000-4000-8000-000000000000'
+    const sessionId = credentialStorageVersion === 1 ? credential : '00000000-0000-4000-8000-000000000010'
+    const row = {
+      sessionId, userId: 'user-1',
+      lastSeenAt: new Date(now - 30_000), expiresAt: new Date(now + 60_000),
+      revokedAt: null, credentialStorageVersion, databaseNow: new Date(now),
+    }
+    mockDbSelect
+      .mockReturnValueOnce(chain([{ state: 'expansion' }]))
+      .mockReturnValueOnce(chain([row]))
+      .mockReturnValueOnce(chain([row]))
+      .mockReturnValueOnce(chain([{ state: 'expansion' }]))
+    mockDbUpdate.mockReturnValue(chain([{
+      attemptCount: 1,
+      claimToken: '00000000-0000-4000-8000-000000000011',
+      credentialDigest: Buffer.alloc(32, 1),
+      generation: '00000000-0000-4000-8000-000000000012',
+      legacyCredential: expectedLegacyKey,
+      sessionId,
+    }]))
+    let transactions = 0
+    mockDbTransaction.mockImplementation(async (callback: (tx: unknown) => unknown) => {
+      transactions += 1
+      const result = await callback(transactionClient())
+      if (transactions === 2) throw new Error('simulated process loss after Redis write')
+      return result
+    })
+
+    await expect(getSession(fakeRequest(credential))).resolves.toEqual({ sessionId, userId: 'user-1' })
+    expect(mockRedisSet).toHaveBeenCalledTimes(credentialStorageVersion === 1 ? 2 : 1)
+
+    await destroySession(credential)
+    expect(mockRedisSet.mock.invocationCallOrder.at(-1)!).toBeLessThan(mockRedisDel.mock.invocationCallOrder[0])
+    expect(mockRedisDel).toHaveBeenCalledWith(
+      expect.stringMatching(/^session:v2:/),
+      ...(expectedLegacyKey ? [`session:${expectedLegacyKey}`] : []),
+    )
+  })
+
+  it('skips cache population when the row-lock transaction fails before a write', async () => {
+    const now = Date.now()
+    vi.setSystemTime(now)
+    mockDbSelect.mockReturnValue(chain([{
+      sessionId: '00000000-0000-4000-8000-000000000010', userId: 'user-1',
+      lastSeenAt: new Date(now - 30_000), expiresAt: new Date(now + 60_000),
+      revokedAt: null, credentialStorageVersion: 2, databaseNow: new Date(now),
+    }]))
+    let transactions = 0
+    mockDbTransaction.mockImplementation(async (callback: (tx: unknown) => unknown) => {
+      transactions += 1
+      if (transactions === 2) throw new Error('session row lock unavailable')
+      return callback(transactionClient())
+    })
+
+    await expect(getSession(fakeRequest('00000000-0000-4000-8000-000000000000'))).resolves.toEqual({
+      sessionId: '00000000-0000-4000-8000-000000000010', userId: 'user-1',
+    })
+    expect(mockRedisSet).not.toHaveBeenCalled()
   })
 
   it('does not write a legacy cache when the sliding-refresh transaction fails to commit', async () => {
@@ -609,6 +695,16 @@ describe('getSession — write-behind logic', () => {
         credentialStorageVersion: 1,
         databaseNow: new Date(now),
       }]))
+      .mockReturnValueOnce(chain([{
+        sessionId: '00000000-0000-4000-8000-000000000010',
+        userId: 'user-1',
+        lastSeenAt: new Date(now),
+        expiresAt: new Date(now + 604_800_000),
+        revokedAt: null,
+        credentialStorageVersion: 1,
+        databaseNow: new Date(now),
+      }]))
+      .mockReturnValueOnce(chain([{ state: 'expansion' }]))
     mockDbTransaction.mockImplementationOnce(async (callback: (tx: unknown) => unknown) => {
       await callback(transactionClient())
       throw new Error('commit failed')
@@ -636,6 +732,16 @@ describe('getSession — write-behind logic', () => {
         credentialStorageVersion: 1,
         databaseNow: new Date(now),
       }]))
+      .mockReturnValueOnce(chain([{
+        sessionId: '00000000-0000-4000-8000-000000000010',
+        userId: 'user-1',
+        lastSeenAt: new Date(now),
+        expiresAt: new Date(now + 604_800_000),
+        revokedAt: null,
+        credentialStorageVersion: 1,
+        databaseNow: new Date(now),
+      }]))
+      .mockReturnValueOnce(chain([{ state: 'expansion' }]))
     let committed = false
     mockDbTransaction.mockImplementationOnce(async (callback: (tx: unknown) => unknown) => {
       const result = await callback(transactionClient())
@@ -663,7 +769,14 @@ describe('destroySession', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     mockRedisDel.mockResolvedValue(1)
-    mockDbUpdate.mockReturnValue(chain(undefined))
+    mockDbUpdate.mockReturnValue(chain([{
+      attemptCount: 1,
+      claimToken: '00000000-0000-4000-8000-000000000011',
+      credentialDigest: Buffer.alloc(32, 1),
+      generation: '00000000-0000-4000-8000-000000000012',
+      legacyCredential: '00000000-0000-4000-8000-000000000000',
+      sessionId: '00000000-0000-4000-8000-000000000010',
+    }]))
   })
 
   it('deletes both digest and legacy Redis keys after DB revocation', async () => {
@@ -677,7 +790,16 @@ describe('destroySession', () => {
 
   it('sets revokedAt in the DB', async () => {
     await destroySession('00000000-0000-4000-8000-000000000000')
-    expect(mockDbUpdate).toHaveBeenCalledOnce()
+    expect(mockDbUpdate).toHaveBeenCalledTimes(2)
+  })
+
+  it('keeps the durable purge pending when Redis deletion fails', async () => {
+    mockRedisDel.mockRejectedValueOnce(new Error('redis unavailable'))
+
+    await expect(destroySession('00000000-0000-4000-8000-000000000000')).resolves.toBeUndefined()
+
+    expect(mockDbUpdate).toHaveBeenCalledTimes(2)
+    expect(mockRedisDel).toHaveBeenCalledOnce()
   })
 })
 
@@ -698,7 +820,7 @@ describe('login/finish — clone detection', () => {
     mockDbUpdate.mockReturnValue(chain([]))
   })
 
-  it('does NOT return 403 when newCounter=0 and storedCounter=0 (counter-0 passkeys are exempt)', async () => {
+  it('creates a session when newCounter=0 and storedCounter=0 (counter-0 passkeys are exempt)', async () => {
     const storedCredential = {
       id: 'cred-row-id',
       credentialId: 'abc123',
@@ -712,6 +834,7 @@ describe('login/finish — clone detection', () => {
     mockDbSelect
       .mockReturnValueOnce(chain([storedCredential]))
       .mockReturnValueOnce(chain([user]))
+      .mockReturnValueOnce(chain([{ state: 'expansion' }]))
 
     mockVerifyAuthenticationResponse.mockResolvedValue({
       verified: true,
@@ -730,8 +853,9 @@ describe('login/finish — clone detection', () => {
     })
 
     const res = await POST(req as never)
-    // Counter-0 passkeys are exempt — must NOT be 403
-    expect(res.status).not.toBe(403)
+    expect(res.status).toBe(200)
+    await expect(res.json()).resolves.toEqual({ userId: 'user-1', displayName: 'Alice' })
+    expect(res.headers.get('set-cookie')).toMatch(/^forge_session=[0-9a-f-]{36};/)
   })
 
   it('returns 403 when newCounter < storedCounter and storedCounter > 0', async () => {

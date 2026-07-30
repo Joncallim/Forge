@@ -170,6 +170,7 @@ function statusLabel(status: string): string {
     awaiting_answers: 'Needs answers',
     awaiting_approval: 'Needs approval',
     dead_lettered: 'Stopped after retries',
+    indeterminate: 'Retry status unknown',
     pending: 'Pending execution',
   }
   if (labels[status]) return labels[status]
@@ -1234,6 +1235,7 @@ function statusBadgeClass(status: string): string {
     case 'skipped':
     case 'validation_skipped':
     case 'warning':
+    case 'indeterminate':
       return 'border-amber-200 bg-amber-50 text-amber-900 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-200'
     case 'completed':
     case 'success':
@@ -4302,7 +4304,14 @@ export default function TaskDetailPage() {
     summaries: TaskQuestionSummary[],
   ) => {
     if (!planVersion) {
-      setClarificationQuestions([])
+      try {
+        const response = await fetch(`/api/tasks/${taskId}/questions`)
+        if (!response.ok) throw new Error('Legacy clarification history is unavailable')
+        const body = await response.json() as { questions?: TaskQuestion[] }
+        setClarificationQuestions(body.questions ?? [])
+      } catch {
+        setClarificationQuestions([])
+      }
       return
     }
     try {
@@ -4656,12 +4665,20 @@ export default function TaskDetailPage() {
       return
     }
 
-    if (mcpFreshness !== null && 'request' in action && action.request) {
+    // Packet-context reapproval is deliberately not an S5 recovery action.
+    // It is completed through the existing project filesystem decision
+    // control below, which owns the current decision/version compare-and-set.
+    if (
+      action.kind !== 'reapprove_packet_context'
+      && mcpFreshness !== null
+      && 'request' in action
+      && action.request
+    ) {
       const identity = action.request
       if (identity.schemaVersion === 1) {
         void submitMcpOperatorAction({
           schemaVersion: 1,
-          action: action.kind === 'reapprove_packet_context' ? 'retry_execution' : action.kind,
+          action: action.kind,
           expectedFreshnessFingerprint: mcpFreshness,
           localRunEvidenceId: identity.localRunEvidenceId,
           evidenceFingerprint: identity.evidenceFingerprint,
@@ -4673,9 +4690,7 @@ export default function TaskDetailPage() {
             ? 'retry_execution'
             : action.kind === 'review_submission'
               ? 'acknowledge_possible_submission'
-              : action.kind === 'reapprove_packet_context'
-                ? 'retry_execution'
-                : action.kind,
+              : action.kind,
           expectedFreshnessFingerprint: mcpFreshness,
           priorRuntimeAuditId: identity.priorRuntimeAuditId,
           markerFingerprint: identity.markerFingerprint,

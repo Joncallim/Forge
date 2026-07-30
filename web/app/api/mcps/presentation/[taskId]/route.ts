@@ -9,7 +9,7 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
     return NextResponse.json(admissionProjection((await readAuthorizedS5State(request, taskId)).state))
   } catch (error) {
     if (error instanceof S5RouteAuthorizationError) return NextResponse.json({ error: error.message }, { status: error.status })
-    console.error('[mcps/presentation GET] Unexpected error', error)
+    console.error('[mcps/presentation GET] Unexpected fixed-category failure')
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }

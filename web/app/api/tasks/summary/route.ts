@@ -52,8 +52,8 @@ export async function GET(request: NextRequest) {
       byStatus,
       attentionTasks,
     })
-  } catch (err) {
-    console.error('[GET /api/tasks/summary] Unexpected error', err)
+  } catch {
+    console.error('[GET /api/tasks/summary] Unexpected error')
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }

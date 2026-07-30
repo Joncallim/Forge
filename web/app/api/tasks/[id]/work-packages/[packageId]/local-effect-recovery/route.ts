@@ -63,9 +63,9 @@ export async function POST(
         const retry = await enqueueBlockedHandoffRetry(taskId, { source: 'local-effect-recovery' })
         continuationStatus = retry.status
       }
-    } catch (error) {
+    } catch {
       continuationStatus = 'pending'
-      console.error('[POST local-effect-recovery] Recovery committed but continuation is pending', error)
+      console.error('[POST local-effect-recovery] Recovery committed but continuation is pending')
     }
 
     return NextResponse.json({ result: { ...result, continuationStatus } }, {
@@ -78,7 +78,7 @@ export async function POST(
         { status: error.code === 'configuration' ? 503 : 409 },
       )
     }
-    console.error('[POST local-effect-recovery] Unexpected error', error)
+    console.error('[POST local-effect-recovery] Unexpected error')
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }

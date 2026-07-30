@@ -20,7 +20,7 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
     })
   } catch (error) {
     if (error instanceof S5RouteAuthorizationError) return NextResponse.json({ error: error.message }, { status: error.status })
-    console.error('[mcps/freshness GET] Unexpected error', error)
+    console.error('[mcps/freshness GET] Unexpected fixed-category failure')
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }

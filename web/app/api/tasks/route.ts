@@ -6,13 +6,14 @@ import { projects, tasks } from '@/db/schema'
 import { eq, desc, count, getTableColumns, type SQL } from 'drizzle-orm'
 import { getSession } from '@/lib/session'
 import { redis } from '@/lib/redis'
-import { generateTaskTitle } from '@/lib/task-title'
+import { generateTaskTitle, UNTITLED_TASK_TITLE } from '@/lib/task-title'
 import { recordTaskLogBestEffort } from '@/worker/task-logs'
 import {
   accessibleProjectOwnerCondition,
   getAccessibleProject,
 } from '@/lib/project-access'
 import { guardEpic172ProjectManagementIngress } from '@/lib/projects/epic-172-project-ingress'
+import { projectTaskCompatibilityTask } from '@/lib/mcps/leakage-drain'
 
 // ---------------------------------------------------------------------------
 // Validation schema
@@ -94,9 +95,16 @@ export async function GET(request: NextRequest) {
 
     const total = Number(totalResult[0]?.total ?? 0)
 
-    return NextResponse.json({ tasks: rows, total, page })
-  } catch (err) {
-    console.error('[GET /api/tasks] Unexpected error', err)
+    return NextResponse.json({
+      tasks: rows.map((row) => ({
+        ...projectTaskCompatibilityTask(row),
+        projectName: row.projectName,
+      })),
+      total,
+      page,
+    })
+  } catch {
+    console.error('[GET /api/tasks] Unexpected error')
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }
@@ -138,7 +146,14 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Project not found' }, { status: 404 })
     }
 
-    const title = data.title.trim() || (await generateTaskTitle(data.prompt, data.pmProviderConfigId))
+    const suppliedTitle = data.title.trim()
+    let title = suppliedTitle
+    if (!title) {
+      const { readS4RuntimeModeV1 } = await import('@/lib/mcps/s4-lease')
+      title = await readS4RuntimeModeV1() === 'protected'
+        ? UNTITLED_TASK_TITLE
+        : await generateTaskTitle(data.prompt, data.pmProviderConfigId)
+    }
 
     const [task] = await db
       .insert(tasks)
@@ -172,9 +187,9 @@ export async function POST(request: NextRequest) {
     })
 
     console.info('[POST /api/tasks] Created task', { id: task.id, projectId: task.projectId })
-    return NextResponse.json({ task }, { status: 201 })
-  } catch (err) {
-    console.error('[POST /api/tasks] Unexpected error', err)
+    return NextResponse.json({ task: projectTaskCompatibilityTask(task) }, { status: 201 })
+  } catch {
+    console.error('[POST /api/tasks] Unexpected error')
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }

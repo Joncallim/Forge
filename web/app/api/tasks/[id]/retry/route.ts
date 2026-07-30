@@ -132,8 +132,8 @@ export async function POST(
     })
 
     return NextResponse.json({ task })
-  } catch (err) {
-    console.error('[POST /api/tasks/:id/retry] Unexpected error', err)
+  } catch {
+    console.error('[POST /api/tasks/:id/retry] Unexpected error')
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }

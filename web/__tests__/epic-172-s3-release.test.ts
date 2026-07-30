@@ -97,7 +97,6 @@ describe('Epic 172 S3 release seam', () => {
     )
     const bridgeStep = workflow.slice(
       workflow.indexOf('name: Run the fail-closed Epic 172 Step 0 E2E bridge suite'),
-      workflow.indexOf('uses: actions/upload-artifact'),
     )
     const handoffConcurrency = readFileSync(
       fileURLToPath(new URL('../e2e/mcp-handoff-concurrency.spec.ts', import.meta.url)),
@@ -110,6 +109,9 @@ describe('Epic 172 S3 release seam', () => {
     expect(workflow).toContain("CI-only observer. PostgreSQL's default PUBLIC CONNECT/TEMPORARY")
     expect(workflow).toContain('object-level CI boundary, not global database isolation')
     expect(bridgeStep).toContain('FORGE_E2E_AUDIT_OBSERVER_DATABASE_URL:')
+    expect(workflow).not.toContain('uses: actions/upload-artifact')
+    expect(workflow).not.toContain('web/playwright-report')
+    expect(workflow).not.toContain('web/test-results')
     expect(handoffConcurrency).toContain('FORGE_E2E_AUDIT_OBSERVER_DATABASE_URL is required')
     expect(handoffConcurrency).toContain("currentUser: 'forge_e2e_audit_observer'")
     expect(handoffConcurrency).toContain('from public.filesystem_mcp_runtime_audits')

@@ -1,21 +1,22 @@
 import 'server-only'
 
 import postgres from 'postgres'
+import { fixedDatabaseRoleUrl } from '@/lib/mcps/fixed-database-url'
 
 // ---------------------------------------------------------------------------
-// S5 reads `work_package_local_run_evidence` for terminal/recovery validation,
-// but that table is owned by `forge_s4_routines_owner` and the ordinary Forge
-// application login is denied every privilege on it (see the S4 boundary proof
-// in .github/workflows/web-ci.yml). Selecting it through `@/db` therefore fails
-// with 42501 in any correctly provisioned deployment.
+// S5 reads protected local evidence and its terminal runtime audit together for
+// terminal/recovery validation, but the ordinary Forge application login is
+// intentionally not the authority for those rows (see the S4 boundary proof
+// in .github/workflows/web-ci.yml). Selecting the protected evidence through
+// `@/db` therefore fails with 42501 in any correctly provisioned deployment.
 //
-// This module is the only place S5 touches that table. It uses a dedicated
-// fixed-principal connection, selects an explicit safe column list (never
-// `claim_token`, never a lease digest), and fails closed: when the principal is
-// not configured, is denied, or errors for any reason, the caller receives
+// This module is the only S5 boundary that touches either table. It uses one
+// dedicated fixed-principal statement and an explicit safe column list: never
+// `claim_token`, grant nonces, authorization snapshots, or any other live
+// authority field. When the principal is unavailable, the caller receives
 // `null` and every evidence-dependent fact degrades to the truthful
-// non-actionable `unavailable`/`invalid` presentation rather than throwing or
-// falling back to an unauthorized connection.
+// non-actionable `unavailable`/`invalid` presentation rather than falling back
+// to an unauthorized connection.
 // ---------------------------------------------------------------------------
 
 export const S5_LOCAL_EVIDENCE_READER_URL_ENV = 'FORGE_LOCAL_RUN_EVIDENCE_READER_DATABASE_URL'
@@ -29,9 +30,33 @@ export type S5ProtectedLocalRunEvidenceRow = Readonly<{
   terminalAt: Date | null
 }>
 
+export type S5ProtectedRuntimeAuditRow = Readonly<{
+  id: string
+  workPackageId: string | null
+  agentRunId: string | null
+  localRunEvidenceId: string | null
+  assembly: Record<string, unknown> | null
+  delivery: Record<string, unknown> | null
+  terminal: Record<string, unknown> | null
+  terminalAt: Date | null
+  updatedAt: Date
+}>
+
+export type S5ProtectedTerminalSnapshot = Readonly<{
+  evidenceRows: readonly S5ProtectedLocalRunEvidenceRow[]
+  auditRows: readonly S5ProtectedRuntimeAuditRow[]
+}>
+
 function readerUrl(): string | null {
-  const value = process.env[S5_LOCAL_EVIDENCE_READER_URL_ENV]?.trim()
-  return value && value.length > 0 ? value : null
+  try {
+    return fixedDatabaseRoleUrl({
+      environmentName: S5_LOCAL_EVIDENCE_READER_URL_ENV,
+      expectedUsername: 'forge_local_evidence_reader',
+      value: process.env[S5_LOCAL_EVIDENCE_READER_URL_ENV],
+    })
+  } catch {
+    return null
+  }
 }
 
 export function s5LocalEvidenceReaderConfigured(): boolean {
@@ -44,9 +69,9 @@ export function s5LocalEvidenceReaderConfigured(): boolean {
  * for the caller: it means "this slice of evidence cannot be proven right now",
  * and S5 must present the corresponding facts as unavailable.
  */
-export async function readS5ProtectedLocalRunEvidence(
+export async function readS5ProtectedTerminalSnapshot(
   taskId: string,
-): Promise<readonly S5ProtectedLocalRunEvidenceRow[] | null> {
+): Promise<S5ProtectedTerminalSnapshot | null> {
   const url = readerUrl()
   if (!url) return null
   const sql = postgres(url, {
@@ -56,34 +81,88 @@ export async function readS5ProtectedLocalRunEvidence(
     transform: { undefined: null },
   })
   try {
-    const rows = await sql<S5ProtectedLocalRunEvidenceRow[]>`
+    const [snapshot] = await sql<{
+      evidenceRows: Array<{
+        id: string
+        workPackageId: string
+        agentRunId: string
+        state: string
+        leaseExpiresAt: string
+        terminalAt: string | null
+      }>
+      auditRows: Array<{
+        id: string
+        workPackageId: string | null
+        agentRunId: string | null
+        localRunEvidenceId: string | null
+        assembly: Record<string, unknown> | null
+        delivery: Record<string, unknown> | null
+        terminal: Record<string, unknown> | null
+        terminalAt: string | null
+        updatedAt: string
+      }>
+    }[]>`
       select
-        evidence.id as "id",
-        evidence.work_package_id as "workPackageId",
-        evidence.agent_run_id as "agentRunId",
-        evidence.state as "state",
-        evidence.lease_expires_at as "leaseExpiresAt",
-        evidence.terminal_at as "terminalAt"
-      from public.work_package_local_run_evidence evidence
-      where evidence.task_id = ${taskId}::uuid
-      order by evidence.created_at asc, evidence.id asc
+        coalesce((
+          select jsonb_agg(jsonb_build_object(
+            'id', evidence.id,
+            'workPackageId', evidence.work_package_id,
+            'agentRunId', evidence.agent_run_id,
+            'state', evidence.state,
+            'leaseExpiresAt', evidence.lease_expires_at,
+            'terminalAt', evidence.terminal_at
+          ) order by evidence.created_at, evidence.id)
+          from public.work_package_local_run_evidence evidence
+          where evidence.task_id = ${taskId}::uuid
+        ), '[]'::jsonb) as "evidenceRows",
+        coalesce((
+          select jsonb_agg(jsonb_build_object(
+            'id', audit.id,
+            'workPackageId', audit.work_package_id,
+            'agentRunId', audit.agent_run_id,
+            'localRunEvidenceId', audit.local_run_evidence_id,
+            'assembly', audit.assembly,
+            'delivery', audit.delivery,
+            'terminal', audit.terminal,
+            'terminalAt', audit.terminal_at,
+            'updatedAt', audit.created_at
+          ) order by audit.created_at, audit.id)
+          from public.filesystem_mcp_runtime_audits audit
+          where audit.task_id = ${taskId}::uuid
+        ), '[]'::jsonb) as "auditRows"
     `
-    return rows.map((row) => ({
-      id: row.id,
-      workPackageId: row.workPackageId,
-      agentRunId: row.agentRunId,
-      state: row.state,
-      leaseExpiresAt: row.leaseExpiresAt,
-      terminalAt: row.terminalAt,
-    }))
-  } catch (error) {
-    console.error('[s5-protected-reader] Local run evidence read failed closed', {
-      code: typeof error === 'object' && error !== null && 'code' in error
-        ? String((error as { code?: unknown }).code)
-        : 'unknown',
-    })
+    if (!snapshot || !Array.isArray(snapshot.evidenceRows) || !Array.isArray(snapshot.auditRows)) return null
+    return {
+      evidenceRows: snapshot.evidenceRows.map((row) => ({
+        id: row.id,
+        workPackageId: row.workPackageId,
+        agentRunId: row.agentRunId,
+        state: row.state,
+        leaseExpiresAt: new Date(row.leaseExpiresAt),
+        terminalAt: row.terminalAt === null ? null : new Date(row.terminalAt),
+      })),
+      auditRows: snapshot.auditRows.map((row) => ({
+        id: row.id,
+        workPackageId: row.workPackageId,
+        agentRunId: row.agentRunId,
+        localRunEvidenceId: row.localRunEvidenceId,
+        assembly: row.assembly,
+        delivery: row.delivery,
+        terminal: row.terminal,
+        terminalAt: row.terminalAt === null ? null : new Date(row.terminalAt),
+        updatedAt: new Date(row.updatedAt),
+      })),
+    }
+  } catch {
+    console.error('[s5-protected-reader] Protected local-evidence read unavailable')
     return null
   } finally {
     await sql.end({ timeout: 5 }).catch(() => {})
   }
+}
+
+export async function readS5ProtectedLocalRunEvidence(
+  taskId: string,
+): Promise<readonly S5ProtectedLocalRunEvidenceRow[] | null> {
+  return (await readS5ProtectedTerminalSnapshot(taskId))?.evidenceRows ?? null
 }

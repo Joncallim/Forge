@@ -15,6 +15,7 @@ const LOGIN_ROLES = [
   // access is a column-scoped SELECT on work_package_local_run_evidence issued
   // after migrations by provision-epic-172-local-evidence-reader.
   'forge_local_evidence_reader',
+  'forge_project_root_reconciler',
 ] as const
 const OWNER = 'forge_s4_routines_owner'
 const PROTECTED_ROLES = [OWNER, ...LOGIN_ROLES] as const
@@ -23,6 +24,8 @@ const OWNED_TABLES = [
   'architect_plan_entries',
   'architect_plan_execution_references',
   'architect_plan_history_reads',
+  'architect_clarification_answers',
+  'architect_clarification_answer_writes',
   'protected_package_entry_registrations',
   'protected_entry_capability_bindings',
   'mcp_operator_review_versions',
@@ -30,6 +33,12 @@ const OWNED_TABLES = [
   'work_package_local_run_evidence',
   'filesystem_mcp_decision_nonce_claims',
   'project_root_ref_reconciliation',
+  'project_root_change_journal_counter',
+  'project_root_change_journal',
+  'project_root_reconciliation_operations',
+  'project_root_reconciliation_checkpoints',
+  'project_root_reconciliation_outcomes',
+  'project_root_reconciliation_write_contexts',
   's4_completion_handoffs',
   's4_protected_review_sources',
   's4_protected_review_source_reads',
@@ -38,6 +47,23 @@ const OWNED_TABLES = [
   'local_effect_recovery_actions',
   'local_projection_archive_operations',
   'local_projection_archive_operation_checkpoints',
+] as const
+const EXACT_CLARIFICATION_ROUTINES = [
+  {
+    identity: 'forge.bind_architect_replan_context_v3(uuid,uuid)',
+    name: 'bind_architect_replan_context_v3',
+    grantee: 'forge_architect_plan_writer',
+  },
+  {
+    identity: 'forge.resolve_architect_plan_entry_v2(uuid)',
+    name: 'resolve_architect_plan_entry_v2',
+    grantee: 'forge_architect_plan_resolver',
+  },
+  {
+    identity: 'forge.append_architect_clarification_answer_v1(bytea,uuid,uuid,uuid,bigint,uuid,text,text,text)',
+    name: 'append_architect_clarification_answer_v1',
+    grantee: 'forge_architect_plan_history_reader',
+  },
 ] as const
 
 function literal(value: string): string {
@@ -105,11 +131,46 @@ async function main(): Promise<void> {
         forge_packet_issuer,
         forge_review_source_resolver,
         forge_s4_recovery_operator,
-        forge_local_projection_archiver
+        forge_local_projection_archiver,
+        forge_project_root_reconciler
     `)
     await admin`revoke create on schema forge from ${admin(OWNER)}`
     await admin`revoke create on schema public from ${admin(OWNER)}`
     await admin`grant execute on function forge.read_epic_172_enablement_state_v1() to ${admin(OWNER)}`
+    // These six routines are trigger-only: migrations create their triggers
+    // before this bootstrap runs, and the owning trigger tables invoke them.
+    // No runtime login needs direct EXECUTE, so remove PostgreSQL's default
+    // PUBLIC function grant without opening a reconciler capability.
+    await admin.unsafe(`
+      revoke execute on function
+        public.forge_epic_172_reject_mutation_v1(),
+        public.forge_epic_172_reject_project_hard_delete_v1(),
+        public.forge_preallocate_filesystem_decision_pointer(),
+        public.forge_preallocate_project_filesystem_decision_pointer(),
+        public.forge_reject_filesystem_grant_history_mutation(),
+        public.forge_reject_project_filesystem_decision_mutation()
+      from public
+    `)
+    const [{ publicTriggerExecuteCount }] = await admin<{ publicTriggerExecuteCount: number }[]>`
+      select count(*)::integer as "publicTriggerExecuteCount"
+      from pg_catalog.pg_proc routine
+      cross join lateral pg_catalog.aclexplode(
+        coalesce(routine.proacl, pg_catalog.acldefault('f', routine.proowner))
+      ) acl
+      where routine.oid = any(array[
+        'public.forge_epic_172_reject_mutation_v1()'::pg_catalog.regprocedure,
+        'public.forge_epic_172_reject_project_hard_delete_v1()'::pg_catalog.regprocedure,
+        'public.forge_preallocate_filesystem_decision_pointer()'::pg_catalog.regprocedure,
+        'public.forge_preallocate_project_filesystem_decision_pointer()'::pg_catalog.regprocedure,
+        'public.forge_reject_filesystem_grant_history_mutation()'::pg_catalog.regprocedure,
+        'public.forge_reject_project_filesystem_decision_mutation()'::pg_catalog.regprocedure
+      ])
+        and acl.grantee = 0
+        and acl.privilege_type = 'EXECUTE'
+    `
+    if (publicTriggerExecuteCount !== 0) {
+      throw new Error('Trigger-only S3 helpers retain an unsafe PUBLIC EXECUTE grant.')
+    }
     // S4 claims and archive transitions take row locks on the bounded S3
     // current-head set. PostgreSQL requires UPDATE privilege for SELECT ...
     // FOR UPDATE even though these routines never modify the head rows.
@@ -142,6 +203,10 @@ async function main(): Promise<void> {
       await admin.unsafe(`grant usage on schema forge to ${LOGIN_ROLES.join(', ')}`)
       await admin`grant execute on function forge.read_epic_172_enablement_state_v1() to ${admin(OWNER)}`
       await admin`grant select, update on table public.work_package_local_projection_heads to ${admin(OWNER)}`
+      await admin`grant select on table public.projects, public.tasks, public.work_packages, public.filesystem_mcp_grant_approvals, public.filesystem_mcp_current_decision_pointers, public.project_filesystem_grant_decisions, public.project_filesystem_current_decision_pointers, public.work_package_local_projection_heads to forge_project_root_reconciler`
+      await admin`grant update (status, error_message, updated_at) on table public.tasks to forge_project_root_reconciler`
+      await admin`grant update (status, blocked_reason, metadata, updated_at) on table public.work_packages to forge_project_root_reconciler`
+      await admin`grant execute on function forge.advance_local_projection_head_v1(uuid,uuid,text,uuid,bigint,text,jsonb,bigint,text,text) to forge_project_root_reconciler`
       const [{ protectedOwnershipCount }] = await admin<{ protectedOwnershipCount: number }[]>`
         select ((
           select count(*) from pg_catalog.pg_class relation
@@ -162,6 +227,11 @@ async function main(): Promise<void> {
       }
       const migrationLiteral = literal(migrationRole)
       const tableList = OWNED_TABLES.map(literal).join(',')
+      const exactClarificationRoutineValues = EXACT_CLARIFICATION_ROUTINES.map((routine) => `(
+        ${literal(routine.identity)},
+        ${literal(routine.name)},
+        ${literal(routine.grantee)}::pg_catalog.regrole
+      )`).join(',')
       await admin.unsafe(`
         create or replace function public.forge_begin_epic_172_s4_owner_bootstrap_v1()
         returns void
@@ -203,7 +273,8 @@ async function main(): Promise<void> {
               'forge_packet_issuer'::regrole,
               'forge_review_source_resolver'::regrole,
               'forge_s4_recovery_operator'::regrole,
-              'forge_local_projection_archiver'::regrole
+              'forge_local_projection_archiver'::regrole,
+              'forge_project_root_reconciler'::regrole
             ])
                or membership.member = any(array[
                  '${OWNER}'::regrole,
@@ -213,7 +284,8 @@ async function main(): Promise<void> {
                  'forge_packet_issuer'::regrole,
                  'forge_review_source_resolver'::regrole,
                  'forge_s4_recovery_operator'::regrole,
-                 'forge_local_projection_archiver'::regrole
+              'forge_local_projection_archiver'::regrole,
+              'forge_project_root_reconciler'::regrole
                ])
           ) <> 1 or (
             select pg_catalog.count(*)
@@ -261,7 +333,8 @@ async function main(): Promise<void> {
               'forge_packet_issuer'::regrole,
               'forge_review_source_resolver'::regrole,
               'forge_s4_recovery_operator'::regrole,
-              'forge_local_projection_archiver'::regrole
+              'forge_local_projection_archiver'::regrole,
+              'forge_project_root_reconciler'::regrole
             ])
                or membership.member = any(array[
                  '${OWNER}'::regrole,
@@ -271,7 +344,8 @@ async function main(): Promise<void> {
                  'forge_packet_issuer'::regrole,
                  'forge_review_source_resolver'::regrole,
                  'forge_s4_recovery_operator'::regrole,
-                 'forge_local_projection_archiver'::regrole
+                 'forge_local_projection_archiver'::regrole,
+                 'forge_project_root_reconciler'::regrole
                ])
           ) <> 1 or (
             select pg_catalog.count(*)
@@ -320,6 +394,68 @@ async function main(): Promise<void> {
                 and table_row.relname = any(array[${tableList}])
             ) using errcode = '42501';
           end if;
+          if exists (
+            with expected(routine_identity, routine_name, expected_grantee) as (
+              values ${exactClarificationRoutineValues}
+            ),
+            observed as (
+              select
+                expected.routine_identity,
+                expected.routine_name,
+                expected.expected_grantee,
+                routine.oid as routine_oid,
+                routine.proowner,
+                pg_catalog.count(acl.grantee) as acl_count,
+                pg_catalog.count(acl.grantee) filter (
+                  where acl.grantee = routine.proowner
+                    and acl.privilege_type = 'EXECUTE'
+                    and not acl.is_grantable
+                ) as owner_execute_count,
+                pg_catalog.count(acl.grantee) filter (
+                  where acl.grantee = expected.expected_grantee
+                    and acl.privilege_type = 'EXECUTE'
+                    and not acl.is_grantable
+                ) as expected_execute_count
+              from expected
+              left join pg_catalog.pg_proc routine
+                on routine.oid = pg_catalog.to_regprocedure(expected.routine_identity)
+              left join lateral pg_catalog.aclexplode(
+                coalesce(
+                  routine.proacl,
+                  pg_catalog.acldefault('f', routine.proowner)
+                )
+              ) acl on true
+              group by expected.routine_identity, expected.routine_name,
+                expected.expected_grantee, routine.oid, routine.proowner
+            )
+            select 1
+            from observed
+            where observed.routine_oid is null
+               or observed.proowner <> '${OWNER}'::regrole
+               or observed.acl_count <> 2
+               or observed.owner_execute_count <> 1
+               or observed.expected_execute_count <> 1
+          ) or exists (
+            with expected(routine_identity, routine_name, expected_grantee) as (
+              values ${exactClarificationRoutineValues}
+            )
+            select 1
+            from pg_catalog.pg_proc routine
+            join pg_catalog.pg_namespace namespace_row
+              on namespace_row.oid = routine.pronamespace
+            where namespace_row.nspname = 'forge'
+              and exists (
+                select 1 from expected
+                where expected.routine_name = routine.proname
+              )
+              and not exists (
+                select 1 from expected
+                where pg_catalog.to_regprocedure(expected.routine_identity) = routine.oid
+              )
+          ) then
+            raise exception 'The exact S4 clarification routine authority is incomplete'
+              using errcode = '42501';
+          end if;
           if (
             select pg_catalog.count(*)
             from pg_catalog.pg_proc routine
@@ -345,6 +481,15 @@ async function main(): Promise<void> {
                 ,'fill_project_root_ref_on_insert_v1'
                 ,'guard_project_root_ref_renull_v1'
                 ,'reconcile_project_root_refs_v1'
+                ,'append_project_root_change_journal_v1'
+                ,'reject_project_root_change_journal_mutation_v1'
+                ,'assert_project_root_reconciler_v1'
+                ,'assert_project_root_journal_window_v1'
+                ,'materialize_project_root_ref_expansion_v1'
+                ,'begin_project_root_reconciliation_v1'
+                ,'claim_project_root_reconciliation_batch_v1'
+                ,'complete_project_root_reconciliation_generation_v1'
+                ,'reject_project_root_reconciliation_history_mutation_v1'
                 ,'s4_protected_paths_enabled_v1'
                 ,'guard_s4_approval_gate_review_head_v1'
                 ,'bind_architect_replan_entry_v1'
@@ -382,6 +527,9 @@ async function main(): Promise<void> {
                 ,'apply_local_effect_recovery_action_v2'
                 ,'apply_packet_issuance_recovery_action_v2'
                 ,'bind_architect_replan_context_v2'
+                ,'bind_architect_replan_context_v3'
+                ,'resolve_architect_plan_entry_v2'
+                ,'append_architect_clarification_answer_v1'
                 ,'local_projection_archive_operation_fingerprint_v2'
                 ,'inspect_local_projection_overlimit_v2'
                 ,'apply_local_projection_overlimit_archive_v2'
@@ -400,7 +548,7 @@ async function main(): Promise<void> {
                 ) acl
                 where acl.grantee = 0 and acl.privilege_type = 'EXECUTE'
               )
-          ) <> 61 then
+          ) <> 73 then
             raise exception 'The S4 routine owner or PUBLIC boundary is incomplete'
               using errcode = '42501';
           end if;
@@ -454,7 +602,8 @@ async function main(): Promise<void> {
               'forge_packet_issuer',
               'forge_review_source_resolver',
               'forge_s4_recovery_operator',
-              'forge_local_projection_archiver'
+              'forge_local_projection_archiver',
+              'forge_project_root_reconciler'
             ]) role_name
             where not pg_catalog.has_schema_privilege(role_name, 'forge', 'usage')
                or pg_catalog.has_schema_privilege(role_name, 'forge', 'create')
@@ -506,7 +655,8 @@ async function main(): Promise<void> {
               'forge_packet_issuer'::regrole,
               'forge_review_source_resolver'::regrole,
               'forge_s4_recovery_operator'::regrole,
-              'forge_local_projection_archiver'::regrole
+              'forge_local_projection_archiver'::regrole,
+              'forge_project_root_reconciler'::regrole
             ])
                or membership.member = any(array[
                  '${OWNER}'::regrole,
@@ -516,7 +666,8 @@ async function main(): Promise<void> {
                  'forge_packet_issuer'::regrole,
                  'forge_review_source_resolver'::regrole,
                  'forge_s4_recovery_operator'::regrole,
-                 'forge_local_projection_archiver'::regrole
+                 'forge_local_projection_archiver'::regrole,
+                 'forge_project_root_reconciler'::regrole
                ])
           ) then
             raise exception 'A finalized S4 protected principal retains a membership edge'
@@ -533,7 +684,8 @@ async function main(): Promise<void> {
               'forge_packet_issuer',
               'forge_review_source_resolver',
               'forge_s4_recovery_operator',
-              'forge_local_projection_archiver'
+              'forge_local_projection_archiver',
+              'forge_project_root_reconciler'
             ])
               and role.rolpassword is not null
           ) or exists (
@@ -546,7 +698,8 @@ async function main(): Promise<void> {
               'forge_packet_issuer'::regrole,
               'forge_review_source_resolver'::regrole,
               'forge_s4_recovery_operator'::regrole,
-              'forge_local_projection_archiver'::regrole
+              'forge_local_projection_archiver'::regrole,
+              'forge_project_root_reconciler'::regrole
             ])
           ) then
             raise exception 'A finalized S4 principal retains a password or role setting'
@@ -561,7 +714,8 @@ async function main(): Promise<void> {
               'forge_packet_issuer'::regrole,
               'forge_review_source_resolver'::regrole,
               'forge_s4_recovery_operator'::regrole,
-              'forge_local_projection_archiver'::regrole
+              'forge_local_projection_archiver'::regrole,
+              'forge_project_root_reconciler'::regrole
             ])
           ) or exists (
             select 1 from pg_catalog.pg_proc routine
@@ -572,7 +726,8 @@ async function main(): Promise<void> {
               'forge_packet_issuer'::regrole,
               'forge_review_source_resolver'::regrole,
               'forge_s4_recovery_operator'::regrole,
-              'forge_local_projection_archiver'::regrole
+              'forge_local_projection_archiver'::regrole,
+              'forge_project_root_reconciler'::regrole
             ])
           ) or exists (
             select 1 from pg_catalog.pg_namespace namespace_row
@@ -583,7 +738,8 @@ async function main(): Promise<void> {
               'forge_packet_issuer'::regrole,
               'forge_review_source_resolver'::regrole,
               'forge_s4_recovery_operator'::regrole,
-              'forge_local_projection_archiver'::regrole
+              'forge_local_projection_archiver'::regrole,
+              'forge_project_root_reconciler'::regrole
             ])
           ) or exists (
             select 1 from pg_catalog.pg_database database_row
@@ -594,7 +750,8 @@ async function main(): Promise<void> {
               'forge_packet_issuer'::regrole,
               'forge_review_source_resolver'::regrole,
               'forge_s4_recovery_operator'::regrole,
-              'forge_local_projection_archiver'::regrole
+              'forge_local_projection_archiver'::regrole,
+              'forge_project_root_reconciler'::regrole
             ])
           ) then
             raise exception 'A dedicated S4 login owns a database object'

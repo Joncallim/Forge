@@ -42,6 +42,21 @@ vi.mock('@/db', () => ({
 vi.mock('@/lib/providers/registry', () => ({
   getProvider: mockGetProvider,
   getModel: mockGetModel,
+  providerExecutionSnapshot: vi.fn((config: {
+    id: string
+    isLocal: boolean
+    modelId: string
+    providerType: string
+    updatedAt: Date
+  }) => ({
+    acpExecutionMode: config.providerType === 'acp' ? 'unconfined_host_process' : 'not_applicable',
+    configId: config.id,
+    fingerprint: 'test-provider-snapshot',
+    isLocal: config.isLocal,
+    modelId: config.modelId,
+    providerType: config.providerType,
+    updatedAt: config.updatedAt,
+  })),
 }))
 
 vi.mock('@/lib/mcps/manager', () => ({
@@ -199,8 +214,8 @@ describe('answered-question retry contract', () => {
   it('passes finalAttempt into answered-question processing', () => {
     const runtimeSource = fs.readFileSync(path.join(repoRoot, 'worker/runtime.ts'), 'utf8')
 
-    expect(runtimeSource).toContain(
-      'await processAnsweredQuestions(claimedAnswers.job.taskId, { finalAttempt })',
+    expect(runtimeSource).toMatch(
+      /await processAnsweredQuestions\(claimedAnswers\.job\.taskId, \{\s+claimLeaseFence,\s+executionContext,\s+finalAttempt,\s+\}\)/,
     )
   })
 
@@ -212,6 +227,17 @@ describe('answered-question retry contract', () => {
     expect(runtimeSource.indexOf('acknowledgeMissingTaskJob(')).toBeLessThan(
       runtimeSource.indexOf('startTaskAttempt({'),
     )
+  })
+
+  it('schedules session cache purges independently of blocked handoff recovery', () => {
+    const runtimeSource = fs.readFileSync(path.join(repoRoot, 'worker/runtime.ts'), 'utf8')
+
+    expect(runtimeSource).toContain('FORGE_SESSION_CACHE_PURGE_INTERVAL_SECONDS')
+    expect(runtimeSource).toContain('const sweepSessionCachePurges')
+    expect(runtimeSource).toContain("import('../lib/session')")
+    expect(runtimeSource).toContain("void sweepSessionCachePurges({ startup: true })")
+    expect(runtimeSource).toContain('Session cache purge sweep failed')
+    expect(runtimeSource).toContain('clearInterval(sessionCachePurgeTimer)')
   })
 
   it('restores answered rows and awaiting_answers status on retryable re-plan failure', async () => {
