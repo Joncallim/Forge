@@ -487,9 +487,27 @@ SET status = 'blocked', metadata = pg_catalog.jsonb_set(package.metadata, '{pack
 FROM next_marker
 WHERE package.id = '27000000-0000-4000-8000-00000000d101';
 -- Exhaustively execute the persisted packet disposition/action cartesian
--- product under the actual recovery login. Each case receives a distinct,
--- canonically fingerprinted marker; allowed actions must replay exactly, while
--- every disallowed pairing must leave the ledger and package untouched.
+-- product under the actual recovery login. Marker fields stay inside the
+-- production contract; unique actors isolate each ledger idempotency identity.
+INSERT INTO public.users (id, display_name) VALUES
+  ('27000000-0000-4000-8000-00000000d901', 'packet matrix 01'),
+  ('27000000-0000-4000-8000-00000000d902', 'packet matrix 02'),
+  ('27000000-0000-4000-8000-00000000d903', 'packet matrix 03'),
+  ('27000000-0000-4000-8000-00000000d904', 'packet matrix 04'),
+  ('27000000-0000-4000-8000-00000000d905', 'packet matrix 05'),
+  ('27000000-0000-4000-8000-00000000d906', 'packet matrix 06'),
+  ('27000000-0000-4000-8000-00000000d907', 'packet matrix 07'),
+  ('27000000-0000-4000-8000-00000000d908', 'packet matrix 08'),
+  ('27000000-0000-4000-8000-00000000d909', 'packet matrix 09'),
+  ('27000000-0000-4000-8000-00000000d910', 'packet matrix 10'),
+  ('27000000-0000-4000-8000-00000000d911', 'packet matrix 11'),
+  ('27000000-0000-4000-8000-00000000d912', 'packet matrix 12'),
+  ('27000000-0000-4000-8000-00000000d913', 'packet matrix 13'),
+  ('27000000-0000-4000-8000-00000000d914', 'packet matrix 14'),
+  ('27000000-0000-4000-8000-00000000d915', 'packet matrix 15'),
+  ('27000000-0000-4000-8000-00000000d916', 'packet matrix 16'),
+  ('27000000-0000-4000-8000-00000000d917', 'packet matrix 17'),
+  ('27000000-0000-4000-8000-00000000d918', 'packet matrix 18');
 CREATE FUNCTION public.forge_proof_packet_action_matrix_v1()
 RETURNS void LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = pg_catalog, public, forge AS $$
@@ -498,6 +516,7 @@ DECLARE
   v_marker jsonb;
   v_disposition text;
   v_action text;
+  v_next_disposition text;
   v_allowed boolean;
   v_fingerprint text;
   v_before_actions integer;
@@ -510,6 +529,19 @@ DECLARE
   v_expected_result text;
   v_expected_status text;
   v_authorizer uuid;
+  v_actor uuid;
+  v_index integer := 0;
+  v_actors uuid[] := ARRAY[
+    '27000000-0000-4000-8000-00000000d901'::uuid,'27000000-0000-4000-8000-00000000d902'::uuid,
+    '27000000-0000-4000-8000-00000000d903'::uuid,'27000000-0000-4000-8000-00000000d904'::uuid,
+    '27000000-0000-4000-8000-00000000d905'::uuid,'27000000-0000-4000-8000-00000000d906'::uuid,
+    '27000000-0000-4000-8000-00000000d907'::uuid,'27000000-0000-4000-8000-00000000d908'::uuid,
+    '27000000-0000-4000-8000-00000000d909'::uuid,'27000000-0000-4000-8000-00000000d910'::uuid,
+    '27000000-0000-4000-8000-00000000d911'::uuid,'27000000-0000-4000-8000-00000000d912'::uuid,
+    '27000000-0000-4000-8000-00000000d913'::uuid,'27000000-0000-4000-8000-00000000d914'::uuid,
+    '27000000-0000-4000-8000-00000000d915'::uuid,'27000000-0000-4000-8000-00000000d916'::uuid,
+    '27000000-0000-4000-8000-00000000d917'::uuid,'27000000-0000-4000-8000-00000000d918'::uuid
+  ];
 BEGIN
   SELECT metadata->'packet_issuance' INTO STRICT v_base
   FROM public.work_packages WHERE id = '27000000-0000-4000-8000-00000000d101';
@@ -520,12 +552,18 @@ BEGIN
     FOREACH v_action IN ARRAY ARRAY[
       'acknowledge_possible_submission','retry_execution','decline_packet_recovery'
     ] LOOP
+      v_index := v_index + 1; v_actor := v_actors[v_index];
+      IF v_disposition = 'reapprove_allow_once' THEN
+        v_next_disposition := 'reapprove_allow_once';
+      ELSIF v_disposition = 'review_then_reapprove_allow_once' THEN
+        v_next_disposition := 'reapprove_allow_once';
+      ELSIF v_disposition IN ('retry_execution','reviewed_submission') THEN
+        v_next_disposition := 'retry_execution';
+      ELSE
+        v_next_disposition := 'review_submission';
+      END IF;
       v_marker := v_base || pg_catalog.jsonb_build_object(
-        'disposition', v_disposition,
-        -- markerFingerprint deliberately covers nextDisposition but ignores
-        -- unknown fields. Use this canonical covered field to prevent an
-        -- earlier same-action ledger replay from satisfying a new matrix case.
-        'nextDisposition', 'matrix:' || v_disposition || ':' || v_action
+        'disposition', v_disposition, 'nextDisposition', v_next_disposition
       );
       v_marker := pg_catalog.jsonb_set(v_marker, '{markerFingerprint}',
         pg_catalog.to_jsonb(forge.packet_recovery_marker_fingerprint_v2(v_marker - 'markerFingerprint')), true);
@@ -559,7 +597,7 @@ BEGIN
         SELECT * INTO v_first FROM forge.apply_packet_issuance_recovery_action_v2(
           '27000000-0000-4000-8000-00000000d001', '27000000-0000-4000-8000-00000000d101',
           '27000000-0000-4000-8000-00000000d401', v_action, v_fingerprint,
-          '27000000-0000-4000-8000-000000000001', v_authorizer
+          v_actor, v_authorizer
         );
         IF NOT v_allowed THEN RAISE EXCEPTION 'disallowed packet matrix pair passed: %/%', v_disposition, v_action; END IF;
         SELECT metadata, status INTO v_after_metadata, v_after_status
@@ -580,7 +618,7 @@ BEGIN
         SELECT * INTO v_second FROM forge.apply_packet_issuance_recovery_action_v2(
           '27000000-0000-4000-8000-00000000d001', '27000000-0000-4000-8000-00000000d101',
           '27000000-0000-4000-8000-00000000d401', v_action, v_fingerprint,
-          '27000000-0000-4000-8000-000000000001', v_authorizer
+          v_actor, v_authorizer
         );
         IF v_second.action_id IS DISTINCT FROM v_first.action_id
            OR v_second.result IS DISTINCT FROM v_first.result
