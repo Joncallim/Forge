@@ -397,15 +397,23 @@ $recovery_success_assertions$;
 -- Packet secondary-action matrix. Acknowledge is only valid for review
 -- dispositions, then its exact new marker permits decline. Both actions are
 -- ledger-first replayable and retain no project authority binding.
-UPDATE public.work_packages
-SET status = 'blocked', metadata = pg_catalog.jsonb_set(
-  metadata, '{packet_issuance}',
-  (SELECT marker || '{"disposition":"review_submission"}'::jsonb
-   FROM forge_proof_saved_packet_marker), true
+WITH next_marker AS (
+  SELECT marker || '{"disposition":"review_submission"}'::jsonb AS marker
+  FROM forge_proof_saved_packet_marker
 )
-WHERE id = '27000000-0000-4000-8000-00000000d101';
+UPDATE public.work_packages package
+SET status = 'blocked', metadata = pg_catalog.jsonb_set(
+  package.metadata, '{packet_issuance}',
+  pg_catalog.jsonb_set(next_marker.marker, '{markerFingerprint}',
+    pg_catalog.to_jsonb(forge.packet_recovery_marker_fingerprint_v2(
+      next_marker.marker - 'markerFingerprint'
+    )), true
+  ), true
+)
+FROM next_marker
+WHERE package.id = '27000000-0000-4000-8000-00000000d101';
 SELECT metadata->'packet_issuance'->>'markerFingerprint' AS fingerprint
-FROM public.work_packages WHERE id = '27000000-0000-4000-8000-00000000d101';
+FROM public.work_packages WHERE id = '27000000-0000-4000-8000-00000000d101'
 \gset packet_ack_
 SET SESSION AUTHORIZATION forge_s4_recovery_operator;
 SELECT result, result_marker_fingerprint, package_status
@@ -422,7 +430,7 @@ FROM forge.apply_packet_issuance_recovery_action_v2(
   :'packet_ack_fingerprint', '27000000-0000-4000-8000-000000000001', NULL
 );
 SELECT metadata->'packet_issuance'->>'markerFingerprint' AS fingerprint
-FROM public.work_packages WHERE id = '27000000-0000-4000-8000-00000000d101';
+FROM public.work_packages WHERE id = '27000000-0000-4000-8000-00000000d101'
 \gset packet_decline_
 SELECT result, package_status
 FROM forge.apply_packet_issuance_recovery_action_v2(
@@ -459,10 +467,20 @@ $packet_secondary_action_assertions$;
 
 -- Every wrong pairing and stale token is rejected before it can append a
 -- ledger row or alter the canonical package projection.
-UPDATE public.work_packages
-SET status = 'blocked', metadata = pg_catalog.jsonb_set(metadata, '{packet_issuance}',
-  (SELECT marker || '{"disposition":"retry_execution"}'::jsonb FROM forge_proof_saved_packet_marker), true)
-WHERE id = '27000000-0000-4000-8000-00000000d101';
+WITH next_marker AS (
+  SELECT marker || '{"disposition":"retry_execution"}'::jsonb AS marker
+  FROM forge_proof_saved_packet_marker
+)
+UPDATE public.work_packages package
+SET status = 'blocked', metadata = pg_catalog.jsonb_set(package.metadata, '{packet_issuance}',
+  pg_catalog.jsonb_set(next_marker.marker, '{markerFingerprint}',
+    pg_catalog.to_jsonb(forge.packet_recovery_marker_fingerprint_v2(
+      next_marker.marker - 'markerFingerprint'
+    )), true
+  ), true
+)
+FROM next_marker
+WHERE package.id = '27000000-0000-4000-8000-00000000d101';
 CREATE FUNCTION public.forge_proof_expect_packet_action_rejected_v1(p_action text, p_fingerprint text, p_authorizer uuid)
 RETURNS void LANGUAGE plpgsql SET search_path = pg_catalog, forge AS $$
 BEGIN
@@ -493,9 +511,13 @@ BEGIN
   IF (SELECT count(*) FROM public.filesystem_mcp_issuance_recovery_actions
       WHERE prior_runtime_audit_id = '27000000-0000-4000-8000-00000000d401') <> 3
      OR (SELECT status FROM public.work_packages WHERE id = '27000000-0000-4000-8000-00000000d101') <> 'blocked'
-     OR (SELECT metadata->'packet_issuance' FROM public.work_packages
-         WHERE id = '27000000-0000-4000-8000-00000000d101')
-        <> (SELECT marker || '{"disposition":"retry_execution"}'::jsonb FROM forge_proof_saved_packet_marker) THEN
+     OR (SELECT metadata->'packet_issuance'->>'disposition' FROM public.work_packages
+         WHERE id = '27000000-0000-4000-8000-00000000d101') <> 'retry_execution'
+     OR (SELECT forge.packet_recovery_marker_fingerprint_v2(
+           (metadata->'packet_issuance') - 'markerFingerprint'
+         ) FROM public.work_packages WHERE id = '27000000-0000-4000-8000-00000000d101')
+        <> (SELECT metadata->'packet_issuance'->>'markerFingerprint'
+            FROM public.work_packages WHERE id = '27000000-0000-4000-8000-00000000d101') THEN
     RAISE EXCEPTION 'Rejected packet actions changed durable ledger or canonical marker state';
   END IF;
 END;
