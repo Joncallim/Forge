@@ -195,8 +195,35 @@ The test must report all tests passed with zero skips and emits these markers:
 
 That proof covers the PostgreSQL authorization, row/checkpoint compare-and-set,
 resume, reappearance, and protected-artifact link-race contracts. It does not
-claim the separate Redis credential-revocation/namespace proof or the complete cross-sink production proof.
-Those are later gates and must be run and reviewed separately.
+claim the separate Redis credential-revocation/namespace proof or the combined
+cross-sink production boundary by itself. Those are separate gates and must be
+run together through the mandatory proof below.
+
+## Combined cross-sink production proof
+
+The mandatory combined CI proof is
+`cross-sink-production-sentinel.postgres-redis.test.ts`. It must pass exactly
+1/1 and emit `S4_CROSS_SINK_PRODUCTION_SENTINEL_OK`. It composes the supported
+production writers, readers, routes, projections, and scrub adapters against
+disposable PostgreSQL and Redis services and verifies the supported sink set
+collectively:
+
+- canonical `tasks.prompt` authorization;
+- task API projections;
+- logs and export;
+- Server-Sent Events live, snapshot, and replay;
+- Redis history, sequence, and live data;
+- worker diagnostics;
+- the scrubbed database inventory;
+- the signed producers-disabled receipt;
+- zero-scan and reappearance checks; and
+- legacy Redis ACL revocation.
+
+This is exact hosted disposable-service release evidence, not a production
+deployment, not proof for arbitrary future producers or sinks, and not proof of correctness. New producer or sink surfaces must extend the proof corpus and
+inspection before they can rely on this marker. It does not imply that the
+future specialist, ACP, or three-lease execution lifecycle is implemented or
+enabled.
 
 ## Redis ACL and protected-mode cutover
 
@@ -277,7 +304,7 @@ FORGE_S4_REDIS_ACL_TEST_REQUIRED=1 FORGE_S4_REDIS_ACL_DESTRUCTIVE_TEST=1 \
 # S4_REDIS_ACL_LEGACY_REVOKED_OK
 ```
 
-These are separate gates and do not claim the deferred complete cross-sink
+These are separate gates and do not replace the mandatory combined cross-sink
 production proof. Before activation, keep the database mode legacy and do not
 inject the dedicated URLs into running legacy processes while investigating.
 Creating the ACL users and storing their secrets out of process does not select
