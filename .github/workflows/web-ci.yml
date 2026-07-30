@@ -537,27 +537,6 @@ jobs:
           FORGE_QUEUE_ADOPTION_WRITER_DATABASE_URL: postgresql://forge_architect_plan_writer:forge_plan_writer_test@localhost:5432/forge_queue_adoption_ci_test
           FORGE_QUEUE_ADOPTION_RESOLVER_DATABASE_URL: postgresql://forge_architect_plan_resolver:forge_plan_resolver_test@localhost:5432/forge_queue_adoption_ci_test
           FORGE_QUEUE_ADOPTION_HISTORY_READER_DATABASE_URL: postgresql://forge_architect_plan_history_reader:forge_plan_history_reader_test@localhost:5432/forge_queue_adoption_ci_test
-      - name: Run mandatory S4 PostgreSQL zero-skip proof
-        env:
-          FORGE_S4_REQUIRE_POSTGRES_TEST: '1'
-          FORGE_S4_POSTGRES_TEST_DATABASE_URL: postgresql://forge_e2e:forge@localhost:5432/forge_s4_ci_test
-          FORGE_EPIC_172_TEST_APP_DATABASE_URL: postgresql://forge_app_test:forge_app_test@localhost:5432/forge_s4_ci_test
-          FORGE_PACKET_ISSUER_DATABASE_URL: postgresql://forge_packet_issuer:forge_packet_issuer_test@localhost:5432/forge_s4_ci_test
-          FORGE_ARCHITECT_PLAN_WRITER_DATABASE_URL: postgresql://forge_architect_plan_writer:forge_plan_writer_test@localhost:5432/forge_s4_ci_test
-          FORGE_ARCHITECT_PLAN_RESOLVER_DATABASE_URL: postgresql://forge_architect_plan_resolver:forge_plan_resolver_test@localhost:5432/forge_s4_ci_test
-          FORGE_ARCHITECT_PLAN_HISTORY_READER_DATABASE_URL: postgresql://forge_architect_plan_history_reader:forge_plan_history_reader_test@localhost:5432/forge_s4_ci_test
-        run: |
-          set -o pipefail
-          report="$(mktemp)"
-          npm run test:mcp:s4-postgres -- --reporter=default | tee "$report"
-          if grep -Eq '[1-9][0-9]* skipped' "$report"; then
-            echo 'The mandatory S4 PostgreSQL proof was skipped.' >&2
-            exit 1
-          fi
-          if ! grep -Eq '[1-9][0-9]* passed' "$report"; then
-            echo 'The mandatory S4 PostgreSQL proof did not report a passing test.' >&2
-            exit 1
-          fi
       - name: Create a pristine cross-sink proof database
         working-directory: .
         env:
@@ -581,6 +560,27 @@ jobs:
             OWNER forge_migration_test
             TEMPLATE forge_s4_ci_test;
           SQL
+      - name: Run mandatory S4 PostgreSQL zero-skip proof
+        env:
+          FORGE_S4_REQUIRE_POSTGRES_TEST: '1'
+          FORGE_S4_POSTGRES_TEST_DATABASE_URL: postgresql://forge_e2e:forge@localhost:5432/forge_s4_ci_test
+          FORGE_EPIC_172_TEST_APP_DATABASE_URL: postgresql://forge_app_test:forge_app_test@localhost:5432/forge_s4_ci_test
+          FORGE_PACKET_ISSUER_DATABASE_URL: postgresql://forge_packet_issuer:forge_packet_issuer_test@localhost:5432/forge_s4_ci_test
+          FORGE_ARCHITECT_PLAN_WRITER_DATABASE_URL: postgresql://forge_architect_plan_writer:forge_plan_writer_test@localhost:5432/forge_s4_ci_test
+          FORGE_ARCHITECT_PLAN_RESOLVER_DATABASE_URL: postgresql://forge_architect_plan_resolver:forge_plan_resolver_test@localhost:5432/forge_s4_ci_test
+          FORGE_ARCHITECT_PLAN_HISTORY_READER_DATABASE_URL: postgresql://forge_architect_plan_history_reader:forge_plan_history_reader_test@localhost:5432/forge_s4_ci_test
+        run: |
+          set -o pipefail
+          report="$(mktemp)"
+          npm run test:mcp:s4-postgres -- --reporter=default | tee "$report"
+          if grep -Eq '[1-9][0-9]* skipped' "$report"; then
+            echo 'The mandatory S4 PostgreSQL proof was skipped.' >&2
+            exit 1
+          fi
+          if ! grep -Eq '[1-9][0-9]* passed' "$report"; then
+            echo 'The mandatory S4 PostgreSQL proof did not report a passing test.' >&2
+            exit 1
+          fi
       - name: Run mandatory S4 Redis zero-skip proof
         env:
           FORGE_S4_REQUIRE_REDIS_TEST: '1'
