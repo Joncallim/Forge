@@ -429,9 +429,14 @@ FROM forge.apply_packet_issuance_recovery_action_v2(
   '27000000-0000-4000-8000-00000000d401', 'acknowledge_possible_submission',
   :'packet_ack_fingerprint', '27000000-0000-4000-8000-000000000001', NULL
 );
+-- The recovery login has no direct mutable projection read. Inspect the
+-- returned action above under that boundary, then capture the next CAS token
+-- under the admin fixture context.
+RESET SESSION AUTHORIZATION;
 SELECT metadata->'packet_issuance'->>'markerFingerprint' AS fingerprint
 FROM public.work_packages WHERE id = '27000000-0000-4000-8000-00000000d101'
 \gset packet_decline_
+SET SESSION AUTHORIZATION forge_s4_recovery_operator;
 SELECT result, package_status
 FROM forge.apply_packet_issuance_recovery_action_v2(
   '27000000-0000-4000-8000-00000000d001', '27000000-0000-4000-8000-00000000d101',
