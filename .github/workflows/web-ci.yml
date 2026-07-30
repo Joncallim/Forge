@@ -133,6 +133,8 @@ jobs:
           npm run protocol:bootstrap-epic-172-s3-release-owner
           npx tsx scripts/ci/migrate-through-0026.ts
           npm run protocol:bootstrap-epic-172-s4-roles
+          npx tsx scripts/ci/migrate-through-0027.ts
+          npx tsx scripts/bootstrap-epic-172-s5-recovery-owner.ts
           npm run db:migrate
         env:
           DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_s4_ci_test
@@ -208,6 +210,15 @@ jobs:
           DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_epic_172_ci_test
       - name: Bootstrap migration-0027 S4 protocol ownership
         run: npm run protocol:bootstrap-epic-172-s4-roles
+        env:
+          DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_epic_172_ci_test
+          FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_epic_172_ci_test
+      - name: Apply migrations through 0027
+        run: npx tsx scripts/ci/migrate-through-0027.ts
+        env:
+          DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_epic_172_ci_test
+      - name: Bootstrap migration-0028 S5 recovery ownership
+        run: npx tsx scripts/bootstrap-epic-172-s5-recovery-owner.ts
         env:
           DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_epic_172_ci_test
           FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_epic_172_ci_test

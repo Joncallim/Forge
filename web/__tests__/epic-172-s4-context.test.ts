@@ -123,6 +123,11 @@ describe('Epic 172 S4 PostgreSQL CI contract', () => {
     expect(webCiWorkflow).toContain('npm run protocol:bootstrap-epic-172-s4-roles')
     expect(webCiWorkflow).toContain('name: Create the freshly migrated isolated S4 PostgreSQL proof database')
     expect(webCiWorkflow).toContain('CREATE DATABASE forge_s4_ci_test OWNER forge_migration_test;')
+    expect(webCiWorkflow).toContain('npx tsx scripts/ci/migrate-through-0027.ts\n          npx tsx scripts/bootstrap-epic-172-s5-recovery-owner.ts\n          npm run db:migrate')
+    const stage0027 = webCiWorkflow.indexOf('name: Apply migrations through 0027')
+    const handoff0028 = webCiWorkflow.indexOf('name: Bootstrap migration-0028 S5 recovery ownership')
+    expect(stage0027).toBeLessThan(handoff0028)
+    expect(handoff0028).toBeLessThan(webCiWorkflow.indexOf('name: Apply migrations as the disposable migration owner'))
     expect(webCiWorkflow).toContain('npm run test:mcp:s4-postgres -- --reporter=default | tee "$report"')
     expect(webCiWorkflow).toContain('run: npm run test:unit:zero-skip')
     const zeroSkipStep = webCiWorkflow.slice(
