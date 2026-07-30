@@ -86,6 +86,10 @@ export const EPIC_172_STEP0_E2E_INVENTORY = [
     classification: 'run-disabled-safe',
   },
   {
+    id: 'filesystem-grant-lifecycle-concurrency.spec.ts::locked health revalidation rejects a mutable filesystem change without durable approval writes',
+    classification: 'run-disabled-safe',
+  },
+  {
     id: 'filesystem-grant-lifecycle-concurrency.spec.ts::root repoint keeps the retained project decision and pointer unchanged while revoking issuance',
     classification: 'run-disabled-safe',
   },
