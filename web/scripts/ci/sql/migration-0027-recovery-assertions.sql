@@ -405,7 +405,7 @@ SET status = 'blocked', metadata = pg_catalog.jsonb_set(
 )
 WHERE id = '27000000-0000-4000-8000-00000000d101';
 SELECT metadata->'packet_issuance'->>'markerFingerprint' AS fingerprint
-FROM public.work_packages WHERE id = '27000000-0000-4000-8000-00000000d101
+FROM public.work_packages WHERE id = '27000000-0000-4000-8000-00000000d101';
 \gset packet_ack_
 SET SESSION AUTHORIZATION forge_s4_recovery_operator;
 SELECT result, result_marker_fingerprint, package_status
@@ -422,7 +422,7 @@ FROM forge.apply_packet_issuance_recovery_action_v2(
   :'packet_ack_fingerprint', '27000000-0000-4000-8000-000000000001', NULL
 );
 SELECT metadata->'packet_issuance'->>'markerFingerprint' AS fingerprint
-FROM public.work_packages WHERE id = '27000000-0000-4000-8000-00000000d101
+FROM public.work_packages WHERE id = '27000000-0000-4000-8000-00000000d101';
 \gset packet_decline_
 SELECT result, package_status
 FROM forge.apply_packet_issuance_recovery_action_v2(
