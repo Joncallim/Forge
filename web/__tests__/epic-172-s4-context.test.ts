@@ -278,6 +278,65 @@ describe('Epic 172 S4 PostgreSQL CI contract', () => {
     expect(s4Migration).toMatch(/RETURNS TABLE \(purpose text, source_kind text, task_id uuid/)
   })
 
+  it('certifies every protected clarification table and routine in the S4 owner finalizer', () => {
+    const ownedTableInventory = s4RoleBootstrap.match(
+      /const OWNED_TABLES = \[([\s\S]*?)\] as const/,
+    )?.[1] ?? ''
+    const exactRoutineInventory = s4RoleBootstrap.match(
+      /const EXACT_CLARIFICATION_ROUTINES = \[([\s\S]*?)\] as const/,
+    )?.[1] ?? ''
+
+    for (const table of [
+      'architect_clarification_answers',
+      'architect_clarification_answer_writes',
+    ]) {
+      expect(ownedTableInventory).toContain(`'${table}'`)
+    }
+    for (const routine of [
+      {
+        identity: 'forge.bind_architect_replan_context_v3(uuid,uuid)',
+        name: 'bind_architect_replan_context_v3',
+        grantee: 'forge_architect_plan_writer',
+      },
+      {
+        identity: 'forge.resolve_architect_plan_entry_v2(uuid)',
+        name: 'resolve_architect_plan_entry_v2',
+        grantee: 'forge_architect_plan_resolver',
+      },
+      {
+        identity: 'forge.append_architect_clarification_answer_v1(bytea,uuid,uuid,uuid,bigint,uuid,text,text,text)',
+        name: 'append_architect_clarification_answer_v1',
+        grantee: 'forge_architect_plan_history_reader',
+      },
+    ]) {
+      expect(exactRoutineInventory).toContain(`identity: '${routine.identity}'`)
+      expect(exactRoutineInventory).toContain(`name: '${routine.name}'`)
+      expect(exactRoutineInventory).toContain(`grantee: '${routine.grantee}'`)
+    }
+
+    expect(s4RoleBootstrap).toContain('acl.grantee <> table_row.relowner')
+    expect(s4RoleBootstrap).toContain("acl.grantee = 0 and acl.privilege_type = 'EXECUTE'")
+    expect(s4RoleBootstrap).toContain(
+      'routine.oid = pg_catalog.to_regprocedure(expected.routine_identity)',
+    )
+    expect(s4RoleBootstrap).toMatch(
+      /if exists \(\s+with expected\(routine_identity, routine_name, expected_grantee\)/,
+    )
+    expect(s4RoleBootstrap).toContain('observed.proowner <>')
+    expect(s4RoleBootstrap).toContain('observed.acl_count <> 2')
+    expect(s4RoleBootstrap).toContain('observed.owner_execute_count <> 1')
+    expect(s4RoleBootstrap).toContain('observed.expected_execute_count <> 1')
+    expect(s4RoleBootstrap).toContain('and not acl.is_grantable')
+    expect(s4RoleBootstrap).toContain(
+      'pg_catalog.to_regprocedure(expected.routine_identity) = routine.oid',
+    )
+    expect(s4RoleBootstrap).toContain(
+      "raise exception 'The exact S4 clarification routine authority is incomplete'",
+    )
+    expect(s4RoleBootstrap).not.toContain('acl.grantee <> case routine.proname')
+    expect(s4RoleBootstrap).toContain(') <> 73 then')
+  })
+
   it('audits the complete protected clarification history set without truncation', () => {
     const historyReader = s4Migration.match(
       /CREATE OR REPLACE FUNCTION forge\.read_architect_plan_history_v1\([\s\S]*?\n\$\$;/,

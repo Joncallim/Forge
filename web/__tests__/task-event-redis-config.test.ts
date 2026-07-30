@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const names = [
   'REDIS_URL',
@@ -13,6 +13,13 @@ describe('task-event Redis credential boundary', () => {
   })
 
   afterEach(() => {
+    const globalTaskEvents = globalThis as typeof globalThis & {
+      forgeTaskEventPublisherRedis?: { disconnect: (reconnect?: boolean) => void }
+      forgeTaskEventPublisherRedisUrl?: string
+    }
+    globalTaskEvents.forgeTaskEventPublisherRedis?.disconnect(false)
+    delete globalTaskEvents.forgeTaskEventPublisherRedis
+    delete globalTaskEvents.forgeTaskEventPublisherRedisUrl
     for (const name of names) {
       const value = original[name]
       if (value === undefined) delete process.env[name]
@@ -90,6 +97,55 @@ describe('task-event Redis credential boundary', () => {
     process.env.FORGE_TASK_EVENT_SUBSCRIBER_REDIS_URL = 'redis://events:subscriber-password@subscriber.example.test/0'
     const { taskEventRedisConfiguration } = await import('@/lib/task-event-redis')
     expect(taskEventRedisConfiguration('protected').dedicated).toBe(true)
+  })
+
+  it('reuses one dedicated publisher in production without adding listeners', async () => {
+    vi.stubEnv('NODE_ENV', 'production')
+    try {
+      const { taskEventPublisherRedis } = await import('@/lib/task-event-redis')
+      const configuration = {
+        dedicated: true,
+        publisherUrl: 'redis://event-publisher:publisher-password@localhost/14',
+        subscriberUrl: 'redis://event-subscriber:subscriber-password@localhost/14',
+      }
+      const first = taskEventPublisherRedis(configuration)
+      const second = taskEventPublisherRedis(configuration)
+
+      expect(second).toBe(first)
+      expect(first.status).toBe('wait')
+      expect(first.listenerCount('error')).toBe(1)
+    } finally {
+      vi.unstubAllEnvs()
+    }
+  })
+
+  it('retires a closed publisher and supports deterministic test cleanup', async () => {
+    const {
+      resetTaskEventPublisherRedisForTests,
+      taskEventPublisherRedis,
+    } = await import('@/lib/task-event-redis')
+    const configuration = {
+      dedicated: true,
+      publisherUrl: 'redis://event-publisher:publisher-password@localhost/14',
+      subscriberUrl: 'redis://event-subscriber:subscriber-password@localhost/14',
+    }
+    const first = taskEventPublisherRedis(configuration)
+    first.disconnect(false)
+    expect(first.status).toBe('end')
+
+    const replacement = taskEventPublisherRedis(configuration)
+    expect(replacement).not.toBe(first)
+    expect(replacement.status).toBe('wait')
+
+    resetTaskEventPublisherRedisForTests()
+    expect((globalThis as typeof globalThis & {
+      forgeTaskEventPublisherRedis?: unknown
+      forgeTaskEventPublisherRedisUrl?: unknown
+    }).forgeTaskEventPublisherRedis).toBeUndefined()
+    expect((globalThis as typeof globalThis & {
+      forgeTaskEventPublisherRedisUrl?: unknown
+    }).forgeTaskEventPublisherRedisUrl).toBeUndefined()
+    expect(replacement.status).toBe('end')
   })
 
   it('uses v2-only live and durable names even while shared legacy compatibility is configured', async () => {

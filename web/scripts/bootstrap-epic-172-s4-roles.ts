@@ -19,6 +19,8 @@ const OWNED_TABLES = [
   'architect_plan_entries',
   'architect_plan_execution_references',
   'architect_plan_history_reads',
+  'architect_clarification_answers',
+  'architect_clarification_answer_writes',
   'protected_package_entry_registrations',
   'protected_entry_capability_bindings',
   'mcp_operator_review_versions',
@@ -40,6 +42,23 @@ const OWNED_TABLES = [
   'local_effect_recovery_actions',
   'local_projection_archive_operations',
   'local_projection_archive_operation_checkpoints',
+] as const
+const EXACT_CLARIFICATION_ROUTINES = [
+  {
+    identity: 'forge.bind_architect_replan_context_v3(uuid,uuid)',
+    name: 'bind_architect_replan_context_v3',
+    grantee: 'forge_architect_plan_writer',
+  },
+  {
+    identity: 'forge.resolve_architect_plan_entry_v2(uuid)',
+    name: 'resolve_architect_plan_entry_v2',
+    grantee: 'forge_architect_plan_resolver',
+  },
+  {
+    identity: 'forge.append_architect_clarification_answer_v1(bytea,uuid,uuid,uuid,bigint,uuid,text,text,text)',
+    name: 'append_architect_clarification_answer_v1',
+    grantee: 'forge_architect_plan_history_reader',
+  },
 ] as const
 
 function literal(value: string): string {
@@ -203,6 +222,11 @@ async function main(): Promise<void> {
       }
       const migrationLiteral = literal(migrationRole)
       const tableList = OWNED_TABLES.map(literal).join(',')
+      const exactClarificationRoutineValues = EXACT_CLARIFICATION_ROUTINES.map((routine) => `(
+        ${literal(routine.identity)},
+        ${literal(routine.name)},
+        ${literal(routine.grantee)}::pg_catalog.regrole
+      )`).join(',')
       await admin.unsafe(`
         create or replace function public.forge_begin_epic_172_s4_owner_bootstrap_v1()
         returns void
@@ -365,6 +389,68 @@ async function main(): Promise<void> {
                 and table_row.relname = any(array[${tableList}])
             ) using errcode = '42501';
           end if;
+          if exists (
+            with expected(routine_identity, routine_name, expected_grantee) as (
+              values ${exactClarificationRoutineValues}
+            ),
+            observed as (
+              select
+                expected.routine_identity,
+                expected.routine_name,
+                expected.expected_grantee,
+                routine.oid as routine_oid,
+                routine.proowner,
+                pg_catalog.count(acl.grantee) as acl_count,
+                pg_catalog.count(acl.grantee) filter (
+                  where acl.grantee = routine.proowner
+                    and acl.privilege_type = 'EXECUTE'
+                    and not acl.is_grantable
+                ) as owner_execute_count,
+                pg_catalog.count(acl.grantee) filter (
+                  where acl.grantee = expected.expected_grantee
+                    and acl.privilege_type = 'EXECUTE'
+                    and not acl.is_grantable
+                ) as expected_execute_count
+              from expected
+              left join pg_catalog.pg_proc routine
+                on routine.oid = pg_catalog.to_regprocedure(expected.routine_identity)
+              left join lateral pg_catalog.aclexplode(
+                coalesce(
+                  routine.proacl,
+                  pg_catalog.acldefault('f', routine.proowner)
+                )
+              ) acl on true
+              group by expected.routine_identity, expected.routine_name,
+                expected.expected_grantee, routine.oid, routine.proowner
+            )
+            select 1
+            from observed
+            where observed.routine_oid is null
+               or observed.proowner <> '${OWNER}'::regrole
+               or observed.acl_count <> 2
+               or observed.owner_execute_count <> 1
+               or observed.expected_execute_count <> 1
+          ) or exists (
+            with expected(routine_identity, routine_name, expected_grantee) as (
+              values ${exactClarificationRoutineValues}
+            )
+            select 1
+            from pg_catalog.pg_proc routine
+            join pg_catalog.pg_namespace namespace_row
+              on namespace_row.oid = routine.pronamespace
+            where namespace_row.nspname = 'forge'
+              and exists (
+                select 1 from expected
+                where expected.routine_name = routine.proname
+              )
+              and not exists (
+                select 1 from expected
+                where pg_catalog.to_regprocedure(expected.routine_identity) = routine.oid
+              )
+          ) then
+            raise exception 'The exact S4 clarification routine authority is incomplete'
+              using errcode = '42501';
+          end if;
           if (
             select pg_catalog.count(*)
             from pg_catalog.pg_proc routine
@@ -436,6 +522,9 @@ async function main(): Promise<void> {
                 ,'apply_local_effect_recovery_action_v2'
                 ,'apply_packet_issuance_recovery_action_v2'
                 ,'bind_architect_replan_context_v2'
+                ,'bind_architect_replan_context_v3'
+                ,'resolve_architect_plan_entry_v2'
+                ,'append_architect_clarification_answer_v1'
                 ,'local_projection_archive_operation_fingerprint_v2'
                 ,'inspect_local_projection_overlimit_v2'
                 ,'apply_local_projection_overlimit_archive_v2'
@@ -454,7 +543,7 @@ async function main(): Promise<void> {
                 ) acl
                 where acl.grantee = 0 and acl.privilege_type = 'EXECUTE'
               )
-          ) <> 70 then
+          ) <> 73 then
             raise exception 'The S4 routine owner or PUBLIC boundary is incomplete'
               using errcode = '42501';
           end if;

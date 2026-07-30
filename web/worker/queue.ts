@@ -219,6 +219,20 @@ local function valid_marker(marker, now_ms)
   end
   return true
 end
+local function legacy_marker_timestamp(marker, now_ms)
+  if type(marker) ~= 'string'
+      or not string.match(marker, '^[1-9][0-9]*$') then
+    return nil
+  end
+  local numeric_timestamp = tonumber(marker)
+  if not numeric_timestamp
+      or numeric_timestamp < 1
+      or numeric_timestamp > 9007199254740991
+      or numeric_timestamp > now_ms then
+    return nil
+  end
+  return numeric_timestamp
+end
 `
 
 const LUA_TYPE_HELPER = `
@@ -671,10 +685,10 @@ end
 local now_ms = redis_now_ms()
 local current_marker = redis.call('HGET', KEYS[2], ARGV[1])
 if current_marker then
-  if not valid_marker(current_marker, now_ms) then
+  local timestamp = legacy_marker_timestamp(current_marker, now_ms)
+  if not timestamp then
     error('forge_queue_claim_marker_invalid')
   end
-  local timestamp = tonumber(string.match(current_marker, '^([1-9][0-9]*):'))
   if (now_ms - timestamp) < tonumber(ARGV[3]) then
     if redis.call('LREM', KEYS[1], 1, ARGV[1]) ~= 1 then
       return 2
