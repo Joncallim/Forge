@@ -28,7 +28,7 @@ import {
 } from '@/components/ui/select'
 import { MarkdownView } from '@/components/MarkdownView'
 import { McpPresentation } from '@/components/mcps/McpPresentation'
-import { BrandedTerminalJoin } from '@/components/mcps/BrandedTerminalJoin'
+import { BrandedTerminalJoinView } from '@/components/mcps/BrandedTerminalJoinView'
 import { PlanDiffView } from '@/components/PlanDiffView'
 import { mergeAgentRun, useTaskStream } from '@/hooks/useTaskStream'
 import type { AgentRun, Artifact, TaskQuestion } from '@/hooks/useTaskStream'
@@ -43,6 +43,10 @@ import {
 } from '@/lib/mcps/execution-design-metadata'
 import {
   admissionPresentationFromUnknown,
+  CANONICAL_MCP_PRESENTATION_MAX_AGE_MS,
+  canonicalMcpOperatorActionIsBound,
+  canonicalMcpPresentationAgeMs,
+  canonicalMcpPresentationIsFresh,
   canonicalMcpTaskPresentationFromUnknown,
   type CanonicalMcpOperatorAction,
   type CanonicalMcpTaskPresentation,
@@ -1735,7 +1739,18 @@ export function CanonicalMcpOperatorPanel({
   pending: boolean
   onAction: (action: CanonicalMcpOperatorAction) => void
 }) {
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 1000)
+    return () => window.clearInterval(timer)
+  }, [])
   if (presentation === null) return null
+  const freshnessAge = canonicalMcpPresentationAgeMs(presentation, now)
+  const isFresh = canonicalMcpPresentationIsFresh(presentation, now)
+  const freshnessSeconds = freshnessAge === null ? -1 : Math.floor(freshnessAge / 1000)
+  const terminalPackageIds = new Set(presentation.terminals.map((terminal) => terminal.workPackageId))
+  const actionableRecoveries = presentation.recoveries.filter((recovery) => !terminalPackageIds.has(recovery.workPackageId))
+  const actions = isFresh ? actionableRecoveries.flatMap((recovery) => recovery.actions.filter(canonicalMcpOperatorActionIsBound)) : []
   return (
     <section aria-labelledby="mcp-runtime-state-heading" className="rounded-lg border border-border p-4">
       <div className="flex flex-wrap items-start justify-between gap-3">
@@ -1747,10 +1762,18 @@ export function CanonicalMcpOperatorPanel({
             This view is one server observation. Recovery controls disappear if its evidence or terminal state cannot be verified.
           </p>
         </div>
-        <BrandedTerminalJoin presentation={{ state: 'current', freshnessSeconds: 0, fingerprint: presentation.freshnessFingerprint }}>
+        <BrandedTerminalJoinView presentation={isFresh
+          ? { state: 'current', freshnessSeconds, fingerprint: presentation.freshnessFingerprint }
+          : { state: 'terminal_only', message: 'Server observation is stale' }}>
           Server observed
-        </BrandedTerminalJoin>
+        </BrandedTerminalJoinView>
       </div>
+
+      {!isFresh && (
+        <p role="status" aria-live="polite" className="mt-3 text-xs text-muted-foreground">
+          This observation is older than {CANONICAL_MCP_PRESENTATION_MAX_AGE_MS / 1000} seconds. Recovery actions are hidden until Forge refreshes it.
+        </p>
+      )}
 
       {!presentation.localEvidenceAvailable && (
         <p role="status" className="mt-3 text-xs text-muted-foreground">
@@ -1771,9 +1794,9 @@ export function CanonicalMcpOperatorPanel({
         </dl>
       )}
 
-      {presentation.recoveries.length > 0 && (
+      {actionableRecoveries.length > 0 && (
         <div className="mt-3 grid gap-2">
-          {presentation.recoveries.map((recovery) => (
+          {actionableRecoveries.map((recovery) => (
             <McpPresentation
               key={`${recovery.workPackageId}-${recovery.headline}`}
               presentation={{
@@ -1789,11 +1812,11 @@ export function CanonicalMcpOperatorPanel({
         </div>
       )}
 
-      {presentation.recoveries.some((recovery) => recovery.actions.length > 0) && (
+      {actions.length > 0 && (
         <div className="mt-3 grid gap-2">
-          {presentation.recoveries.flatMap((recovery) => recovery.actions.map((action) => (
+          {actions.map((action) => (
             <Button
-              key={`${recovery.workPackageId}-${action.action}`}
+              key={`${action.action}-${action.identity.schemaVersion === 1 ? action.identity.localRunEvidenceId : action.identity.priorRuntimeAuditId}`}
               type="button"
               size="sm"
               variant={action.action.startsWith('decline_') ? 'outline' : 'secondary'}
@@ -1803,26 +1826,26 @@ export function CanonicalMcpOperatorPanel({
             >
               {action.label}
             </Button>
-          )))}
+          ))}
         </div>
       )}
 
       {presentation.terminals.length > 0 && (
         <div className="mt-3 grid gap-2">
           {presentation.terminals.map((terminal) => terminal.state === 'terminal' ? (
-            <BrandedTerminalJoin
+            <BrandedTerminalJoinView
               key={terminal.workPackageId}
               presentation={{ state: 'terminal', terminalAt: formatDatetime(terminal.terminalAt ?? ''), outcome: terminal.outcome ?? 'unknown' }}
             >
               {terminal.title}: {terminal.outcome === 'succeeded' ? 'completed' : 'failed'}
-            </BrandedTerminalJoin>
+            </BrandedTerminalJoinView>
           ) : (
-            <BrandedTerminalJoin
+            <BrandedTerminalJoinView
               key={terminal.workPackageId}
               presentation={{ state: 'terminal_only', message: 'Terminal evidence unavailable' }}
             >
               {terminal.title}: terminal evidence unavailable
-            </BrandedTerminalJoin>
+            </BrandedTerminalJoinView>
           ))}
         </div>
       )}
@@ -1833,7 +1856,8 @@ export function CanonicalMcpOperatorPanel({
 export function canonicalMcpOperatorActionRequest(
   action: CanonicalMcpOperatorAction,
   expectedFreshnessFingerprint: string,
-): Record<string, unknown> {
+): Record<string, unknown> | null {
+  if (!canonicalMcpOperatorActionIsBound(action)) return null
   const identity = action.identity
   return identity.schemaVersion === 1
     ? {
@@ -2791,7 +2815,6 @@ function WorkforcePanel({
   filesystemAudits,
   fallbackAgents,
   onGateDecided,
-  projectId,
   taskId,
   taskStatus,
   artifacts,
@@ -2804,7 +2827,6 @@ function WorkforcePanel({
   filesystemAudits: FilesystemAudit[]
   fallbackAgents: PlannedAgent[]
   onGateDecided: () => Promise<void>
-  projectId: string
   taskId: string
   taskStatus: string | null
   artifacts: Artifact[]
@@ -4521,14 +4543,16 @@ export default function TaskDetailPage() {
     if (taskStatus && REFRESH_STATUSES.has(taskStatus)) {
       loadTask()
       loadLogs()
+      loadMcpPresentation()
     }
-  }, [taskStatus, loadLogs, loadTask])
+  }, [taskStatus, loadLogs, loadMcpPresentation, loadTask])
 
   useEffect(() => {
     if (streamRefreshRevision > 0) {
       loadTask()
+      loadMcpPresentation()
     }
-  }, [streamRefreshRevision, loadTask])
+  }, [streamRefreshRevision, loadMcpPresentation, loadTask])
 
   useEffect(() => {
     if (taskLogRevision > 0) {
@@ -4715,7 +4739,10 @@ export default function TaskDetailPage() {
 
   function handleCanonicalMcpOperatorAction(action: CanonicalMcpOperatorAction) {
     if (mcpPresentation === null) return
-    void submitMcpOperatorAction(canonicalMcpOperatorActionRequest(action, mcpPresentation.freshnessFingerprint))
+    if (!canonicalMcpPresentationIsFresh(mcpPresentation)) return
+    const request = canonicalMcpOperatorActionRequest(action, mcpPresentation.freshnessFingerprint)
+    if (request === null) return
+    void submitMcpOperatorAction(request)
   }
 
   if (loading) {
@@ -5294,7 +5321,6 @@ export default function TaskDetailPage() {
             commandAudits={commandAudits}
             filesystemAudits={filesystemAudits}
             fallbackAgents={plannedAgents}
-            projectId={task.projectId}
             taskId={taskId}
             taskStatus={currentStatus}
             onGateDecided={loadTask}

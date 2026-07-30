@@ -184,6 +184,26 @@ export type CanonicalMcpTaskPresentation = Readonly<{
   terminals: readonly CanonicalMcpTerminalPresentation[]
 }>
 
+/** Browser observations expire quickly so a delayed tab cannot submit stale evidence. */
+export const CANONICAL_MCP_PRESENTATION_MAX_AGE_MS = 30_000
+
+export function canonicalMcpPresentationAgeMs(
+  presentation: Pick<CanonicalMcpTaskPresentation, 'computedAt'>,
+  now = Date.now(),
+): number | null {
+  const computedAt = Date.parse(presentation.computedAt)
+  if (!Number.isFinite(computedAt) || !Number.isFinite(now)) return null
+  return Math.max(0, now - computedAt)
+}
+
+export function canonicalMcpPresentationIsFresh(
+  presentation: Pick<CanonicalMcpTaskPresentation, 'computedAt'>,
+  now = Date.now(),
+): boolean {
+  const age = canonicalMcpPresentationAgeMs(presentation, now)
+  return age !== null && age <= CANONICAL_MCP_PRESENTATION_MAX_AGE_MS
+}
+
 export type PresentationCta =
   | { kind: 'scroll'; label: string; targetId: string }
   | { kind: 'link'; label: string; href: string }
@@ -1574,12 +1594,24 @@ const CANONICAL_OPERATOR_ACTIONS = new Set<CanonicalMcpOperatorAction['action']>
   'decline_packet_recovery',
 ])
 
+function actionMatchesIdentity(action: CanonicalMcpOperatorAction['action'], schemaVersion: number): boolean {
+  return schemaVersion === 1
+    ? LOCAL_EFFECT_RECOVERY_ACTIONS.includes(action as typeof LOCAL_EFFECT_RECOVERY_ACTIONS[number])
+    : schemaVersion === 2 && PACKET_ISSUANCE_RECOVERY_ACTIONS.includes(action as typeof PACKET_ISSUANCE_RECOVERY_ACTIONS[number])
+}
+
+/** The DTO action name and its evidence family are a single closed contract. */
+export function canonicalMcpOperatorActionIsBound(action: CanonicalMcpOperatorAction): boolean {
+  return actionMatchesIdentity(action.action, action.identity.schemaVersion)
+}
+
 function canonicalActionFromUnknown(value: unknown): CanonicalMcpOperatorAction | null {
   if (!isRecord(value) || !CANONICAL_OPERATOR_ACTIONS.has(value.action as CanonicalMcpOperatorAction['action'])) return null
   if (typeof value.label !== 'string' || value.label.length === 0 || value.label.length > 160 || !isRecord(value.identity)) return null
   const identity = value.identity
   if (
     identity.schemaVersion === 1 &&
+    actionMatchesIdentity(value.action as CanonicalMcpOperatorAction['action'], 1) &&
     UUID.test(identity.localRunEvidenceId as string) &&
     FINGERPRINT.test(identity.evidenceFingerprint as string)
   ) {
@@ -1595,6 +1627,7 @@ function canonicalActionFromUnknown(value: unknown): CanonicalMcpOperatorAction 
   }
   if (
     identity.schemaVersion === 2 &&
+    actionMatchesIdentity(value.action as CanonicalMcpOperatorAction['action'], 2) &&
     UUID.test(identity.priorRuntimeAuditId as string) &&
     FINGERPRINT.test(identity.markerFingerprint as string)
   ) {

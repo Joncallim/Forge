@@ -1,10 +1,15 @@
 import { renderToStaticMarkup } from 'react-dom/server'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import {
   CanonicalMcpOperatorPanel,
   canonicalMcpOperatorActionRequest,
 } from '@/app/dashboard/tasks/[id]/page'
-import type { CanonicalMcpTaskPresentation } from '@/lib/mcps/admission-copy'
+import {
+  CANONICAL_MCP_PRESENTATION_MAX_AGE_MS,
+  canonicalMcpPresentationIsFresh,
+  canonicalMcpTaskPresentationFromUnknown,
+  type CanonicalMcpTaskPresentation,
+} from '@/lib/mcps/admission-copy'
 
 const taskId = '00000000-0000-4000-8000-000000000001'
 const packageId = '00000000-0000-4000-8000-000000000002'
@@ -17,7 +22,7 @@ const evidence = `sha256:${'c'.repeat(64)}`
 function packet(overrides: Partial<CanonicalMcpTaskPresentation> = {}): CanonicalMcpTaskPresentation {
   return {
     schemaVersion: 1,
-    computedAt: '2026-07-30T00:00:00.000Z',
+    computedAt: new Date().toISOString(),
     freshnessFingerprint: freshness,
     taskId,
     localEvidenceAvailable: true,
@@ -82,6 +87,49 @@ describe('canonical task MCP presentation', () => {
       localRunEvidenceId: evidenceId,
       evidenceFingerprint: evidence,
     })
+  })
+
+  it('rejects mixed action families in both directions and never creates a request', () => {
+    const packetActionWithLocalIdentity = {
+      action: 'retry_execution',
+      label: 'Invalid mixed action',
+      identity: { schemaVersion: 1, localRunEvidenceId: evidenceId, evidenceFingerprint: evidence },
+    }
+    const localActionWithPacketIdentity = {
+      action: 'retry_local_execution',
+      label: 'Invalid mixed action',
+      identity: { schemaVersion: 2, priorRuntimeAuditId: auditId, markerFingerprint: marker },
+    }
+    for (const action of [packetActionWithLocalIdentity, localActionWithPacketIdentity]) {
+      expect(canonicalMcpTaskPresentationFromUnknown(packet({
+        recoveries: [{ ...packet().recoveries[0], actions: [action] }],
+      }))).toBeNull()
+      expect(canonicalMcpOperatorActionRequest(action as never, freshness)).toBeNull()
+      const forgedMarkup = renderToStaticMarkup(
+        <CanonicalMcpOperatorPanel
+          presentation={packet({ recoveries: [{ ...packet().recoveries[0], actions: [action as never] }] })}
+          pending={false}
+          onAction={() => undefined}
+        />,
+      )
+      expect(forgedMarkup).not.toContain('<button')
+    }
+  })
+
+  it('expires an observation on the bounded client clock and hides its controls on the next render', () => {
+    vi.useFakeTimers()
+    const observedAt = new Date('2026-07-31T00:00:00.000Z')
+    vi.setSystemTime(observedAt)
+    const presentation = packet({ computedAt: observedAt.toISOString() })
+    expect(canonicalMcpPresentationIsFresh(presentation)).toBe(true)
+    expect(renderToStaticMarkup(<CanonicalMcpOperatorPanel presentation={presentation} pending={false} onAction={() => undefined} />)).toContain('<button')
+
+    vi.advanceTimersByTime(CANONICAL_MCP_PRESENTATION_MAX_AGE_MS + 1)
+    expect(canonicalMcpPresentationIsFresh(presentation)).toBe(false)
+    const staleMarkup = renderToStaticMarkup(<CanonicalMcpOperatorPanel presentation={presentation} pending={false} onAction={() => undefined} />)
+    expect(staleMarkup).not.toContain('<button')
+    expect(staleMarkup).toContain('Recovery actions are hidden')
+    vi.useRealTimers()
   })
 
   it('hides controls for unavailable, terminal, and stale/unknown server presentations while branding terminal evidence', () => {
