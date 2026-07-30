@@ -7,7 +7,9 @@ import { getRequiredEnv } from '@/lib/env'
 type ForgeDb = PostgresJsDatabase<typeof schema>
 type PostgresClient = ReturnType<typeof postgres>
 
-const POSTGRES_SNAPSHOT_ID = /^[0-9a-f]{8}-[0-9a-f]+$/i
+// PostgreSQL exports `XXXXXXXX-XXXXXXXX-X` snapshot IDs. Keep every segment
+// hexadecimal and bounded before the protected reader embeds it as a literal.
+const POSTGRES_SNAPSHOT_ID = /^[0-9a-f]{8}-[0-9a-f]{8}-[0-9a-f]{1,8}$/i
 
 const globalForDb = globalThis as unknown as {
   forgeDb: ForgeDb | undefined

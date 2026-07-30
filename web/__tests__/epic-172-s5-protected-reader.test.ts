@@ -148,15 +148,28 @@ describe('S5 protected local run evidence reader', () => {
     const client = mockClient(() => Promise.resolve([{ evidenceRows: [], auditRows: [] }]))
     const { readS5ProtectedTerminalSnapshot } = await import('@/lib/mcps/s5-protected-reader')
     await expect(readS5ProtectedTerminalSnapshot('task-1', {
-      snapshotId: '000003A1-1', databaseUrl: 'postgres://forge_app@localhost/forge',
+      snapshotId: '00000003-0000001B-1', databaseUrl: 'postgres://forge_app@localhost/forge',
     })).resolves.toEqual({ evidenceRows: [], auditRows: [] })
     expect(client.begin).toHaveBeenCalledWith('isolation level repeatable read read only', expect.any(Function))
-    expect(client.unsafe).toHaveBeenCalledWith("set transaction snapshot '000003A1-1'")
+    expect(client.unsafe).toHaveBeenCalledWith("set transaction snapshot '00000003-0000001B-1'")
+    for (const snapshotId of [
+      '00000003-0000001B-1', 'FFFFFFFF-00000000-ABCDEF12',
+    ]) {
+      await expect(readS5ProtectedTerminalSnapshot('task-1', {
+        snapshotId, databaseUrl: 'postgres://forge_app@localhost/forge',
+      })).resolves.toEqual({ evidenceRows: [], auditRows: [] })
+    }
+    for (const snapshotId of [
+      '000003A1-1', "00000003-0000001B-1'; select 1; --",
+      '00000003-0000001B-1 --', ' 00000003-0000001B-1',
+      '00000003-0000001B-1 ', '00000003_0000001B_1',
+    ]) {
+      await expect(readS5ProtectedTerminalSnapshot('task-1', {
+        snapshotId, databaseUrl: 'postgres://forge_app@localhost/forge',
+      })).resolves.toBeNull()
+    }
     await expect(readS5ProtectedTerminalSnapshot('task-1', {
-      snapshotId: "000003A1-1'; select 1; --", databaseUrl: 'postgres://forge_app@localhost/forge',
-    })).resolves.toBeNull()
-    await expect(readS5ProtectedTerminalSnapshot('task-1', {
-      snapshotId: '000003A1-1', databaseUrl: 'postgres://forge_app@other-host/forge',
+      snapshotId: '00000003-0000001B-1', databaseUrl: 'postgres://forge_app@other-host/forge',
     })).resolves.toBeNull()
   })
 })

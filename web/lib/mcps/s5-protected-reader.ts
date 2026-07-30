@@ -20,7 +20,9 @@ import { fixedDatabaseRoleUrl } from '@/lib/mcps/fixed-database-url'
 // ---------------------------------------------------------------------------
 
 export const S5_LOCAL_EVIDENCE_READER_URL_ENV = 'FORGE_LOCAL_RUN_EVIDENCE_READER_DATABASE_URL'
-const POSTGRES_SNAPSHOT_ID = /^[0-9a-f]{8}-[0-9a-f]+$/i
+// PostgreSQL exports `XXXXXXXX-XXXXXXXX-X` snapshot IDs. Keep every segment
+// hexadecimal and bounded before embedding it as a transaction snapshot literal.
+const POSTGRES_SNAPSHOT_ID = /^[0-9a-f]{8}-[0-9a-f]{8}-[0-9a-f]{1,8}$/i
 
 export type S5ProtectedLocalRunEvidenceRow = Readonly<{
   id: string
