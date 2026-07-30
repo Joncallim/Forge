@@ -108,6 +108,7 @@ jobs:
           CREATE DATABASE forge_migration_0026_upgrade_test OWNER forge_migration_test;
           CREATE DATABASE forge_migration_0027_upgrade_test OWNER forge_migration_test;
           CREATE DATABASE forge_migration_0028_upgrade_test OWNER forge_migration_test;
+          CREATE DATABASE forge_s5_handoff_failure_test OWNER forge_migration_test;
           CREATE DATABASE forge_s4_ci_test OWNER forge_migration_test;
           SQL
       - name: Prove populated migration 0025 to 0026 upgrade
@@ -126,6 +127,30 @@ jobs:
           FORGE_MIGRATION_RECOVERY_BASELINE: '0027'
           FORGE_MIGRATION_0027_DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_migration_0028_upgrade_test
           FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_migration_0028_upgrade_test
+      - name: Prove failed S5 owner handoff is forcibly cleaned up
+        env:
+          DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_s5_handoff_failure_test
+          FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_s5_handoff_failure_test
+        run: |
+          set -euo pipefail
+          npm run protocol:bootstrap-epic-172-release-roles
+          npx tsx scripts/ci/migrate-through-0025.ts
+          npm run protocol:bootstrap-epic-172-s3-release-owner
+          npx tsx scripts/ci/migrate-through-0026.ts
+          npm run protocol:bootstrap-epic-172-s4-roles
+          npx tsx scripts/ci/migrate-through-0027.ts
+          npx tsx scripts/bootstrap-epic-172-s5-recovery-owner.ts
+          set +e
+          # Commit the opened owner edge first, then simulate a subsequent
+          # 0028 statement failure. This proves cleanup is needed even when
+          # PostgreSQL cannot roll the earlier bootstrap call back for us.
+          psql "$DATABASE_URL" --set ON_ERROR_STOP=1 --command "select public.forge_begin_epic_172_s4_owner_bootstrap_v1();"
+          psql "$DATABASE_URL" --set ON_ERROR_STOP=1 --command "select 1 / 0;"
+          failed=$?
+          set -e
+          npx tsx scripts/bootstrap-epic-172-s5-recovery-owner.ts --cleanup
+          psql "$FORGE_DATABASE_ADMIN_URL" --set ON_ERROR_STOP=1 --command "do \$\$ begin if pg_catalog.has_function_privilege('forge_migration_test', 'public.forge_begin_epic_172_s4_owner_bootstrap_v1()', 'execute') or pg_catalog.pg_has_role('forge_migration_test', 'forge_s4_routines_owner', 'member') or pg_catalog.has_schema_privilege('forge_migration_test', 'forge', 'create') then raise exception 'S5 cleanup proof retained migration authority'; end if; end \$\$;"
+          test "$failed" -ne 0
       - name: Create the freshly migrated isolated S4 PostgreSQL proof database
         run: |
           npm run protocol:bootstrap-epic-172-release-roles

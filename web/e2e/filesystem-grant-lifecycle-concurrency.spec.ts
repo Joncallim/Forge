@@ -1066,15 +1066,20 @@ test('project approval CAS accepts only the exact observed authority pointer', a
   const fixture = await seed()
   const sql = sqlClient()
   try {
-    // none -> D1 is a distinct CAS state, not an implicit wildcard.
-    await mutateProjectFilesystemGrant({
-      actorId: fixture.userId,
-      capabilities: ['filesystem.project.read'],
-      enabled: true,
-      expectedAuthority: null,
-      projectId: fixture.projectId,
-      reason: 'none to D1',
-    })
+    // none -> D1 is a distinct CAS state, not an implicit wildcard. Two
+    // simultaneous observers of none must elect exactly one writer.
+    const initial = await bounded(Promise.allSettled([0, 1].map((contender) =>
+      mutateProjectFilesystemGrant({
+        actorId: fixture.userId,
+        capabilities: ['filesystem.project.read'],
+        enabled: true,
+        expectedAuthority: null,
+        projectId: fixture.projectId,
+        reason: `none to D1 contender ${contender}`,
+      }),
+    )), 10_000, 'none to D1 authority CAS')
+    expect(initial.filter((outcome) => outcome.status === 'fulfilled')).toHaveLength(1)
+    expect(initial.filter((outcome) => outcome.status === 'rejected')).toHaveLength(1)
     const d1 = await loadCurrentProjectFilesystemDecision(fixture.projectId)
     expect(d1).not.toBeNull()
     if (!d1) throw new Error('D1 project authority was not persisted')

@@ -18,6 +18,35 @@ async function main(): Promise<void> {
   await migration.end({ timeout: 5 })
   const admin = postgres(adminUrl, { max: 1, onnotice: () => {} })
   try {
+    if (process.argv.includes('--cleanup')) {
+      // This is deliberately idempotent. A failed 0028 transaction can leave
+      // the migration login holding the owner edge opened by BEGIN; CI invokes
+      // this path unconditionally so a failed cutover never becomes a durable
+      // privilege escalation.
+      await admin.unsafe(`revoke execute on function ${BEGIN}, ${FINALIZE} from ${identifier(migrationRole)};`)
+      await admin.unsafe(`revoke forge_s4_routines_owner from ${identifier(migrationRole)};`)
+      await admin.unsafe(`revoke create on schema forge from ${identifier(migrationRole)};`)
+      const [{ executeGrants, ownerMembership, schemaCreate }] = await admin<{
+        executeGrants: number
+        ownerMembership: boolean
+        schemaCreate: boolean
+      }[]>`
+        select
+          (select count(*)::integer
+           from pg_catalog.aclexplode(coalesce(
+             (select proacl from pg_catalog.pg_proc where oid = ${BEGIN}::regprocedure),
+             pg_catalog.acldefault('f', (select proowner from pg_catalog.pg_proc where oid = ${BEGIN}::regprocedure))
+           )) acl
+           where acl.grantee = ${migrationRole}::regrole and acl.privilege_type = 'EXECUTE') as "executeGrants",
+          pg_catalog.pg_has_role(${migrationRole}::name, 'forge_s4_routines_owner', 'MEMBER') as "ownerMembership",
+          pg_catalog.has_schema_privilege(${migrationRole}::name, 'forge', 'CREATE') as "schemaCreate"
+      `
+      if (executeGrants !== 0 || ownerMembership || schemaCreate) {
+        throw new Error('The S5 recovery owner cleanup did not remove every temporary authority edge.')
+      }
+      console.log('✓ Removed and verified every temporary S5 recovery owner handoff edge.')
+      return
+    }
     await admin.unsafe(`grant execute on function ${BEGIN}, ${FINALIZE} to ${identifier(migrationRole)};`)
     const [{ grants }] = await admin<{ grants: number }[]>`
       select count(*)::integer as "grants"
