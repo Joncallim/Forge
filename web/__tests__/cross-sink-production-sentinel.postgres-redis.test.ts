@@ -880,6 +880,33 @@ async function bindLegacyClient(
   return binding
 }
 
+async function revokeFreshlyBoundLegacyClient(
+  admin: Redis,
+  client: Redis,
+  user: string,
+  database: number,
+  originalBinding: LegacyClientBinding,
+): Promise<Readonly<{
+  binding: LegacyClientBinding
+  removedUsers: number
+}>> {
+  let binding: LegacyClientBinding
+  try {
+    requireLiveLegacyBinding(originalBinding)
+    binding = await bindLegacyClient(admin, client, user, database)
+    if (binding.clientId !== originalBinding.clientId) {
+      throw fixedError('cross_sink.redis.legacy_pre_delete_binding_changed')
+    }
+  } catch {
+    throw fixedError('cross_sink.redis.legacy_pre_delete_binding_failed')
+  }
+  const removedUsers = Number(await runRedisStep(
+    'cross_sink.redis.legacy_acl_revoke_failed',
+    () => admin.call('ACL', 'DELUSER', user),
+  ))
+  return { binding, removedUsers }
+}
+
 async function requireLegacyClientTerminated(
   admin: Redis,
   client: Redis,
@@ -1032,13 +1059,21 @@ if (safeFailureMode === 'redis') {
     const publisherUser = `cross_pub_${randomUUID().replaceAll('-', '')}`
     const subscriberUser = `cross_sub_${randomUUID().replaceAll('-', '')}`
     const legacyUser = `cross_legacy_${randomUUID().replaceAll('-', '')}`
-    const ownedUsers = new Set([publisherUser, subscriberUser, legacyUser])
+    const closedBindingUser = `cross_closed_${randomUUID().replaceAll('-', '')}`
+    const aclUsers = [publisherUser, subscriberUser, legacyUser, closedBindingUser]
+    const ownedUsers = new Set(aclUsers)
     const publisherPassword = randomBytes(32).toString('base64url')
     const subscriberPassword = randomBytes(32).toString('base64url')
     const legacyPassword = randomBytes(32).toString('base64url')
+    const closedBindingPassword = randomBytes(32).toString('base64url')
     const publisherUrl = credentialUrl(validatedRedis!.url, publisherUser, publisherPassword)
     const subscriberUrl = credentialUrl(validatedRedis!.url, subscriberUser, subscriberPassword)
     const legacyUrl = credentialUrl(validatedRedis!.url, legacyUser, legacyPassword)
+    const closedBindingUrl = credentialUrl(
+      validatedRedis!.url,
+      closedBindingUser,
+      closedBindingPassword,
+    )
     const clients = new Set<Redis>()
     const diagnosticArguments: unknown[] = []
     const originalWarn = console.warn
@@ -1074,6 +1109,7 @@ if (safeFailureMode === 'redis') {
       'redis_reappearance',
       'redis_zero_scan',
       'legacy_client_bound',
+      'legacy_revocation_fresh_binding_guard',
       'sse_live',
       'sse_replay',
       'sse_snapshot',
@@ -1180,8 +1216,8 @@ if (safeFailureMode === 'redis') {
         databaseRule, '+ping', '+info', '+client|setinfo', '+get',
         '+zrangebyscore', '+subscribe', '+unsubscribe',
       ]
-      const legacyRules = [
-        'reset', 'on', `>${legacyPassword}`,
+      const legacyRules = (password: string) => [
+        'reset', 'on', `>${password}`,
         `~${legacyKeys.history}`, `~${legacyKeys.sequence}`,
         databaseRule, '+ping', '+info', '+client|setinfo', '+client|id',
         '+acl|whoami', '+zadd', '+set',
@@ -1196,7 +1232,16 @@ if (safeFailureMode === 'redis') {
       )
       await runRedisStep(
         'cross_sink.redis.legacy_acl_create_failed',
-        () => redisAdmin.call('ACL', 'SETUSER', legacyUser, ...legacyRules),
+        () => redisAdmin.call('ACL', 'SETUSER', legacyUser, ...legacyRules(legacyPassword)),
+      )
+      await runRedisStep(
+        'cross_sink.redis.closed_binding_acl_create_failed',
+        () => redisAdmin.call(
+          'ACL',
+          'SETUSER',
+          closedBindingUser,
+          ...legacyRules(closedBindingPassword),
+        ),
       )
       assertAclIdentity(
         await runRedisStep(
@@ -1225,6 +1270,58 @@ if (safeFailureMode === 'redis') {
         [],
         [databaseRule, '+acl|whoami', '+client|id', '+zadd', '+set'],
       )
+      const closedBindingClient = trackClient(
+        closedBindingUrl,
+        'cross_sink.redis.closed_binding_client_create_failed',
+      )
+      await runRedisStep(
+        'cross_sink.redis.closed_binding_client_connect_failed',
+        () => closedBindingClient.connect(),
+      )
+      const closedBinding = await bindLegacyClient(
+        redisAdmin,
+        closedBindingClient,
+        closedBindingUser,
+        validatedRedis!.database,
+      )
+      disconnectRedisClient(
+        closedBindingClient,
+        'cross_sink.redis.closed_binding_client_close_failed',
+      )
+      await runRedisStep(
+        'cross_sink.redis.closed_binding_client_end_failed',
+        () => withTimeout(new Promise<void>((resolve) => {
+          if (closedBindingClient.status === 'end') {
+            resolve()
+            return
+          }
+          closedBindingClient.once('end', resolve)
+        }), 'cross_sink.redis.closed_binding_client_end_failed'),
+      )
+      let closedBindingRejected = false
+      try {
+        await revokeFreshlyBoundLegacyClient(
+          redisAdmin,
+          closedBindingClient,
+          closedBindingUser,
+          validatedRedis!.database,
+          closedBinding,
+        )
+      } catch (error) {
+        closedBindingRejected = error instanceof Error
+          && error.message === 'cross_sink.redis.legacy_pre_delete_binding_failed'
+          && Object.keys(error).length === 0
+      }
+      assertFixed(
+        closedBindingRejected,
+        'The cross-sink proof did not reject a stale legacy client binding before revocation.',
+      )
+      assertFixed(await runRedisStep(
+        'cross_sink.redis.closed_binding_acl_read_failed',
+        () => redisAdmin.call('ACL', 'GETUSER', closedBindingUser),
+      ) !== null,
+        'The cross-sink proof deleted an identity after its fresh binding check failed.')
+      verifiedContracts.add('legacy_revocation_fresh_binding_guard')
 
       process.env.DATABASE_URL = validatedPostgresAppUrl!
       process.env.FORGE_TASK_EVENT_PUBLISHER_REDIS_URL = publisherUrl
@@ -2117,12 +2214,14 @@ if (safeFailureMode === 'redis') {
 
       assertFixed(legacyBinding !== null,
         'The cross-sink proof did not retain its bound legacy client identity.')
-      requireLiveLegacyBinding(legacyBinding)
-      const removedUsers = Number(await runRedisStep(
-        'cross_sink.redis.legacy_acl_revoke_failed',
-        () => redisAdmin.call('ACL', 'DELUSER', legacyUser),
-      ))
-      assertFixed(removedUsers === 1,
+      const revocation = await revokeFreshlyBoundLegacyClient(
+        redisAdmin,
+        legacyClient,
+        legacyUser,
+        validatedRedis!.database,
+        legacyBinding,
+      )
+      assertFixed(revocation.removedUsers === 1,
         'The cross-sink proof did not revoke exactly one legacy Redis ACL identity.')
       ownedUsers.delete(legacyUser)
       assertFixed(await runRedisStep(
@@ -2130,7 +2229,7 @@ if (safeFailureMode === 'redis') {
         () => redisAdmin.call('ACL', 'GETUSER', legacyUser),
       ) === null,
         'The cross-sink proof found the revoked legacy Redis ACL identity.')
-      await requireLegacyClientTerminated(redisAdmin, legacyClient, legacyBinding)
+      await requireLegacyClientTerminated(redisAdmin, legacyClient, revocation.binding)
       const staleLegacyClient = trackClient(
         legacyUrl,
         'cross_sink.redis.revoked_client_create_failed',
@@ -2235,7 +2334,7 @@ if (safeFailureMode === 'redis') {
             }
           },
         },
-        ...[publisherUser, subscriberUser, legacyUser].map(
+        ...aclUsers.map(
           (user, index): CleanupStage => ({
             category: `redis_acl_remove_${index + 1}`,
             run: async () => {
@@ -2251,7 +2350,7 @@ if (safeFailureMode === 'redis') {
             },
           }),
         ),
-        ...[publisherUser, subscriberUser, legacyUser].map(
+        ...aclUsers.map(
           (user, index): CleanupStage => ({
             category: `redis_acl_absence_${index + 1}`,
             run: async () => {
