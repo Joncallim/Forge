@@ -6,7 +6,6 @@ import { getRequiredEnv } from '@/lib/env'
 
 type ForgeDb = PostgresJsDatabase<typeof schema>
 type PostgresClient = ReturnType<typeof postgres>
-type ForgeTransaction = Parameters<Parameters<ForgeDb['transaction']>[0]>[0]
 
 const POSTGRES_SNAPSHOT_ID = /^[0-9a-f]{8}-[0-9a-f]+$/i
 
@@ -56,7 +55,7 @@ export async function closeDb(): Promise<void> {
  * server-side callback and the exporter remains open until it has completed.
  */
 export async function withExportedRepeatableReadSnapshot<T>(input: {
-  run: (tx: ForgeTransaction, snapshotId: string, databaseUrl: string) => Promise<T>
+  run: (tx: ForgeDb, snapshotId: string, databaseUrl: string) => Promise<T>
 }): Promise<T> {
   const databaseUrl = getRequiredEnv('DATABASE_URL')
   const client = postgres(databaseUrl, { max: 1, prepare: true, onnotice: () => {} })
@@ -66,8 +65,8 @@ export async function withExportedRepeatableReadSnapshot<T>(input: {
       if (typeof snapshotId !== 'string' || !POSTGRES_SNAPSHOT_ID.test(snapshotId)) {
         throw new Error('PostgreSQL returned an invalid exported snapshot identifier.')
       }
-      return input.run(drizzle(sql, { schema }), snapshotId, databaseUrl)
-    })
+      return input.run(drizzle(sql as unknown as PostgresClient, { schema }), snapshotId, databaseUrl)
+    }) as unknown as T
   } finally {
     await client.end({ timeout: 5 }).catch(() => {})
   }
