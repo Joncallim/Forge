@@ -121,15 +121,29 @@ function taskEventRedisPrincipal(redisUrl: string): string {
 
 const globalForTaskEvents = globalThis as unknown as {
   forgeTaskEventPublisherRedis?: Redis
+  forgeTaskEventPublisherRedisUrl?: string
+}
+
+function retireTaskEventPublisherRedis(): void {
+  const client = globalForTaskEvents.forgeTaskEventPublisherRedis
+  delete globalForTaskEvents.forgeTaskEventPublisherRedis
+  delete globalForTaskEvents.forgeTaskEventPublisherRedisUrl
+  if (!client) return
+  client.removeAllListeners()
+  client.disconnect(false)
 }
 
 export function taskEventPublisherRedis(configuration: TaskEventRedisConfiguration): Redis {
   if (!configuration.dedicated) {
     return redis
   }
-  if (globalForTaskEvents.forgeTaskEventPublisherRedis) {
-    return globalForTaskEvents.forgeTaskEventPublisherRedis
+  const cached = globalForTaskEvents.forgeTaskEventPublisherRedis
+  if (cached
+    && globalForTaskEvents.forgeTaskEventPublisherRedisUrl === configuration.publisherUrl
+    && cached.status !== 'end') {
+    return cached
   }
+  retireTaskEventPublisherRedis()
   const client = new Redis(configuration.publisherUrl, {
     lazyConnect: true,
     maxRetriesPerRequest: 3,
@@ -138,8 +152,15 @@ export function taskEventPublisherRedis(configuration: TaskEventRedisConfigurati
   client.on('error', () => {
     console.warn('[task-events] Publisher connection unavailable')
   })
-  if (process.env.NODE_ENV !== 'production') {
-    globalForTaskEvents.forgeTaskEventPublisherRedis = client
-  }
+  globalForTaskEvents.forgeTaskEventPublisherRedis = client
+  globalForTaskEvents.forgeTaskEventPublisherRedisUrl = configuration.publisherUrl
   return client
+}
+
+/** Releases the process-scoped dedicated publisher between isolated tests. */
+export function resetTaskEventPublisherRedisForTests(): void {
+  if (process.env.NODE_ENV !== 'test') {
+    throw new Error('The task-event publisher test reset is unavailable.')
+  }
+  retireTaskEventPublisherRedis()
 }
