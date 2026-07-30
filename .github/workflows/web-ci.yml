@@ -107,6 +107,7 @@ jobs:
           CREATE DATABASE forge_epic_172_ci_test OWNER forge_migration_test;
           CREATE DATABASE forge_migration_0026_upgrade_test OWNER forge_migration_test;
           CREATE DATABASE forge_migration_0027_upgrade_test OWNER forge_migration_test;
+          CREATE DATABASE forge_migration_0028_upgrade_test OWNER forge_migration_test;
           CREATE DATABASE forge_s4_ci_test OWNER forge_migration_test;
           SQL
       - name: Prove populated migration 0025 to 0026 upgrade
@@ -114,11 +115,17 @@ jobs:
         env:
           FORGE_MIGRATION_0026_DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_migration_0026_upgrade_test
           FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_migration_0026_upgrade_test
-      - name: Prove populated migration 0026 to 0027 upgrade and strict cutover
+      - name: Prove populated migration 0026 to latest recovery upgrade and strict cutover
         run: npm run test:migration-0027-upgrade
         env:
           FORGE_MIGRATION_0027_DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_migration_0027_upgrade_test
           FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_migration_0027_upgrade_test
+      - name: Prove recorded migration 0027 to 0028 recovery upgrade and strict cutover
+        run: npm run test:migration-0027-upgrade
+        env:
+          FORGE_MIGRATION_RECOVERY_BASELINE: '0027'
+          FORGE_MIGRATION_0027_DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_migration_0028_upgrade_test
+          FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_migration_0028_upgrade_test
       - name: Create the freshly migrated isolated S4 PostgreSQL proof database
         run: |
           npm run protocol:bootstrap-epic-172-release-roles

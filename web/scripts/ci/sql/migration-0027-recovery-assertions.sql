@@ -706,6 +706,76 @@ BEGIN
 END;
 $local_recovery_rejection_zero_mutation$;
 
+-- Exercise every local marker disposition/action pair against the installed
+-- routine.  Each transition uses the real marker and canonical evidence; the
+-- marker is restored between cases so one terminal action cannot authorize
+-- the next.  This specifically guards the decline action, whose accepted
+-- disposition intentionally differs from its action name.
+CREATE TEMP TABLE forge_proof_saved_local_marker ON COMMIT DROP AS
+SELECT metadata->'local_effect_recovery' AS marker
+FROM public.work_packages
+WHERE id = '27000000-0000-4000-8000-00000000e101';
+
+UPDATE public.work_packages
+SET metadata = pg_catalog.jsonb_set(
+  metadata, '{local_effect_recovery}',
+  (SELECT marker || '{"disposition":"review_local_changes","nextDisposition":"retry_local_execution"}'::jsonb
+   FROM forge_proof_saved_local_marker), true
+)
+WHERE id = '27000000-0000-4000-8000-00000000e101';
+SET SESSION AUTHORIZATION forge_s4_recovery_operator;
+SELECT result, package_status FROM forge.apply_local_effect_recovery_action_v2(
+  '27000000-0000-4000-8000-00000000e001', '27000000-0000-4000-8000-00000000e101',
+  '27000000-0000-4000-8000-00000000e301', 'review_local_changes',
+  (SELECT marker->>'evidenceFingerprint' FROM forge_proof_saved_local_marker),
+  '27000000-0000-4000-8000-000000000001'
+);
+RESET SESSION AUTHORIZATION;
+
+UPDATE public.work_packages
+SET metadata = pg_catalog.jsonb_set(
+  metadata, '{local_effect_recovery}',
+  (SELECT marker || '{"disposition":"acknowledge_possible_local_invocation"}'::jsonb
+   FROM forge_proof_saved_local_marker), true
+)
+WHERE id = '27000000-0000-4000-8000-00000000e101';
+SET SESSION AUTHORIZATION forge_s4_recovery_operator;
+SELECT result, package_status FROM forge.apply_local_effect_recovery_action_v2(
+  '27000000-0000-4000-8000-00000000e001', '27000000-0000-4000-8000-00000000e101',
+  '27000000-0000-4000-8000-00000000e301', 'acknowledge_possible_local_invocation',
+  (SELECT marker->>'evidenceFingerprint' FROM forge_proof_saved_local_marker),
+  '27000000-0000-4000-8000-000000000001'
+);
+RESET SESSION AUTHORIZATION;
+
+UPDATE public.work_packages
+SET metadata = pg_catalog.jsonb_set(metadata, '{local_effect_recovery}',
+  (SELECT marker FROM forge_proof_saved_local_marker), true)
+WHERE id = '27000000-0000-4000-8000-00000000e101';
+SET SESSION AUTHORIZATION forge_s4_recovery_operator;
+SELECT result, package_status FROM forge.apply_local_effect_recovery_action_v2(
+  '27000000-0000-4000-8000-00000000e001', '27000000-0000-4000-8000-00000000e101',
+  '27000000-0000-4000-8000-00000000e301', 'decline_local_retry',
+  (SELECT marker->>'evidenceFingerprint' FROM forge_proof_saved_local_marker),
+  '27000000-0000-4000-8000-000000000001'
+);
+RESET SESSION AUTHORIZATION;
+DO $local_disposition_actions$
+BEGIN
+  IF (SELECT count(*) FROM public.local_effect_recovery_actions
+      WHERE local_run_evidence_id = '27000000-0000-4000-8000-00000000e301'
+        AND action IN ('review_local_changes', 'acknowledge_possible_local_invocation', 'decline_local_retry')) <> 3
+     OR (SELECT status FROM public.work_packages WHERE id = '27000000-0000-4000-8000-00000000e101') <> 'cancelled' THEN
+    RAISE EXCEPTION 'Local recovery disposition/action proof did not persist exactly one action per transition';
+  END IF;
+END;
+$local_disposition_actions$;
+
+UPDATE public.work_packages
+SET status = 'blocked', metadata = pg_catalog.jsonb_set(metadata, '{local_effect_recovery}',
+  (SELECT marker FROM forge_proof_saved_local_marker), true)
+WHERE id = '27000000-0000-4000-8000-00000000e101';
+
 SELECT 'sha256:' || pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(
   'forge:local-run-evidence:v1:' || evidence.id::text || ':' || evidence.terminal::text,
   'UTF8'

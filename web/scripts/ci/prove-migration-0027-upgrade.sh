@@ -3,6 +3,11 @@ set -euo pipefail
 
 : "${FORGE_MIGRATION_0027_DATABASE_URL:?Set the disposable PostgreSQL 0027 upgrade database URL.}"
 : "${FORGE_DATABASE_ADMIN_URL:?Set the short-lived PostgreSQL administrator URL.}"
+upgrade_baseline="${FORGE_MIGRATION_RECOVERY_BASELINE:-0026}"
+if [[ "${upgrade_baseline}" != '0026' && "${upgrade_baseline}" != '0027' ]]; then
+  echo 'FORGE_MIGRATION_RECOVERY_BASELINE must be 0026 or 0027.' >&2
+  exit 2
+fi
 export DATABASE_URL="${FORGE_MIGRATION_0027_DATABASE_URL}"
 migration_principal="$(psql "${DATABASE_URL}" --no-align --tuples-only --command 'SELECT current_user')"
 
@@ -24,8 +29,10 @@ observed_legacy_expiry_ms="$(redis-cli -u "${REDIS_URL}" pexpiretime "session:${
 redis-cli -u "${REDIS_URL}" set 'session:orphan-migration-0027' \
   '{"userId":"orphan","lastSeenAt":0}' PX 600000 >/dev/null
 
-echo 'Bootstrapping the exact S4 owner handoff and applying only pending 0027.'
+echo "Bootstrapping the exact S4 owner handoff and applying pending migrations from ${upgrade_baseline}."
 npm run protocol:bootstrap-epic-172-s4-roles
+npx tsx scripts/ci/migrate-through-0027.ts
+npx tsx scripts/bootstrap-epic-172-s5-recovery-owner.ts
 npm run db:migrate
 psql "${FORGE_DATABASE_ADMIN_URL}" --set ON_ERROR_STOP=1 \
   --set migration_principal="${migration_principal}" \
@@ -84,4 +91,4 @@ if [[ "${migration_count_before}" != "${migration_count_after}" ]]; then
   echo 'The 0027 migrator rerun recorded an unexpected migration.' >&2
   exit 1
 fi
-echo 'Populated PostgreSQL 0026 to 0027 upgrade, session/root reconciliation, and strict cutover proof passed.'
+echo "Populated PostgreSQL ${upgrade_baseline} to latest upgrade, recovery assertions, session/root reconciliation, and strict cutover proof passed."
