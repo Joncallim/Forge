@@ -1532,12 +1532,12 @@ describe.skipIf(!enabled)('Epic 172 legacy leakage scrub PostgreSQL proof', () =
         github_app_id, controller_run_id, controller_job_id, envelope_digest, detached_signature, nonce, issued_at, envelope
       ) values
         (${ids.expandReceipt}::uuid, 's4_expand', 179, 's4', ${exactBuilds}::text::jsonb,
-          '[{"name":"bootstrap","measurementDigest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]'::jsonb, ${'a'.repeat(40)}, 1, '[]'::jsonb, ${'0'.repeat(64)}, ${'1'.repeat(64)},
+          '[{"name":"bootstrap","measurementDigest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]'::jsonb, ${'a'.repeat(40)}, ${null}, '[]'::jsonb, ${'0'.repeat(64)}, ${'1'.repeat(64)},
           ${signer.id}::uuid, 1, 's4-scrub-proof', 'scrub-proof', 'expand', ${'2'.repeat(64)},
           decode(repeat('aa', 64), 'hex'), ${randomUUID()}::uuid, transaction_timestamp(), '{}'::jsonb),
         (${ids.disabledReceipt}::uuid, 's4_producers_disabled', 179, 's4', ${exactBuilds}::text::jsonb,
           '[{"name":"s4_expand_receipt"},{"name":"legacy_credentials_publishers_and_sessions_drained"},{"name":"expansion_journal_reconciled_through_watermark"},{"name":"project_root_bindings_complete"},{"name":"legacy_prompt_and_event_data_zero_scan_green"},{"name":"all_v2_producers_disabled"}]'::jsonb,
-          ${'a'.repeat(40)}, 1, jsonb_build_array(${ids.expandReceipt}::text), ${'0'.repeat(64)}, ${'3'.repeat(64)},
+          ${'a'.repeat(40)}, ${null}, jsonb_build_array(${ids.expandReceipt}::text), ${'0'.repeat(64)}, ${'3'.repeat(64)},
           ${signer.id}::uuid, 1, 's4-scrub-proof', 'scrub-proof', 'disabled', ${'4'.repeat(64)},
           decode(repeat('bb', 64), 'hex'), ${randomUUID()}::uuid, transaction_timestamp(), '{}'::jsonb)
       `

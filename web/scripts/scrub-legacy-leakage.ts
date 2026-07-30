@@ -311,7 +311,7 @@ export function createLegacyLeakagePostgresAdapter(
           and jsonb_typeof(receipt.exact_builds) = 'array'
           and jsonb_array_length(receipt.exact_builds) > 0
           and receipt.reviewed_sha ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'
-          and receipt.epoch > 0
+          and receipt.epoch is null
           and receipt.signature_domain = 'forge:epic-172-release-evidence:v1'
           and receipt.envelope_version = 1
           and receipt.envelope_digest ~ '^[0-9a-f]{64}$'
@@ -321,7 +321,7 @@ export function createLegacyLeakagePostgresAdapter(
           and predecessor.owner_slice = 's4'
           and predecessor.exact_builds = receipt.exact_builds
           and predecessor.reviewed_sha = receipt.reviewed_sha
-          and predecessor.epoch = receipt.epoch
+          and predecessor.epoch is not distinct from receipt.epoch
           and enablement.state = 'disabled'
           and (
             select array_agg(claim.value ->> 'name' order by claim.ordinal)

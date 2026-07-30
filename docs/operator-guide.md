@@ -269,8 +269,9 @@ fixture; it is not a complete proof of production safety.
 For the separate legacy-data maintenance procedure, use the [legacy leakage
 scrub runbook](operators/legacy-leakage-scrub-v1.md). It requires a dedicated
 admin PostgreSQL connection and a private 32-byte HMAC key. The PostgreSQL
-proof, Redis credential-revocation proof, and complete cross-sink proof are
-separate gates; do not treat one as evidence for the others.
+scrub proof, Redis purge proof, and Redis ACL proof are each necessary, but
+none alone proves that the supported production sinks share one safe boundary.
+The mandatory combined cross-sink proof below is a separate release gate.
 
 ### Redis task-event cutover
 
@@ -377,8 +378,34 @@ FORGE_S4_REDIS_ACL_TEST_REQUIRED=1 FORGE_S4_REDIS_ACL_DESTRUCTIVE_TEST=1 \
 # S4_REDIS_ACL_LEGACY_REVOKED_OK
 ```
 
-These are separate gates. Passing them does not claim the deferred complete
-cross-sink production proof.
+These are separate gates. Passing them does not replace the mandatory combined
+cross-sink proof below.
+
+#### Combined cross-sink production proof
+
+The mandatory combined CI proof is
+`cross-sink-production-sentinel.postgres-redis.test.ts`. It must pass exactly
+1/1 and emit `S4_CROSS_SINK_PRODUCTION_SENTINEL_OK`. It composes the real
+production writers, readers, routes, projections, and scrub adapters against
+disposable PostgreSQL and Redis services, then checks the supported sink set
+collectively:
+
+- canonical `tasks.prompt` authorization;
+- task API projections;
+- logs and export;
+- Server-Sent Events live, snapshot, and replay;
+- Redis history, sequence, and live data;
+- worker diagnostics;
+- the scrubbed database inventory;
+- the signed producers-disabled receipt;
+- zero-scan and reappearance checks; and
+- legacy Redis ACL revocation.
+
+This is exact hosted disposable-service release evidence. It is not a
+production deployment, not proof for arbitrary future producers or sinks, and not proof of correctness. Any new producer or sink must extend the proof
+corpus and inspection before relying on this marker. It does not imply that
+the future specialist, ACP, or three-lease execution lifecycle is implemented
+or enabled.
 
 #### Rollback-safe handling
 

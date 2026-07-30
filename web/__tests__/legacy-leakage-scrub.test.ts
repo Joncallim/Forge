@@ -1002,7 +1002,26 @@ describe('legacy leakage CLI and operator guide', () => {
       expect(envExample).toContain(envName)
     }
     expect(runbook).toContain('Redis credential-revocation/namespace proof')
-    expect(runbook).toContain('complete cross-sink production proof')
+    expect(runbook).not.toContain(['deferred complete', 'cross-sink production proof'].join(' '))
+    for (const combinedProofContract of [
+      'mandatory combined CI proof',
+      'cross-sink-production-sentinel.postgres-redis.test.ts',
+      'S4_CROSS_SINK_PRODUCTION_SENTINEL_OK',
+      'canonical `tasks.prompt` authorization',
+      'task API projections',
+      'logs and export',
+      'Server-Sent Events live, snapshot, and replay',
+      'Redis history, sequence, and live data',
+      'worker diagnostics',
+      'scrubbed database inventory',
+      'signed producers-disabled receipt',
+      'zero-scan and reappearance checks',
+      'legacy Redis ACL revocation',
+      'not proof for arbitrary future producers or sinks',
+      'not proof of correctness',
+    ]) {
+      expect(runbook).toContain(combinedProofContract)
+    }
     expect(runbook).toContain('schemaVersion: 2')
     expect(runbook).toContain('sentinelSetFingerprint')
     expect(runbook).toContain('legacy_task_log_unavailable')
@@ -1130,7 +1149,9 @@ forge:task-events:v2:* keys.`
       'S4_REDIS_ACL_DENIALS_OK',
       'S4_REDIS_ACL_LEGACY_REVOKED_OK',
     ]) expect(runbook).toContain(proofContract)
-    expect(runbook).toMatch(/deferred complete cross-sink\s+production proof/)
+    expect(runbook).not.toContain(['deferred complete', 'cross-sink production proof'].join(' '))
+    expect(operatorGuide).toContain('cross-sink-production-sentinel.postgres-redis.test.ts')
+    expect(operatorGuide).toContain('S4_CROSS_SINK_PRODUCTION_SENTINEL_OK')
     expect(operatorGuide).toContain('database-authoritative S4 runtime mode')
     expect(operatorGuide).toMatch(/Changing environment values\s+alone cannot flip the mode/)
     for (const aclToken of [
