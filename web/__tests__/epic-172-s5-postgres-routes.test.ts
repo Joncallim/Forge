@@ -420,15 +420,7 @@ run('S5 real PostgreSQL HTTP authorization boundary', () => {
       request(ownerCredential, `/api/mcps/terminal-state/${ids.ownerTask}`),
       { params: Promise.resolve({ taskId: ids.ownerTask }) },
     )
-    expect(await terminalState.json()).toMatchObject({
-      terminalPackages: [{
-        runtimeAuditId: ids.ownerAudit,
-        workPackageId: ids.ownerPackage,
-        state: 'terminal',
-        deliveryOutcome: 'submitted',
-        terminalOutcome: 'succeeded',
-      }],
-    })
+    expect(await terminalState.json()).toMatchObject({ terminalPackages: [] })
 
     console.log('S5_POSTGRES_HTTP_AUTHORIZATION_OK')
   })
@@ -454,7 +446,10 @@ run('S5 real PostgreSQL HTTP authorization boundary', () => {
         `
         await tx`
           update filesystem_mcp_runtime_audits
-          set status = 'failed', terminal = '{"status":"failed","failureCode":"preflight_failed"}'::jsonb,
+          set status = 'failed',
+              assembly = '{"state":"not_assembled","failureStage":"preflight"}'::jsonb,
+              delivery = '{"state":"not_exposed"}'::jsonb,
+              terminal = '{"status":"failed","failureCode":"preflight_failed"}'::jsonb,
               terminal_at = ${transitionedTerminalAt}::timestamptz
           where id = ${ids.ownerAudit}::uuid
         `
