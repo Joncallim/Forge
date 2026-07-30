@@ -1484,6 +1484,92 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
     expect(row).toEqual({ agentRunId: runId, state: 'claimed' })
   })
 
+  it('rejects hostile clarification routine identities and ACL tuples without retaining mutations', async () => {
+    const rollbackMarker = 'S4 clarification routine authority probe rollback'
+    const authorityError = 'The exact S4 clarification routine authority is incomplete'
+
+    async function runAuthorityProbe(mutation: string): Promise<'accepted' | 'rejected'> {
+      try {
+        await admin.begin(async (tx) => {
+          const [{ migrationRole }] = await tx<{ migrationRole: string }[]>`
+            select database_row.datdba::pg_catalog.regrole::text as "migrationRole"
+            from pg_catalog.pg_database database_row
+            where database_row.datname = pg_catalog.current_database()
+          `
+          await tx.unsafe(`
+            alter role forge_s4_routines_owner password null;
+            alter role forge_architect_plan_writer password null;
+            alter role forge_architect_plan_resolver password null;
+            alter role forge_architect_plan_history_reader password null;
+            alter role forge_packet_issuer password null;
+            alter role forge_review_source_resolver password null;
+            alter role forge_s4_recovery_operator password null;
+            alter role forge_local_projection_archiver password null;
+            alter role forge_project_root_reconciler password null;
+          `)
+          await tx`grant forge_s4_routines_owner to ${tx(migrationRole)}
+            with admin false, inherit false, set true`
+          await tx`grant execute on function
+            public.forge_finalize_epic_172_s4_owner_bootstrap_v1()
+            to ${tx(migrationRole)}`
+          await tx.unsafe(mutation)
+          await tx`set local session authorization ${tx(migrationRole)}`
+          await tx`select public.forge_finalize_epic_172_s4_owner_bootstrap_v1()`
+          throw new Error(rollbackMarker)
+        })
+      } catch (error) {
+        if (error instanceof Error && error.message === rollbackMarker) return 'accepted'
+        if (
+          typeof error === 'object'
+          && error !== null
+          && 'code' in error
+          && error.code === '42501'
+          && 'message' in error
+          && error.message === authorityError
+        ) {
+          return 'rejected'
+        }
+        throw new Error('The S4 clarification routine authority probe failed unexpectedly.')
+      }
+      throw new Error('The S4 clarification routine authority probe did not roll back.')
+    }
+
+    const hostileMutations = [
+      `
+        grant execute on function forge.bind_architect_replan_context_v3(uuid,uuid)
+          to forge_packet_issuer;
+      `,
+      `
+        grant execute on function forge.resolve_architect_plan_entry_v2(uuid)
+          to forge_architect_plan_resolver with grant option;
+      `,
+      `
+        revoke execute on function
+          forge.append_architect_clarification_answer_v1(
+            bytea,uuid,uuid,uuid,bigint,uuid,text,text,text
+          )
+          from forge_architect_plan_history_reader;
+      `,
+      `
+        alter function forge.resolve_architect_plan_entry_v2(uuid)
+          rename to resolve_architect_plan_entry_v2_exact_probe;
+        create function forge.resolve_architect_plan_entry_v2(text)
+          returns void language plpgsql as 'begin return; end';
+        revoke all on function forge.resolve_architect_plan_entry_v2(text) from public;
+        alter function forge.resolve_architect_plan_entry_v2(text)
+          owner to forge_s4_routines_owner;
+        grant execute on function forge.resolve_architect_plan_entry_v2(text)
+          to forge_architect_plan_resolver;
+      `,
+    ]
+
+    expect(await runAuthorityProbe('')).toBe('accepted')
+    for (const mutation of hostileMutations) {
+      expect(await runAuthorityProbe(mutation)).toBe('rejected')
+      expect(await runAuthorityProbe('')).toBe('accepted')
+    }
+  })
+
 })
 
 describe.skipIf(!enabled)('Epic 172 legacy leakage scrub PostgreSQL proof', () => {
