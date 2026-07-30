@@ -24,5 +24,12 @@ export function BrandedTerminalJoinView({ presentation, className, children }: B
     : presentation.state === 'current'
       ? <span className="inline-flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-blue-500 animate-pulse" /><span className="font-semibold uppercase tracking-wide">Current</span><span aria-hidden="true" className="text-blue-400 dark:text-blue-500">{presentation.freshnessSeconds}s</span></span>
       : <span className="inline-flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-amber-400" /><span className="font-semibold uppercase tracking-wide">Terminal Only</span></span>
-  return <div className={`${base} ${colorClass} ${className ?? ''}`}>{badge}{children ? <span className="text-current/70">{children}</span> : null}</div>
+  return (
+    <div
+      className={`${base} ${colorClass} ${className ?? ''}`}
+      {...(presentation.state === 'terminal' ? { role: 'status', 'aria-live': 'polite' } : {})}
+    >
+      {badge}{children ? <span className="text-current/70">{children}</span> : null}
+    </div>
+  )
 }

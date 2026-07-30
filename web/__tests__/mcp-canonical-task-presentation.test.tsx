@@ -4,6 +4,7 @@ import {
   CanonicalMcpOperatorPanel,
   canonicalMcpOperatorActionRequest,
 } from '@/app/dashboard/tasks/[id]/page'
+import { BrandedTerminalJoinView } from '@/components/mcps/BrandedTerminalJoinView'
 import {
   CANONICAL_MCP_PRESENTATION_MAX_AGE_MS,
   canonicalMcpPresentationAgeMs,
@@ -148,7 +149,7 @@ describe('canonical task MCP presentation', () => {
     )).toBe(false)
   })
 
-  it('keeps ticking freshness text out of live regions and announces only stale state', () => {
+  it('keeps current and terminal-only observations non-live while terminal outcomes stay live', () => {
     const observedAt = new Date()
     const currentMarkup = renderToStaticMarkup(
       <CanonicalMcpOperatorPanel presentation={packet({ computedAt: observedAt.toISOString() })} pending={false} onAction={() => undefined} />,
@@ -161,6 +162,16 @@ describe('canonical task MCP presentation', () => {
     )
     expect(staleMarkup).toContain('role="status"')
     expect(staleMarkup).toContain('Recovery actions are hidden')
+
+    const terminalMarkup = renderToStaticMarkup(
+      <BrandedTerminalJoinView presentation={{ state: 'terminal', terminalAt: 'now', outcome: 'failed' }} />,
+    )
+    const terminalOnlyMarkup = renderToStaticMarkup(
+      <BrandedTerminalJoinView presentation={{ state: 'terminal_only', message: 'stale' }} />,
+    )
+    expect(terminalMarkup).toContain('role="status"')
+    expect(terminalMarkup).toContain('aria-live="polite"')
+    expect(terminalOnlyMarkup).not.toContain('role="status"')
   })
 
   it('hides controls for unavailable, terminal, and stale/unknown server presentations while branding terminal evidence', () => {
