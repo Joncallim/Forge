@@ -1122,6 +1122,15 @@ SELECT public.forge_proof_local_action_matrix_v1();
 RESET SESSION AUTHORIZATION;
 REVOKE EXECUTE ON FUNCTION public.forge_proof_local_action_matrix_v1() FROM forge_s4_recovery_operator;
 
+-- The following legacy named transitions use the original fixture actor.
+-- Snapshot that actor's ledger after the cartesian actors have finished, so
+-- their intentional appends can never affect this exact +3 proof.
+CREATE TEMP TABLE forge_proof_local_legacy_baseline ON COMMIT DROP AS
+SELECT count(*)::integer AS action_count
+FROM public.local_effect_recovery_actions
+WHERE local_run_evidence_id = '27000000-0000-4000-8000-00000000e301'
+  AND actor_user_id = '27000000-0000-4000-8000-000000000001';
+
 UPDATE public.work_packages
 SET metadata = pg_catalog.jsonb_set(
   metadata, '{local_effect_recovery}',
@@ -1170,7 +1179,8 @@ DO $local_disposition_actions$
 BEGIN
   IF (SELECT count(*) FROM public.local_effect_recovery_actions
       WHERE local_run_evidence_id = '27000000-0000-4000-8000-00000000e301'
-        AND action IN ('review_local_changes', 'acknowledge_possible_local_invocation', 'decline_local_retry')) <> 3
+        AND actor_user_id = '27000000-0000-4000-8000-000000000001')
+       <> (SELECT action_count + 3 FROM forge_proof_local_legacy_baseline)
      OR (SELECT status FROM public.work_packages WHERE id = '27000000-0000-4000-8000-00000000e101') <> 'cancelled' THEN
     RAISE EXCEPTION 'Local recovery disposition/action proof did not persist exactly one action per transition';
   END IF;
@@ -1213,7 +1223,8 @@ BEGIN
   IF (SELECT pg_catalog.count(*)
       FROM public.local_effect_recovery_actions action
       WHERE action.local_run_evidence_id = '27000000-0000-4000-8000-00000000e301'
-        AND action.action = 'retry_local_execution') <> 1
+        AND action.action = 'retry_local_execution'
+        AND action.actor_user_id = '27000000-0000-4000-8000-000000000001') <> 1
      OR NOT EXISTS (
        SELECT 1 FROM public.work_packages package
        WHERE package.id = '27000000-0000-4000-8000-00000000e101'
