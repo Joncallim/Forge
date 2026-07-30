@@ -14,6 +14,8 @@ import {
   reconcileFilesystemGrantsForProject,
 } from '../lib/mcps/filesystem-grant-reconciliation'
 import { requiresFilesystemGrantApproval } from '../lib/mcps/filesystem-grants'
+import { filesystemGrantHealthError } from '../lib/mcps/filesystem-grants'
+import { getProjectMcpOverview } from '../lib/mcps/manager'
 import {
   buildFilesystemGrantBlockMetadata,
   canonicalPositiveDecisionRevision,
@@ -1132,6 +1134,63 @@ test('project approval CAS accepts only the exact observed authority pointer', a
       where project_id = ${fixture.projectId}
     `
     expect(count).toBe(2)
+  } finally {
+    await sql.end()
+  }
+})
+
+test('locked health revalidation rejects a mutable filesystem change without durable approval writes', async () => {
+  const fixture = await seed()
+  const sql = sqlClient()
+  try {
+    // This is the route's preliminary observation. The independent SQL update
+    // is deliberately made after it and before the locked callback runs.
+    const [preliminary] = await sql<{ mcp_config: Record<string, unknown> }[]>`
+      select mcp_config from projects where id = ${fixture.projectId}
+    `
+    expect(preliminary.mcp_config).toEqual({})
+    await sql`
+      update projects
+      set mcp_config = ${sql.json({
+        profile: 'custom', requiredMcps: [],
+        overrides: { filesystem: { enabled: false } },
+      })}
+      where id = ${fixture.projectId}
+    `
+    await expect(bounded(mutateProjectFilesystemGrant({
+      actorId: fixture.userId,
+      capabilities: ['filesystem.project.read'],
+      enabled: true,
+      expectedAuthority: null,
+      projectId: fixture.projectId,
+      reason: 'must roll back after locked health change',
+      assertCurrentFilesystemHealth: async (lockedProject) => {
+        const overview = await getProjectMcpOverview(lockedProject, undefined, {
+          cache: false,
+          ensureWorkspace: false,
+        })
+        const healthError = filesystemGrantHealthError(overview.statuses)
+        if (!healthError) throw new Error('fixture did not make filesystem health unavailable')
+        throw new Error(`locked health rejected: ${healthError}`)
+      },
+    }), 10_000, 'locked filesystem health revalidation')).rejects.toThrow('locked health rejected')
+    const [{ decisions, pointerMutations, projections, recoveryActions }] = await sql<{
+      decisions: number
+      pointerMutations: number
+      projections: number
+      recoveryActions: number
+    }[]>`
+      select
+        (select count(*)::int from project_filesystem_grant_decisions where project_id = ${fixture.projectId}) as decisions,
+        (select count(*)::int from project_filesystem_current_decision_pointers
+         where project_id = ${fixture.projectId} and current_decision_id is not null) as "pointerMutations",
+        (select count(*)::int from work_package_local_projection_heads where task_id = ${fixture.taskId} and head_revision > 0) as projections,
+        (select count(*)::int from filesystem_mcp_issuance_recovery_actions where task_id = ${fixture.taskId}) +
+        (select count(*)::int from local_effect_recovery_actions where task_id = ${fixture.taskId}) as "recoveryActions"
+    `
+    expect({ decisions, pointerMutations, projections, recoveryActions }).toEqual({
+      decisions: 0, pointerMutations: 0, projections: 0, recoveryActions: 0,
+    })
   } finally {
     await sql.end()
   }

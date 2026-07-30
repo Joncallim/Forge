@@ -162,6 +162,15 @@ BEGIN
 END;
 $seed_recovery_marker$;
 
+-- Keep the exact canonical packet marker.  The following matrix restores this
+-- value between transitions so every action is exercised against real locked
+-- PostgreSQL rows, rather than chaining a test-only projection.
+CREATE TEMP TABLE forge_proof_saved_packet_marker ON COMMIT DROP AS
+SELECT metadata->'packet_issuance' AS marker
+FROM public.work_packages
+WHERE id = '27000000-0000-4000-8000-00000000d101';
+GRANT SELECT ON TABLE forge_proof_saved_packet_marker TO forge_s4_recovery_operator;
+
 CREATE FUNCTION public.forge_proof_expect_packet_retry_rejected_v1()
 RETURNS void LANGUAGE plpgsql SET search_path = pg_catalog, forge AS $$
 BEGIN
@@ -384,6 +393,114 @@ BEGIN
   END IF;
 END;
 $recovery_success_assertions$;
+
+-- Packet secondary-action matrix. Acknowledge is only valid for review
+-- dispositions, then its exact new marker permits decline. Both actions are
+-- ledger-first replayable and retain no project authority binding.
+UPDATE public.work_packages
+SET status = 'blocked', metadata = pg_catalog.jsonb_set(
+  metadata, '{packet_issuance}',
+  (SELECT marker || '{"disposition":"review_submission"}'::jsonb
+   FROM forge_proof_saved_packet_marker), true
+)
+WHERE id = '27000000-0000-4000-8000-00000000d101';
+SELECT metadata->'packet_issuance'->>'markerFingerprint' AS fingerprint
+FROM public.work_packages WHERE id = '27000000-0000-4000-8000-00000000d101
+\gset packet_ack_
+SET SESSION AUTHORIZATION forge_s4_recovery_operator;
+SELECT result, result_marker_fingerprint, package_status
+FROM forge.apply_packet_issuance_recovery_action_v2(
+  '27000000-0000-4000-8000-00000000d001', '27000000-0000-4000-8000-00000000d101',
+  '27000000-0000-4000-8000-00000000d401', 'acknowledge_possible_submission',
+  :'packet_ack_fingerprint', '27000000-0000-4000-8000-000000000001', NULL
+);
+-- Exact action replay returns the retained result after the mutable marker moved.
+SELECT result, result_marker_fingerprint, package_status
+FROM forge.apply_packet_issuance_recovery_action_v2(
+  '27000000-0000-4000-8000-00000000d001', '27000000-0000-4000-8000-00000000d101',
+  '27000000-0000-4000-8000-00000000d401', 'acknowledge_possible_submission',
+  :'packet_ack_fingerprint', '27000000-0000-4000-8000-000000000001', NULL
+);
+SELECT metadata->'packet_issuance'->>'markerFingerprint' AS fingerprint
+FROM public.work_packages WHERE id = '27000000-0000-4000-8000-00000000d101
+\gset packet_decline_
+SELECT result, package_status
+FROM forge.apply_packet_issuance_recovery_action_v2(
+  '27000000-0000-4000-8000-00000000d001', '27000000-0000-4000-8000-00000000d101',
+  '27000000-0000-4000-8000-00000000d401', 'decline_packet_recovery',
+  :'packet_decline_fingerprint', '27000000-0000-4000-8000-000000000001', NULL
+);
+SELECT result, package_status
+FROM forge.apply_packet_issuance_recovery_action_v2(
+  '27000000-0000-4000-8000-00000000d001', '27000000-0000-4000-8000-00000000d101',
+  '27000000-0000-4000-8000-00000000d401', 'decline_packet_recovery',
+  :'packet_decline_fingerprint', '27000000-0000-4000-8000-000000000001', NULL
+);
+RESET SESSION AUTHORIZATION;
+DO $packet_secondary_action_assertions$
+BEGIN
+  IF (SELECT count(*) FROM public.filesystem_mcp_issuance_recovery_actions
+      WHERE prior_runtime_audit_id = '27000000-0000-4000-8000-00000000d401'
+        AND action = 'acknowledge_possible_submission') <> 1
+     OR (SELECT count(*) FROM public.filesystem_mcp_issuance_recovery_actions
+         WHERE prior_runtime_audit_id = '27000000-0000-4000-8000-00000000d401'
+           AND action = 'decline_packet_recovery') <> 1
+     OR EXISTS (SELECT 1 FROM public.filesystem_mcp_issuance_recovery_actions
+                WHERE prior_runtime_audit_id = '27000000-0000-4000-8000-00000000d401'
+                  AND action IN ('acknowledge_possible_submission','decline_packet_recovery')
+                  AND (authorizing_decision_id IS NOT NULL OR authorizing_project_decision_id IS NOT NULL))
+     OR (SELECT status FROM public.work_packages WHERE id = '27000000-0000-4000-8000-00000000d101') <> 'cancelled'
+     OR (SELECT metadata ? 'packet_issuance' FROM public.work_packages
+         WHERE id = '27000000-0000-4000-8000-00000000d101') THEN
+    RAISE EXCEPTION 'Packet acknowledge/decline matrix did not retain exact ledger, authority, marker, or status semantics';
+  END IF;
+END;
+$packet_secondary_action_assertions$;
+
+-- Every wrong pairing and stale token is rejected before it can append a
+-- ledger row or alter the canonical package projection.
+UPDATE public.work_packages
+SET status = 'blocked', metadata = pg_catalog.jsonb_set(metadata, '{packet_issuance}',
+  (SELECT marker || '{"disposition":"retry_execution"}'::jsonb FROM forge_proof_saved_packet_marker), true)
+WHERE id = '27000000-0000-4000-8000-00000000d101';
+CREATE FUNCTION public.forge_proof_expect_packet_action_rejected_v1(p_action text, p_fingerprint text, p_authorizer uuid)
+RETURNS void LANGUAGE plpgsql SET search_path = pg_catalog, forge AS $$
+BEGIN
+  BEGIN
+    PERFORM 1 FROM forge.apply_packet_issuance_recovery_action_v2(
+      '27000000-0000-4000-8000-00000000d001', '27000000-0000-4000-8000-00000000d101',
+      '27000000-0000-4000-8000-00000000d401', p_action, p_fingerprint,
+      '27000000-0000-4000-8000-000000000001', p_authorizer
+    );
+  EXCEPTION WHEN serialization_failure OR SQLSTATE 'P1726' OR invalid_parameter_value THEN RETURN;
+  END;
+  RAISE EXCEPTION 'Packet action % unexpectedly passed its rejection fixture', p_action;
+END;
+$$;
+GRANT EXECUTE ON FUNCTION public.forge_proof_expect_packet_action_rejected_v1(text,text,uuid)
+  TO forge_s4_recovery_operator;
+SET SESSION AUTHORIZATION forge_s4_recovery_operator;
+SELECT public.forge_proof_expect_packet_action_rejected_v1('acknowledge_possible_submission',
+  (SELECT marker->>'markerFingerprint' FROM forge_proof_saved_packet_marker), NULL);
+SELECT public.forge_proof_expect_packet_action_rejected_v1('decline_packet_recovery',
+  'sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee', NULL);
+SELECT public.forge_proof_expect_packet_action_rejected_v1('retry_execution',
+  (SELECT marker->>'markerFingerprint' FROM forge_proof_saved_packet_marker),
+  '27000000-0000-4000-8000-00000000d502');
+RESET SESSION AUTHORIZATION;
+DO $packet_rejects_unchanged$
+BEGIN
+  IF (SELECT count(*) FROM public.filesystem_mcp_issuance_recovery_actions
+      WHERE prior_runtime_audit_id = '27000000-0000-4000-8000-00000000d401') <> 3
+     OR (SELECT status FROM public.work_packages WHERE id = '27000000-0000-4000-8000-00000000d101') <> 'blocked'
+     OR (SELECT metadata->'packet_issuance' FROM public.work_packages
+         WHERE id = '27000000-0000-4000-8000-00000000d101')
+        <> (SELECT marker || '{"disposition":"retry_execution"}'::jsonb FROM forge_proof_saved_packet_marker) THEN
+    RAISE EXCEPTION 'Rejected packet actions changed durable ledger or canonical marker state';
+  END IF;
+END;
+$packet_rejects_unchanged$;
+REVOKE SELECT ON TABLE forge_proof_saved_packet_marker FROM forge_s4_recovery_operator;
 
 -- Local-effect recovery must make the same authoritative task-wide decision
 -- as packet recovery before it writes its ledger or package state.
