@@ -396,5 +396,12 @@ describe('local-projection over-limit operator commands', () => {
       'acl.grantee = 0',
       'can execute a non-archive forge routine',
     ]) expect(proof).toContain(evidence)
+    const recoveryProof = readFileSync(
+      new URL('../scripts/ci/sql/migration-0027-recovery-assertions.sql', import.meta.url),
+      'utf8',
+    )
+    expect(recoveryProof).toContain('GRANT SELECT ON TABLE forge_proof_saved_local_marker TO forge_s4_recovery_operator;')
+    expect(recoveryProof).toContain('REVOKE SELECT ON TABLE forge_proof_saved_local_marker FROM forge_s4_recovery_operator;')
+    expect(recoveryProof).not.toContain('GRANT SELECT ON TABLE forge_proof_saved_local_marker TO PUBLIC;')
   })
 })

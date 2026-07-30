@@ -715,6 +715,7 @@ CREATE TEMP TABLE forge_proof_saved_local_marker ON COMMIT DROP AS
 SELECT metadata->'local_effect_recovery' AS marker
 FROM public.work_packages
 WHERE id = '27000000-0000-4000-8000-00000000e101';
+GRANT SELECT ON TABLE forge_proof_saved_local_marker TO forge_s4_recovery_operator;
 
 UPDATE public.work_packages
 SET metadata = pg_catalog.jsonb_set(
@@ -818,4 +819,5 @@ BEGIN
   END IF;
 END;
 $local_recovery_success_assertions$;
+REVOKE SELECT ON TABLE forge_proof_saved_local_marker FROM forge_s4_recovery_operator;
 ROLLBACK;
