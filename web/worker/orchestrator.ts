@@ -544,6 +544,7 @@ async function loadLatestPlanArtifact(taskId: string): Promise<LatestPlanArtifac
 }
 
 export type CreatedArchitectPlanArtifact = typeof artifacts.$inferSelect & {
+  architectPlanStorageMode: 'legacy' | 'protected'
   protectedArchitectPlanEntries: ArchitectPlanEntryEnvelope[]
 }
 
@@ -657,7 +658,10 @@ export async function createArchitectPlanArtifact(
     title: 'Artifact created',
   })
 
-  return Object.assign(artifact, { protectedArchitectPlanEntries })
+  return Object.assign(artifact, {
+    architectPlanStorageMode: storage.mode,
+    protectedArchitectPlanEntries,
+  })
 }
 
 function planTextFromCheckpoint(checkpoint: ArchitectResumeCheckpoint | null): string | null {
@@ -783,6 +787,7 @@ async function persistOpenQuestions(
   questions: readonly ProtectedOpenQuestion[],
   artifactId: string,
   planVersion: string,
+  storageMode: CreatedArchitectPlanArtifact['architectPlanStorageMode'],
   claimLeaseFence: ClaimLeaseFence,
 ): Promise<number> {
   // Answered rows are the opaque durable projection of protected subledger
@@ -807,12 +812,20 @@ async function persistOpenQuestions(
   const rows = await db
     .insert(taskQuestions)
     .values(
-      questions.map((question) => ({
-        id: question.questionId, taskId,
-        questionEntryId: `clarification_question:${question.questionId}`,
-        sourcePlanArtifactId: artifactId, sourcePlanVersion: Number(planVersion),
-        status: 'open' as const,
-      })),
+      questions.map((question) => storageMode === 'protected'
+        ? {
+            id: question.questionId,
+            taskId,
+            questionEntryId: `clarification_question:${question.questionId}`,
+            sourcePlanArtifactId: artifactId,
+            sourcePlanVersion: Number(planVersion),
+            status: 'open' as const,
+          }
+        : {
+            id: question.questionId,
+            taskId,
+            status: 'legacy_unavailable' as const,
+          }),
     )
     .returning()
 
@@ -1205,6 +1218,7 @@ async function runArchitect(
       protectedOpenQuestions,
       artifact.id,
       planVersion,
+      artifact.architectPlanStorageMode,
       claimLeaseFence,
     )
 
