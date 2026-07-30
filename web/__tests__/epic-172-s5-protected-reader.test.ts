@@ -9,7 +9,11 @@ const ENV_NAME = 'FORGE_LOCAL_RUN_EVIDENCE_READER_DATABASE_URL'
 const original = process.env[ENV_NAME]
 
 function mockClient(behaviour: () => Promise<unknown>) {
-  const client = Object.assign(vi.fn(behaviour), { end: vi.fn().mockResolvedValue(undefined) })
+  const client = Object.assign(vi.fn(behaviour), {
+    begin: vi.fn(async (_options: unknown, run: (tx: unknown) => Promise<unknown>) => run(client)),
+    unsafe: vi.fn().mockResolvedValue(undefined),
+    end: vi.fn().mockResolvedValue(undefined),
+  })
   postgresFactory.mockReturnValue(client)
   return client
 }
@@ -137,5 +141,22 @@ describe('S5 protected local run evidence reader', () => {
     expect(s5LocalEvidenceReaderConfigured()).toBe(false)
     await expect(readS5ProtectedLocalRunEvidence('task-1')).resolves.toBeNull()
     expect(postgresFactory).not.toHaveBeenCalled()
+  })
+
+  it('imports only a validated exported snapshot from the same database', async () => {
+    process.env[ENV_NAME] = 'postgres://forge_local_evidence_reader@localhost/forge'
+    const client = mockClient(() => Promise.resolve([{ evidenceRows: [], auditRows: [] }]))
+    const { readS5ProtectedTerminalSnapshot } = await import('@/lib/mcps/s5-protected-reader')
+    await expect(readS5ProtectedTerminalSnapshot('task-1', {
+      snapshotId: '000003A1-1', databaseUrl: 'postgres://forge_app@localhost/forge',
+    })).resolves.toEqual({ evidenceRows: [], auditRows: [] })
+    expect(client.begin).toHaveBeenCalledWith('isolation level repeatable read read only', expect.any(Function))
+    expect(client.unsafe).toHaveBeenCalledWith("set transaction snapshot '000003A1-1'")
+    await expect(readS5ProtectedTerminalSnapshot('task-1', {
+      snapshotId: "000003A1-1'; select 1; --", databaseUrl: 'postgres://forge_app@localhost/forge',
+    })).resolves.toBeNull()
+    await expect(readS5ProtectedTerminalSnapshot('task-1', {
+      snapshotId: '000003A1-1', databaseUrl: 'postgres://forge_app@other-host/forge',
+    })).resolves.toBeNull()
   })
 })

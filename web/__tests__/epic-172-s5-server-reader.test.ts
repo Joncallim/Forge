@@ -148,4 +148,30 @@ describe('S5 authoritative reader identities', () => {
       state: 'unavailable',
     })
   })
+
+  it('keeps recovery actionable when a historical audit is not a current terminal package', () => {
+    const state = {
+      computedAt: '2026-07-30T00:00:00.000Z', observedAtMs: 0, localEvidenceAvailable: true,
+      taskId: 'task', projectId: 'project', taskStatus: 'approved', freshnessFingerprint: `sha256:${'b'.repeat(64)}`,
+      packages: [{ workPackageId: 'package', title: 'Recovered package', assignedRole: 'backend', status: 'blocked', requestedCapabilities: [], boundedRuntimeRequestedCapabilities: [], blockingCapabilities: [], currentDecision: null, decisionHistory: [], blockMetadata: null, pointerFingerprint: '', pointerVersion: '0' }],
+      projectGrant: null,
+      recoveryMarkers: [{ workPackageId: 'package', kind: 'packet_issuance' as const, state: 'current' as const, action: 'retry_execution', allowedActions: ['retry_execution'], evidenceId: 'audit', evidenceFingerprint: `sha256:${'c'.repeat(64)}` }],
+      terminalPackages: [], evidenceRecords: [],
+    }
+    expect(canonicalTaskPresentationProjection(state).recoveries[0]?.actions).toHaveLength(1)
+  })
+
+  it('uses current terminal status and reconciled effective admission rather than package decision history', () => {
+    const state = {
+      computedAt: '2026-07-30T00:00:00.000Z', observedAtMs: 0, localEvidenceAvailable: true,
+      taskId: 'task', projectId: 'project', taskStatus: 'completed', freshnessFingerprint: `sha256:${'d'.repeat(64)}`,
+      packages: [{ workPackageId: 'package', title: 'Terminal package', assignedRole: 'backend', status: 'completed', requestedCapabilities: ['filesystem.project.read'], boundedRuntimeRequestedCapabilities: ['filesystem.project.read'], blockingCapabilities: [], currentDecision: null, decisionHistory: [], blockMetadata: null, pointerFingerprint: '', pointerVersion: '0', effectiveAdmission: { phase: 'approved' as const, source: 'project-level' as const, consumed: false, revocationReason: null } }],
+      projectGrant: null,
+      recoveryMarkers: [{ workPackageId: 'package', kind: 'packet_issuance' as const, state: 'current' as const, action: 'retry_execution', allowedActions: ['retry_execution'], evidenceId: 'audit', evidenceFingerprint: `sha256:${'e'.repeat(64)}` }],
+      terminalPackages: [], evidenceRecords: [],
+    }
+    const projection = canonicalTaskPresentationProjection(state)
+    expect(projection.recoveries[0]?.actions).toEqual([])
+    expect(projection.admission[0]?.decision).toBe('approved')
+  })
 })

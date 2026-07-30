@@ -2,15 +2,18 @@ import 'server-only'
 
 import { createHash } from 'node:crypto'
 import { and, asc, eq } from 'drizzle-orm'
-import { db } from '@/db'
+import { withExportedRepeatableReadSnapshot } from '@/db'
 import {
   filesystemMcpCurrentDecisionPointers,
   filesystemMcpGrantApprovals,
   projectFilesystemCurrentDecisionPointers,
   projectFilesystemGrantDecisions,
+  projects,
   tasks,
   workPackages,
 } from '@/db/schema'
+import { readEffectiveGrantState } from '@/lib/mcps/admission'
+import { parseProjectFilesystemDecisionAuthority } from '@/lib/mcps/filesystem-project-authority'
 import { readS5ProtectedTerminalSnapshot } from '@/lib/mcps/s5-protected-reader'
 import { summarizeFilesystemCapabilities } from '@/lib/mcps/filesystem-grants'
 import { parseFilesystemGrantBlockMetadata } from '@/lib/mcps/filesystem-grant-lifecycle'
@@ -79,6 +82,12 @@ export type S5PackagePresenter = Readonly<{
   blockMetadata: Record<string, unknown> | null
   pointerFingerprint: string
   pointerVersion: string
+  effectiveAdmission?: Readonly<{
+    phase: 'none' | 'proposed' | 'approved' | 'denied' | 'revoked' | 'not_issued'
+    source: 'none' | 'package-local' | 'project-level'
+    consumed: boolean
+    revocationReason: string | null
+  }>
 }>
 
 export type S5RecoveryMarkerPresenter = Readonly<{
@@ -380,20 +389,24 @@ export async function readS5AuthoritativeTaskState(
   taskId: string,
   userId: string,
 ): Promise<S5AuthoritativeTaskState> {
-  const [task] = await db
+  return withExportedRepeatableReadSnapshot({ run: async (tx, snapshotId, databaseUrl) => {
+  const [task] = await tx
     .select({
       id: tasks.id,
       projectId: tasks.projectId,
       status: tasks.status,
       updatedAt: tasks.updatedAt,
+      projectMcpConfig: projects.mcpConfig,
+      projectRootBindingRevision: projects.rootBindingRevision,
     })
     .from(tasks)
+    .innerJoin(projects, eq(projects.id, tasks.projectId))
     .where(and(eq(tasks.id, taskId), eq(tasks.submittedBy, userId)))
     .limit(1)
   if (!task) throw new S5TaskNotFoundError()
 
   const [packageRows, decisions, pointers, projectPointers, projectDecisions, protectedSnapshot] = await Promise.all([
-    db.select({
+    tx.select({
       id: workPackages.id,
       title: workPackages.title,
       assignedRole: workPackages.assignedRole,
@@ -403,7 +416,7 @@ export async function readS5AuthoritativeTaskState(
       metadata: workPackages.metadata,
       updatedAt: workPackages.updatedAt,
     }).from(workPackages).where(eq(workPackages.taskId, taskId)).orderBy(asc(workPackages.sequence), asc(workPackages.id)),
-    db.select({
+    tx.select({
       id: filesystemMcpGrantApprovals.id,
       taskId: filesystemMcpGrantApprovals.taskId,
       workPackageId: filesystemMcpGrantApprovals.workPackageId,
@@ -416,7 +429,7 @@ export async function readS5AuthoritativeTaskState(
       createdAt: filesystemMcpGrantApprovals.createdAt,
       updatedAt: filesystemMcpGrantApprovals.updatedAt,
     }).from(filesystemMcpGrantApprovals).where(eq(filesystemMcpGrantApprovals.taskId, taskId)).orderBy(asc(filesystemMcpGrantApprovals.createdAt), asc(filesystemMcpGrantApprovals.id)),
-    db.select({
+    tx.select({
       taskId: filesystemMcpCurrentDecisionPointers.taskId,
       workPackageId: filesystemMcpCurrentDecisionPointers.workPackageId,
       currentDecisionId: filesystemMcpCurrentDecisionPointers.currentDecisionId,
@@ -428,9 +441,9 @@ export async function readS5AuthoritativeTaskState(
       pointerVersion: filesystemMcpCurrentDecisionPointers.pointerVersion,
       updatedAt: filesystemMcpCurrentDecisionPointers.updatedAt,
     }).from(filesystemMcpCurrentDecisionPointers).where(eq(filesystemMcpCurrentDecisionPointers.taskId, taskId)),
-    db.select().from(projectFilesystemCurrentDecisionPointers).where(eq(projectFilesystemCurrentDecisionPointers.projectId, task.projectId)).limit(1),
-    db.select().from(projectFilesystemGrantDecisions).where(eq(projectFilesystemGrantDecisions.projectId, task.projectId)).orderBy(asc(projectFilesystemGrantDecisions.decisionGeneration)),
-    readS5ProtectedTerminalSnapshot(taskId),
+    tx.select().from(projectFilesystemCurrentDecisionPointers).where(eq(projectFilesystemCurrentDecisionPointers.projectId, task.projectId)).limit(1),
+    tx.select().from(projectFilesystemGrantDecisions).where(eq(projectFilesystemGrantDecisions.projectId, task.projectId)).orderBy(asc(projectFilesystemGrantDecisions.decisionGeneration)),
+    readS5ProtectedTerminalSnapshot(taskId, { snapshotId, databaseUrl }),
   ])
 
   // A `null` protected read is "cannot be proven right now", not "no evidence".
@@ -452,36 +465,6 @@ export async function readS5AuthoritativeTaskState(
     decidedAt: decision.createdAt.toISOString(),
   })
 
-  const packages = packageRows.map((pkg): S5PackagePresenter => {
-    const summary = summarizeFilesystemCapabilities({ mcpRequirements: pkg.mcpRequirements, metadata: pkg.metadata })
-    const pointer = pointerByPackage.get(pkg.id)
-    const current = pointer?.currentDecisionId ? decisionById.get(pointer.currentDecisionId) : undefined
-    const exactCurrent = current
-      && pointer?.taskId === taskId
-      && pointer.currentDecisionTaskId === taskId
-      && pointer.currentDecisionWorkPackageId === pkg.id
-      && current.taskId === taskId
-      && current.workPackageId === pkg.id
-      && current.grantDecisionRevision === pointer.currentDecisionRevision
-      && current.pointerFingerprint === pointer.currentDecisionFingerprint
-        ? current
-        : null
-    return {
-      workPackageId: pkg.id,
-      title: pkg.title,
-      assignedRole: pkg.assignedRole,
-      status: pkg.status,
-      requestedCapabilities: summary.requestedCapabilities,
-      boundedRuntimeRequestedCapabilities: summary.boundedRuntimeRequestedCapabilities,
-      blockingCapabilities: summary.blockingCapabilities,
-      currentDecision: exactCurrent ? safeDecision(exactCurrent) : null,
-      decisionHistory: decisions.filter((decision) => decision.workPackageId === pkg.id).map(safeDecision),
-      blockMetadata: parseFilesystemGrantBlockMetadata(pkg.metadata),
-      pointerFingerprint: pointer?.pointerFingerprint ?? '',
-      pointerVersion: pointer?.pointerVersion.toString() ?? '0',
-    }
-  })
-
   const projectPointer = projectPointers[0]
   const projectDecision = projectPointer?.currentDecisionId
     ? projectDecisions.find((decision) => decision.id === projectPointer.currentDecisionId)
@@ -495,6 +478,76 @@ export async function readS5AuthoritativeTaskState(
     && projectDecision.decisionGeneration === projectPointer.currentDecisionGeneration
       ? projectDecision
       : null
+
+  const packages = packageRows.map((pkg): S5PackagePresenter => {
+    const summary = summarizeFilesystemCapabilities({
+      mcpRequirements: pkg.mcpRequirements,
+      metadata: pkg.metadata,
+      projectMcpConfig: task.projectMcpConfig,
+      projectFilesystemDecision: exactProjectDecision ? {
+        schemaVersion: 2,
+        decisionId: exactProjectDecision.id,
+        projectId: exactProjectDecision.projectId,
+        decision: exactProjectDecision.decision,
+        capabilities: exactProjectDecision.capabilities,
+        grantDecisionRevision: exactProjectDecision.grantDecisionRevision.toString(),
+        rootBindingRevision: exactProjectDecision.rootBindingRevision.toString(),
+        decisionFingerprint: exactProjectDecision.decisionFingerprint,
+        decisionGeneration: exactProjectDecision.decisionGeneration.toString(),
+        decidedAt: exactProjectDecision.decidedAt.toISOString(),
+        decidedBy: exactProjectDecision.decidedBy,
+        reason: exactProjectDecision.reason,
+        revocationReason: exactProjectDecision.revocationReason,
+      } : undefined,
+      projectRootBindingRevision: task.projectRootBindingRevision,
+    })
+    const pointer = pointerByPackage.get(pkg.id)
+    const current = pointer?.currentDecisionId ? decisionById.get(pointer.currentDecisionId) : undefined
+    const exactCurrent = current
+      && pointer?.taskId === taskId
+      && pointer.currentDecisionTaskId === taskId
+      && pointer.currentDecisionWorkPackageId === pkg.id
+      && current.taskId === taskId
+      && current.workPackageId === pkg.id
+      && current.grantDecisionRevision === pointer.currentDecisionRevision
+      && current.pointerFingerprint === pointer.currentDecisionFingerprint
+        ? current
+        : null
+    const authority = exactProjectDecision ? parseProjectFilesystemDecisionAuthority({
+      schemaVersion: 2, decisionId: exactProjectDecision.id, projectId: exactProjectDecision.projectId,
+      decision: exactProjectDecision.decision, capabilities: exactProjectDecision.capabilities,
+      grantDecisionRevision: exactProjectDecision.grantDecisionRevision.toString(), rootBindingRevision: exactProjectDecision.rootBindingRevision.toString(),
+      decisionFingerprint: exactProjectDecision.decisionFingerprint, decisionGeneration: exactProjectDecision.decisionGeneration.toString(),
+      decidedAt: exactProjectDecision.decidedAt.toISOString(), decidedBy: exactProjectDecision.decidedBy,
+      reason: exactProjectDecision.reason, revocationReason: exactProjectDecision.revocationReason,
+    }) : null
+    const effective = readEffectiveGrantState({ metadata: pkg.metadata }, {
+      mcpConfig: task.projectMcpConfig,
+      filesystemGrantDecision: authority,
+      rootBindingRevision: task.projectRootBindingRevision,
+    }, summary.boundedRuntimeRequestedCapabilities)
+    return {
+      workPackageId: pkg.id,
+      title: pkg.title,
+      assignedRole: pkg.assignedRole,
+      status: pkg.status,
+      requestedCapabilities: summary.requestedCapabilities,
+      boundedRuntimeRequestedCapabilities: summary.boundedRuntimeRequestedCapabilities,
+      blockingCapabilities: summary.blockingCapabilities,
+      currentDecision: exactCurrent ? safeDecision(exactCurrent) : null,
+      decisionHistory: decisions.filter((decision) => decision.workPackageId === pkg.id).map(safeDecision),
+      blockMetadata: parseFilesystemGrantBlockMetadata(pkg.metadata),
+      pointerFingerprint: pointer?.pointerFingerprint ?? '',
+      pointerVersion: pointer?.pointerVersion.toString() ?? '0',
+      effectiveAdmission: {
+        phase: effective.phase,
+        source: effective.source,
+        consumed: effective.consumed === true,
+        revocationReason: effective.revocationReason ?? null,
+      },
+    }
+  })
+
   const projectGrant = exactProjectDecision ? {
     id: exactProjectDecision.id,
     enabled: exactProjectDecision.decision === 'approved',
@@ -511,7 +564,13 @@ export async function readS5AuthoritativeTaskState(
     .filter((pkg) => pkg.status === 'blocked')
     .flatMap((pkg) => normalizeS5RecoveryMarkers(pkg, evidenceRows, auditRows))
 
-  const terminalPackages = auditRows.map((audit) => normalizeS5TerminalAudit(audit, evidenceRows))
+  const terminalStatus = new Set(['completed', 'failed', 'cancelled', 'rejected'])
+  const terminalPackages = packageRows.flatMap((pkg) => {
+    if (!terminalStatus.has(pkg.status)) return []
+    const audit = auditRows.filter((candidate) => candidate.workPackageId === pkg.id)
+      .sort((a, b) => a.updatedAt.getTime() - b.updatedAt.getTime() || a.id.localeCompare(b.id)).at(-1)
+    return audit ? [normalizeS5TerminalAudit(audit, evidenceRows)] : []
+  })
 
   const evidenceRecords = evidenceRows.map((evidence): S5LocalEvidencePresenter => ({
     id: evidence.id,
@@ -552,6 +611,7 @@ export async function readS5AuthoritativeTaskState(
     terminalPackages,
     evidenceRecords,
   }
+  }})
 }
 
 // Every projection re-materializes its rows through these explicit field
@@ -584,6 +644,7 @@ export function safePackagePresenter(pkg: S5PackagePresenter): S5PackagePresente
     blockMetadata: pkg.blockMetadata,
     pointerFingerprint: pkg.pointerFingerprint,
     pointerVersion: pkg.pointerVersion,
+    ...(pkg.effectiveAdmission ? { effectiveAdmission: { ...pkg.effectiveAdmission } } : {}),
   }
 }
 
@@ -770,9 +831,9 @@ export function canonicalTaskPresentationProjection(state: S5AuthoritativeTaskSt
       workPackageId: pkg.workPackageId,
       title: pkg.title,
       requiresMcp: pkg.requestedCapabilities.length > 0,
-      decision: pkg.currentDecision?.decision === 'approved'
+      decision: pkg.effectiveAdmission?.phase === 'approved' && !pkg.effectiveAdmission.consumed
         ? 'approved' as const
-        : pkg.currentDecision?.decision === 'denied'
+        : pkg.effectiveAdmission?.phase === 'denied' || pkg.effectiveAdmission?.phase === 'revoked'
           ? 'denied' as const
           : 'unavailable' as const,
     })),

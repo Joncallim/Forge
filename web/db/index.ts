@@ -6,6 +6,9 @@ import { getRequiredEnv } from '@/lib/env'
 
 type ForgeDb = PostgresJsDatabase<typeof schema>
 type PostgresClient = ReturnType<typeof postgres>
+type ForgeTransaction = Parameters<Parameters<ForgeDb['transaction']>[0]>[0]
+
+const POSTGRES_SNAPSHOT_ID = /^[0-9a-f]{8}-[0-9a-f]+$/i
 
 const globalForDb = globalThis as unknown as {
   forgeDb: ForgeDb | undefined
@@ -45,4 +48,27 @@ export async function closeDb(): Promise<void> {
   await client.end({ timeout: 5 })
   globalForDb.forgeDbClient = undefined
   globalForDb.forgeDb = undefined
+}
+
+/**
+ * Pins ordinary S5 reads to one PostgreSQL snapshot while a least-privilege
+ * reader imports that same observation. The snapshot never leaves this
+ * server-side callback and the exporter remains open until it has completed.
+ */
+export async function withExportedRepeatableReadSnapshot<T>(input: {
+  run: (tx: ForgeTransaction, snapshotId: string, databaseUrl: string) => Promise<T>
+}): Promise<T> {
+  const databaseUrl = getRequiredEnv('DATABASE_URL')
+  const client = postgres(databaseUrl, { max: 1, prepare: true, onnotice: () => {} })
+  try {
+    return await client.begin('isolation level repeatable read read only', async (sql) => {
+      const [{ snapshotId }] = await sql<{ snapshotId: string }[]>`select pg_export_snapshot() as "snapshotId"`
+      if (typeof snapshotId !== 'string' || !POSTGRES_SNAPSHOT_ID.test(snapshotId)) {
+        throw new Error('PostgreSQL returned an invalid exported snapshot identifier.')
+      }
+      return input.run(drizzle(sql, { schema }), snapshotId, databaseUrl)
+    })
+  } finally {
+    await client.end({ timeout: 5 }).catch(() => {})
+  }
 }
