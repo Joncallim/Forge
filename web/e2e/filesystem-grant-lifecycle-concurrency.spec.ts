@@ -1148,12 +1148,23 @@ test('locked health revalidation rejects a mutable filesystem change without dur
     const [preliminary] = await sql<{ mcp_config: Record<string, unknown> }[]>`
       select mcp_config from projects where id = ${fixture.projectId}
     `
-    expect(preliminary.mcp_config).toEqual({})
+    const baselineOverrides = preliminary.mcp_config.overrides
+    const overrides = baselineOverrides && typeof baselineOverrides === 'object' && !Array.isArray(baselineOverrides)
+      ? baselineOverrides as Record<string, unknown>
+      : {}
     await sql`
       update projects
       set mcp_config = ${sql.json({
-        profile: 'custom', requiredMcps: [],
-        overrides: { filesystem: { enabled: false } },
+        ...preliminary.mcp_config,
+        overrides: {
+          ...overrides,
+          filesystem: {
+            ...(overrides.filesystem && typeof overrides.filesystem === 'object' && !Array.isArray(overrides.filesystem)
+              ? overrides.filesystem as Record<string, unknown>
+              : {}),
+            enabled: false,
+          },
+        },
       })}
       where id = ${fixture.projectId}
     `
