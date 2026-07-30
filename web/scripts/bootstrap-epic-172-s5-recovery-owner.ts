@@ -5,6 +5,11 @@ import { getRequiredEnv } from '@/lib/env'
 const BEGIN = 'public.forge_begin_epic_172_s4_owner_bootstrap_v1()'
 const FINALIZE = 'public.forge_finalize_epic_172_s4_owner_bootstrap_v1()'
 
+function identifier(value: string): string {
+  if (!/^[a-z_][a-z0-9_]*$/i.test(value)) throw new Error('The migration login is not a safe PostgreSQL role identifier.')
+  return `"${value}"`
+}
+
 async function main(): Promise<void> {
   const adminUrl = process.env.FORGE_DATABASE_ADMIN_URL?.trim()
   if (!adminUrl) throw new Error('FORGE_DATABASE_ADMIN_URL is required for the one-shot S5 owner handoff.')
@@ -13,9 +18,7 @@ async function main(): Promise<void> {
   await migration.end({ timeout: 5 })
   const admin = postgres(adminUrl, { max: 1, onnotice: () => {} })
   try {
-    await admin.unsafe(`
-      grant execute on function ${BEGIN}, ${FINALIZE} to ${admin(migrationRole)};
-    `)
+    await admin.unsafe(`grant execute on function ${BEGIN}, ${FINALIZE} to ${identifier(migrationRole)};`)
     const [{ grants }] = await admin<{ grants: number }[]>`
       select count(*)::integer as "grants"
       from pg_catalog.aclexplode(coalesce(

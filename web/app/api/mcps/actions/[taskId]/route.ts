@@ -238,7 +238,10 @@ export async function POST(
         decisionGeneration: state.projectGrant.decisionGeneration,
       },
       assertCurrentFilesystemHealth: async (lockedProject) => {
-        const lockedOverview = await getProjectMcpOverview(lockedProject)
+        const lockedOverview = await getProjectMcpOverview(lockedProject, undefined, {
+          cache: false,
+          ensureWorkspace: false,
+        })
         const lockedHealthError = filesystemGrantHealthError(lockedOverview.statuses)
         if (lockedHealthError) {
           throw new S4LifecycleError('conflict', lockedHealthError)
