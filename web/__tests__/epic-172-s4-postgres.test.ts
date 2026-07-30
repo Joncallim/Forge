@@ -939,7 +939,7 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
       sourcePlanVersion: '1',
       taskId,
     }]
-    await admin`update task_questions set status = 'legacy_unavailable'
+    await admin`delete from task_questions
       where task_id = ${taskId}::uuid and id = ${secondQuestionId}::uuid`
     await expect(appendArchitectClarificationAnswers(batch)).rejects.toMatchObject({
       code: 'invalid_evidence',
@@ -954,8 +954,13 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
           where task_id = ${taskId}::uuid and status = 'answered') as "answeredCount"`
     expect(afterConflict).toEqual({ answerCount: 0, answeredCount: 0 })
 
-    await admin`update task_questions set status = 'open'
-      where task_id = ${taskId}::uuid and id = ${secondQuestionId}::uuid`
+    await admin`insert into task_questions (
+        id, task_id, question_entry_id, source_plan_artifact_id, source_plan_version, status
+      ) values (
+        ${secondQuestionId}::uuid, ${taskId}::uuid,
+        ${`clarification_question:${secondQuestionId}`},
+        ${source.artifactId}::uuid, 1, 'open'
+      )`
     await expect(appendArchitectClarificationAnswers(batch)).resolves.toEqual([
       { answerId: firstAnswerId, allAnswered: false },
       { answerId: secondAnswerId, allAnswered: true },
