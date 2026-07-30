@@ -486,6 +486,92 @@ SET status = 'blocked', metadata = pg_catalog.jsonb_set(package.metadata, '{pack
 )
 FROM next_marker
 WHERE package.id = '27000000-0000-4000-8000-00000000d101';
+-- Exhaustively execute the persisted packet disposition/action cartesian
+-- product under the actual recovery login. Each case receives a distinct,
+-- canonically fingerprinted marker; allowed actions must replay exactly, while
+-- every disallowed pairing must leave the ledger and package untouched.
+CREATE FUNCTION public.forge_proof_packet_action_matrix_v1()
+RETURNS void LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, public, forge AS $$
+DECLARE
+  v_base jsonb;
+  v_marker jsonb;
+  v_disposition text;
+  v_action text;
+  v_allowed boolean;
+  v_fingerprint text;
+  v_before_actions integer;
+  v_before_metadata jsonb;
+  v_before_status text;
+  v_authorizer uuid;
+BEGIN
+  SELECT metadata->'packet_issuance' INTO STRICT v_base
+  FROM public.work_packages WHERE id = '27000000-0000-4000-8000-00000000d101';
+  FOREACH v_disposition IN ARRAY ARRAY[
+    'review_local_changes','reapprove_allow_once','review_then_reapprove_allow_once',
+    'retry_execution','review_submission','reviewed_submission'
+  ] LOOP
+    FOREACH v_action IN ARRAY ARRAY[
+      'acknowledge_possible_submission','retry_execution','decline_packet_recovery'
+    ] LOOP
+      v_marker := v_base || pg_catalog.jsonb_build_object(
+        'disposition', v_disposition, 'matrixCase', v_disposition || ':' || v_action
+      );
+      v_marker := pg_catalog.jsonb_set(v_marker, '{markerFingerprint}',
+        pg_catalog.to_jsonb(forge.packet_recovery_marker_fingerprint_v2(v_marker - 'markerFingerprint')), true);
+      UPDATE public.work_packages SET status = 'blocked',
+        metadata = pg_catalog.jsonb_set(metadata, '{packet_issuance}', v_marker, true)
+      WHERE id = '27000000-0000-4000-8000-00000000d101';
+      v_fingerprint := v_marker->>'markerFingerprint';
+      v_authorizer := CASE WHEN v_action = 'retry_execution'
+        THEN '27000000-0000-4000-8000-00000000d501'::uuid ELSE NULL END;
+      v_allowed := (v_action = 'acknowledge_possible_submission'
+          AND v_disposition IN ('review_then_reapprove_allow_once','review_submission'))
+        OR (v_action = 'retry_execution'
+          AND v_disposition IN ('retry_execution','reviewed_submission'))
+        OR (v_action = 'decline_packet_recovery'
+          AND v_disposition IN ('reapprove_allow_once','review_then_reapprove_allow_once',
+            'retry_execution','review_submission','reviewed_submission'));
+      SELECT count(*)::integer, metadata, status INTO v_before_actions, v_before_metadata, v_before_status
+      FROM public.filesystem_mcp_issuance_recovery_actions action
+      CROSS JOIN public.work_packages package
+      WHERE action.prior_runtime_audit_id = '27000000-0000-4000-8000-00000000d401'
+        AND package.id = '27000000-0000-4000-8000-00000000d101'
+      GROUP BY package.metadata, package.status;
+      BEGIN
+        PERFORM 1 FROM forge.apply_packet_issuance_recovery_action_v2(
+          '27000000-0000-4000-8000-00000000d001', '27000000-0000-4000-8000-00000000d101',
+          '27000000-0000-4000-8000-00000000d401', v_action, v_fingerprint,
+          '27000000-0000-4000-8000-000000000001', v_authorizer
+        );
+        IF NOT v_allowed THEN RAISE EXCEPTION 'disallowed packet matrix pair passed: %/%', v_disposition, v_action; END IF;
+        PERFORM 1 FROM forge.apply_packet_issuance_recovery_action_v2(
+          '27000000-0000-4000-8000-00000000d001', '27000000-0000-4000-8000-00000000d101',
+          '27000000-0000-4000-8000-00000000d401', v_action, v_fingerprint,
+          '27000000-0000-4000-8000-000000000001', v_authorizer
+        );
+      EXCEPTION WHEN serialization_failure OR SQLSTATE 'P1726' OR invalid_parameter_value THEN
+        IF v_allowed THEN RAISE; END IF;
+      END;
+      IF NOT v_allowed AND (
+        (SELECT count(*) FROM public.filesystem_mcp_issuance_recovery_actions
+         WHERE prior_runtime_audit_id = '27000000-0000-4000-8000-00000000d401') <> v_before_actions
+        OR (SELECT metadata FROM public.work_packages WHERE id = '27000000-0000-4000-8000-00000000d101') IS DISTINCT FROM v_before_metadata
+        OR (SELECT status FROM public.work_packages WHERE id = '27000000-0000-4000-8000-00000000d101') IS DISTINCT FROM v_before_status
+      ) THEN RAISE EXCEPTION 'rejected packet matrix pair mutated state: %/%', v_disposition, v_action; END IF;
+    END LOOP;
+  END LOOP;
+  UPDATE public.work_packages SET status = 'blocked',
+    metadata = pg_catalog.jsonb_set(metadata, '{packet_issuance}', v_base, true)
+  WHERE id = '27000000-0000-4000-8000-00000000d101';
+END;
+$$;
+ALTER FUNCTION public.forge_proof_packet_action_matrix_v1() OWNER TO forge_s4_routines_owner;
+GRANT EXECUTE ON FUNCTION public.forge_proof_packet_action_matrix_v1() TO forge_s4_recovery_operator;
+SET SESSION AUTHORIZATION forge_s4_recovery_operator;
+SELECT public.forge_proof_packet_action_matrix_v1();
+RESET SESSION AUTHORIZATION;
+REVOKE EXECUTE ON FUNCTION public.forge_proof_packet_action_matrix_v1() FROM forge_s4_recovery_operator;
 CREATE FUNCTION public.forge_proof_expect_packet_action_rejected_v1(p_action text, p_fingerprint text, p_authorizer uuid)
 RETURNS void LANGUAGE plpgsql SET search_path = pg_catalog, forge AS $$
 BEGIN

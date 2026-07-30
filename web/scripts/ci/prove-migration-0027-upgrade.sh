@@ -32,8 +32,7 @@ redis-cli -u "${REDIS_URL}" set 'session:orphan-migration-0027' \
 echo "Bootstrapping the exact S4 owner handoff and applying pending migrations from ${upgrade_baseline}."
 npm run protocol:bootstrap-epic-172-s4-roles
 npx tsx scripts/ci/migrate-through-0027.ts
-npx tsx scripts/bootstrap-epic-172-s5-recovery-owner.ts
-npm run db:migrate
+bash scripts/ci/apply-epic-172-s5-recovery-migration.sh
 psql "${FORGE_DATABASE_ADMIN_URL}" --set ON_ERROR_STOP=1 \
   --set migration_principal="${migration_principal}" \
   --file scripts/ci/sql/migration-0027-expansion-assertions.sql

@@ -139,16 +139,12 @@ jobs:
           npx tsx scripts/ci/migrate-through-0026.ts
           npm run protocol:bootstrap-epic-172-s4-roles
           npx tsx scripts/ci/migrate-through-0027.ts
-          npx tsx scripts/bootstrap-epic-172-s5-recovery-owner.ts
           set +e
-          # Commit the opened owner edge first, then simulate a subsequent
-          # 0028 statement failure. This proves cleanup is needed even when
-          # PostgreSQL cannot roll the earlier bootstrap call back for us.
-          psql "$DATABASE_URL" --set ON_ERROR_STOP=1 --command "select public.forge_begin_epic_172_s4_owner_bootstrap_v1();"
-          psql "$DATABASE_URL" --set ON_ERROR_STOP=1 --command "select 1 / 0;"
+          # Use the same wrapper as normal migration paths; it opens the
+          # temporary edge, fails after BEGIN, and must clean it in its trap.
+          FORGE_S5_FORCE_HANDOFF_FAILURE=1 bash scripts/ci/apply-epic-172-s5-recovery-migration.sh
           failed=$?
           set -e
-          npx tsx scripts/bootstrap-epic-172-s5-recovery-owner.ts --cleanup
           psql "$FORGE_DATABASE_ADMIN_URL" --set ON_ERROR_STOP=1 --command "do \$\$ begin if pg_catalog.has_function_privilege('forge_migration_test', 'public.forge_begin_epic_172_s4_owner_bootstrap_v1()', 'execute') or pg_catalog.pg_has_role('forge_migration_test', 'forge_s4_routines_owner', 'member') or pg_catalog.has_schema_privilege('forge_migration_test', 'forge', 'create') then raise exception 'S5 cleanup proof retained migration authority'; end if; end \$\$;"
           test "$failed" -ne 0
       - name: Create the freshly migrated isolated S4 PostgreSQL proof database
@@ -159,8 +155,7 @@ jobs:
           npx tsx scripts/ci/migrate-through-0026.ts
           npm run protocol:bootstrap-epic-172-s4-roles
           npx tsx scripts/ci/migrate-through-0027.ts
-          npx tsx scripts/bootstrap-epic-172-s5-recovery-owner.ts
-          npm run db:migrate
+          bash scripts/ci/apply-epic-172-s5-recovery-migration.sh
         env:
           DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_s4_ci_test
           FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_s4_ci_test
@@ -242,15 +237,11 @@ jobs:
         run: npx tsx scripts/ci/migrate-through-0027.ts
         env:
           DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_epic_172_ci_test
-      - name: Bootstrap migration-0028 S5 recovery ownership
-        run: npx tsx scripts/bootstrap-epic-172-s5-recovery-owner.ts
+      - name: Apply migration-0028 with failure-safe S5 recovery ownership
+        run: bash scripts/ci/apply-epic-172-s5-recovery-migration.sh
         env:
           DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_epic_172_ci_test
           FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_epic_172_ci_test
-      - name: Apply migrations as the disposable migration owner
-        run: npm run db:migrate
-        env:
-          DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_epic_172_ci_test
       - name: Configure disposable release and S4 principal passwords
         working-directory: .
         env:
