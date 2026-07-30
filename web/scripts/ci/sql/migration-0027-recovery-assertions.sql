@@ -521,7 +521,11 @@ BEGIN
       'acknowledge_possible_submission','retry_execution','decline_packet_recovery'
     ] LOOP
       v_marker := v_base || pg_catalog.jsonb_build_object(
-        'disposition', v_disposition, 'matrixCase', v_disposition || ':' || v_action
+        'disposition', v_disposition,
+        -- markerFingerprint deliberately covers nextDisposition but ignores
+        -- unknown fields. Use this canonical covered field to prevent an
+        -- earlier same-action ledger replay from satisfying a new matrix case.
+        'nextDisposition', 'matrix:' || v_disposition || ':' || v_action
       );
       v_marker := pg_catalog.jsonb_set(v_marker, '{markerFingerprint}',
         pg_catalog.to_jsonb(forge.packet_recovery_marker_fingerprint_v2(v_marker - 'markerFingerprint')), true);
