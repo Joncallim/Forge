@@ -8,6 +8,7 @@ import {
   isS5FreshnessFingerprint,
   normalizeS5RecoveryMarkers,
   normalizeS5TerminalAudit,
+  s5EffectiveAdmissionDecision,
 } from '@/lib/mcps/s5-server-reader'
 
 describe('S5 authoritative reader identities', () => {
@@ -165,7 +166,7 @@ describe('S5 authoritative reader identities', () => {
     const state = {
       computedAt: '2026-07-30T00:00:00.000Z', observedAtMs: 0, localEvidenceAvailable: true,
       taskId: 'task', projectId: 'project', taskStatus: 'completed', freshnessFingerprint: `sha256:${'d'.repeat(64)}`,
-      packages: [{ workPackageId: 'package', title: 'Terminal package', assignedRole: 'backend', status: 'completed', requestedCapabilities: ['filesystem.project.read'], boundedRuntimeRequestedCapabilities: ['filesystem.project.read'], blockingCapabilities: [], currentDecision: null, decisionHistory: [], blockMetadata: null, pointerFingerprint: '', pointerVersion: '0', effectiveAdmission: { phase: 'approved' as const, source: 'project-level' as const, consumed: false, revocationReason: null } }],
+      packages: [{ workPackageId: 'package', title: 'Terminal package', assignedRole: 'backend', status: 'completed', requestedCapabilities: ['filesystem.project.read'], boundedRuntimeRequestedCapabilities: ['filesystem.project.read'], blockingCapabilities: [], currentDecision: null, decisionHistory: [], blockMetadata: null, pointerFingerprint: '', pointerVersion: '0', effectiveAdmission: { phase: 'approved' as const, source: 'project-level' as const, status: 'approved' as const, grantMode: 'always_allow' as const, consumed: false, coveredCapabilities: ['filesystem.project.read'], revocationReason: null } }],
       projectGrant: null,
       recoveryMarkers: [{ workPackageId: 'package', kind: 'packet_issuance' as const, state: 'current' as const, action: 'retry_execution', allowedActions: ['retry_execution'], evidenceId: 'audit', evidenceFingerprint: `sha256:${'e'.repeat(64)}` }],
       terminalPackages: [], evidenceRecords: [],
@@ -173,5 +174,33 @@ describe('S5 authoritative reader identities', () => {
     const projection = canonicalTaskPresentationProjection(state)
     expect(projection.recoveries[0]?.actions).toEqual([])
     expect(projection.admission[0]?.decision).toBe('approved')
+  })
+
+  it('uses exact admission coverage for local, project, consumed, and revoked authority', () => {
+    const packageBase = {
+      workPackageId: 'package', title: 'Package', assignedRole: 'backend', status: 'blocked',
+      requestedCapabilities: ['filesystem.project.read', 'filesystem.project.search'],
+      boundedRuntimeRequestedCapabilities: ['filesystem.project.read', 'filesystem.project.search'],
+      blockingCapabilities: [], currentDecision: null, decisionHistory: [], blockMetadata: null,
+      pointerFingerprint: '', pointerVersion: '0',
+    }
+    const grant = (overrides: Record<string, unknown>) => ({
+      phase: 'approved' as const, source: 'package-local' as const, status: 'approved' as const,
+      grantMode: 'allow_once' as const, consumed: false, coveredCapabilities: ['filesystem.project.read'],
+      revocationReason: null, ...overrides,
+    })
+    expect(s5EffectiveAdmissionDecision({ ...packageBase, effectiveAdmission: grant({}) })).toBe('unavailable')
+    expect(s5EffectiveAdmissionDecision({ ...packageBase, effectiveAdmission: grant({
+      coveredCapabilities: ['filesystem.project.read', 'filesystem.project.search'],
+    }) })).toBe('approved')
+    expect(s5EffectiveAdmissionDecision({ ...packageBase, effectiveAdmission: grant({
+      source: 'project-level', grantMode: 'always_allow', coveredCapabilities: ['filesystem.project.read', 'filesystem.project.search'],
+    }) })).toBe('approved')
+    expect(s5EffectiveAdmissionDecision({ ...packageBase, effectiveAdmission: grant({
+      coveredCapabilities: ['filesystem.project.read', 'filesystem.project.search'], consumed: true,
+    }) })).toBe('unavailable')
+    expect(s5EffectiveAdmissionDecision({ ...packageBase, effectiveAdmission: grant({
+      phase: 'revoked', status: 'not_issued', grantMode: null, coveredCapabilities: [], revocationReason: 'project_grant_removed',
+    }) })).toBe('denied')
   })
 })

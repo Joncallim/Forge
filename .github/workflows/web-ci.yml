@@ -710,9 +710,9 @@ jobs:
           if (
             report.testResults?.length !== 1
             || result?.status !== 'passed'
-            || result?.assertionResults?.length !== 1
-            || report.numTotalTests !== 1
-            || report.numPassedTests !== 1
+            || result?.assertionResults?.length !== 2
+            || report.numTotalTests !== 2
+            || report.numPassedTests !== 2
             || report.numFailedTests !== 0
             || report.numPendingTests !== 0
             || report.numTodoTests !== 0
@@ -720,7 +720,7 @@ jobs:
             || report.numPendingTestSuites !== 0
             || markerCount !== 1
           ) {
-            throw new Error('The mandatory S5 PostgreSQL proof must run exactly one file and one passing test with one terminal marker and no skips.')
+            throw new Error('The mandatory S5 PostgreSQL proof must run exactly one file, two passing tests, one terminal marker, and no skips.')
           }
           NODE
       - name: Remove the disposable S5 HTTP authorization proof database

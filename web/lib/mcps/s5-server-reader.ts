@@ -12,7 +12,7 @@ import {
   tasks,
   workPackages,
 } from '@/db/schema'
-import { readEffectiveGrantState } from '@/lib/mcps/admission'
+import { admitMcpRequirement, readEffectiveGrantState, type EffectiveGrantState } from '@/lib/mcps/admission'
 import { parseProjectFilesystemDecisionAuthority } from '@/lib/mcps/filesystem-project-authority'
 import { readS5ProtectedTerminalSnapshot } from '@/lib/mcps/s5-protected-reader'
 import { summarizeFilesystemCapabilities } from '@/lib/mcps/filesystem-grants'
@@ -85,7 +85,10 @@ export type S5PackagePresenter = Readonly<{
   effectiveAdmission?: Readonly<{
     phase: 'none' | 'proposed' | 'approved' | 'denied' | 'revoked' | 'not_issued'
     source: 'none' | 'package-local' | 'project-level'
+    status: 'not_issued' | 'approved' | 'denied'
+    grantMode: 'allow_once' | 'always_allow' | null
     consumed: boolean
+    coveredCapabilities: readonly string[]
     revocationReason: string | null
   }>
 }>
@@ -388,8 +391,13 @@ export function normalizeS5TerminalAudit(audit: {
 export async function readS5AuthoritativeTaskState(
   taskId: string,
   userId: string,
+  /** Fixture-only synchronization point; routes never supply this callback. */
+  afterExporterSnapshotEstablished?: () => Promise<void>,
 ): Promise<S5AuthoritativeTaskState> {
   return withExportedRepeatableReadSnapshot({ run: async (tx, snapshotId, databaseUrl) => {
+  // The real PostgreSQL fixture uses this bounded server-only seam to commit a
+  // competing transition after export and before the protected import.
+  if (afterExporterSnapshotEstablished) await afterExporterSnapshotEstablished()
   const [task] = await tx
     .select({
       id: tasks.id,
@@ -542,7 +550,10 @@ export async function readS5AuthoritativeTaskState(
       effectiveAdmission: {
         phase: effective.phase,
         source: effective.source,
+        status: effective.status,
+        grantMode: effective.grantMode ?? null,
         consumed: effective.consumed === true,
+        coveredCapabilities: effective.coveredCapabilities,
         revocationReason: effective.revocationReason ?? null,
       },
     }
@@ -644,7 +655,10 @@ export function safePackagePresenter(pkg: S5PackagePresenter): S5PackagePresente
     blockMetadata: pkg.blockMetadata,
     pointerFingerprint: pkg.pointerFingerprint,
     pointerVersion: pkg.pointerVersion,
-    ...(pkg.effectiveAdmission ? { effectiveAdmission: { ...pkg.effectiveAdmission } } : {}),
+    ...(pkg.effectiveAdmission ? { effectiveAdmission: {
+      ...pkg.effectiveAdmission,
+      coveredCapabilities: [...pkg.effectiveAdmission.coveredCapabilities],
+    } } : {}),
   }
 }
 
@@ -766,6 +780,36 @@ function canonicalRecoveryAction(marker: S5RecoveryMarkerPresenter, action: stri
   return null
 }
 
+const S5_HEALTHY_FILESYSTEM_STATUS = {
+  mcpId: 'filesystem', displayName: 'Filesystem', description: 'S5 admission projection',
+  installPath: 'server-owned', installState: 'installed' as const, status: 'healthy' as const,
+  enabled: true, error: null, checkedAt: '1970-01-01T00:00:00.000Z',
+}
+
+/** Reuse the admission contract so S5 cannot weaken its coverage semantics. */
+export function s5EffectiveAdmissionDecision(pkg: S5PackagePresenter): 'approved' | 'denied' | 'unavailable' {
+  if (!pkg.effectiveAdmission || pkg.boundedRuntimeRequestedCapabilities.length === 0) return 'unavailable'
+  const effectiveGrant: EffectiveGrantState = {
+    phase: pkg.effectiveAdmission.phase,
+    source: pkg.effectiveAdmission.source,
+    status: pkg.effectiveAdmission.status,
+    coveredCapabilities: [...pkg.effectiveAdmission.coveredCapabilities],
+    ...(pkg.effectiveAdmission.grantMode ? { grantMode: pkg.effectiveAdmission.grantMode } : {}),
+    ...(pkg.effectiveAdmission.consumed ? { consumed: true } : {}),
+    ...(pkg.effectiveAdmission.revocationReason ? { revocationReason: pkg.effectiveAdmission.revocationReason as EffectiveGrantState['revocationReason'] } : {}),
+  }
+  const decision = admitMcpRequirement({
+    mcpId: 'filesystem', agent: pkg.assignedRole, requirement: 'required',
+    requestedCapabilities: [...pkg.boundedRuntimeRequestedCapabilities],
+    packageProhibitedKeys: new Set(), status: S5_HEALTHY_FILESYSTEM_STATUS,
+    hasPromptOnlyContext: false, effectiveGrant, fallback: { action: 'block' },
+  })
+  if (decision.status === 'allowed' && decision.mode === 'bounded_context_approved') return 'approved'
+  return pkg.effectiveAdmission.phase === 'denied' || pkg.effectiveAdmission.phase === 'revoked'
+    ? 'denied'
+    : 'unavailable'
+}
+
 /**
  * The task UI's single S5 DTO. Recovery availability and terminal status are
  * joined while the authoritative state is still in memory, preventing the
@@ -831,11 +875,7 @@ export function canonicalTaskPresentationProjection(state: S5AuthoritativeTaskSt
       workPackageId: pkg.workPackageId,
       title: pkg.title,
       requiresMcp: pkg.requestedCapabilities.length > 0,
-      decision: pkg.effectiveAdmission?.phase === 'approved' && !pkg.effectiveAdmission.consumed
-        ? 'approved' as const
-        : pkg.effectiveAdmission?.phase === 'denied' || pkg.effectiveAdmission?.phase === 'revoked'
-          ? 'denied' as const
-          : 'unavailable' as const,
+      decision: s5EffectiveAdmissionDecision(pkg),
     })),
     recoveries,
     terminals,

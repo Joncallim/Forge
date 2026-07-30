@@ -432,4 +432,48 @@ run('S5 real PostgreSQL HTTP authorization boundary', () => {
 
     console.log('S5_POSTGRES_HTTP_AUTHORIZATION_OK')
   })
+
+  it('keeps one real PostgreSQL observation across a committed ordinary and protected transition', async () => {
+    const { readS5AuthoritativeTaskState } = await import('@/lib/mcps/s5-server-reader')
+    let transitionCommitted = false
+    const before = await readS5AuthoritativeTaskState(ids.ownerTask, ids.owner, async () => {
+      await admin.begin(async (tx) => {
+        await tx`
+          update tasks set status = 'failed', updated_at = clock_timestamp()
+          where id = ${ids.ownerTask}::uuid
+        `
+        await tx`
+          update work_packages set status = 'failed', updated_at = clock_timestamp()
+          where id = ${ids.ownerPackage}::uuid
+        `
+        await tx`
+          update work_package_local_run_evidence
+          set terminal = '{"status":"failed"}'::jsonb, terminal_at = clock_timestamp()
+          where id = ${ids.ownerEvidence}::uuid
+        `
+        await tx`
+          update filesystem_mcp_runtime_audits
+          set status = 'failed', terminal = '{"status":"failed","failureCode":"preflight_failed"}'::jsonb,
+              terminal_at = clock_timestamp()
+          where id = ${ids.ownerAudit}::uuid
+        `
+      })
+      transitionCommitted = true
+    })
+    expect(transitionCommitted).toBe(true)
+    // The exporter and the least-privilege reader both retain the old state;
+    // current terminal authority remains the blocked package, not its old audit.
+    expect(before.taskStatus).toBe('approved')
+    expect(before.packages).toMatchObject([{ workPackageId: ids.ownerPackage, status: 'blocked' }])
+    expect(before.terminalPackages).toEqual([])
+
+    const after = await readS5AuthoritativeTaskState(ids.ownerTask, ids.owner)
+    expect(after.taskStatus).toBe('failed')
+    expect(after.packages).toMatchObject([{ workPackageId: ids.ownerPackage, status: 'failed' }])
+    expect(after.terminalPackages).toMatchObject([{
+      runtimeAuditId: ids.ownerAudit, workPackageId: ids.ownerPackage,
+      state: 'terminal', terminalOutcome: 'failed',
+    }])
+    expect(before.freshnessFingerprint).not.toBe(after.freshnessFingerprint)
+  })
 })
