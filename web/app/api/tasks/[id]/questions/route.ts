@@ -10,7 +10,7 @@ import { getAccessibleTask } from '@/lib/task-access'
 import { guardEpic172ProjectManagementIngress } from '@/lib/projects/epic-172-project-ingress'
 import { publishTaskEvent } from '@/worker/events'
 import { taskQuestionSummary } from '@/lib/mcps/clarification-projection'
-import { appendArchitectClarificationAnswer } from '@/lib/mcps/history-reader'
+import { appendArchitectClarificationAnswers } from '@/lib/mcps/history-reader'
 import { architectPlanStorageConfiguration } from '@/lib/mcps/s4-protocol-store'
 import { readS4RuntimeModeV1 } from '@/lib/mcps/s4-lease'
 import {
@@ -327,11 +327,14 @@ export async function POST(
       const existingQuestions = await db
         .select({
           id: taskQuestions.id,
+          status: taskQuestions.status,
+          answerReferenceId: taskQuestions.answerReferenceId,
+          questionEntryId: taskQuestions.questionEntryId,
           sourcePlanArtifactId: taskQuestions.sourcePlanArtifactId,
           sourcePlanVersion: taskQuestions.sourcePlanVersion,
         })
         .from(taskQuestions)
-        .where(and(eq(taskQuestions.taskId, taskId), inArray(taskQuestions.id, questionIds)))
+        .where(eq(taskQuestions.taskId, taskId))
       const existingIds = new Set(existingQuestions.map((question) => question.id))
       const unknownIds = questionIds.filter((id) => !existingIds.has(id))
       if (unknownIds.length > 0) {
@@ -345,18 +348,30 @@ export async function POST(
         return NextResponse.json({ error: 'Protected clarification history is unavailable.' }, { status: 409 })
       }
       const sourceById = new Map(existingQuestions.map((question) => [question.id, question]))
-      if ([...sourceById.values()].some((question) => !question.sourcePlanArtifactId || !question.sourcePlanVersion)) {
+      const requestedQuestions = questionIds.map((id) => sourceById.get(id)!)
+      if (requestedQuestions.some((question) =>
+        question.status !== 'open'
+        || question.answerReferenceId !== null
+        || question.questionEntryId !== `clarification_question:${question.id}`
+        || !question.sourcePlanArtifactId
+        || !question.sourcePlanVersion)) {
         return NextResponse.json({ error: 'Clarification source is unavailable.' }, { status: 409 })
       }
-      const appended = []
-      for (const answer of answers) {
+      const currentSource = requestedQuestions[0]
+      if (existingQuestions.some((question) =>
+        question.status === 'open'
+        && (question.sourcePlanArtifactId !== currentSource.sourcePlanArtifactId
+          || question.sourcePlanVersion !== currentSource.sourcePlanVersion))) {
+        return NextResponse.json({ error: 'Clarification source is unavailable.' }, { status: 409 })
+      }
+      const appended = await appendArchitectClarificationAnswers(answers.map((answer) => {
         const source = sourceById.get(answer.id)!
-        appended.push(await appendArchitectClarificationAnswer({
+        return {
           answer: answer.answer, digestKey: storage.digestKey, digestKeyId: storage.digestKeyId,
           questionId: answer.id, sessionCredential: credential,
           sourcePlanArtifactId: source.sourcePlanArtifactId!, sourcePlanVersion: String(source.sourcePlanVersion), taskId,
-        }))
-      }
+        }
+      }))
       const updatedQuestions = await db
         .select({
           id: taskQuestions.id,
@@ -378,15 +393,17 @@ export async function POST(
     }
     const { updatedQuestions, allAnswered } = result
 
-    await publishTaskEvent(taskId, 'questions:answered', {
-      answeredCount: updatedQuestions.length,
-      allAnswered,
-    })
-
     if (allAnswered) {
       await redis.lpush('forge:answers', JSON.stringify({ taskId }))
       console.info('[POST /api/tasks/:id/questions] All questions answered; enqueued re-plan', { taskId })
     }
+
+    await publishTaskEvent(taskId, 'questions:answered', {
+      answeredCount: updatedQuestions.length,
+      allAnswered,
+    }).catch(() => {
+      console.warn('[POST /api/tasks/:id/questions] Answer progress event unavailable')
+    })
 
     console.info('[POST /api/tasks/:id/questions] Recorded answers', {
       taskId,

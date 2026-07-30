@@ -10,7 +10,11 @@ import {
 } from '@/lib/mcps/s4-protocol-store'
 import { ARCHITECT_PLAN_HEADER, architectReplanReferenceForEntry } from '@/lib/mcps/architect-plan-entries'
 import { computeCredentialDigest } from '@/lib/session-credential-digest'
-import { appendArchitectClarificationAnswer, readArchitectPlanHistory } from '@/lib/mcps/history-reader'
+import {
+  appendArchitectClarificationAnswer,
+  appendArchitectClarificationAnswers,
+  readArchitectPlanHistory,
+} from '@/lib/mcps/history-reader'
 import { hashPassword } from '@/lib/password'
 import { closeDb } from '@/db'
 import {
@@ -867,6 +871,100 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
       referenceId: answerReferenceId,
     })).rejects.toMatchObject({ code: 'invalid_evidence' })
     await runStatefulHistoryProof()
+  })
+
+  it('rolls back the whole protected clarification form when a later append conflicts', async () => {
+    const taskId = randomUUID()
+    const runId = randomUUID()
+    const firstQuestionId = randomUUID()
+    const secondQuestionId = randomUUID()
+    const firstAnswerId = randomUUID()
+    const secondAnswerId = randomUUID()
+    await admin`insert into tasks (id, project_id, submitted_by, title, prompt, status)
+      values (${taskId}::uuid, ${ids.project}::uuid, ${ids.user}::uuid,
+        'Atomic clarification batch', 'protected', 'awaiting_answers')`
+    await admin`insert into agent_runs (id, task_id, agent_type, model_id_used, status)
+      values (${runId}::uuid, ${taskId}::uuid, 'architect', 'test', 'completed')`
+    const source = await recordArchitectPlanVersion({
+      agentRunId: runId,
+      digestKey: key,
+      digestKeyId: 's4-test-key',
+      planVersion: '1',
+      taskId,
+      entries: [
+        { agent: null, bindingFingerprint: null, content: 'body', entryId: 'plan_body:000000', entryKind: 'plan_body', projectionEligible: false, requirementKey: null },
+        { agent: null, bindingFingerprint: null, content: JSON.stringify({ requirementKey: 'plan-policy', schemaVersion: 1 }), entryId: 'requirement:plan-policy', entryKind: 'requirement', projectionEligible: false, requirementKey: 'plan-policy' },
+        ...[firstQuestionId, secondQuestionId].map((questionId) => ({
+          agent: null,
+          bindingFingerprint: null,
+          content: JSON.stringify({
+            schemaVersion: 1,
+            questionId,
+            question: 'Which branch?',
+            suggestions: ['main'],
+          }),
+          entryId: `clarification_question:${questionId}`,
+          entryKind: 'clarification_question' as const,
+          projectionEligible: false,
+          requirementKey: null,
+        })),
+      ],
+    })
+    await admin`insert into task_questions (
+        id, task_id, question_entry_id, source_plan_artifact_id, source_plan_version, status
+      ) values
+        (${firstQuestionId}::uuid, ${taskId}::uuid,
+          ${`clarification_question:${firstQuestionId}`}, ${source.artifactId}::uuid, 1, 'open'),
+        (${secondQuestionId}::uuid, ${taskId}::uuid,
+          ${`clarification_question:${secondQuestionId}`}, ${source.artifactId}::uuid, 1, 'open')`
+
+    const batch = [{
+      answer: 'main',
+      answerId: firstAnswerId,
+      digestKey: key,
+      digestKeyId: 's4-test-key',
+      questionId: firstQuestionId,
+      sessionCredential,
+      sourcePlanArtifactId: source.artifactId,
+      sourcePlanVersion: '1',
+      taskId,
+    }, {
+      answer: 'release',
+      answerId: secondAnswerId,
+      digestKey: key,
+      digestKeyId: 's4-test-key',
+      questionId: secondQuestionId,
+      sessionCredential,
+      sourcePlanArtifactId: source.artifactId,
+      sourcePlanVersion: '1',
+      taskId,
+    }]
+    await admin`delete from task_questions
+      where task_id = ${taskId}::uuid and id = ${secondQuestionId}::uuid`
+    await expect(appendArchitectClarificationAnswers(batch)).rejects.toMatchObject({
+      code: 'invalid_evidence',
+    })
+    const [afterConflict] = await admin<{
+      answerCount: number
+      answeredCount: number
+    }[]>`select
+        (select count(*)::integer from architect_clarification_answers
+          where task_id = ${taskId}::uuid) as "answerCount",
+        (select count(*)::integer from task_questions
+          where task_id = ${taskId}::uuid and status = 'answered') as "answeredCount"`
+    expect(afterConflict).toEqual({ answerCount: 0, answeredCount: 0 })
+
+    await admin`insert into task_questions (
+        id, task_id, question_entry_id, source_plan_artifact_id, source_plan_version, status
+      ) values (
+        ${secondQuestionId}::uuid, ${taskId}::uuid,
+        ${`clarification_question:${secondQuestionId}`},
+        ${source.artifactId}::uuid, 1, 'open'
+      )`
+    await expect(appendArchitectClarificationAnswers(batch)).resolves.toEqual([
+      { answerId: firstAnswerId, allAnswered: false },
+      { answerId: secondAnswerId, allAnswered: true },
+    ])
   })
 
   it('serves protected Architect history through the real password session route with PostgreSQL as authority', async () => {
