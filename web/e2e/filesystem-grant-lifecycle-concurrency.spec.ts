@@ -39,6 +39,12 @@ function sqlClient() {
   return postgres(url, { max: 1 })
 }
 
+function s4ProofSqlClient() {
+  const url = process.env.FORGE_S4_POSTGRES_TEST_DATABASE_URL?.trim()
+  if (!url) throw new Error('FORGE_S4_POSTGRES_TEST_DATABASE_URL is required for protected S4 assertion reads')
+  return postgres(url, { max: 1 })
+}
+
 async function bounded<T>(promise: Promise<T>, milliseconds: number, label: string): Promise<T> {
   let timeout: ReturnType<typeof setTimeout> | undefined
   try {
@@ -1142,6 +1148,7 @@ test('project approval CAS accepts only the exact observed authority pointer', a
 test('locked health revalidation rejects a mutable filesystem change without durable approval writes', async () => {
   const fixture = await seed()
   const sql = sqlClient()
+  const proofSql = s4ProofSqlClient()
   try {
     // This is the route's preliminary observation. The independent SQL update
     // is deliberately made after it and before the locked callback runs.
@@ -1185,17 +1192,19 @@ test('locked health revalidation rejects a mutable filesystem change without dur
         throw new Error(`locked health rejected: ${healthError}`)
       },
     }), 10_000, 'locked filesystem health revalidation')).rejects.toThrow('locked health rejected')
-    const [{ decisions, pointerMutations, projections, recoveryActions }] = await sql<{
+    const [{ decisions, pointerMutations, projections }] = await sql<{
       decisions: number
       pointerMutations: number
       projections: number
-      recoveryActions: number
     }[]>`
       select
         (select count(*)::int from project_filesystem_grant_decisions where project_id = ${fixture.projectId}) as decisions,
         (select count(*)::int from project_filesystem_current_decision_pointers
          where project_id = ${fixture.projectId} and current_decision_id is not null) as "pointerMutations",
-        (select count(*)::int from work_package_local_projection_heads where task_id = ${fixture.taskId} and head_revision > 0) as projections,
+        (select count(*)::int from work_package_local_projection_heads where task_id = ${fixture.taskId} and head_revision > 0) as projections
+    `
+    const [{ recoveryActions }] = await proofSql<{ recoveryActions: number }[]>`
+      select
         (select count(*)::int from filesystem_mcp_issuance_recovery_actions where task_id = ${fixture.taskId}) +
         (select count(*)::int from local_effect_recovery_actions where task_id = ${fixture.taskId}) as "recoveryActions"
     `
@@ -1204,6 +1213,7 @@ test('locked health revalidation rejects a mutable filesystem change without dur
     })
   } finally {
     await sql.end()
+    await proofSql.end()
   }
 })
 

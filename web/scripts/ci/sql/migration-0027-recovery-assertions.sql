@@ -503,6 +503,10 @@ DECLARE
   v_before_actions integer;
   v_before_metadata jsonb;
   v_before_status text;
+  v_first record;
+  v_second record;
+  v_after_metadata jsonb;
+  v_after_status text;
   v_authorizer uuid;
 BEGIN
   SELECT metadata->'packet_issuance' INTO STRICT v_base
@@ -539,17 +543,44 @@ BEGIN
         AND package.id = '27000000-0000-4000-8000-00000000d101'
       GROUP BY package.metadata, package.status;
       BEGIN
-        PERFORM 1 FROM forge.apply_packet_issuance_recovery_action_v2(
+        SELECT * INTO v_first FROM forge.apply_packet_issuance_recovery_action_v2(
           '27000000-0000-4000-8000-00000000d001', '27000000-0000-4000-8000-00000000d101',
           '27000000-0000-4000-8000-00000000d401', v_action, v_fingerprint,
           '27000000-0000-4000-8000-000000000001', v_authorizer
         );
         IF NOT v_allowed THEN RAISE EXCEPTION 'disallowed packet matrix pair passed: %/%', v_disposition, v_action; END IF;
-        PERFORM 1 FROM forge.apply_packet_issuance_recovery_action_v2(
+        SELECT metadata, status INTO v_after_metadata, v_after_status
+        FROM public.work_packages WHERE id = '27000000-0000-4000-8000-00000000d101';
+        IF (SELECT count(*) FROM public.filesystem_mcp_issuance_recovery_actions
+            WHERE prior_runtime_audit_id = '27000000-0000-4000-8000-00000000d401') <> v_before_actions + 1
+           OR v_first.result IS DISTINCT FROM CASE v_action WHEN 'acknowledge_possible_submission' THEN 'acknowledged'
+             WHEN 'retry_execution' THEN 'ready' ELSE 'cancelled' END
+           OR v_first.package_status IS DISTINCT FROM CASE v_action WHEN 'acknowledge_possible_submission' THEN 'blocked'
+             WHEN 'retry_execution' THEN 'ready' ELSE 'cancelled' END
+           OR v_after_status IS DISTINCT FROM v_first.package_status
+           OR (v_action = 'acknowledge_possible_submission' AND (
+             NOT v_after_metadata ? 'packet_issuance'
+             OR v_after_metadata->'packet_issuance'->>'markerFingerprint' IS DISTINCT FROM v_first.result_marker_fingerprint
+             OR forge.packet_recovery_marker_fingerprint_v2((v_after_metadata->'packet_issuance') - 'markerFingerprint')
+                IS DISTINCT FROM v_first.result_marker_fingerprint))
+           OR (v_action <> 'acknowledge_possible_submission' AND v_after_metadata ? 'packet_issuance') THEN
+          RAISE EXCEPTION 'allowed packet matrix pair did not append its exact canonical transition: %/%', v_disposition, v_action;
+        END IF;
+        SELECT * INTO v_second FROM forge.apply_packet_issuance_recovery_action_v2(
           '27000000-0000-4000-8000-00000000d001', '27000000-0000-4000-8000-00000000d101',
           '27000000-0000-4000-8000-00000000d401', v_action, v_fingerprint,
           '27000000-0000-4000-8000-000000000001', v_authorizer
         );
+        IF v_second.action_id IS DISTINCT FROM v_first.action_id
+           OR v_second.result IS DISTINCT FROM v_first.result
+           OR v_second.result_marker_fingerprint IS DISTINCT FROM v_first.result_marker_fingerprint
+           OR v_second.package_status IS DISTINCT FROM v_first.package_status
+           OR (SELECT count(*) FROM public.filesystem_mcp_issuance_recovery_actions
+               WHERE prior_runtime_audit_id = '27000000-0000-4000-8000-00000000d401') <> v_before_actions + 1
+           OR (SELECT metadata FROM public.work_packages WHERE id = '27000000-0000-4000-8000-00000000d101') IS DISTINCT FROM v_after_metadata
+           OR (SELECT status FROM public.work_packages WHERE id = '27000000-0000-4000-8000-00000000d101') IS DISTINCT FROM v_after_status THEN
+          RAISE EXCEPTION 'packet matrix replay was not ledger-first and byte-stable: %/%', v_disposition, v_action;
+        END IF;
       EXCEPTION WHEN serialization_failure OR SQLSTATE 'P1726' OR invalid_parameter_value THEN
         IF v_allowed THEN RAISE; END IF;
       END;
@@ -989,6 +1020,10 @@ DECLARE
   v_before_actions integer;
   v_before_metadata jsonb;
   v_before_status text;
+  v_first record;
+  v_second record;
+  v_after_metadata jsonb;
+  v_after_status text;
   v_actors uuid[] := ARRAY[
     '27000000-0000-4000-8000-00000000e901'::uuid,'27000000-0000-4000-8000-00000000e902'::uuid,
     '27000000-0000-4000-8000-00000000e903'::uuid,'27000000-0000-4000-8000-00000000e904'::uuid,
@@ -1026,17 +1061,44 @@ BEGIN
         AND package.id = '27000000-0000-4000-8000-00000000e101'
       GROUP BY package.metadata, package.status;
       BEGIN
-        PERFORM 1 FROM forge.apply_local_effect_recovery_action_v2(
+        SELECT * INTO v_first FROM forge.apply_local_effect_recovery_action_v2(
           '27000000-0000-4000-8000-00000000e001', '27000000-0000-4000-8000-00000000e101',
           '27000000-0000-4000-8000-00000000e301', v_action,
           v_marker->>'evidenceFingerprint', v_actor
         );
         IF NOT v_allowed THEN RAISE EXCEPTION 'disallowed local matrix pair passed: %/%', v_disposition, v_action; END IF;
-        PERFORM 1 FROM forge.apply_local_effect_recovery_action_v2(
+        SELECT metadata, status INTO v_after_metadata, v_after_status
+        FROM public.work_packages WHERE id = '27000000-0000-4000-8000-00000000e101';
+        IF (SELECT count(*) FROM public.local_effect_recovery_actions
+            WHERE local_run_evidence_id = '27000000-0000-4000-8000-00000000e301') <> v_before_actions + 1
+           OR v_first.result IS DISTINCT FROM CASE v_action WHEN 'review_local_changes' THEN 'reviewed'
+             WHEN 'acknowledge_possible_local_invocation' THEN 'acknowledged'
+             WHEN 'retry_local_execution' THEN 'ready' ELSE 'cancelled' END
+           OR v_first.package_status IS DISTINCT FROM CASE v_action WHEN 'review_local_changes' THEN 'blocked'
+             WHEN 'acknowledge_possible_local_invocation' THEN 'blocked'
+             WHEN 'retry_local_execution' THEN 'ready' ELSE 'cancelled' END
+           OR v_after_status IS DISTINCT FROM v_first.package_status
+           OR (v_action IN ('review_local_changes','acknowledge_possible_local_invocation')
+             AND NOT v_after_metadata ? 'local_effect_recovery')
+           OR (v_action NOT IN ('review_local_changes','acknowledge_possible_local_invocation')
+             AND v_after_metadata ? 'local_effect_recovery') THEN
+          RAISE EXCEPTION 'allowed local matrix pair did not append its exact canonical transition: %/%', v_disposition, v_action;
+        END IF;
+        SELECT * INTO v_second FROM forge.apply_local_effect_recovery_action_v2(
           '27000000-0000-4000-8000-00000000e001', '27000000-0000-4000-8000-00000000e101',
           '27000000-0000-4000-8000-00000000e301', v_action,
           v_marker->>'evidenceFingerprint', v_actor
         );
+        IF v_second.action_id IS DISTINCT FROM v_first.action_id
+           OR v_second.result IS DISTINCT FROM v_first.result
+           OR v_second.result_marker_fingerprint IS DISTINCT FROM v_first.result_marker_fingerprint
+           OR v_second.package_status IS DISTINCT FROM v_first.package_status
+           OR (SELECT count(*) FROM public.local_effect_recovery_actions
+               WHERE local_run_evidence_id = '27000000-0000-4000-8000-00000000e301') <> v_before_actions + 1
+           OR (SELECT metadata FROM public.work_packages WHERE id = '27000000-0000-4000-8000-00000000e101') IS DISTINCT FROM v_after_metadata
+           OR (SELECT status FROM public.work_packages WHERE id = '27000000-0000-4000-8000-00000000e101') IS DISTINCT FROM v_after_status THEN
+          RAISE EXCEPTION 'local matrix replay was not ledger-first and byte-stable: %/%', v_disposition, v_action;
+        END IF;
       EXCEPTION WHEN serialization_failure OR SQLSTATE 'P1726' THEN
         IF v_allowed THEN RAISE; END IF;
       END;

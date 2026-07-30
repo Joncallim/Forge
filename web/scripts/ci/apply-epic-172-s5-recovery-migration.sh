@@ -14,7 +14,12 @@ cleanup() {
   npx tsx scripts/bootstrap-epic-172-s5-recovery-owner.ts --cleanup
   local cleanup_status=$?
   set -e
-  if [[ $original_status -ne 0 ]]; then exit "$original_status"; fi
+  if [[ $original_status -ne 0 ]]; then
+    if [[ $cleanup_status -ne 0 ]]; then
+      echo 'S5 owner handoff cleanup also failed; preserving the original migration failure.' >&2
+    fi
+    exit "$original_status"
+  fi
   if [[ $cleanup_status -ne 0 ]]; then
     echo 'S5 owner handoff cleanup failed after migration.' >&2
     exit "$cleanup_status"
