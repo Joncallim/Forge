@@ -4256,7 +4256,14 @@ export default function TaskDetailPage() {
     summaries: TaskQuestionSummary[],
   ) => {
     if (!planVersion) {
-      setClarificationQuestions([])
+      try {
+        const response = await fetch(`/api/tasks/${taskId}/questions`)
+        if (!response.ok) throw new Error('Legacy clarification history is unavailable')
+        const body = await response.json() as { questions?: TaskQuestion[] }
+        setClarificationQuestions(body.questions ?? [])
+      } catch {
+        setClarificationQuestions([])
+      }
       return
     }
     try {

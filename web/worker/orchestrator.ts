@@ -52,6 +52,12 @@ import {
 import {
   ARCHITECT_PLAN_HEADER,
 } from '../lib/mcps/architect-plan-entries'
+import {
+  LEGACY_CLARIFICATION_METADATA_KEY,
+  legacyClarificationAllAnswered,
+  readLegacyClarification,
+  sealLegacyClarification,
+} from '../lib/mcps/legacy-clarification'
 import { readS4RuntimeModeV1 } from '../lib/mcps/s4-lease'
 import {
   appendProtectedArchitectClarifications,
@@ -460,6 +466,7 @@ function mockArchitectPlan(task: TaskRow, project: ProjectRow): string {
 
 export type LatestPlanArtifact = {
   id?: string
+  agentRunId?: string
   content: string
   metadata: Record<string, unknown>
 }
@@ -528,7 +535,12 @@ function regeneratedPlanText(planText: string): string {
 
 async function loadLatestPlanArtifact(taskId: string): Promise<LatestPlanArtifact | null> {
   const [artifact] = await db
-    .select({ id: artifacts.id, content: artifacts.content, metadata: artifacts.metadata })
+    .select({
+      id: artifacts.id,
+      agentRunId: artifacts.agentRunId,
+      content: artifacts.content,
+      metadata: artifacts.metadata,
+    })
     .from(artifacts)
     .innerJoin(agentRuns, eq(artifacts.agentRunId, agentRuns.id))
     .where(and(eq(agentRuns.taskId, taskId), eq(artifacts.artifactType, 'adr_text')))
@@ -538,12 +550,14 @@ async function loadLatestPlanArtifact(taskId: string): Promise<LatestPlanArtifac
   if (!artifact) return null
   return {
     id: artifact.id,
+    agentRunId: artifact.agentRunId,
     content: artifact.content,
     metadata: isRecord(artifact.metadata) ? artifact.metadata : {},
   }
 }
 
 export type CreatedArchitectPlanArtifact = typeof artifacts.$inferSelect & {
+  architectPlanStorageMode: 'legacy' | 'protected'
   protectedArchitectPlanEntries: ArchitectPlanEntryEnvelope[]
 }
 
@@ -657,7 +671,10 @@ export async function createArchitectPlanArtifact(
     title: 'Artifact created',
   })
 
-  return Object.assign(artifact, { protectedArchitectPlanEntries })
+  return Object.assign(artifact, {
+    architectPlanStorageMode: storage.mode,
+    protectedArchitectPlanEntries,
+  })
 }
 
 function planTextFromCheckpoint(checkpoint: ArchitectResumeCheckpoint | null): string | null {
@@ -783,6 +800,7 @@ async function persistOpenQuestions(
   questions: readonly ProtectedOpenQuestion[],
   artifactId: string,
   planVersion: string,
+  storageMode: CreatedArchitectPlanArtifact['architectPlanStorageMode'],
   claimLeaseFence: ClaimLeaseFence,
 ): Promise<number> {
   // Answered rows are the opaque durable projection of protected subledger
@@ -807,12 +825,20 @@ async function persistOpenQuestions(
   const rows = await db
     .insert(taskQuestions)
     .values(
-      questions.map((question) => ({
-        id: question.questionId, taskId,
-        questionEntryId: `clarification_question:${question.questionId}`,
-        sourcePlanArtifactId: artifactId, sourcePlanVersion: Number(planVersion),
-        status: 'open' as const,
-      })),
+      questions.map((question) => storageMode === 'protected'
+        ? {
+            id: question.questionId,
+            taskId,
+            questionEntryId: `clarification_question:${question.questionId}`,
+            sourcePlanArtifactId: artifactId,
+            sourcePlanVersion: Number(planVersion),
+            status: 'open' as const,
+          }
+        : {
+            id: question.questionId,
+            taskId,
+            status: 'open' as const,
+          }),
     )
     .returning()
 
@@ -843,6 +869,49 @@ function answeredQuestionSnapshot(
 ): AnsweredQuestion[] {
   void questions
   return []
+}
+
+async function legacyAnsweredQuestionSnapshot(
+  taskId: string,
+  questions: Array<typeof taskQuestions.$inferSelect>,
+  claimLeaseFence: ClaimLeaseFence,
+): Promise<AnsweredQuestion[]> {
+  claimLeaseFence.assertOwned()
+  const artifact = await loadLatestPlanArtifact(taskId)
+  claimLeaseFence.assertOwned()
+  const planVersion = artifact?.metadata.planVersion
+  const envelope = artifact
+    && artifact.agentRunId
+    && typeof planVersion === 'string'
+    ? readLegacyClarification(artifact.metadata, {
+        taskId,
+        agentRunId: artifact.agentRunId,
+        planVersion,
+      })
+    : null
+  if (!envelope || !legacyClarificationAllAnswered(envelope)) {
+    throw new Error('Legacy clarification history is unavailable for re-plan.')
+  }
+  const rowById = new Map(questions.map((question) => [question.id, question]))
+  if (rowById.size !== envelope.questions.length
+    || envelope.questions.some((question) => {
+      const row = rowById.get(question.id)
+      return !row
+        || row.status !== 'answered'
+        || row.answeredAt === null
+        || row.questionEntryId !== null
+        || row.sourcePlanArtifactId !== null
+        || row.sourcePlanVersion !== null
+        || row.answerReferenceId !== null
+    })) {
+    throw new Error('Legacy clarification projection does not match its durable artifact.')
+  }
+  return envelope.questions.map((question) => ({
+    questionId: question.id,
+    answerId: question.id,
+    question: question.question,
+    answer: question.answer!,
+  }))
 }
 
 async function runArchitect(
@@ -1183,6 +1252,22 @@ async function runArchitect(
       // Revised plans carry only their current protected open-question entries.
       answeredQuestions: [],
     })
+    const legacyClarificationMetadata = s4RuntimeMode === 'legacy' && protectedOpenQuestions.length > 0
+      ? {
+          [LEGACY_CLARIFICATION_METADATA_KEY]: sealLegacyClarification({
+            schemaVersion: 1,
+            taskId: task.id,
+            agentRunId: run.id,
+            planVersion,
+            questions: protectedOpenQuestions.map((question) => ({
+              id: question.questionId,
+              question: question.question,
+              suggestions: question.suggestions,
+              answer: null,
+            })),
+          }),
+        }
+      : {}
     claimLeaseFence.assertOwned()
     const artifact = await createArchitectPlanArtifact(task.id, run.id, artifactPlanText, planVersion, {
       openQuestionCount: prepared.questions.length,
@@ -1198,6 +1283,7 @@ async function runArchitect(
       mcpExecutionDesign: previousPlan !== null && artifactComparableMetadata === previousComparableMetadata && isRecord(previousPlanArtifact?.metadata.mcpExecutionDesign)
         ? previousPlanArtifact.metadata.mcpExecutionDesign
         : prepared.mcpExecutionDesign,
+      ...legacyClarificationMetadata,
     }, protectedEntries, claimLeaseFence)
     claimLeaseFence.assertOwned()
     const openQuestionCount = await persistOpenQuestions(
@@ -1205,6 +1291,7 @@ async function runArchitect(
       protectedOpenQuestions,
       artifact.id,
       planVersion,
+      artifact.architectPlanStorageMode,
       claimLeaseFence,
     )
 
@@ -1284,7 +1371,10 @@ async function runArchitect(
       runStatus: 'completed',
       artifactId: artifact.id,
       openQuestionCount,
-      openQuestions: prepared.questions.map((question) => question.question),
+      // Question text remains only in protected history or the encrypted
+      // legacy artifact envelope. Checkpoints retain the count, not a derived
+      // plaintext copy.
+      openQuestions: [],
       revisedFromAnswers: answeredQuestions.length > 0,
       revisedFromPlan: previousPlan !== null,
       protectedHistory: isRecord(artifact.metadata) && artifact.metadata.historyAvailable === true,
@@ -1523,7 +1613,12 @@ export async function processAnsweredQuestions(
     return 'completed'
   }
 
-  const answeredQuestions = answeredQuestionSnapshot(existingQuestions)
+  const runtimeMode = await readS4RuntimeModeV1()
+  claimLeaseFence.assertOwned()
+  const storage = architectPlanStorageConfiguration(process.env, runtimeMode)
+  const answeredQuestions = storage.mode === 'legacy'
+    ? await legacyAnsweredQuestionSnapshot(taskId, existingQuestions, claimLeaseFence)
+    : answeredQuestionSnapshot(existingQuestions)
 
   if (!recoveredRunningOccurrence) {
     claimLeaseFence.assertOwned()

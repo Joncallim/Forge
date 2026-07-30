@@ -2323,7 +2323,7 @@ export const taskQuestions = pgTable(
     sourcePlanArtifactId: uuid('source_plan_artifact_id'),
     sourcePlanVersion: bigint('source_plan_version', { mode: 'number' }),
     answerReferenceId: uuid('answer_reference_id'),
-    // 'open'|'answered'
+    // 'open'|'answered'|'legacy_unavailable'
     status: text('status').notNull().default('open'),
     createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
     answeredAt: timestamp('answered_at', tsOpts),

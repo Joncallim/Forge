@@ -72,8 +72,7 @@ export async function readArchitectPlanHistory(input: {
   }
 }
 
-/** Dormant B2A writer: callers must opt in explicitly during the route cutover. */
-export async function appendArchitectClarificationAnswer(input: {
+export type ArchitectClarificationAnswerInput = {
   answer: string
   answerId?: string
   digestKey: Buffer
@@ -83,33 +82,79 @@ export async function appendArchitectClarificationAnswer(input: {
   sourcePlanArtifactId: string
   sourcePlanVersion: string
   taskId: string
-}): Promise<{ answerId: string; allAnswered: boolean }> {
-  const answerId = input.answerId ?? randomUUID()
-  const envelope = materializeArchitectClarificationAnswer({
-    answer: input.answer, answerId, digestKey: input.digestKey, digestKeyId: input.digestKeyId,
-    questionId: input.questionId, sourcePlanArtifactId: input.sourcePlanArtifactId,
-    sourcePlanVersion: input.sourcePlanVersion, taskId: input.taskId,
+}
+
+/**
+ * Appends one protected clarification form as one database transaction.
+ *
+ * Every answer envelope is validated before a connection is opened. The
+ * existing fixed-authority routine then revalidates each source and open
+ * question inside one transaction, so a later conflict rolls back earlier
+ * appends instead of partially saving the form.
+ */
+export async function appendArchitectClarificationAnswers(
+  inputs: readonly ArchitectClarificationAnswerInput[],
+): Promise<readonly { answerId: string; allAnswered: boolean }[]> {
+  if (inputs.length < 1) {
+    throw new HistoryReaderError('invalid_evidence', 'The protected clarification append failed closed.')
+  }
+  const first = inputs[0]
+  const questionIds = new Set(inputs.map((input) => input.questionId))
+  if (questionIds.size !== inputs.length
+    || inputs.some((input) =>
+      input.sourcePlanArtifactId !== first.sourcePlanArtifactId
+      || input.sourcePlanVersion !== first.sourcePlanVersion)) {
+    throw new HistoryReaderError('invalid_evidence', 'The protected clarification append failed closed.')
+  }
+  const prepared = inputs.map((input) => {
+    if (input.taskId !== first.taskId
+      || input.sessionCredential !== first.sessionCredential
+      || input.digestKeyId !== first.digestKeyId
+      || !input.digestKey.equals(first.digestKey)) {
+      throw new HistoryReaderError('invalid_evidence', 'The protected clarification append failed closed.')
+    }
+    const answerId = input.answerId ?? randomUUID()
+    const envelope = materializeArchitectClarificationAnswer({
+      answer: input.answer, answerId, digestKey: input.digestKey, digestKeyId: input.digestKeyId,
+      questionId: input.questionId, sourcePlanArtifactId: input.sourcePlanArtifactId,
+      sourcePlanVersion: input.sourcePlanVersion, taskId: input.taskId,
+    })
+    return { answerId, envelope, input }
   })
-  const credentialBytes = Buffer.from(input.sessionCredential, 'ascii')
+  const credentialBytes = Buffer.from(first.sessionCredential, 'ascii')
   const sql = postgres(historyReaderUrl(), { max: 1, prepare: true, onnotice: () => {}, transform: { undefined: null } })
   try {
-    const [row] = await sql<{ answerId: string; allAnswered: boolean }[]>`
-      select answer_id as "answerId", all_answered as "allAnswered"
-      from forge.append_architect_clarification_answer_v1(
-        ${credentialBytes}::bytea, ${input.taskId}::uuid, ${input.questionId}::uuid,
-        ${input.sourcePlanArtifactId}::uuid, ${input.sourcePlanVersion}::bigint,
-        ${answerId}::uuid, ${envelope.answer}::text, ${envelope.contentDigest}::text,
-        ${envelope.digestKeyId}::text
-      )
-    `
-    if (!row || row.answerId !== answerId) throw new Error('missing answer append result')
-    return row
+    return await sql.begin(async (transaction) => {
+      const appended: { answerId: string; allAnswered: boolean }[] = []
+      for (const { answerId, envelope, input } of prepared) {
+        const [row] = await transaction<{ answerId: string; allAnswered: boolean }[]>`
+          select answer_id as "answerId", all_answered as "allAnswered"
+          from forge.append_architect_clarification_answer_v1(
+            ${credentialBytes}::bytea, ${input.taskId}::uuid, ${input.questionId}::uuid,
+            ${input.sourcePlanArtifactId}::uuid, ${input.sourcePlanVersion}::bigint,
+            ${answerId}::uuid, ${envelope.answer}::text, ${envelope.contentDigest}::text,
+            ${envelope.digestKeyId}::text
+          )
+        `
+        if (!row || row.answerId !== answerId) throw new Error('missing answer append result')
+        appended.push(row)
+      }
+      return appended
+    })
   } catch {
     throw new HistoryReaderError('invalid_evidence', 'The protected clarification append failed closed.')
   } finally {
     credentialBytes.fill(0)
     await sql.end({ timeout: 5 })
   }
+}
+
+/** Single-answer compatibility wrapper around the atomic batch writer. */
+export async function appendArchitectClarificationAnswer(
+  input: ArchitectClarificationAnswerInput,
+): Promise<{ answerId: string; allAnswered: boolean }> {
+  const [row] = await appendArchitectClarificationAnswers([input])
+  return row
 }
 
 export async function appendProtectedMcpOperatorReview(input: {

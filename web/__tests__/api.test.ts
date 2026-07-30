@@ -17,6 +17,7 @@ import path from 'node:path'
 import { getTableName } from 'drizzle-orm'
 import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { canonicalS3Marker } from '../test-support/filesystem-grant-marker-fixtures'
+import { LEGACY_CLARIFICATION_MAX_TEXT_BYTES } from '@/lib/mcps/legacy-clarification'
 
 const taskEventRedisEnvironment = {
   publisher: process.env.FORGE_TASK_EVENT_PUBLISHER_REDIS_URL,
@@ -64,12 +65,12 @@ const mockLoadProtectedApprovalReviewPreflight = vi.fn().mockResolvedValue(null)
 const mockReadProtectedMcpOperatorReview = vi.fn().mockResolvedValue([])
 const mockListApprovedPackagePlanRegistrations = vi.fn().mockResolvedValue([])
 const {
-  mockAppendArchitectClarificationAnswer,
+  mockAppendArchitectClarificationAnswers,
   mockReadS4RuntimeModeV1,
   mockArchitectPlanStorageConfiguration,
   mockGenerateTaskTitle,
 } = vi.hoisted(() => ({
-  mockAppendArchitectClarificationAnswer: vi.fn(),
+  mockAppendArchitectClarificationAnswers: vi.fn(),
   mockReadS4RuntimeModeV1: vi.fn().mockResolvedValue('protected'),
   mockArchitectPlanStorageConfiguration: vi.fn().mockReturnValue({
     mode: 'protected', digestKey: Buffer.alloc(32, 7), digestKeyId: 'test-v1',
@@ -82,7 +83,7 @@ vi.mock('@/lib/mcps/protected-review-preflight', () => ({
 vi.mock('@/lib/mcps/history-reader', () => ({
   listApprovedPackagePlanRegistrations: mockListApprovedPackagePlanRegistrations,
   readProtectedMcpOperatorReview: mockReadProtectedMcpOperatorReview,
-  appendArchitectClarificationAnswer: mockAppendArchitectClarificationAnswer,
+  appendArchitectClarificationAnswers: mockAppendArchitectClarificationAnswers,
 }))
 vi.mock('@/lib/mcps/s4-lease', async (importOriginal) => ({
   ...await importOriginal<typeof import('@/lib/mcps/s4-lease')>(),
@@ -7188,7 +7189,13 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
 // ---------------------------------------------------------------------------
 
 describe('POST /api/tasks/:id/questions', () => {
-  beforeEach(() => { vi.clearAllMocks() })
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mockReadS4RuntimeModeV1.mockResolvedValue('protected')
+    mockArchitectPlanStorageConfiguration.mockReturnValue({
+      mode: 'protected', digestKey: Buffer.alloc(32, 7), digestKeyId: 'test-v1',
+    })
+  })
 
   it('returns 401 when not authenticated', async () => {
     mockGetSession.mockResolvedValue(null)
@@ -7245,6 +7252,66 @@ describe('POST /api/tasks/:id/questions', () => {
     expect(JSON.stringify(body)).not.toContain('RAW-')
   })
 
+  it('presents an encrypted legacy clarification only through the authorized question route', async () => {
+    const previousSecret = process.env.SESSION_SECRET
+    process.env.SESSION_SECRET = 'legacy-question-route-test-secret'
+    try {
+      const taskId = '11111111-1111-4111-8111-111111111111'
+      const questionId = '77777777-7777-4777-8777-777777777777'
+      const agentRunId = '88888888-8888-4888-8888-888888888888'
+      const question = 'RAW-LEGACY-QUESTION-SENTINEL'
+      const suggestion = 'RAW-LEGACY-SUGGESTION-SENTINEL'
+      const { sealLegacyClarification } = await import('@/lib/mcps/legacy-clarification')
+      const metadata = {
+        historyAvailable: false,
+        planVersion: '1',
+        storageMode: 'legacy',
+        legacyClarificationV1: sealLegacyClarification({
+          schemaVersion: 1,
+          taskId,
+          agentRunId,
+          planVersion: '1',
+          questions: [{ id: questionId, question, suggestions: [suggestion], answer: null }],
+        }),
+      }
+      mockGetSession.mockResolvedValue(FAKE_SESSION)
+      mockReadS4RuntimeModeV1.mockResolvedValueOnce('legacy')
+      mockArchitectPlanStorageConfiguration.mockReturnValueOnce({ mode: 'legacy' })
+      mockDbSelect
+        .mockReturnValueOnce(chain([{ id: taskId, status: 'awaiting_answers' }]))
+        .mockReturnValueOnce(chain([{
+          id: questionId,
+          status: 'open',
+          createdAt: new Date('2026-07-30T00:00:00.000Z'),
+          answeredAt: null,
+        }]))
+        .mockReturnValueOnce(chain([{ id: 'artifact-1', agentRunId, metadata }]))
+
+      const { GET } = await import('@/app/api/tasks/[id]/questions/route')
+      const response = await GET(authRequest(`/api/tasks/${taskId}/questions`) as never, {
+        params: Promise.resolve({ id: taskId }),
+      })
+
+      expect(response.status).toBe(200)
+      expect(await response.json()).toEqual({
+        questions: [{
+          id: questionId,
+          status: 'open',
+          createdAt: '2026-07-30T00:00:00.000Z',
+          answeredAt: null,
+          question,
+          suggestions: [suggestion],
+          answer: null,
+        }],
+      })
+      expect(JSON.stringify(metadata)).not.toContain(question)
+      expect(JSON.stringify(metadata)).not.toContain(suggestion)
+    } finally {
+      if (previousSecret === undefined) delete process.env.SESSION_SECRET
+      else process.env.SESSION_SECRET = previousSecret
+    }
+  })
+
   it('accepts an opaque question id and answer but returns only content-free summaries', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     const questionId = '77777777-7777-4777-8777-777777777777'
@@ -7253,6 +7320,9 @@ describe('POST /api/tasks/:id/questions', () => {
       .mockReturnValueOnce(chain([{ id: 'task-1', status: 'awaiting_answers' }]))
       .mockReturnValueOnce(chain([{
         id: questionId,
+        status: 'open',
+        answerReferenceId: null,
+        questionEntryId: `clarification_question:${questionId}`,
         sourcePlanArtifactId: '88888888-8888-4888-8888-888888888888',
         sourcePlanVersion: 1,
       }]))
@@ -7262,7 +7332,7 @@ describe('POST /api/tasks/:id/questions', () => {
         createdAt: new Date('2026-07-22T00:00:00.000Z'),
         answeredAt: new Date('2026-07-22T00:01:00.000Z'),
       }]))
-    mockAppendArchitectClarificationAnswer.mockResolvedValue({ answerId: 'answer-1', allAnswered: true })
+    mockAppendArchitectClarificationAnswers.mockResolvedValue([{ answerId: 'answer-1', allAnswered: true }])
     mockRedisLpush.mockResolvedValue(1)
     mockRedisEval.mockResolvedValue(1)
 
@@ -7285,14 +7355,262 @@ describe('POST /api/tasks/:id/questions', () => {
       allAnswered: true,
     })
     expect(JSON.stringify(body)).not.toContain('RAW-')
-    expect(mockAppendArchitectClarificationAnswer).toHaveBeenCalledWith(expect.objectContaining({
-      answer, questionId, taskId: 'task-1',
-    }))
+    expect(mockAppendArchitectClarificationAnswers).toHaveBeenCalledWith([
+      expect.objectContaining({ answer, questionId, taskId: 'task-1' }),
+    ])
     expect(mockDbUpdate).not.toHaveBeenCalled()
     expect(mockRedisPublish).not.toHaveBeenCalled()
     const answeredEvent = mockRedisEval.mock.calls.find((call) => call[4] === 'questions:answered')
     expect(JSON.parse(answeredEvent?.[5] as string)).toEqual({ answeredCount: 1, allAnswered: true })
     expect(JSON.stringify(mockRedisEval.mock.calls)).not.toContain('RAW-')
+  })
+
+  it('records a legacy answer in the encrypted artifact and queues re-plan without public plaintext', async () => {
+    const previousSecret = process.env.SESSION_SECRET
+    process.env.SESSION_SECRET = 'legacy-question-answer-test-secret'
+    try {
+      const taskId = '11111111-1111-4111-8111-111111111111'
+      const questionId = '77777777-7777-4777-8777-777777777777'
+      const agentRunId = '88888888-8888-4888-8888-888888888888'
+      const question = 'RAW-LEGACY-QUESTION-SENTINEL'
+      const answer = 'RAW-LEGACY-ANSWER-SENTINEL'
+      const { readLegacyClarification, sealLegacyClarification } = await import('@/lib/mcps/legacy-clarification')
+      const metadata = {
+        historyAvailable: false,
+        planVersion: '1',
+        storageMode: 'legacy',
+        legacyClarificationV1: sealLegacyClarification({
+          schemaVersion: 1,
+          taskId,
+          agentRunId,
+          planVersion: '1',
+          questions: [{ id: questionId, question, suggestions: ['main'], answer: null }],
+        }),
+      }
+      const artifactUpdate = chain([{ id: 'artifact-1' }])
+      let artifactSet: Record<string, unknown> = {}
+      artifactUpdate.set = vi.fn((value: Record<string, unknown>) => {
+        artifactSet = value
+        return artifactUpdate
+      })
+      const questionUpdate = chain([{
+        id: questionId,
+        status: 'answered',
+        createdAt: new Date('2026-07-30T00:00:00.000Z'),
+        answeredAt: new Date('2026-07-30T00:01:00.000Z'),
+      }])
+      let questionSet: Record<string, unknown> = {}
+      questionUpdate.set = vi.fn((value: Record<string, unknown>) => {
+        questionSet = value
+        return questionUpdate
+      })
+
+      mockGetSession.mockResolvedValue(FAKE_SESSION)
+      mockReadS4RuntimeModeV1.mockResolvedValueOnce('legacy')
+      mockArchitectPlanStorageConfiguration.mockReturnValueOnce({ mode: 'legacy' })
+      mockDbSelect
+        .mockReturnValueOnce(chain([{ id: taskId, status: 'awaiting_answers' }]))
+        .mockReturnValueOnce(chain([{
+          id: questionId,
+          status: 'open',
+          createdAt: new Date('2026-07-30T00:00:00.000Z'),
+          answeredAt: null,
+          answerReferenceId: null,
+          questionEntryId: null,
+          sourcePlanArtifactId: null,
+          sourcePlanVersion: null,
+        }]))
+        .mockReturnValueOnce(chain([{ id: 'artifact-1', agentRunId, metadata }]))
+      mockDbUpdate
+        .mockReturnValueOnce(artifactUpdate)
+        .mockReturnValueOnce(questionUpdate)
+      mockRedisLpush.mockResolvedValue(1)
+      mockRedisEval.mockResolvedValue(1)
+
+      const { POST } = await import('@/app/api/tasks/[id]/questions/route')
+      const response = await POST(authRequest(`/api/tasks/${taskId}/questions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ answers: [{ id: questionId, answer }] }),
+      }) as never, { params: Promise.resolve({ id: taskId }) })
+
+      expect(response.status).toBe(200)
+      expect(await response.json()).toEqual({
+        questions: [{
+          id: questionId,
+          status: 'answered',
+          createdAt: '2026-07-30T00:00:00.000Z',
+          answeredAt: '2026-07-30T00:01:00.000Z',
+        }],
+        allAnswered: true,
+      })
+      expect(questionSet).toEqual(expect.objectContaining({
+        status: 'answered',
+        answeredBy: FAKE_SESSION.userId,
+        answeredAt: expect.any(Date),
+      }))
+      const storedMetadata = artifactSet.metadata as Record<string, unknown>
+      expect(JSON.stringify(storedMetadata)).not.toContain(question)
+      expect(JSON.stringify(storedMetadata)).not.toContain(answer)
+      const persisted = readLegacyClarification(storedMetadata, {
+        taskId,
+        agentRunId,
+        planVersion: '1',
+      })
+      expect(persisted?.questions).toEqual([{
+        id: questionId,
+        question,
+        suggestions: ['main'],
+        answer,
+      }])
+      expect(mockAppendArchitectClarificationAnswers).not.toHaveBeenCalled()
+      expect(mockRedisLpush).toHaveBeenCalledWith('forge:answers', JSON.stringify({ taskId }))
+      expect(JSON.stringify(mockRedisLpush.mock.calls)).not.toContain(answer)
+      expect(JSON.stringify(mockRedisEval.mock.calls)).not.toContain(answer)
+    } finally {
+      if (previousSecret === undefined) delete process.env.SESSION_SECRET
+      else process.env.SESSION_SECRET = previousSecret
+    }
+  })
+
+  it('does not fall back to legacy answering for a protected clarification', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const taskId = '11111111-1111-4111-8111-111111111111'
+    const questionId = '77777777-7777-4777-8777-777777777777'
+    mockDbSelect
+      .mockReturnValueOnce(chain([{ id: taskId, status: 'awaiting_answers' }]))
+      .mockReturnValueOnce(chain([{
+        id: questionId,
+        status: 'open',
+        answerReferenceId: null,
+        questionEntryId: `clarification_question:${questionId}`,
+        sourcePlanArtifactId: null,
+        sourcePlanVersion: null,
+      }]))
+
+    const { POST } = await import('@/app/api/tasks/[id]/questions/route')
+    const response = await POST(authRequest(`/api/tasks/${taskId}/questions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ answers: [{ id: questionId, answer: 'protected answer' }] }),
+    }) as never, { params: Promise.resolve({ id: taskId }) })
+
+    expect(response.status).toBe(409)
+    expect(mockDbTransaction).not.toHaveBeenCalled()
+    expect(mockDbUpdate).not.toHaveBeenCalled()
+    expect(mockAppendArchitectClarificationAnswers).not.toHaveBeenCalled()
+  })
+
+  it('validates the whole protected form before calling the atomic writer', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const firstQuestionId = '77777777-7777-4777-8777-777777777777'
+    const secondQuestionId = '99999999-9999-4999-8999-999999999999'
+    mockDbSelect
+      .mockReturnValueOnce(chain([{ id: 'task-1', status: 'awaiting_answers' }]))
+      .mockReturnValueOnce(chain([{
+        id: firstQuestionId,
+        status: 'open',
+        answerReferenceId: null,
+        questionEntryId: `clarification_question:${firstQuestionId}`,
+        sourcePlanArtifactId: '88888888-8888-4888-8888-888888888888',
+        sourcePlanVersion: 1,
+      }, {
+        id: secondQuestionId,
+        status: 'answered',
+        answerReferenceId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+        questionEntryId: `clarification_question:${secondQuestionId}`,
+        sourcePlanArtifactId: '88888888-8888-4888-8888-888888888888',
+        sourcePlanVersion: 1,
+      }]))
+
+    const { POST } = await import('@/app/api/tasks/[id]/questions/route')
+    const response = await POST(authRequest('/api/tasks/task-1/questions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ answers: [
+        { id: firstQuestionId, answer: 'first' },
+        { id: secondQuestionId, answer: 'second' },
+      ] }),
+    }) as never, { params: Promise.resolve({ id: 'task-1' }) })
+
+    expect(response.status).toBe(409)
+    expect(mockAppendArchitectClarificationAnswers).not.toHaveBeenCalled()
+    expect(mockRedisLpush).not.toHaveBeenCalled()
+    expect(mockRedisEval).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    {
+      name: 'duplicate ids',
+      answers: [
+        { id: '77777777-7777-4777-8777-777777777777', answer: 'first' },
+        { id: '77777777-7777-4777-8777-777777777777', answer: 'second' },
+      ],
+    },
+    {
+      name: 'oversized answer',
+      answers: [{
+        id: '77777777-7777-4777-8777-777777777777',
+        answer: 'x'.repeat(LEGACY_CLARIFICATION_MAX_TEXT_BYTES + 1),
+      }],
+    },
+  ])('rejects $name before any protected write or continuation', async ({ answers }) => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbSelect.mockReturnValueOnce(chain([{ id: 'task-1', status: 'awaiting_answers' }]))
+
+    const { POST } = await import('@/app/api/tasks/[id]/questions/route')
+    const response = await POST(authRequest('/api/tasks/task-1/questions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ answers }),
+    }) as never, { params: Promise.resolve({ id: 'task-1' }) })
+
+    expect(response.status).toBe(400)
+    expect(mockAppendArchitectClarificationAnswers).not.toHaveBeenCalled()
+    expect(mockRedisLpush).not.toHaveBeenCalled()
+    expect(mockRedisEval).not.toHaveBeenCalled()
+  })
+
+  it('durably queues re-plan before best-effort progress publication', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const questionId = '77777777-7777-4777-8777-777777777777'
+    mockDbSelect
+      .mockReturnValueOnce(chain([{ id: 'task-1', status: 'awaiting_answers' }]))
+      .mockReturnValueOnce(chain([{
+        id: questionId,
+        status: 'open',
+        answerReferenceId: null,
+        questionEntryId: `clarification_question:${questionId}`,
+        sourcePlanArtifactId: '88888888-8888-4888-8888-888888888888',
+        sourcePlanVersion: 1,
+      }]))
+      .mockReturnValueOnce(chain([{
+        id: questionId,
+        status: 'answered',
+        createdAt: new Date('2026-07-30T00:00:00.000Z'),
+        answeredAt: new Date('2026-07-30T00:01:00.000Z'),
+      }]))
+    mockAppendArchitectClarificationAnswers.mockResolvedValue([{
+      answerId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      allAnswered: true,
+    }])
+    mockRedisLpush.mockResolvedValue(1)
+    mockRedisEval.mockRejectedValueOnce(new Error('RAW-EVENT-OUTAGE-SENTINEL'))
+
+    const { POST } = await import('@/app/api/tasks/[id]/questions/route')
+    const response = await POST(authRequest('/api/tasks/task-1/questions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ answers: [{ id: questionId, answer: 'RAW-ANSWER-SENTINEL' }] }),
+    }) as never, { params: Promise.resolve({ id: 'task-1' }) })
+
+    expect(response.status).toBe(200)
+    expect(mockRedisLpush).toHaveBeenCalledTimes(1)
+    expect(mockRedisLpush.mock.invocationCallOrder[0]).toBeLessThan(
+      mockRedisEval.mock.invocationCallOrder[0],
+    )
+    expect(JSON.stringify(mockRedisLpush.mock.calls)).not.toContain('RAW-ANSWER-SENTINEL')
+    expect(JSON.stringify(mockRedisEval.mock.calls)).not.toContain('RAW-ANSWER-SENTINEL')
   })
 })
 
