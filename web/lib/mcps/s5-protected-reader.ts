@@ -20,6 +20,9 @@ import { fixedDatabaseRoleUrl } from '@/lib/mcps/fixed-database-url'
 // ---------------------------------------------------------------------------
 
 export const S5_LOCAL_EVIDENCE_READER_URL_ENV = 'FORGE_LOCAL_RUN_EVIDENCE_READER_DATABASE_URL'
+// PostgreSQL exports `XXXXXXXX-XXXXXXXX-X` snapshot IDs. Keep every segment
+// hexadecimal and bounded before embedding it as a transaction snapshot literal.
+const POSTGRES_SNAPSHOT_ID = /^[0-9a-f]{8}-[0-9a-f]{8}-[0-9a-f]{1,8}$/i
 
 export type S5ProtectedLocalRunEvidenceRow = Readonly<{
   id: string
@@ -59,6 +62,19 @@ function readerUrl(): string | null {
   }
 }
 
+function sameDatabase(left: string, right: string): boolean {
+  try {
+    const [a, b] = [new URL(left), new URL(right)]
+    return ['postgres:', 'postgresql:'].includes(a.protocol)
+      && ['postgres:', 'postgresql:'].includes(b.protocol)
+      && a.hostname === b.hostname
+      && (a.port || '5432') === (b.port || '5432')
+      && a.pathname === b.pathname
+  } catch {
+    return false
+  }
+}
+
 export function s5LocalEvidenceReaderConfigured(): boolean {
   return readerUrl() !== null
 }
@@ -71,9 +87,13 @@ export function s5LocalEvidenceReaderConfigured(): boolean {
  */
 export async function readS5ProtectedTerminalSnapshot(
   taskId: string,
+  observation?: Readonly<{ snapshotId: string, databaseUrl: string }>,
 ): Promise<S5ProtectedTerminalSnapshot | null> {
   const url = readerUrl()
   if (!url) return null
+  if (observation && (!POSTGRES_SNAPSHOT_ID.test(observation.snapshotId) || !sameDatabase(url, observation.databaseUrl))) {
+    return null
+  }
   const sql = postgres(url, {
     max: 1,
     prepare: true,
@@ -81,7 +101,14 @@ export async function readS5ProtectedTerminalSnapshot(
     transform: { undefined: null },
   })
   try {
-    const [snapshot] = await sql<{
+    const snapshot = await sql.begin('isolation level repeatable read read only', async (tx) => {
+      if (observation) {
+        // postgres.js cannot parameterize a transaction snapshot literal. The
+        // exporter generated it locally and this strict validator permits only
+        // PostgreSQL's hexadecimal snapshot grammar before interpolation.
+        await tx.unsafe(`set transaction snapshot '${observation.snapshotId}'`)
+      }
+      const [result] = await tx<{
       evidenceRows: Array<{
         id: string
         workPackageId: string
@@ -101,7 +128,7 @@ export async function readS5ProtectedTerminalSnapshot(
         terminalAt: string | null
         updatedAt: string
       }>
-    }[]>`
+      }[]>`
       select
         coalesce((
           select jsonb_agg(jsonb_build_object(
@@ -130,7 +157,9 @@ export async function readS5ProtectedTerminalSnapshot(
           from public.filesystem_mcp_runtime_audits audit
           where audit.task_id = ${taskId}::uuid
         ), '[]'::jsonb) as "auditRows"
-    `
+      `
+      return result
+    })
     if (!snapshot || !Array.isArray(snapshot.evidenceRows) || !Array.isArray(snapshot.auditRows)) return null
     return {
       evidenceRows: snapshot.evidenceRows.map((row) => ({
