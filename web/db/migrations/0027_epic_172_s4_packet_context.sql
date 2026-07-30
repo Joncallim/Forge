@@ -7304,7 +7304,10 @@ ALTER TABLE public.task_questions
     (question_entry_id IS NOT NULL AND source_plan_artifact_id IS NOT NULL AND source_plan_version IS NOT NULL
       AND ((status = 'open' AND answer_reference_id IS NULL) OR (status = 'answered' AND answer_reference_id IS NOT NULL)))
     OR (question_entry_id IS NULL AND source_plan_artifact_id IS NULL AND source_plan_version IS NULL
-      AND answer_reference_id IS NULL AND status = 'legacy_unavailable')
+      AND answer_reference_id IS NULL AND (
+        (status IN ('legacy_unavailable', 'open') AND answered_at IS NULL)
+        OR (status = 'answered' AND answered_at IS NOT NULL)
+      ))
   );
 CREATE TABLE public.architect_clarification_answer_writes (
   id uuid PRIMARY KEY DEFAULT pg_catalog.gen_random_uuid(),

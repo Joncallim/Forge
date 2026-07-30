@@ -1,4 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import fs from 'node:fs'
+import path from 'node:path'
 
 const {
   mockBuildWebResearchContext,
@@ -177,6 +179,7 @@ describe('Architect clarification storage mode', () => {
     digestKey: process.env.FORGE_ARCHITECT_PLAN_DIGEST_KEY_HEX,
     digestKeyId: process.env.FORGE_ARCHITECT_PLAN_DIGEST_KEY_ID,
     mockArchitect: process.env.FORGE_WORKER_MOCK_ARCHITECT,
+    sessionSecret: process.env.SESSION_SECRET,
     writerUrl: process.env.FORGE_ARCHITECT_PLAN_WRITER_DATABASE_URL,
   }
 
@@ -197,6 +200,7 @@ describe('Architect clarification storage mode', () => {
     process.env.FORGE_ARCHITECT_PLAN_DIGEST_KEY_HEX = 'a'.repeat(64)
     process.env.FORGE_ARCHITECT_PLAN_DIGEST_KEY_ID = 'test-key-v1'
     process.env.FORGE_ARCHITECT_PLAN_WRITER_DATABASE_URL = 'postgresql://writer/test'
+    process.env.SESSION_SECRET = 'legacy-clarification-test-secret'
 
     mockDbSelect.mockImplementation(() => chain(selectResults.shift() ?? []))
     mockDbInsert.mockImplementation(() => chain(insertResults.shift() ?? [], {
@@ -245,6 +249,7 @@ describe('Architect clarification storage mode', () => {
       ['FORGE_ARCHITECT_PLAN_DIGEST_KEY_HEX', priorEnv.digestKey],
       ['FORGE_ARCHITECT_PLAN_DIGEST_KEY_ID', priorEnv.digestKeyId],
       ['FORGE_WORKER_MOCK_ARCHITECT', priorEnv.mockArchitect],
+      ['SESSION_SECRET', priorEnv.sessionSecret],
       ['FORGE_ARCHITECT_PLAN_WRITER_DATABASE_URL', priorEnv.writerUrl],
     ] as const) {
       if (value === undefined) delete process.env[name]
@@ -291,7 +296,7 @@ describe('Architect clarification storage mode', () => {
     }
     const question = {
       id: questionId,
-      status: mode === 'protected' ? 'open' : 'legacy_unavailable',
+      status: 'open',
       taskId,
     }
 
@@ -351,13 +356,26 @@ describe('Architect clarification storage mode', () => {
     expect(questionValues).toEqual([
       expect.objectContaining({
         id: expect.any(String),
-        status: 'legacy_unavailable',
+        status: 'open',
         taskId,
       }),
     ])
     expect(questionValues[0]).not.toHaveProperty('questionEntryId')
     expect(questionValues[0]).not.toHaveProperty('sourcePlanArtifactId')
     expect(questionValues[0]).not.toHaveProperty('sourcePlanVersion')
+    const legacyArtifactInsert = insertedValues.find((value) =>
+      value && !Array.isArray(value) && (value as { artifactType?: unknown }).artifactType === 'adr_text',
+    ) as { metadata: Record<string, unknown> }
+    expect(JSON.stringify(legacyArtifactInsert.metadata)).not.toContain(questionText)
+    expect(legacyArtifactInsert.metadata.legacyClarificationV1).toEqual({
+      schemaVersion: 1,
+      ciphertext: expect.stringMatching(/^v1:/),
+    })
+    expect(mockWriteArchitectCheckpointSafely).toHaveBeenCalledWith(expect.objectContaining({
+      openQuestionCount: 1,
+      openQuestions: [],
+    }))
+    expect(JSON.stringify(mockWriteArchitectCheckpointSafely.mock.calls)).not.toContain(questionText)
     expect(mockUpdateTaskStatusIfCurrent).toHaveBeenNthCalledWith(1, taskId, 'pending', 'running')
     expect(mockUpdateTaskStatusIfCurrent).toHaveBeenNthCalledWith(2, taskId, 'running', 'awaiting_answers')
     await expect(orchestrator.previousPlanForArchitectRun({
@@ -366,6 +384,21 @@ describe('Architect clarification storage mode', () => {
       checkpoint: null,
       taskId,
     })).resolves.toBe(artifact.content)
+  })
+
+  it('keeps public plaintext null while permitting open-to-answered legacy projection state', () => {
+    const migration = fs.readFileSync(
+      path.join(process.cwd(), 'db/migrations/0027_epic_172_s4_packet_context.sql'),
+      'utf8',
+    )
+    const constraint = migration.slice(
+      migration.indexOf('ADD CONSTRAINT task_questions_no_public_plaintext_chk'),
+      migration.indexOf('CREATE TABLE public.architect_clarification_answer_writes'),
+    )
+    expect(constraint).toContain('question IS NULL AND suggestions IS NULL AND answer IS NULL')
+    expect(constraint).toContain("status IN ('legacy_unavailable', 'open') AND answered_at IS NULL")
+    expect(constraint).toContain("status = 'answered' AND answered_at IS NOT NULL")
+    expect(constraint).toContain('answer_reference_id IS NULL')
   })
 
   it('retains protected clarification bindings for protected artifacts', async () => {
@@ -386,5 +419,174 @@ describe('Architect clarification storage mode', () => {
       }),
     ])
     expect(mockUpdateTaskStatusIfCurrent).toHaveBeenNthCalledWith(2, taskId, 'running', 'awaiting_answers')
+  })
+
+  it('replans from the answered encrypted legacy artifact without copying plaintext to public sinks', async () => {
+    const answerText = 'Use the release branch.'
+    const { sealLegacyClarification } = await import('@/lib/mcps/legacy-clarification')
+    const routingMetadata = {
+      agentBreakdown: [{
+        role: 'Backend',
+        tasks: 1,
+        summary: 'Apply the targeted branch change',
+      }],
+      agentBreakdownSource: 'fence',
+      capabilityClassification: {
+        schemaVersion: 1,
+        required: ['business-logic'],
+        optional: [],
+        excluded: [],
+      },
+      mcpExecutionDesign: {
+        proposed: {
+          schemaVersion: 1,
+          requirements: [],
+          promptOverlays: {},
+          requirementContexts: [],
+          mcpAwareSubtasks: [],
+        },
+      },
+    }
+    const priorArtifact = {
+      agentRunId: runId,
+      content: 'Confirm the target branch before changing the repository.',
+      id: artifactId,
+      metadata: {
+        ...routingMetadata,
+        historyAvailable: false,
+        planVersion: '1',
+        storageMode: 'legacy',
+        legacyClarificationV1: sealLegacyClarification({
+          schemaVersion: 1,
+          taskId,
+          agentRunId: runId,
+          planVersion: '1',
+          questions: [{
+            id: questionId,
+            question: questionText,
+            suggestions: ['main', 'release'],
+            answer: answerText,
+          }],
+        }),
+      },
+    }
+    const task = {
+      id: taskId,
+      pmProviderConfigId: 'provider-1',
+      projectId,
+      prompt: 'Plan this change.',
+      status: 'awaiting_answers',
+      title: 'Clarification storage',
+    }
+    const project = {
+      defaultBranch: 'main',
+      githubRepo: 'owner/repo',
+      id: projectId,
+      localPath: null,
+      name: 'Clarification project',
+    }
+    const revisedPlan = [
+      '# Implementation plan',
+      '',
+      'Confirm the target branch before changing the repository.',
+      '',
+      '```agent_breakdown_json',
+      JSON.stringify({ agents: routingMetadata.agentBreakdown }),
+      '```',
+      '',
+      '```capability_classification_json',
+      JSON.stringify(routingMetadata.capabilityClassification),
+      '```',
+      '',
+      '```mcp_execution_design_json',
+      JSON.stringify(routingMetadata.mcpExecutionDesign.proposed),
+      '```',
+      '',
+      '```open_questions_json',
+      '{"questions":[]}',
+      '```',
+    ].join('\n')
+    mockStreamText.mockImplementation((input: { prompt: string }) => {
+      expect(input.prompt).toContain(questionText)
+      expect(input.prompt).toContain(answerText)
+      return {
+        finishReason: Promise.resolve('stop'),
+        textStream: (async function* () {
+          yield revisedPlan
+        })(),
+        usage: Promise.resolve({ inputTokens: 12, outputTokens: 24 }),
+      }
+    })
+    selectResults.push(
+      [{ project, task }],
+      [{
+        id: questionId,
+        taskId,
+        status: 'answered',
+        createdAt: new Date('2026-07-30T00:00:00.000Z'),
+        answeredAt: new Date('2026-07-30T00:01:00.000Z'),
+        answeredBy: '66666666-6666-4666-8666-666666666666',
+        answerReferenceId: null,
+        questionEntryId: null,
+        sourcePlanArtifactId: null,
+        sourcePlanVersion: null,
+      }],
+      [priorArtifact],
+      [{
+        agentType: 'architect',
+        displayName: 'Architect',
+        id: 'architect-config',
+        isActive: true,
+        providerConfigId: 'provider-1',
+        systemPrompt: 'Plan carefully.',
+      }],
+      [priorArtifact],
+      [],
+      [],
+    )
+    insertResults.push(
+      [{
+        agentType: 'architect',
+        id: '77777777-7777-4777-8777-777777777777',
+        modelIdUsed: 'test-model',
+        providerConfigId: 'provider-1',
+        startedAt: new Date('2026-07-30T00:02:00.000Z'),
+        status: 'running',
+        taskId,
+      }],
+      [{
+        agentRunId: '77777777-7777-4777-8777-777777777777',
+        artifactType: 'adr_text',
+        content: 'Confirm the target branch before changing the repository.',
+        createdAt: new Date('2026-07-30T00:03:00.000Z'),
+        id: '88888888-8888-4888-8888-888888888888',
+        metadata: {
+          ...routingMetadata,
+          historyAvailable: false,
+          planVersion: '2',
+          storageMode: 'legacy',
+        },
+      }],
+    )
+    updateResults.push([{ id: '77777777-7777-4777-8777-777777777777' }])
+    mockReadS4RuntimeModeV1.mockResolvedValue('legacy')
+
+    const { processAnsweredQuestions } = await import('@/worker/orchestrator')
+    await expect(processAnsweredQuestions(taskId)).resolves.toBe('completed')
+
+    expect(mockUpdateTaskStatusIfCurrent).toHaveBeenNthCalledWith(
+      1, taskId, 'awaiting_answers', 'running',
+    )
+    expect(mockUpdateTaskStatusIfCurrent).toHaveBeenNthCalledWith(
+      2, taskId, 'running', 'awaiting_approval',
+    )
+    expect(JSON.stringify(insertedValues)).not.toContain(questionText)
+    expect(JSON.stringify(insertedValues)).not.toContain(answerText)
+    expect(JSON.stringify(mockPublishTaskEvent.mock.calls)).not.toContain(questionText)
+    expect(JSON.stringify(mockPublishTaskEvent.mock.calls)).not.toContain(answerText)
+    expect(JSON.stringify(mockRecordTaskLogBestEffort.mock.calls)).not.toContain(questionText)
+    expect(JSON.stringify(mockRecordTaskLogBestEffort.mock.calls)).not.toContain(answerText)
+    expect(JSON.stringify(mockWriteArchitectCheckpointSafely.mock.calls)).not.toContain(questionText)
+    expect(JSON.stringify(mockWriteArchitectCheckpointSafely.mock.calls)).not.toContain(answerText)
   })
 })

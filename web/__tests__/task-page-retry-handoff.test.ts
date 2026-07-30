@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
+import fs from 'node:fs'
+import path from 'node:path'
 
 vi.mock('next/navigation', () => ({
   useParams: vi.fn(),
@@ -32,6 +34,21 @@ import {
 } from '@/app/dashboard/tasks/[id]/page'
 
 describe('task page retry handoff controls', () => {
+  it('loads authorized legacy clarification text when protected history has no plan version', () => {
+    const source = fs.readFileSync(
+      path.join(process.cwd(), 'app/dashboard/tasks/[id]/page.tsx'),
+      'utf8',
+    )
+    const loader = source.slice(
+      source.indexOf('const loadClarificationHistory'),
+      source.indexOf('const loadTask = useCallback'),
+    )
+    expect(loader).toContain('if (!planVersion)')
+    expect(loader).toContain('fetch(`/api/tasks/${taskId}/questions`)')
+    expect(loader).toContain('setClarificationQuestions(body.questions ?? [])')
+    expect(loader).toContain('fetch(`/api/tasks/${taskId}/architect-plan-history/${planVersion}`)')
+  })
+
   it('omits a pointer for D1 and preserves the exact D1 tuple for D2 reapproval', () => {
     expect(filesystemGrantExpectedPointerFromState({
       currentDecision: null,
