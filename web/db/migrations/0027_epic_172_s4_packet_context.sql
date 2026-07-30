@@ -5339,7 +5339,24 @@ BEGIN
      -- The supplied value is a public-marker CAS token only. It must match the
      -- current projection but is never used as the authoritative evidence ID.
      OR p_expected_marker_fingerprint <> v_evidence_fingerprint
-     OR v_marker->>'disposition' <> p_action THEN
+     OR (
+       p_action = 'review_local_changes'
+       AND v_marker->>'disposition' <> 'review_local_changes'
+     )
+     OR (
+       p_action = 'acknowledge_possible_local_invocation'
+       AND v_marker->>'disposition' <> 'acknowledge_possible_local_invocation'
+     )
+     OR (
+       p_action = 'retry_local_execution'
+       AND v_marker->>'disposition' <> 'retry_local_execution'
+     )
+     OR (
+       p_action = 'decline_local_retry'
+       AND v_marker->>'disposition' NOT IN (
+         'acknowledge_possible_local_invocation', 'retry_local_execution'
+       )
+     ) THEN
     RAISE EXCEPTION 'local recovery marker changed before action compare-and-set'
       USING ERRCODE = '40001';
   END IF;

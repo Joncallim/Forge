@@ -19,6 +19,10 @@ import {
   type S5AuthoritativeTaskState,
 } from '@/lib/mcps/s5-server-reader'
 import {
+  localEffectRecoveryActionsForDisposition,
+  packetIssuanceRecoveryActionsForDisposition,
+} from '@/lib/mcps/recovery-action-contract'
+import {
   applyLocalEffectRecoveryActionV2,
   applyPacketIssuanceRecoveryActionV2,
   S4LifecycleError,
@@ -72,10 +76,7 @@ function authorizeAgainstPersistedState(
     ))
     if (!marker) return stale
     if (marker.evidenceFingerprint !== request.evidenceFingerprint) return stale
-    // `review_local_changes` is a review step the marker may require before it
-    // advances to a retry disposition; every other action must be the exact
-    // disposition the marker currently carries.
-    if (marker.action !== request.action) return stale
+    if (!localEffectRecoveryActionsForDisposition(marker.action).includes(request.action)) return stale
     return { kind: 'local_effect', workPackageId: marker.workPackageId }
   }
 
@@ -87,7 +88,7 @@ function authorizeAgainstPersistedState(
     ))
     if (!marker) return stale
     if (marker.evidenceFingerprint !== request.markerFingerprint) return stale
-    if (marker.action !== request.action) return stale
+    if (!packetIssuanceRecoveryActionsForDisposition(marker.action).includes(request.action)) return stale
     return { kind: 'packet_issuance', workPackageId: marker.workPackageId }
   }
 
@@ -229,6 +230,20 @@ export async function POST(
       enabled: true,
       projectId: project.id,
       reason: '',
+      expectedAuthority: state.projectGrant === null ? null : {
+        decisionId: state.projectGrant.id,
+        grantDecisionRevision: state.projectGrant.grantDecisionRevision,
+        rootBindingRevision: state.projectGrant.rootBindingRevision,
+        decisionFingerprint: state.projectGrant.decisionFingerprint,
+        decisionGeneration: state.projectGrant.decisionGeneration,
+      },
+      assertCurrentFilesystemHealth: async (lockedProject) => {
+        const lockedOverview = await getProjectMcpOverview(lockedProject)
+        const lockedHealthError = filesystemGrantHealthError(lockedOverview.statuses)
+        if (lockedHealthError) {
+          throw new S4LifecycleError('conflict', lockedHealthError)
+        }
+      },
     })
 
     // Enqueue only after the transaction committed, and never fail the

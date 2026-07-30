@@ -1062,6 +1062,76 @@ test('project pointer retains an exact S4 parent, rejects mismatches, and rolls 
   }
 })
 
+test('project approval CAS accepts only the exact observed authority pointer', async () => {
+  const fixture = await seed()
+  const sql = sqlClient()
+  try {
+    // none -> D1 is a distinct CAS state, not an implicit wildcard.
+    await mutateProjectFilesystemGrant({
+      actorId: fixture.userId,
+      capabilities: ['filesystem.project.read'],
+      enabled: true,
+      expectedAuthority: null,
+      projectId: fixture.projectId,
+      reason: 'none to D1',
+    })
+    const d1 = await loadCurrentProjectFilesystemDecision(fixture.projectId)
+    expect(d1).not.toBeNull()
+    if (!d1) throw new Error('D1 project authority was not persisted')
+
+    // Two clients that both observed D1 contend for D2. The locked, complete
+    // pointer comparison elects one winner and leaves no partial history.
+    const outcomes = await Promise.allSettled([
+      mutateProjectFilesystemGrant({
+        actorId: fixture.userId,
+        capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+        enabled: true,
+        expectedAuthority: d1,
+        projectId: fixture.projectId,
+        reason: 'D1 to D2 contender one',
+      }),
+      mutateProjectFilesystemGrant({
+        actorId: fixture.userId,
+        capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+        enabled: true,
+        expectedAuthority: d1,
+        projectId: fixture.projectId,
+        reason: 'D1 to D2 contender two',
+      }),
+    ])
+    expect(outcomes.filter((outcome) => outcome.status === 'fulfilled')).toHaveLength(1)
+    expect(outcomes.filter((outcome) => outcome.status === 'rejected')).toHaveLength(1)
+
+    const d2 = await loadCurrentProjectFilesystemDecision(fixture.projectId)
+    expect(d2).not.toBeNull()
+    if (!d2) throw new Error('D2 project authority was not persisted')
+    await expect(mutateProjectFilesystemGrant({
+      actorId: fixture.userId,
+      capabilities: ['filesystem.project.read'],
+      enabled: true,
+      expectedAuthority: d1,
+      projectId: fixture.projectId,
+      reason: 'stale D1 replay',
+    })).rejects.toThrow('Project filesystem decision changed concurrently')
+    await expect(mutateProjectFilesystemGrant({
+      actorId: fixture.userId,
+      capabilities: ['filesystem.project.read'],
+      enabled: true,
+      expectedAuthority: { ...d2, decisionId: randomUUID() },
+      projectId: fixture.projectId,
+      reason: 'same revision but different decision id',
+    })).rejects.toThrow('Project filesystem decision changed concurrently')
+    const [{ count }] = await sql<{ count: number }[]>`
+      select count(*)::int as count
+      from project_filesystem_grant_decisions
+      where project_id = ${fixture.projectId}
+    `
+    expect(count).toBe(2)
+  } finally {
+    await sql.end()
+  }
+})
+
 test('root repoint keeps the retained project decision and pointer unchanged while revoking issuance', async () => {
   const fixture = await seed()
   await mutateProjectFilesystemGrant({

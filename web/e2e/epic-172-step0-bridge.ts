@@ -82,6 +82,11 @@ export const EPIC_172_STEP0_E2E_INVENTORY = [
     classification: 'run-disabled-safe',
   },
   {
+    id: 'filesystem-grant-lifecycle-concurrency.spec.ts::project approval CAS accepts only the exact observed authority pointer',
+    category: 'postgres',
+    rationale: 'Project decision identity, revision, root binding, fingerprint, and generation must remain one locked compare-and-set authority.',
+  },
+  {
     id: 'filesystem-grant-lifecycle-concurrency.spec.ts::root repoint keeps the retained project decision and pointer unchanged while revoking issuance',
     classification: 'run-disabled-safe',
   },
