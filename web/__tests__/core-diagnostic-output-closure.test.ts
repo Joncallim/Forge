@@ -4598,6 +4598,12 @@ describe('core output source sentinel', () => {
     const malformedRecoveryMethod = queueSource.match(
       /  private async removeMalformedRecoveryMember\([\s\S]*?\n  private decodeRetryPromotionTransition/,
     )?.[0] ?? ''
+    const currentRecoveryScript = queueSource.match(
+      /const RECOVER_STUCK_JOB_SCRIPT = `([\s\S]*?)`\n\nconst RECOVER_LEGACY_JOB_SCRIPT/,
+    )?.[1] ?? ''
+    const legacyRecoveryScript = queueSource.match(
+      /const RECOVER_LEGACY_JOB_SCRIPT = `([\s\S]*?)`\n\nconst RECOVER_MALFORMED_JOB_SCRIPT/,
+    )?.[1] ?? ''
 
     expect(queueSource).toContain("failureCategory: DEAD_LETTER_FAILURE_CATEGORY")
     expect(queueSource).toContain('schemaVersion: QUEUE_ENVELOPE_SCHEMA_VERSION')
@@ -4838,6 +4844,17 @@ describe('core output source sentinel', () => {
     )
     expect(queueSource).toContain("redis.call('RPUSH', KEYS[1], ARGV[1])")
     expect(queueSource).toContain('const STUCK_RECOVERY_SCAN_LIMIT = 100')
+    expect(currentRecoveryScript).toContain('valid_marker(current_marker, now_ms)')
+    expect(currentRecoveryScript).not.toContain('legacy_marker_timestamp(current_marker, now_ms)')
+    expect(legacyRecoveryScript).toContain(
+      'local timestamp = legacy_marker_timestamp(current_marker, now_ms)',
+    )
+    expect(legacyRecoveryScript).not.toContain('valid_marker(current_marker, now_ms)')
+    expect(queueSource).toContain(
+      "not string.match(marker, '^[1-9][0-9]*$')",
+    )
+    expect(queueSource).toContain('numeric_timestamp > 9007199254740991')
+    expect(queueSource).toContain('numeric_timestamp > now_ms')
     expect(jsonKeyScanSource).toContain('const MAX_JSON_CODE_UNITS = 1_000_000')
     expect(queueSource).toContain('-- forge:queue:recover-malformed-v1')
     expect(queueSource).toContain(
