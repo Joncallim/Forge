@@ -1733,11 +1733,15 @@ function BrokerRetrySummary({ broker }: { broker: WorkforceRecord | null }) {
 export function CanonicalMcpOperatorPanel({
   presentation,
   pending,
+  refreshPending = false,
   onAction,
+  onRefresh = () => undefined,
 }: {
   presentation: CanonicalMcpTaskPresentation | null
   pending: boolean
+  refreshPending?: boolean
   onAction: (action: CanonicalMcpOperatorAction) => void
+  onRefresh?: () => void
 }) {
   const [now, setNow] = useState(() => Date.now())
   useEffect(() => {
@@ -1750,7 +1754,6 @@ export function CanonicalMcpOperatorPanel({
   const freshnessSeconds = freshnessAge === null ? -1 : Math.floor(freshnessAge / 1000)
   const terminalPackageIds = new Set(presentation.terminals.map((terminal) => terminal.workPackageId))
   const actionableRecoveries = presentation.recoveries.filter((recovery) => !terminalPackageIds.has(recovery.workPackageId))
-  const actions = isFresh ? actionableRecoveries.flatMap((recovery) => recovery.actions.filter(canonicalMcpOperatorActionIsBound)) : []
   return (
     <section aria-labelledby="mcp-runtime-state-heading" className="rounded-lg border border-border p-4">
       <div className="flex flex-wrap items-start justify-between gap-3">
@@ -1770,9 +1773,14 @@ export function CanonicalMcpOperatorPanel({
       </div>
 
       {!isFresh && (
-        <p role="status" aria-live="polite" className="mt-3 text-xs text-muted-foreground">
-          This observation is older than {CANONICAL_MCP_PRESENTATION_MAX_AGE_MS / 1000} seconds. Recovery actions are hidden until Forge refreshes it.
-        </p>
+        <div className="mt-3 flex flex-wrap items-center gap-3">
+          <p role="status" aria-live="polite" className="text-xs text-muted-foreground">
+            This observation is older than {CANONICAL_MCP_PRESENTATION_MAX_AGE_MS / 1000} seconds. Recovery actions are hidden until Forge refreshes it.
+          </p>
+          <Button type="button" size="sm" variant="outline" onClick={onRefresh} disabled={pending || refreshPending} aria-busy={refreshPending}>
+            {refreshPending ? 'Refreshing runtime state…' : 'Refresh runtime state'}
+          </Button>
+        </div>
       )}
 
       {!presentation.localEvidenceAvailable && (
@@ -1796,37 +1804,43 @@ export function CanonicalMcpOperatorPanel({
 
       {actionableRecoveries.length > 0 && (
         <div className="mt-3 grid gap-2">
-          {actionableRecoveries.map((recovery) => (
-            <McpPresentation
-              key={`${recovery.workPackageId}-${recovery.headline}`}
-              presentation={{
-                statusKey: recovery.actions.length > 0 ? 'action_required' : 'deferred',
-                tone: recovery.tone,
-                badgeText: recovery.badgeText,
-                headline: `${recovery.title}: ${recovery.headline}`,
-                body: recovery.body,
-                actions: [],
-              }}
-            />
-          ))}
-        </div>
-      )}
-
-      {actions.length > 0 && (
-        <div className="mt-3 grid gap-2">
-          {actions.map((action) => (
-            <Button
-              key={`${action.action}-${action.identity.schemaVersion === 1 ? action.identity.localRunEvidenceId : action.identity.priorRuntimeAuditId}`}
-              type="button"
-              size="sm"
-              variant={action.action.startsWith('decline_') ? 'outline' : 'secondary'}
-              className="w-full justify-start sm:w-fit"
-              disabled={pending}
-              onClick={() => onAction(action)}
-            >
-              {action.label}
-            </Button>
-          ))}
+          {actionableRecoveries.map((recovery) => {
+            const recoveryActions = isFresh ? recovery.actions.filter(canonicalMcpOperatorActionIsBound) : []
+            const headingId = `mcp-recovery-${recovery.workPackageId}-heading`
+            return (
+              <section key={`${recovery.workPackageId}-${recovery.headline}`} aria-labelledby={headingId} className="rounded-md border border-border p-3">
+                <h3 id={headingId} className="sr-only">{recovery.title}: {recovery.headline}</h3>
+                <McpPresentation
+                  presentation={{
+                    statusKey: recoveryActions.length > 0 ? 'action_required' : 'deferred',
+                    tone: recovery.tone,
+                    badgeText: recovery.badgeText,
+                    headline: `${recovery.title}: ${recovery.headline}`,
+                    body: recovery.body,
+                    actions: [],
+                  }}
+                />
+                {recoveryActions.length > 0 && (
+                  <div className="mt-3 flex flex-wrap gap-2" aria-label={`${recovery.title}: recovery actions`}>
+                    {recoveryActions.map((action) => (
+                      <Button
+                        key={`${action.action}-${action.identity.schemaVersion === 1 ? action.identity.localRunEvidenceId : action.identity.priorRuntimeAuditId}`}
+                        type="button"
+                        size="sm"
+                        variant={action.action.startsWith('decline_') ? 'outline' : 'secondary'}
+                        className="w-full justify-start sm:w-fit"
+                        disabled={pending}
+                        aria-label={`${recovery.title}: ${recovery.headline}: ${action.label}`}
+                        onClick={() => onAction(action)}
+                      >
+                        {action.label}
+                      </Button>
+                    ))}
+                  </div>
+                )}
+              </section>
+            )
+          })}
         </div>
       )}
 
@@ -1874,6 +1888,15 @@ export function canonicalMcpOperatorActionRequest(
         priorRuntimeAuditId: identity.priorRuntimeAuditId,
         markerFingerprint: identity.markerFingerprint,
       }
+}
+
+/** Monotonic client request ordering prevents an older presentation response from winning. */
+export function createMcpPresentationRequestSequencer() {
+  let latestRequest = 0
+  return {
+    begin: () => ++latestRequest,
+    isCurrent: (requestId: number) => requestId === latestRequest,
+  }
 }
 
 function filesystemEffectiveState(pkg: WorkPackage): {
@@ -4303,6 +4326,7 @@ export default function TaskDetailPage() {
   const [approvalGates, setApprovalGates] = useState<ApprovalGate[]>([])
   const [mcpPresentation, setMcpPresentation] = useState<CanonicalMcpTaskPresentation | null>(null)
   const [mcpPresentationLoading, setMcpPresentationLoading] = useState(true)
+  const [mcpPresentationError, setMcpPresentationError] = useState<string | null>(null)
   const [mcpActionError, setMcpActionError] = useState<string | null>(null)
   const [mcpActionPending, setMcpActionPending] = useState(false)
   const [vcsChanges, setVcsChanges] = useState<VcsChange[]>([])
@@ -4333,6 +4357,7 @@ export default function TaskDetailPage() {
   const [retrySubmitted, setRetrySubmitted] = useState(false)
   const liveLogTimersRef = useRef<Map<string, number>>(new Map())
   const lastLogSequenceRef = useRef(0)
+  const mcpPresentationRequestRef = useRef(createMcpPresentationRequestSequencer())
 
   // SSE stream
   const {
@@ -4470,20 +4495,30 @@ export default function TaskDetailPage() {
   // The canonical server presentation. Its freshness fingerprint is the exact
   // state the operator is looking at; every operator action echoes it back so
   // the server can refuse (409, zero mutation) if anything moved underneath.
-  const loadMcpPresentation = useCallback(async () => {
+  const loadMcpPresentation = useCallback(async (options: { preserveOnError?: boolean } = {}) => {
+    const requestId = mcpPresentationRequestRef.current.begin()
     setMcpPresentationLoading(true)
+    setMcpPresentationError(null)
     try {
       const res = await fetch(`/api/mcps/presentation/${taskId}`)
       if (!res.ok) {
-        setMcpPresentation(null)
+        if (mcpPresentationRequestRef.current.isCurrent(requestId)) {
+          if (!options.preserveOnError) setMcpPresentation(null)
+          setMcpPresentationError('Current MCP runtime state could not be refreshed. Try again.')
+        }
         return
       }
       const body = await res.json().catch(() => null)
-      setMcpPresentation(canonicalMcpTaskPresentationFromUnknown(body))
+      if (mcpPresentationRequestRef.current.isCurrent(requestId)) {
+        setMcpPresentation(canonicalMcpTaskPresentationFromUnknown(body))
+      }
     } catch {
-      setMcpPresentation(null)
+      if (mcpPresentationRequestRef.current.isCurrent(requestId)) {
+        if (!options.preserveOnError) setMcpPresentation(null)
+        setMcpPresentationError('Current MCP runtime state could not be refreshed. Try again.')
+      }
     } finally {
-      setMcpPresentationLoading(false)
+      if (mcpPresentationRequestRef.current.isCurrent(requestId)) setMcpPresentationLoading(false)
     }
   }, [taskId])
 
@@ -5246,6 +5281,11 @@ export default function TaskDetailPage() {
                 {mcpActionError}
               </p>
             )}
+            {mcpPresentationError !== null && (
+              <p role="alert" className="text-sm text-destructive">
+                {mcpPresentationError}
+              </p>
+            )}
             {mcpActionPending && (
               <p role="status" aria-live="polite" className="text-sm text-muted-foreground">
                 Applying the MCP recovery action…
@@ -5254,7 +5294,9 @@ export default function TaskDetailPage() {
             <CanonicalMcpOperatorPanel
               presentation={mcpPresentation}
               pending={mcpActionPending}
+              refreshPending={mcpPresentationLoading}
               onAction={handleCanonicalMcpOperatorAction}
+              onRefresh={() => { void loadMcpPresentation({ preserveOnError: true }) }}
             />
             {!mcpPresentationLoading && mcpPresentation === null && (
               <p role="status" className="text-xs text-muted-foreground">

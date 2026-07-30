@@ -22,7 +22,7 @@ describe('S5 authoritative reader identities', () => {
       taskId, projectId: '00000000-0000-4000-8000-000000000004', taskStatus: 'approved', freshnessFingerprint: fingerprint,
       packages: [{
         workPackageId: packageId, title: 'Packet package', assignedRole: 'backend', status: 'blocked',
-        requestedCapabilities: [], boundedRuntimeRequestedCapabilities: [], blockingCapabilities: [],
+        requestedCapabilities: ['filesystem.project.write'], boundedRuntimeRequestedCapabilities: [], blockingCapabilities: [],
         currentDecision: null, decisionHistory: [], blockMetadata: null, pointerFingerprint: '', pointerVersion: '0',
       }],
       projectGrant: null,

@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest'
 import {
   CanonicalMcpOperatorPanel,
   canonicalMcpOperatorActionRequest,
+  createMcpPresentationRequestSequencer,
 } from '@/app/dashboard/tasks/[id]/page'
 import { BrandedTerminalJoinView } from '@/components/mcps/BrandedTerminalJoinView'
 import {
@@ -18,6 +19,8 @@ const taskId = '00000000-0000-4000-8000-000000000001'
 const packageId = '00000000-0000-4000-8000-000000000002'
 const auditId = '00000000-0000-4000-8000-000000000003'
 const evidenceId = '00000000-0000-4000-8000-000000000004'
+const secondPackageId = '00000000-0000-4000-8000-000000000005'
+const secondAuditId = '00000000-0000-4000-8000-000000000006'
 const freshness = `sha256:${'a'.repeat(64)}`
 const marker = `sha256:${'b'.repeat(64)}`
 const evidence = `sha256:${'c'.repeat(64)}`
@@ -92,6 +95,32 @@ describe('canonical task MCP presentation', () => {
     })
   })
 
+  it('groups duplicate recovery labels by package and preserves each package identity', () => {
+    const presentation = packet({
+      recoveries: [
+        packet().recoveries[0],
+        {
+          ...packet().recoveries[0],
+          workPackageId: secondPackageId,
+          title: 'Second packet package',
+          actions: [{
+            action: 'retry_execution',
+            label: 'Retry packet execution',
+            identity: { schemaVersion: 2, priorRuntimeAuditId: secondAuditId, markerFingerprint: marker },
+          }],
+        },
+      ],
+    })
+    const markup = renderToStaticMarkup(
+      <CanonicalMcpOperatorPanel presentation={presentation} pending={false} onAction={() => undefined} />,
+    )
+
+    expect(markup).toContain('aria-label="Packet package: Operator recovery is available: Retry packet execution"')
+    expect(markup).toContain('aria-label="Second packet package: Operator recovery is available: Retry packet execution"')
+    expect(canonicalMcpOperatorActionRequest(presentation.recoveries[0].actions[0], freshness)).toMatchObject({ priorRuntimeAuditId: auditId })
+    expect(canonicalMcpOperatorActionRequest(presentation.recoveries[1].actions[0], freshness)).toMatchObject({ priorRuntimeAuditId: secondAuditId })
+  })
+
   it('rejects mixed action families in both directions and never creates a request', () => {
     const invalidActions = [
       {
@@ -132,9 +161,30 @@ describe('canonical task MCP presentation', () => {
     vi.advanceTimersByTime(CANONICAL_MCP_PRESENTATION_MAX_AGE_MS + 1)
     expect(canonicalMcpPresentationIsFresh(presentation)).toBe(false)
     const staleMarkup = renderToStaticMarkup(<CanonicalMcpOperatorPanel presentation={presentation} pending={false} onAction={() => undefined} />)
-    expect(staleMarkup).not.toContain('<button')
+    expect(staleMarkup).not.toContain('Retry packet execution')
+    expect(staleMarkup).toContain('Refresh runtime state')
     expect(staleMarkup).toContain('Recovery actions are hidden')
     vi.useRealTimers()
+  })
+
+  it('offers an explicit quiet-state refresh that restores controls and ignores an older response', () => {
+    const stale = packet({ computedAt: new Date(0).toISOString() })
+    const staleMarkup = renderToStaticMarkup(
+      <CanonicalMcpOperatorPanel presentation={stale} pending={false} onAction={() => undefined} />,
+    )
+    expect(staleMarkup).toContain('Refresh runtime state')
+    expect(staleMarkup).not.toContain('Retry packet execution')
+
+    const refreshedMarkup = renderToStaticMarkup(
+      <CanonicalMcpOperatorPanel presentation={packet()} pending={false} onAction={() => undefined} />,
+    )
+    expect(refreshedMarkup).toContain('Retry packet execution')
+
+    const requests = createMcpPresentationRequestSequencer()
+    const older = requests.begin()
+    const newer = requests.begin()
+    expect(requests.isCurrent(older)).toBe(false)
+    expect(requests.isCurrent(newer)).toBe(true)
   })
 
   it('fails closed for future observations and client clock rollback', () => {
