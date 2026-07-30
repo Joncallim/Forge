@@ -436,6 +436,7 @@ run('S5 real PostgreSQL HTTP authorization boundary', () => {
   it('keeps one real PostgreSQL observation across a committed ordinary and protected transition', async () => {
     const { readS5AuthoritativeTaskState } = await import('@/lib/mcps/s5-server-reader')
     let transitionCommitted = false
+    const transitionedTerminalAt = '2099-01-01T00:00:00.000Z'
     const before = await readS5AuthoritativeTaskState(ids.ownerTask, ids.owner, async () => {
       await admin.begin(async (tx) => {
         await tx`
@@ -448,13 +449,13 @@ run('S5 real PostgreSQL HTTP authorization boundary', () => {
         `
         await tx`
           update work_package_local_run_evidence
-          set terminal = '{"status":"failed"}'::jsonb, terminal_at = clock_timestamp()
+          set terminal = '{"status":"failed"}'::jsonb, terminal_at = ${transitionedTerminalAt}::timestamptz
           where id = ${ids.ownerEvidence}::uuid
         `
         await tx`
           update filesystem_mcp_runtime_audits
           set status = 'failed', terminal = '{"status":"failed","failureCode":"preflight_failed"}'::jsonb,
-              terminal_at = clock_timestamp()
+              terminal_at = ${transitionedTerminalAt}::timestamptz
           where id = ${ids.ownerAudit}::uuid
         `
       })
@@ -464,8 +465,11 @@ run('S5 real PostgreSQL HTTP authorization boundary', () => {
     // The exporter and the least-privilege reader both retain the old state;
     // current terminal authority remains the blocked package, not its old audit.
     expect(before.taskStatus).toBe('approved')
+    expect(before.localEvidenceAvailable).toBe(true)
     expect(before.packages).toMatchObject([{ workPackageId: ids.ownerPackage, status: 'blocked' }])
     expect(before.terminalPackages).toEqual([])
+    const beforeEvidence = before.evidenceRecords.find((evidence) => evidence.id === ids.ownerEvidence)
+    expect(beforeEvidence?.terminalAt).not.toBe(transitionedTerminalAt)
 
     const after = await readS5AuthoritativeTaskState(ids.ownerTask, ids.owner)
     expect(after.taskStatus).toBe('failed')
@@ -474,6 +478,9 @@ run('S5 real PostgreSQL HTTP authorization boundary', () => {
       runtimeAuditId: ids.ownerAudit, workPackageId: ids.ownerPackage,
       state: 'terminal', terminalOutcome: 'failed',
     }])
+    expect(after.localEvidenceAvailable).toBe(true)
+    expect(after.evidenceRecords.find((evidence) => evidence.id === ids.ownerEvidence)?.terminalAt)
+      .toBe(transitionedTerminalAt)
     expect(before.freshnessFingerprint).not.toBe(after.freshnessFingerprint)
   })
 })
