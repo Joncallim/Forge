@@ -54,6 +54,10 @@ const s4Migration = readFileSync(
   fileURLToPath(new URL('../db/migrations/0027_epic_172_s4_packet_context.sql', import.meta.url)),
   'utf8',
 )
+const s5RecoveryMigration = readFileSync(
+  fileURLToPath(new URL('../db/migrations/0028_epic_172_s5_recovery_actions.sql', import.meta.url)),
+  'utf8',
+)
 const sessionReconciliation = readFileSync(
   fileURLToPath(new URL('../scripts/reconcile-session-credentials.ts', import.meta.url)),
   'utf8',
@@ -475,6 +479,19 @@ describe('Epic 172 S4 PostgreSQL CI contract', () => {
       .toBeLessThan(beginHelper.indexOf(
         'The temporary migration-to-owner edge is not the exclusive S4 membership edge',
       ))
+  })
+
+  it('replaces the S5 recovery routine only while the exact owner role is active', () => {
+    const begin = s5RecoveryMigration.indexOf('SELECT public.forge_begin_epic_172_s4_owner_bootstrap_v1();')
+    const setRole = s5RecoveryMigration.indexOf('SET ROLE forge_s4_routines_owner;')
+    const replace = s5RecoveryMigration.indexOf('CREATE OR REPLACE FUNCTION forge.apply_local_effect_recovery_action_v2(')
+    const reset = s5RecoveryMigration.indexOf('RESET ROLE;')
+    const finalize = s5RecoveryMigration.indexOf('SELECT public.forge_finalize_epic_172_s4_owner_bootstrap_v1();')
+    expect(begin).toBeGreaterThanOrEqual(0)
+    expect(begin).toBeLessThan(setRole)
+    expect(setRole).toBeLessThan(replace)
+    expect(replace).toBeLessThan(reset)
+    expect(reset).toBeLessThan(finalize)
   })
 
   it('keeps session cutover additive until exact Redis expiry and key drain are proven', () => {

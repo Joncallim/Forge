@@ -7,6 +7,8 @@
 -- the protected routine, then close it again below.
 SELECT public.forge_begin_epic_172_s4_owner_bootstrap_v1();
 --> statement-breakpoint
+SET ROLE forge_s4_routines_owner;
+--> statement-breakpoint
 CREATE OR REPLACE FUNCTION forge.apply_local_effect_recovery_action_v2(
   p_task_id uuid,
   p_work_package_id uuid,
@@ -279,5 +281,7 @@ BEGIN
   RETURN NEXT;
 END;
 $$;
+--> statement-breakpoint
+RESET ROLE;
 --> statement-breakpoint
 SELECT public.forge_finalize_epic_172_s4_owner_bootstrap_v1();
