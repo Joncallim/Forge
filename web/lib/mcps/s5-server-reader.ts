@@ -27,6 +27,10 @@ import {
   type PacketTerminalOutcome,
   type TerminalPacketDeliveryOutcome,
 } from '@/lib/mcps/packet-issuance-v2'
+import {
+  localEffectRecoveryActionsForDisposition,
+  packetIssuanceRecoveryActionsForDisposition,
+} from '@/lib/mcps/recovery-action-contract'
 
 const SHA256 = /^sha256:[0-9a-f]{64}$/
 
@@ -84,6 +88,7 @@ export type S5RecoveryMarkerPresenter = Readonly<{
     | 'invalid'
   state: 'current' | 'invalid'
   action: string | null
+  allowedActions: readonly string[]
   evidenceId: string | null
   evidenceFingerprint: string | null
 }>
@@ -255,6 +260,7 @@ export function normalizeS5RecoveryMarkers(pkg: {
     kind: 'invalid',
     state: 'invalid',
     action: null,
+    allowedActions: [],
     evidenceId: null,
     evidenceFingerprint: null,
   })
@@ -266,7 +272,7 @@ export function normalizeS5RecoveryMarkers(pkg: {
       && evidence.agentRunId === marker.priorAgentRunId
     ))
     result.push(marker && evidenceMatches
-      ? { workPackageId: pkg.id, kind: 'local_effect_integrity_hold', state: 'current', action: null, evidenceId: marker.localRunEvidenceId, evidenceFingerprint: marker.evidenceFingerprint }
+      ? { workPackageId: pkg.id, kind: 'local_effect_integrity_hold', state: 'current', action: null, allowedActions: [], evidenceId: marker.localRunEvidenceId, evidenceFingerprint: marker.evidenceFingerprint }
       : invalid())
   }
   if (Object.hasOwn(metadata, 'local_effect_recovery')) {
@@ -278,7 +284,7 @@ export function normalizeS5RecoveryMarkers(pkg: {
       && evidence.state !== 'claimed'
     ))
     result.push(marker && evidenceMatches
-      ? { workPackageId: pkg.id, kind: 'local_effect_recovery', state: 'current', action: marker.disposition, evidenceId: marker.localRunEvidenceId, evidenceFingerprint: marker.evidenceFingerprint }
+      ? { workPackageId: pkg.id, kind: 'local_effect_recovery', state: 'current', action: marker.disposition, allowedActions: localEffectRecoveryActionsForDisposition(marker.disposition), evidenceId: marker.localRunEvidenceId, evidenceFingerprint: marker.evidenceFingerprint }
       : invalid())
   }
   if (Object.hasOwn(metadata, 'packet_integrity_hold')) {
@@ -289,7 +295,7 @@ export function normalizeS5RecoveryMarkers(pkg: {
       && audit.agentRunId === marker?.priorAgentRunId
     ))
     result.push(marker && auditMatches
-      ? { workPackageId: pkg.id, kind: 'packet_integrity_hold', state: 'current', action: null, evidenceId: marker.priorRuntimeAuditId, evidenceFingerprint: marker.markerFingerprint }
+      ? { workPackageId: pkg.id, kind: 'packet_integrity_hold', state: 'current', action: null, allowedActions: [], evidenceId: marker.priorRuntimeAuditId, evidenceFingerprint: marker.markerFingerprint }
       : invalid())
   }
   if (Object.hasOwn(metadata, 'packet_issuance')) {
@@ -311,12 +317,12 @@ export function normalizeS5RecoveryMarkers(pkg: {
       && evidence.agentRunId === marker.priorAgentRunId
       && evidence.state !== 'claimed'
     result.push(marker && markerFingerprintMatches && auditMatches
-      ? { workPackageId: pkg.id, kind: 'packet_issuance', state: 'current', action: marker.disposition, evidenceId: marker.priorRuntimeAuditId, evidenceFingerprint: marker.markerFingerprint }
+      ? { workPackageId: pkg.id, kind: 'packet_issuance', state: 'current', action: marker.disposition, allowedActions: packetIssuanceRecoveryActionsForDisposition(marker.disposition), evidenceId: marker.priorRuntimeAuditId, evidenceFingerprint: marker.markerFingerprint }
       : invalid())
   }
   const grant = parseFilesystemGrantBlockMetadata(metadata)
   if (grant) {
-    result.push({ workPackageId: pkg.id, kind: 'filesystem_grant', state: 'current', action: null, evidenceId: null, evidenceFingerprint: grant.blockFingerprint })
+    result.push({ workPackageId: pkg.id, kind: 'filesystem_grant', state: 'current', action: null, allowedActions: [], evidenceId: null, evidenceFingerprint: grant.blockFingerprint })
   }
   return result
 }
@@ -583,6 +589,7 @@ export function safeRecoveryMarkerPresenter(marker: S5RecoveryMarkerPresenter): 
     kind: marker.kind,
     state: marker.state,
     action: marker.action,
+    allowedActions: [...marker.allowedActions],
     evidenceId: marker.evidenceId,
     evidenceFingerprint: marker.evidenceFingerprint,
   }

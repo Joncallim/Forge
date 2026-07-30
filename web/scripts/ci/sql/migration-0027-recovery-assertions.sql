@@ -162,6 +162,15 @@ BEGIN
 END;
 $seed_recovery_marker$;
 
+-- Keep the exact canonical packet marker.  The following matrix restores this
+-- value between transitions so every action is exercised against real locked
+-- PostgreSQL rows, rather than chaining a test-only projection.
+CREATE TEMP TABLE forge_proof_saved_packet_marker ON COMMIT DROP AS
+SELECT metadata->'packet_issuance' AS marker
+FROM public.work_packages
+WHERE id = '27000000-0000-4000-8000-00000000d101';
+GRANT SELECT ON TABLE forge_proof_saved_packet_marker TO forge_s4_recovery_operator;
+
 CREATE FUNCTION public.forge_proof_expect_packet_retry_rejected_v1()
 RETURNS void LANGUAGE plpgsql SET search_path = pg_catalog, forge AS $$
 BEGIN
@@ -384,6 +393,315 @@ BEGIN
   END IF;
 END;
 $recovery_success_assertions$;
+
+-- Packet secondary-action matrix. Acknowledge is only valid for review
+-- dispositions, then its exact new marker permits decline. Both actions are
+-- ledger-first replayable and retain no project authority binding.
+WITH next_marker AS (
+  SELECT marker || '{"disposition":"review_submission"}'::jsonb AS marker
+  FROM forge_proof_saved_packet_marker
+)
+UPDATE public.work_packages package
+SET status = 'blocked', metadata = pg_catalog.jsonb_set(
+  package.metadata, '{packet_issuance}',
+  pg_catalog.jsonb_set(next_marker.marker, '{markerFingerprint}',
+    pg_catalog.to_jsonb(forge.packet_recovery_marker_fingerprint_v2(
+      next_marker.marker - 'markerFingerprint'
+    )), true
+  ), true
+)
+FROM next_marker
+WHERE package.id = '27000000-0000-4000-8000-00000000d101';
+SELECT metadata->'packet_issuance'->>'markerFingerprint' AS fingerprint
+FROM public.work_packages WHERE id = '27000000-0000-4000-8000-00000000d101'
+\gset packet_ack_
+SET SESSION AUTHORIZATION forge_s4_recovery_operator;
+SELECT result, result_marker_fingerprint, package_status
+FROM forge.apply_packet_issuance_recovery_action_v2(
+  '27000000-0000-4000-8000-00000000d001', '27000000-0000-4000-8000-00000000d101',
+  '27000000-0000-4000-8000-00000000d401', 'acknowledge_possible_submission',
+  :'packet_ack_fingerprint', '27000000-0000-4000-8000-000000000001', NULL
+);
+-- Exact action replay returns the retained result after the mutable marker moved.
+SELECT result, result_marker_fingerprint, package_status
+FROM forge.apply_packet_issuance_recovery_action_v2(
+  '27000000-0000-4000-8000-00000000d001', '27000000-0000-4000-8000-00000000d101',
+  '27000000-0000-4000-8000-00000000d401', 'acknowledge_possible_submission',
+  :'packet_ack_fingerprint', '27000000-0000-4000-8000-000000000001', NULL
+);
+-- The recovery login has no direct mutable projection read. Inspect the
+-- returned action above under that boundary, then capture the next CAS token
+-- under the admin fixture context.
+RESET SESSION AUTHORIZATION;
+SELECT metadata->'packet_issuance'->>'markerFingerprint' AS fingerprint
+FROM public.work_packages WHERE id = '27000000-0000-4000-8000-00000000d101'
+\gset packet_decline_
+SET SESSION AUTHORIZATION forge_s4_recovery_operator;
+SELECT result, package_status
+FROM forge.apply_packet_issuance_recovery_action_v2(
+  '27000000-0000-4000-8000-00000000d001', '27000000-0000-4000-8000-00000000d101',
+  '27000000-0000-4000-8000-00000000d401', 'decline_packet_recovery',
+  :'packet_decline_fingerprint', '27000000-0000-4000-8000-000000000001', NULL
+);
+SELECT result, package_status
+FROM forge.apply_packet_issuance_recovery_action_v2(
+  '27000000-0000-4000-8000-00000000d001', '27000000-0000-4000-8000-00000000d101',
+  '27000000-0000-4000-8000-00000000d401', 'decline_packet_recovery',
+  :'packet_decline_fingerprint', '27000000-0000-4000-8000-000000000001', NULL
+);
+RESET SESSION AUTHORIZATION;
+DO $packet_secondary_action_assertions$
+BEGIN
+  IF (SELECT count(*) FROM public.filesystem_mcp_issuance_recovery_actions
+      WHERE prior_runtime_audit_id = '27000000-0000-4000-8000-00000000d401'
+        AND action = 'acknowledge_possible_submission') <> 1
+     OR (SELECT count(*) FROM public.filesystem_mcp_issuance_recovery_actions
+         WHERE prior_runtime_audit_id = '27000000-0000-4000-8000-00000000d401'
+           AND action = 'decline_packet_recovery') <> 1
+     OR EXISTS (SELECT 1 FROM public.filesystem_mcp_issuance_recovery_actions
+                WHERE prior_runtime_audit_id = '27000000-0000-4000-8000-00000000d401'
+                  AND action IN ('acknowledge_possible_submission','decline_packet_recovery')
+                  AND (authorizing_decision_id IS NOT NULL OR authorizing_project_decision_id IS NOT NULL))
+     OR (SELECT status FROM public.work_packages WHERE id = '27000000-0000-4000-8000-00000000d101') <> 'cancelled'
+     OR (SELECT metadata ? 'packet_issuance' FROM public.work_packages
+         WHERE id = '27000000-0000-4000-8000-00000000d101') THEN
+    RAISE EXCEPTION 'Packet acknowledge/decline matrix did not retain exact ledger, authority, marker, or status semantics';
+  END IF;
+END;
+$packet_secondary_action_assertions$;
+
+-- Every wrong pairing and stale token is rejected before it can append a
+-- ledger row or alter the canonical package projection.
+WITH next_marker AS (
+  SELECT marker || '{"disposition":"retry_execution"}'::jsonb AS marker
+  FROM forge_proof_saved_packet_marker
+)
+UPDATE public.work_packages package
+SET status = 'blocked', metadata = pg_catalog.jsonb_set(package.metadata, '{packet_issuance}',
+  pg_catalog.jsonb_set(next_marker.marker, '{markerFingerprint}',
+    pg_catalog.to_jsonb(forge.packet_recovery_marker_fingerprint_v2(
+      next_marker.marker - 'markerFingerprint'
+    )), true
+  ), true
+)
+FROM next_marker
+WHERE package.id = '27000000-0000-4000-8000-00000000d101';
+-- Exhaustively execute the persisted packet disposition/action cartesian
+-- product under the actual recovery login. Marker fields stay inside the
+-- production contract; unique actors isolate each ledger idempotency identity.
+INSERT INTO public.users (id, display_name) VALUES
+  ('27000000-0000-4000-8000-00000000d901', 'packet matrix 01'),
+  ('27000000-0000-4000-8000-00000000d902', 'packet matrix 02'),
+  ('27000000-0000-4000-8000-00000000d903', 'packet matrix 03'),
+  ('27000000-0000-4000-8000-00000000d904', 'packet matrix 04'),
+  ('27000000-0000-4000-8000-00000000d905', 'packet matrix 05'),
+  ('27000000-0000-4000-8000-00000000d906', 'packet matrix 06'),
+  ('27000000-0000-4000-8000-00000000d907', 'packet matrix 07'),
+  ('27000000-0000-4000-8000-00000000d908', 'packet matrix 08'),
+  ('27000000-0000-4000-8000-00000000d909', 'packet matrix 09'),
+  ('27000000-0000-4000-8000-00000000d910', 'packet matrix 10'),
+  ('27000000-0000-4000-8000-00000000d911', 'packet matrix 11'),
+  ('27000000-0000-4000-8000-00000000d912', 'packet matrix 12'),
+  ('27000000-0000-4000-8000-00000000d913', 'packet matrix 13'),
+  ('27000000-0000-4000-8000-00000000d914', 'packet matrix 14'),
+  ('27000000-0000-4000-8000-00000000d915', 'packet matrix 15'),
+  ('27000000-0000-4000-8000-00000000d916', 'packet matrix 16'),
+  ('27000000-0000-4000-8000-00000000d917', 'packet matrix 17'),
+  ('27000000-0000-4000-8000-00000000d918', 'packet matrix 18');
+CREATE FUNCTION public.forge_proof_packet_action_matrix_v1()
+RETURNS void LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, public, forge AS $$
+DECLARE
+  v_base jsonb;
+  v_marker jsonb;
+  v_disposition text;
+  v_action text;
+  v_next_disposition text;
+  v_allowed boolean;
+  v_fingerprint text;
+  v_before_actions integer;
+  v_before_metadata jsonb;
+  v_before_status text;
+  v_first record;
+  v_second record;
+  v_after_metadata jsonb;
+  v_after_status text;
+  v_expected_result text;
+  v_expected_status text;
+  v_authorizer uuid;
+  v_actor uuid;
+  v_index integer := 0;
+  v_actors uuid[] := ARRAY[
+    '27000000-0000-4000-8000-00000000d901'::uuid,'27000000-0000-4000-8000-00000000d902'::uuid,
+    '27000000-0000-4000-8000-00000000d903'::uuid,'27000000-0000-4000-8000-00000000d904'::uuid,
+    '27000000-0000-4000-8000-00000000d905'::uuid,'27000000-0000-4000-8000-00000000d906'::uuid,
+    '27000000-0000-4000-8000-00000000d907'::uuid,'27000000-0000-4000-8000-00000000d908'::uuid,
+    '27000000-0000-4000-8000-00000000d909'::uuid,'27000000-0000-4000-8000-00000000d910'::uuid,
+    '27000000-0000-4000-8000-00000000d911'::uuid,'27000000-0000-4000-8000-00000000d912'::uuid,
+    '27000000-0000-4000-8000-00000000d913'::uuid,'27000000-0000-4000-8000-00000000d914'::uuid,
+    '27000000-0000-4000-8000-00000000d915'::uuid,'27000000-0000-4000-8000-00000000d916'::uuid,
+    '27000000-0000-4000-8000-00000000d917'::uuid,'27000000-0000-4000-8000-00000000d918'::uuid
+  ];
+BEGIN
+  SELECT metadata->'packet_issuance' INTO STRICT v_base
+  FROM public.work_packages WHERE id = '27000000-0000-4000-8000-00000000d101';
+  FOREACH v_disposition IN ARRAY ARRAY[
+    'review_local_changes','reapprove_allow_once','review_then_reapprove_allow_once',
+    'retry_execution','review_submission','reviewed_submission'
+  ] LOOP
+    FOREACH v_action IN ARRAY ARRAY[
+      'acknowledge_possible_submission','retry_execution','decline_packet_recovery'
+    ] LOOP
+      v_index := v_index + 1; v_actor := v_actors[v_index];
+      IF v_disposition = 'reapprove_allow_once' THEN
+        v_next_disposition := 'reapprove_allow_once';
+      ELSIF v_disposition = 'review_then_reapprove_allow_once' THEN
+        v_next_disposition := 'reapprove_allow_once';
+      ELSIF v_disposition IN ('retry_execution','reviewed_submission') THEN
+        v_next_disposition := 'retry_execution';
+      ELSE
+        v_next_disposition := 'review_submission';
+      END IF;
+      v_marker := v_base || pg_catalog.jsonb_build_object(
+        'disposition', v_disposition, 'nextDisposition', v_next_disposition
+      );
+      v_marker := pg_catalog.jsonb_set(v_marker, '{markerFingerprint}',
+        pg_catalog.to_jsonb(forge.packet_recovery_marker_fingerprint_v2(v_marker - 'markerFingerprint')), true);
+      UPDATE public.work_packages SET status = 'blocked',
+        metadata = pg_catalog.jsonb_set(metadata, '{packet_issuance}', v_marker, true)
+      WHERE id = '27000000-0000-4000-8000-00000000d101';
+      v_fingerprint := v_marker->>'markerFingerprint';
+      v_authorizer := CASE WHEN v_action = 'retry_execution'
+        THEN '27000000-0000-4000-8000-00000000d501'::uuid ELSE NULL END;
+      v_allowed := (v_action = 'acknowledge_possible_submission'
+          AND v_disposition IN ('review_then_reapprove_allow_once','review_submission'))
+        OR (v_action = 'retry_execution'
+          AND v_disposition IN ('retry_execution','reviewed_submission'))
+        OR (v_action = 'decline_packet_recovery'
+          AND v_disposition IN ('reapprove_allow_once','review_then_reapprove_allow_once',
+            'retry_execution','review_submission','reviewed_submission'));
+      IF v_action = 'acknowledge_possible_submission' THEN
+        v_expected_result := 'acknowledged'; v_expected_status := 'blocked';
+      ELSIF v_action = 'retry_execution' THEN
+        v_expected_result := 'ready'; v_expected_status := 'ready';
+      ELSE
+        v_expected_result := 'cancelled'; v_expected_status := 'cancelled';
+      END IF;
+      SELECT count(*)::integer, metadata, status INTO v_before_actions, v_before_metadata, v_before_status
+      FROM public.filesystem_mcp_issuance_recovery_actions action
+      CROSS JOIN public.work_packages package
+      WHERE action.prior_runtime_audit_id = '27000000-0000-4000-8000-00000000d401'
+        AND package.id = '27000000-0000-4000-8000-00000000d101'
+      GROUP BY package.metadata, package.status;
+      BEGIN
+        SELECT * INTO v_first FROM forge.apply_packet_issuance_recovery_action_v2(
+          '27000000-0000-4000-8000-00000000d001', '27000000-0000-4000-8000-00000000d101',
+          '27000000-0000-4000-8000-00000000d401', v_action, v_fingerprint,
+          v_actor, v_authorizer
+        );
+        IF NOT v_allowed THEN RAISE EXCEPTION 'disallowed packet matrix pair passed: %/%', v_disposition, v_action; END IF;
+        SELECT metadata, status INTO v_after_metadata, v_after_status
+        FROM public.work_packages WHERE id = '27000000-0000-4000-8000-00000000d101';
+        IF (SELECT count(*) FROM public.filesystem_mcp_issuance_recovery_actions
+            WHERE prior_runtime_audit_id = '27000000-0000-4000-8000-00000000d401') <> v_before_actions + 1
+           OR v_first.result IS DISTINCT FROM v_expected_result
+           OR v_first.package_status IS DISTINCT FROM v_expected_status
+           OR v_after_status IS DISTINCT FROM v_first.package_status
+           OR (v_action = 'acknowledge_possible_submission' AND (
+             NOT v_after_metadata ? 'packet_issuance'
+             OR v_after_metadata->'packet_issuance'->>'markerFingerprint' IS DISTINCT FROM v_first.result_marker_fingerprint
+             OR forge.packet_recovery_marker_fingerprint_v2((v_after_metadata->'packet_issuance') - 'markerFingerprint')
+                IS DISTINCT FROM v_first.result_marker_fingerprint))
+           OR (v_action <> 'acknowledge_possible_submission' AND v_after_metadata ? 'packet_issuance') THEN
+          RAISE EXCEPTION 'allowed packet matrix pair did not append its exact canonical transition: %/%', v_disposition, v_action;
+        END IF;
+        SELECT * INTO v_second FROM forge.apply_packet_issuance_recovery_action_v2(
+          '27000000-0000-4000-8000-00000000d001', '27000000-0000-4000-8000-00000000d101',
+          '27000000-0000-4000-8000-00000000d401', v_action, v_fingerprint,
+          v_actor, v_authorizer
+        );
+        IF v_second.action_id IS DISTINCT FROM v_first.action_id
+           OR v_second.result IS DISTINCT FROM v_first.result
+           OR v_second.result_marker_fingerprint IS DISTINCT FROM v_first.result_marker_fingerprint
+           OR v_second.package_status IS DISTINCT FROM v_first.package_status
+           OR (SELECT count(*) FROM public.filesystem_mcp_issuance_recovery_actions
+               WHERE prior_runtime_audit_id = '27000000-0000-4000-8000-00000000d401') <> v_before_actions + 1
+           OR (SELECT metadata FROM public.work_packages WHERE id = '27000000-0000-4000-8000-00000000d101') IS DISTINCT FROM v_after_metadata
+           OR (SELECT status FROM public.work_packages WHERE id = '27000000-0000-4000-8000-00000000d101') IS DISTINCT FROM v_after_status THEN
+          RAISE EXCEPTION 'packet matrix replay was not ledger-first and byte-stable: %/%', v_disposition, v_action;
+        END IF;
+      EXCEPTION WHEN serialization_failure OR SQLSTATE 'P1726' OR invalid_parameter_value THEN
+        IF v_allowed THEN RAISE; END IF;
+      END;
+      IF NOT v_allowed AND (
+        (SELECT count(*) FROM public.filesystem_mcp_issuance_recovery_actions
+         WHERE prior_runtime_audit_id = '27000000-0000-4000-8000-00000000d401') <> v_before_actions
+        OR (SELECT metadata FROM public.work_packages WHERE id = '27000000-0000-4000-8000-00000000d101') IS DISTINCT FROM v_before_metadata
+        OR (SELECT status FROM public.work_packages WHERE id = '27000000-0000-4000-8000-00000000d101') IS DISTINCT FROM v_before_status
+      ) THEN RAISE EXCEPTION 'rejected packet matrix pair mutated state: %/%', v_disposition, v_action; END IF;
+    END LOOP;
+  END LOOP;
+  UPDATE public.work_packages SET status = 'blocked',
+    metadata = pg_catalog.jsonb_set(metadata, '{packet_issuance}', v_base, true)
+  WHERE id = '27000000-0000-4000-8000-00000000d101';
+END;
+$$;
+ALTER FUNCTION public.forge_proof_packet_action_matrix_v1() OWNER TO forge_s4_routines_owner;
+GRANT EXECUTE ON FUNCTION public.forge_proof_packet_action_matrix_v1() TO forge_s4_recovery_operator;
+SET SESSION AUTHORIZATION forge_s4_recovery_operator;
+SELECT public.forge_proof_packet_action_matrix_v1();
+RESET SESSION AUTHORIZATION;
+REVOKE EXECUTE ON FUNCTION public.forge_proof_packet_action_matrix_v1() FROM forge_s4_recovery_operator;
+CREATE FUNCTION public.forge_proof_expect_packet_action_rejected_v1(p_action text, p_fingerprint text, p_authorizer uuid)
+RETURNS void LANGUAGE plpgsql SET search_path = pg_catalog, forge AS $$
+BEGIN
+  BEGIN
+    PERFORM 1 FROM forge.apply_packet_issuance_recovery_action_v2(
+      '27000000-0000-4000-8000-00000000d001', '27000000-0000-4000-8000-00000000d101',
+      '27000000-0000-4000-8000-00000000d401', p_action, p_fingerprint,
+      '27000000-0000-4000-8000-000000000001', p_authorizer
+    );
+  EXCEPTION WHEN serialization_failure OR SQLSTATE 'P1726' OR invalid_parameter_value THEN RETURN;
+  END;
+  RAISE EXCEPTION 'Packet action % unexpectedly passed its rejection fixture', p_action;
+END;
+$$;
+GRANT EXECUTE ON FUNCTION public.forge_proof_expect_packet_action_rejected_v1(text,text,uuid)
+  TO forge_s4_recovery_operator;
+-- The cartesian matrix above deliberately appended allowed actions. Snapshot
+-- the exact durable state immediately before these three stale/invalid calls;
+-- rejection is zero-mutation relative to that state, not to an earlier phase.
+CREATE TEMP TABLE forge_proof_packet_rejection_baseline ON COMMIT DROP AS
+SELECT
+  (SELECT count(*)::integer FROM public.filesystem_mcp_issuance_recovery_actions
+   WHERE prior_runtime_audit_id = '27000000-0000-4000-8000-00000000d401') AS action_count,
+  package.status AS package_status,
+  package.metadata AS package_metadata
+FROM public.work_packages package
+WHERE package.id = '27000000-0000-4000-8000-00000000d101';
+SET SESSION AUTHORIZATION forge_s4_recovery_operator;
+SELECT public.forge_proof_expect_packet_action_rejected_v1('acknowledge_possible_submission',
+  (SELECT marker->>'markerFingerprint' FROM forge_proof_saved_packet_marker), NULL);
+SELECT public.forge_proof_expect_packet_action_rejected_v1('decline_packet_recovery',
+  'sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee', NULL);
+SELECT public.forge_proof_expect_packet_action_rejected_v1('retry_execution',
+  (SELECT marker->>'markerFingerprint' FROM forge_proof_saved_packet_marker),
+  '27000000-0000-4000-8000-00000000d502');
+RESET SESSION AUTHORIZATION;
+DO $packet_rejects_unchanged$
+BEGIN
+  IF (SELECT count(*) FROM public.filesystem_mcp_issuance_recovery_actions
+      WHERE prior_runtime_audit_id = '27000000-0000-4000-8000-00000000d401')
+        <> (SELECT action_count FROM forge_proof_packet_rejection_baseline)
+     OR (SELECT status FROM public.work_packages WHERE id = '27000000-0000-4000-8000-00000000d101')
+        IS DISTINCT FROM (SELECT package_status FROM forge_proof_packet_rejection_baseline)
+     OR (SELECT metadata FROM public.work_packages WHERE id = '27000000-0000-4000-8000-00000000d101')
+        IS DISTINCT FROM (SELECT package_metadata FROM forge_proof_packet_rejection_baseline) THEN
+    RAISE EXCEPTION 'Rejected packet actions changed durable ledger or canonical marker state';
+  END IF;
+END;
+$packet_rejects_unchanged$;
+REVOKE SELECT ON TABLE forge_proof_saved_packet_marker FROM forge_s4_recovery_operator;
 
 -- Local-effect recovery must make the same authoritative task-wide decision
 -- as packet recovery before it writes its ledger or package state.
@@ -706,6 +1024,230 @@ BEGIN
 END;
 $local_recovery_rejection_zero_mutation$;
 
+-- Exercise every local marker disposition/action pair against the installed
+-- routine.  Each transition uses the real marker and canonical evidence; the
+-- marker is restored between cases so one terminal action cannot authorize
+-- the next.  This specifically guards the decline action, whose accepted
+-- disposition intentionally differs from its action name.
+CREATE TEMP TABLE forge_proof_saved_local_marker ON COMMIT DROP AS
+SELECT metadata->'local_effect_recovery' AS marker
+FROM public.work_packages
+WHERE id = '27000000-0000-4000-8000-00000000e101';
+GRANT SELECT ON TABLE forge_proof_saved_local_marker TO forge_s4_recovery_operator;
+
+-- Exhaustive local recovery disposition/action matrix. The local marker's CAS
+-- token is the canonical evidence fingerprint, so each cartesian case uses a
+-- distinct fixture actor while still calling the installed protected routine.
+INSERT INTO public.users (id, display_name) VALUES
+  ('27000000-0000-4000-8000-00000000e901', 'local matrix 01'),
+  ('27000000-0000-4000-8000-00000000e902', 'local matrix 02'),
+  ('27000000-0000-4000-8000-00000000e903', 'local matrix 03'),
+  ('27000000-0000-4000-8000-00000000e904', 'local matrix 04'),
+  ('27000000-0000-4000-8000-00000000e905', 'local matrix 05'),
+  ('27000000-0000-4000-8000-00000000e906', 'local matrix 06'),
+  ('27000000-0000-4000-8000-00000000e907', 'local matrix 07'),
+  ('27000000-0000-4000-8000-00000000e908', 'local matrix 08'),
+  ('27000000-0000-4000-8000-00000000e909', 'local matrix 09'),
+  ('27000000-0000-4000-8000-00000000e910', 'local matrix 10'),
+  ('27000000-0000-4000-8000-00000000e911', 'local matrix 11'),
+  ('27000000-0000-4000-8000-00000000e912', 'local matrix 12'),
+  ('27000000-0000-4000-8000-00000000e913', 'local matrix 13'),
+  ('27000000-0000-4000-8000-00000000e914', 'local matrix 14'),
+  ('27000000-0000-4000-8000-00000000e915', 'local matrix 15'),
+  ('27000000-0000-4000-8000-00000000e916', 'local matrix 16');
+CREATE FUNCTION public.forge_proof_local_action_matrix_v1()
+RETURNS void LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, public, forge AS $$
+DECLARE
+  v_base jsonb;
+  v_marker jsonb;
+  v_disposition text;
+  v_action text;
+  v_allowed boolean;
+  v_actor uuid;
+  v_index integer := 0;
+  v_before_actions integer;
+  v_before_metadata jsonb;
+  v_before_status text;
+  v_first record;
+  v_second record;
+  v_after_metadata jsonb;
+  v_after_status text;
+  v_expected_result text;
+  v_expected_status text;
+  v_actors uuid[] := ARRAY[
+    '27000000-0000-4000-8000-00000000e901'::uuid,'27000000-0000-4000-8000-00000000e902'::uuid,
+    '27000000-0000-4000-8000-00000000e903'::uuid,'27000000-0000-4000-8000-00000000e904'::uuid,
+    '27000000-0000-4000-8000-00000000e905'::uuid,'27000000-0000-4000-8000-00000000e906'::uuid,
+    '27000000-0000-4000-8000-00000000e907'::uuid,'27000000-0000-4000-8000-00000000e908'::uuid,
+    '27000000-0000-4000-8000-00000000e909'::uuid,'27000000-0000-4000-8000-00000000e910'::uuid,
+    '27000000-0000-4000-8000-00000000e911'::uuid,'27000000-0000-4000-8000-00000000e912'::uuid,
+    '27000000-0000-4000-8000-00000000e913'::uuid,'27000000-0000-4000-8000-00000000e914'::uuid,
+    '27000000-0000-4000-8000-00000000e915'::uuid,'27000000-0000-4000-8000-00000000e916'::uuid
+  ];
+BEGIN
+  SELECT metadata->'local_effect_recovery' INTO STRICT v_base
+  FROM public.work_packages WHERE id = '27000000-0000-4000-8000-00000000e101';
+  FOREACH v_disposition IN ARRAY ARRAY[
+    'review_local_changes','acknowledge_possible_local_invocation','retry_local_execution','dependent_packet'
+  ] LOOP
+    FOREACH v_action IN ARRAY ARRAY[
+      'review_local_changes','acknowledge_possible_local_invocation','retry_local_execution','decline_local_retry'
+    ] LOOP
+      v_index := v_index + 1; v_actor := v_actors[v_index];
+      v_marker := v_base || pg_catalog.jsonb_build_object(
+        'disposition', v_disposition, 'nextDisposition', 'retry_local_execution',
+        'matrixCase', v_disposition || ':' || v_action
+      );
+      UPDATE public.work_packages SET status = 'blocked',
+        metadata = pg_catalog.jsonb_set(metadata, '{local_effect_recovery}', v_marker, true)
+      WHERE id = '27000000-0000-4000-8000-00000000e101';
+      v_allowed := (v_action = 'review_local_changes' AND v_disposition = 'review_local_changes')
+        OR (v_action = 'acknowledge_possible_local_invocation' AND v_disposition = 'acknowledge_possible_local_invocation')
+        OR (v_action = 'retry_local_execution' AND v_disposition = 'retry_local_execution')
+        OR (v_action = 'decline_local_retry' AND v_disposition IN ('acknowledge_possible_local_invocation','retry_local_execution'));
+      IF v_action = 'review_local_changes' THEN
+        v_expected_result := 'reviewed'; v_expected_status := 'blocked';
+      ELSIF v_action = 'acknowledge_possible_local_invocation' THEN
+        v_expected_result := 'acknowledged'; v_expected_status := 'blocked';
+      ELSIF v_action = 'retry_local_execution' THEN
+        v_expected_result := 'ready'; v_expected_status := 'ready';
+      ELSE
+        v_expected_result := 'cancelled'; v_expected_status := 'cancelled';
+      END IF;
+      SELECT count(*)::integer, metadata, status INTO v_before_actions, v_before_metadata, v_before_status
+      FROM public.local_effect_recovery_actions action CROSS JOIN public.work_packages package
+      WHERE action.local_run_evidence_id = '27000000-0000-4000-8000-00000000e301'
+        AND package.id = '27000000-0000-4000-8000-00000000e101'
+      GROUP BY package.metadata, package.status;
+      BEGIN
+        SELECT * INTO v_first FROM forge.apply_local_effect_recovery_action_v2(
+          '27000000-0000-4000-8000-00000000e001', '27000000-0000-4000-8000-00000000e101',
+          '27000000-0000-4000-8000-00000000e301', v_action,
+          v_marker->>'evidenceFingerprint', v_actor
+        );
+        IF NOT v_allowed THEN RAISE EXCEPTION 'disallowed local matrix pair passed: %/%', v_disposition, v_action; END IF;
+        SELECT metadata, status INTO v_after_metadata, v_after_status
+        FROM public.work_packages WHERE id = '27000000-0000-4000-8000-00000000e101';
+        IF (SELECT count(*) FROM public.local_effect_recovery_actions
+            WHERE local_run_evidence_id = '27000000-0000-4000-8000-00000000e301') <> v_before_actions + 1
+           OR v_first.result IS DISTINCT FROM v_expected_result
+           OR v_first.package_status IS DISTINCT FROM v_expected_status
+           OR v_after_status IS DISTINCT FROM v_first.package_status
+           OR (v_action IN ('review_local_changes','acknowledge_possible_local_invocation')
+             AND NOT v_after_metadata ? 'local_effect_recovery')
+           OR (v_action NOT IN ('review_local_changes','acknowledge_possible_local_invocation')
+             AND v_after_metadata ? 'local_effect_recovery') THEN
+          RAISE EXCEPTION 'allowed local matrix pair did not append its exact canonical transition: %/%', v_disposition, v_action;
+        END IF;
+        SELECT * INTO v_second FROM forge.apply_local_effect_recovery_action_v2(
+          '27000000-0000-4000-8000-00000000e001', '27000000-0000-4000-8000-00000000e101',
+          '27000000-0000-4000-8000-00000000e301', v_action,
+          v_marker->>'evidenceFingerprint', v_actor
+        );
+        IF v_second.action_id IS DISTINCT FROM v_first.action_id
+           OR v_second.result IS DISTINCT FROM v_first.result
+           OR v_second.result_marker_fingerprint IS DISTINCT FROM v_first.result_marker_fingerprint
+           OR v_second.package_status IS DISTINCT FROM v_first.package_status
+           OR (SELECT count(*) FROM public.local_effect_recovery_actions
+               WHERE local_run_evidence_id = '27000000-0000-4000-8000-00000000e301') <> v_before_actions + 1
+           OR (SELECT metadata FROM public.work_packages WHERE id = '27000000-0000-4000-8000-00000000e101') IS DISTINCT FROM v_after_metadata
+           OR (SELECT status FROM public.work_packages WHERE id = '27000000-0000-4000-8000-00000000e101') IS DISTINCT FROM v_after_status THEN
+          RAISE EXCEPTION 'local matrix replay was not ledger-first and byte-stable: %/%', v_disposition, v_action;
+        END IF;
+      EXCEPTION WHEN serialization_failure OR SQLSTATE 'P1726' THEN
+        IF v_allowed THEN RAISE; END IF;
+      END;
+      IF NOT v_allowed AND (
+        (SELECT count(*) FROM public.local_effect_recovery_actions
+         WHERE local_run_evidence_id = '27000000-0000-4000-8000-00000000e301') <> v_before_actions
+        OR (SELECT metadata FROM public.work_packages WHERE id = '27000000-0000-4000-8000-00000000e101') IS DISTINCT FROM v_before_metadata
+        OR (SELECT status FROM public.work_packages WHERE id = '27000000-0000-4000-8000-00000000e101') IS DISTINCT FROM v_before_status
+      ) THEN RAISE EXCEPTION 'rejected local matrix pair mutated state: %/%', v_disposition, v_action; END IF;
+    END LOOP;
+  END LOOP;
+  UPDATE public.work_packages SET status = 'blocked',
+    metadata = pg_catalog.jsonb_set(metadata, '{local_effect_recovery}', v_base, true)
+  WHERE id = '27000000-0000-4000-8000-00000000e101';
+END;
+$$;
+ALTER FUNCTION public.forge_proof_local_action_matrix_v1() OWNER TO forge_s4_routines_owner;
+GRANT EXECUTE ON FUNCTION public.forge_proof_local_action_matrix_v1() TO forge_s4_recovery_operator;
+SET SESSION AUTHORIZATION forge_s4_recovery_operator;
+SELECT public.forge_proof_local_action_matrix_v1();
+RESET SESSION AUTHORIZATION;
+REVOKE EXECUTE ON FUNCTION public.forge_proof_local_action_matrix_v1() FROM forge_s4_recovery_operator;
+
+-- The following legacy named transitions use the original fixture actor.
+-- Snapshot that actor's ledger after the cartesian actors have finished, so
+-- their intentional appends can never affect this exact +3 proof.
+CREATE TEMP TABLE forge_proof_local_legacy_baseline ON COMMIT DROP AS
+SELECT count(*)::integer AS action_count
+FROM public.local_effect_recovery_actions
+WHERE local_run_evidence_id = '27000000-0000-4000-8000-00000000e301'
+  AND actor_user_id = '27000000-0000-4000-8000-000000000001';
+
+UPDATE public.work_packages
+SET metadata = pg_catalog.jsonb_set(
+  metadata, '{local_effect_recovery}',
+  (SELECT marker || '{"disposition":"review_local_changes","nextDisposition":"retry_local_execution"}'::jsonb
+   FROM forge_proof_saved_local_marker), true
+)
+WHERE id = '27000000-0000-4000-8000-00000000e101';
+SET SESSION AUTHORIZATION forge_s4_recovery_operator;
+SELECT result, package_status FROM forge.apply_local_effect_recovery_action_v2(
+  '27000000-0000-4000-8000-00000000e001', '27000000-0000-4000-8000-00000000e101',
+  '27000000-0000-4000-8000-00000000e301', 'review_local_changes',
+  (SELECT marker->>'evidenceFingerprint' FROM forge_proof_saved_local_marker),
+  '27000000-0000-4000-8000-000000000001'
+);
+RESET SESSION AUTHORIZATION;
+
+UPDATE public.work_packages
+SET metadata = pg_catalog.jsonb_set(
+  metadata, '{local_effect_recovery}',
+  (SELECT marker || '{"disposition":"acknowledge_possible_local_invocation"}'::jsonb
+   FROM forge_proof_saved_local_marker), true
+)
+WHERE id = '27000000-0000-4000-8000-00000000e101';
+SET SESSION AUTHORIZATION forge_s4_recovery_operator;
+SELECT result, package_status FROM forge.apply_local_effect_recovery_action_v2(
+  '27000000-0000-4000-8000-00000000e001', '27000000-0000-4000-8000-00000000e101',
+  '27000000-0000-4000-8000-00000000e301', 'acknowledge_possible_local_invocation',
+  (SELECT marker->>'evidenceFingerprint' FROM forge_proof_saved_local_marker),
+  '27000000-0000-4000-8000-000000000001'
+);
+RESET SESSION AUTHORIZATION;
+
+UPDATE public.work_packages
+SET metadata = pg_catalog.jsonb_set(metadata, '{local_effect_recovery}',
+  (SELECT marker FROM forge_proof_saved_local_marker), true)
+WHERE id = '27000000-0000-4000-8000-00000000e101';
+SET SESSION AUTHORIZATION forge_s4_recovery_operator;
+SELECT result, package_status FROM forge.apply_local_effect_recovery_action_v2(
+  '27000000-0000-4000-8000-00000000e001', '27000000-0000-4000-8000-00000000e101',
+  '27000000-0000-4000-8000-00000000e301', 'decline_local_retry',
+  (SELECT marker->>'evidenceFingerprint' FROM forge_proof_saved_local_marker),
+  '27000000-0000-4000-8000-000000000001'
+);
+RESET SESSION AUTHORIZATION;
+DO $local_disposition_actions$
+BEGIN
+  IF (SELECT count(*) FROM public.local_effect_recovery_actions
+      WHERE local_run_evidence_id = '27000000-0000-4000-8000-00000000e301'
+        AND actor_user_id = '27000000-0000-4000-8000-000000000001')
+       <> (SELECT action_count + 3 FROM forge_proof_local_legacy_baseline)
+     OR (SELECT status FROM public.work_packages WHERE id = '27000000-0000-4000-8000-00000000e101') <> 'cancelled' THEN
+    RAISE EXCEPTION 'Local recovery disposition/action proof did not persist exactly one action per transition';
+  END IF;
+END;
+$local_disposition_actions$;
+
+UPDATE public.work_packages
+SET status = 'blocked', metadata = pg_catalog.jsonb_set(metadata, '{local_effect_recovery}',
+  (SELECT marker FROM forge_proof_saved_local_marker), true)
+WHERE id = '27000000-0000-4000-8000-00000000e101';
+
 SELECT 'sha256:' || pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(
   'forge:local-run-evidence:v1:' || evidence.id::text || ':' || evidence.terminal::text,
   'UTF8'
@@ -737,7 +1279,8 @@ BEGIN
   IF (SELECT pg_catalog.count(*)
       FROM public.local_effect_recovery_actions action
       WHERE action.local_run_evidence_id = '27000000-0000-4000-8000-00000000e301'
-        AND action.action = 'retry_local_execution') <> 1
+        AND action.action = 'retry_local_execution'
+        AND action.actor_user_id = '27000000-0000-4000-8000-000000000001') <> 1
      OR NOT EXISTS (
        SELECT 1 FROM public.work_packages package
        WHERE package.id = '27000000-0000-4000-8000-00000000e101'
@@ -748,4 +1291,5 @@ BEGIN
   END IF;
 END;
 $local_recovery_success_assertions$;
+REVOKE SELECT ON TABLE forge_proof_saved_local_marker FROM forge_s4_recovery_operator;
 ROLLBACK;

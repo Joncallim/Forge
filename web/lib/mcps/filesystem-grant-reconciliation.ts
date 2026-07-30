@@ -1428,8 +1428,12 @@ export async function mutateTaskFilesystemGrants(input: {
 
 export async function mutateProjectFilesystemGrant(input: {
   actorId: string
+  assertCurrentFilesystemHealth?: (project: LockedProject) => Promise<void>
   capabilities: readonly string[]
   enabled: boolean
+  expectedAuthority?: Pick<ProjectFilesystemDecisionAuthority,
+    'decisionId' | 'grantDecisionRevision' | 'rootBindingRevision' | 'decisionFingerprint' | 'decisionGeneration'
+  > | null
   projectId: string
   reason: string
 }): Promise<{
@@ -1445,6 +1449,23 @@ export async function mutateProjectFilesystemGrant(input: {
       projectWide: true,
       tx,
     })
+    const actualAuthority = locked.projectAuthority
+    const expectedAuthority = input.expectedAuthority
+    if (expectedAuthority !== undefined) {
+      const exactAuthorityMatch = actualAuthority !== null && expectedAuthority !== null &&
+        actualAuthority.decisionId === expectedAuthority.decisionId &&
+        actualAuthority.grantDecisionRevision === expectedAuthority.grantDecisionRevision &&
+        actualAuthority.rootBindingRevision === expectedAuthority.rootBindingRevision &&
+        actualAuthority.decisionFingerprint === expectedAuthority.decisionFingerprint &&
+        actualAuthority.decisionGeneration === expectedAuthority.decisionGeneration
+      if ((actualAuthority === null) !== (expectedAuthority === null) ||
+        (actualAuthority !== null && !exactAuthorityMatch)) {
+        throw httpError('Project filesystem decision changed concurrently. Reload and retry.', 409)
+      }
+    }
+    // The route may have read health before waiting on these locks. Re-read it
+    // after the authority CAS and before appending any immutable decision.
+    await input.assertCurrentFilesystemHealth?.(locked.project)
     const now = await lockedTransactionNow(tx)
     if (locked.project.rootBindingRevision <= BigInt(0)) {
       throw httpError('The project root is not bound to protocol v2. Filesystem decisions remain disabled.', 409)

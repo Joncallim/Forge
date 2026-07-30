@@ -54,6 +54,14 @@ const s4Migration = readFileSync(
   fileURLToPath(new URL('../db/migrations/0027_epic_172_s4_packet_context.sql', import.meta.url)),
   'utf8',
 )
+const s5RecoveryMigration = readFileSync(
+  fileURLToPath(new URL('../db/migrations/0028_epic_172_s5_recovery_actions.sql', import.meta.url)),
+  'utf8',
+)
+const s5RecoveryMigrationWrapper = readFileSync(
+  fileURLToPath(new URL('../scripts/ci/apply-epic-172-s5-recovery-migration.sh', import.meta.url)),
+  'utf8',
+)
 const sessionReconciliation = readFileSync(
   fileURLToPath(new URL('../scripts/reconcile-session-credentials.ts', import.meta.url)),
   'utf8',
@@ -113,12 +121,22 @@ function admission(overrides: Partial<McpWorkPackageAdmission> = {}): McpWorkPac
 describe('Epic 172 S4 PostgreSQL CI contract', () => {
   it('bootstraps S4 before migration and makes all dedicated PostgreSQL fixtures mandatory', () => {
     const bootstrapIndex = webCiWorkflow.indexOf('name: Bootstrap migration-0027 S4 protocol ownership')
-    const migrateIndex = webCiWorkflow.indexOf('name: Apply migrations as the disposable migration owner')
+    const migrateIndex = webCiWorkflow.indexOf('name: Apply migration-0028 with failure-safe S5 recovery ownership')
     expect(bootstrapIndex).toBeGreaterThan(-1)
     expect(migrateIndex).toBeGreaterThan(bootstrapIndex)
     expect(webCiWorkflow).toContain('npm run protocol:bootstrap-epic-172-s4-roles')
     expect(webCiWorkflow).toContain('name: Create the freshly migrated isolated S4 PostgreSQL proof database')
     expect(webCiWorkflow).toContain('CREATE DATABASE forge_s4_ci_test OWNER forge_migration_test;')
+    const stage0027 = webCiWorkflow.indexOf('name: Apply migrations through 0027')
+    const handoff0028 = webCiWorkflow.indexOf('name: Apply migration-0028 with failure-safe S5 recovery ownership')
+    expect(bootstrapIndex).toBeLessThan(stage0027)
+    expect(stage0027).toBeLessThan(handoff0028)
+    expect(webCiWorkflow).toContain('run: bash scripts/ci/apply-epic-172-s5-recovery-migration.sh')
+    expect(s5RecoveryMigrationWrapper).toContain('npx tsx scripts/bootstrap-epic-172-s5-recovery-owner.ts')
+    expect(s5RecoveryMigrationWrapper).toContain('npm run db:migrate')
+    expect(s5RecoveryMigrationWrapper).toContain('trap cleanup EXIT')
+    expect(s5RecoveryMigrationWrapper).toContain('bootstrap-epic-172-s5-recovery-owner.ts --cleanup')
+    expect(handoff0028).toBeLessThan(webCiWorkflow.indexOf('name: Configure disposable release and S4 principal passwords'))
     expect(webCiWorkflow).toContain('npm run test:mcp:s4-postgres -- --reporter=default | tee "$report"')
     expect(webCiWorkflow).toContain('run: npm run test:unit:zero-skip')
     const zeroSkipStep = webCiWorkflow.slice(
@@ -475,6 +493,19 @@ describe('Epic 172 S4 PostgreSQL CI contract', () => {
       .toBeLessThan(beginHelper.indexOf(
         'The temporary migration-to-owner edge is not the exclusive S4 membership edge',
       ))
+  })
+
+  it('replaces the S5 recovery routine only while the exact owner role is active', () => {
+    const begin = s5RecoveryMigration.indexOf('SELECT public.forge_begin_epic_172_s4_owner_bootstrap_v1();')
+    const setRole = s5RecoveryMigration.indexOf('SET ROLE forge_s4_routines_owner;')
+    const replace = s5RecoveryMigration.indexOf('CREATE OR REPLACE FUNCTION forge.apply_local_effect_recovery_action_v2(')
+    const reset = s5RecoveryMigration.indexOf('RESET ROLE;')
+    const finalize = s5RecoveryMigration.indexOf('SELECT public.forge_finalize_epic_172_s4_owner_bootstrap_v1();')
+    expect(begin).toBeGreaterThanOrEqual(0)
+    expect(begin).toBeLessThan(setRole)
+    expect(setRole).toBeLessThan(replace)
+    expect(replace).toBeLessThan(reset)
+    expect(reset).toBeLessThan(finalize)
   })
 
   it('keeps session cutover additive until exact Redis expiry and key drain are proven', () => {

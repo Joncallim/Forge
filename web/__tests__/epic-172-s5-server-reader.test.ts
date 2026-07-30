@@ -52,6 +52,7 @@ describe('S5 authoritative reader identities', () => {
       kind: 'invalid',
       state: 'invalid',
       action: null,
+      allowedActions: [],
       evidenceId: null,
       evidenceFingerprint: null,
     }])

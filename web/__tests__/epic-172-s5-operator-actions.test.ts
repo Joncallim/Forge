@@ -177,7 +177,7 @@ describe('S5 operator action endpoint', () => {
   })
 
   it('refuses an action the persisted marker does not currently offer', async () => {
-    const response = await post({ ...retryLocal, action: 'decline_local_retry' })
+    const response = await post({ ...retryLocal, action: 'acknowledge_possible_local_invocation' })
     expect(response.status).toBe(409)
     expect((await response.json()).code).toBe('stale_action')
     expect(mutateProjectFilesystemGrant).not.toHaveBeenCalled()
@@ -211,14 +211,14 @@ describe('S5 operator action endpoint', () => {
   })
 
   it.each([
-    ['local', 'review_local_changes'],
-    ['local', 'acknowledge_possible_local_invocation'],
-    ['local', 'retry_local_execution'],
-    ['local', 'decline_local_retry'],
-    ['packet', 'acknowledge_possible_submission'],
-    ['packet', 'retry_execution'],
-    ['packet', 'decline_packet_recovery'],
-  ] as const)('applies the released %s recovery action %s through its exact S4 routine', async (kind, action) => {
+    ['local', 'review_local_changes', 'review_local_changes'],
+    ['local', 'acknowledge_possible_local_invocation', 'acknowledge_possible_local_invocation'],
+    ['local', 'retry_local_execution', 'retry_local_execution'],
+    ['local', 'decline_local_retry', 'retry_local_execution'],
+    ['packet', 'acknowledge_possible_submission', 'review_submission'],
+    ['packet', 'retry_execution', 'retry_execution'],
+    ['packet', 'decline_packet_recovery', 'retry_execution'],
+  ] as const)('applies the released %s recovery action %s through its exact S4 routine', async (kind, action, disposition) => {
     const request = kind === 'local'
       ? { ...retryLocal, action }
       : {
@@ -233,7 +233,7 @@ describe('S5 operator action endpoint', () => {
         workPackageId: PACKAGE_ID,
         kind: kind === 'local' ? 'local_effect_recovery' : 'packet_issuance',
         state: 'current',
-        action,
+        action: disposition,
         evidenceId: kind === 'local' ? EVIDENCE_ID : AUDIT_ID,
         evidenceFingerprint: kind === 'local' ? EVIDENCE_FINGERPRINT : MARKER_FINGERPRINT,
       }],
@@ -266,6 +266,40 @@ describe('S5 operator action endpoint', () => {
     expect(enqueueBlockedHandoffRetry).toHaveBeenCalledWith(TASK_ID, {
       source: kind === 'local' ? 'local-effect-recovery' : 'packet-issuance-recovery',
     })
+  })
+
+  it.each([
+    ['local', 'review_local_changes', 'decline_local_retry'],
+    ['local', 'acknowledge_possible_local_invocation', 'retry_local_execution'],
+    ['local', 'retry_local_execution', 'acknowledge_possible_local_invocation'],
+    ['packet', 'review_submission', 'retry_execution'],
+    ['packet', 'reapprove_allow_once', 'acknowledge_possible_submission'],
+  ] as const)('refuses invalid %s disposition/action pairs with zero mutation', async (kind, disposition, action) => {
+    const request = kind === 'local'
+      ? { ...retryLocal, action }
+      : {
+          schemaVersion: 1,
+          action,
+          expectedFreshnessFingerprint: FINGERPRINT,
+          priorRuntimeAuditId: AUDIT_ID,
+          markerFingerprint: MARKER_FINGERPRINT,
+        }
+    readS5AuthoritativeTaskState.mockResolvedValue(state({
+      recoveryMarkers: [{
+        workPackageId: PACKAGE_ID,
+        kind: kind === 'local' ? 'local_effect_recovery' : 'packet_issuance',
+        state: 'current',
+        action: disposition,
+        evidenceId: kind === 'local' ? EVIDENCE_ID : AUDIT_ID,
+        evidenceFingerprint: kind === 'local' ? EVIDENCE_FINGERPRINT : MARKER_FINGERPRINT,
+      }],
+    }))
+
+    const response = await post(request)
+    expect(response.status).toBe(409)
+    expect(applyLocalEffectRecoveryActionV2).not.toHaveBeenCalled()
+    expect(applyPacketIssuanceRecoveryActionV2).not.toHaveBeenCalled()
+    expect(mutateProjectFilesystemGrant).not.toHaveBeenCalled()
   })
 
   it('honours the closed ingress gate before doing anything else', async () => {
@@ -309,6 +343,39 @@ describe('S5 operator action endpoint', () => {
         actorId: 'owner',
         capabilities: ['filesystem.project.read', 'filesystem.project.list', 'filesystem.project.search'],
         projectId: PROJECT_ID,
+        expectedAuthority: null,
+      }))
+    })
+
+    it('passes the full observed project-decision pointer to the locked mutation', async () => {
+      const decision = {
+        id: EVIDENCE_ID,
+        enabled: true,
+        capabilities: ['filesystem.project.read'],
+        grantDecisionRevision: '4',
+        rootBindingRevision: '3',
+        decisionFingerprint: FINGERPRINT,
+        decisionGeneration: '7',
+        decidedAt: '',
+        decidedBy: '',
+      }
+      readS5AuthoritativeTaskState.mockResolvedValue(state({ projectGrant: decision }))
+
+      const response = await post({
+        ...approve,
+        expectedProjectDecisionId: decision.id,
+        expectedProjectDecisionRevision: decision.grantDecisionRevision,
+      })
+
+      expect(response.status).toBe(200)
+      expect(mutateProjectFilesystemGrant).toHaveBeenCalledWith(expect.objectContaining({
+        expectedAuthority: {
+          decisionId: decision.id,
+          grantDecisionRevision: decision.grantDecisionRevision,
+          rootBindingRevision: decision.rootBindingRevision,
+          decisionFingerprint: decision.decisionFingerprint,
+          decisionGeneration: decision.decisionGeneration,
+        },
       }))
     })
 
