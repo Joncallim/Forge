@@ -588,6 +588,17 @@ END;
 $$;
 GRANT EXECUTE ON FUNCTION public.forge_proof_expect_packet_action_rejected_v1(text,text,uuid)
   TO forge_s4_recovery_operator;
+-- The cartesian matrix above deliberately appended allowed actions. Snapshot
+-- the exact durable state immediately before these three stale/invalid calls;
+-- rejection is zero-mutation relative to that state, not to an earlier phase.
+CREATE TEMP TABLE forge_proof_packet_rejection_baseline ON COMMIT DROP AS
+SELECT
+  (SELECT count(*)::integer FROM public.filesystem_mcp_issuance_recovery_actions
+   WHERE prior_runtime_audit_id = '27000000-0000-4000-8000-00000000d401') AS action_count,
+  package.status AS package_status,
+  package.metadata AS package_metadata
+FROM public.work_packages package
+WHERE package.id = '27000000-0000-4000-8000-00000000d101';
 SET SESSION AUTHORIZATION forge_s4_recovery_operator;
 SELECT public.forge_proof_expect_packet_action_rejected_v1('acknowledge_possible_submission',
   (SELECT marker->>'markerFingerprint' FROM forge_proof_saved_packet_marker), NULL);
@@ -600,15 +611,12 @@ RESET SESSION AUTHORIZATION;
 DO $packet_rejects_unchanged$
 BEGIN
   IF (SELECT count(*) FROM public.filesystem_mcp_issuance_recovery_actions
-      WHERE prior_runtime_audit_id = '27000000-0000-4000-8000-00000000d401') <> 3
-     OR (SELECT status FROM public.work_packages WHERE id = '27000000-0000-4000-8000-00000000d101') <> 'blocked'
-     OR (SELECT metadata->'packet_issuance'->>'disposition' FROM public.work_packages
-         WHERE id = '27000000-0000-4000-8000-00000000d101') <> 'retry_execution'
-     OR (SELECT forge.packet_recovery_marker_fingerprint_v2(
-           (metadata->'packet_issuance') - 'markerFingerprint'
-         ) FROM public.work_packages WHERE id = '27000000-0000-4000-8000-00000000d101')
-        <> (SELECT metadata->'packet_issuance'->>'markerFingerprint'
-            FROM public.work_packages WHERE id = '27000000-0000-4000-8000-00000000d101') THEN
+      WHERE prior_runtime_audit_id = '27000000-0000-4000-8000-00000000d401')
+        <> (SELECT action_count FROM forge_proof_packet_rejection_baseline)
+     OR (SELECT status FROM public.work_packages WHERE id = '27000000-0000-4000-8000-00000000d101')
+        IS DISTINCT FROM (SELECT package_status FROM forge_proof_packet_rejection_baseline)
+     OR (SELECT metadata FROM public.work_packages WHERE id = '27000000-0000-4000-8000-00000000d101')
+        IS DISTINCT FROM (SELECT package_metadata FROM forge_proof_packet_rejection_baseline) THEN
     RAISE EXCEPTION 'Rejected packet actions changed durable ledger or canonical marker state';
   END IF;
 END;
