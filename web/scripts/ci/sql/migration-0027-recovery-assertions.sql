@@ -947,6 +947,111 @@ FROM public.work_packages
 WHERE id = '27000000-0000-4000-8000-00000000e101';
 GRANT SELECT ON TABLE forge_proof_saved_local_marker TO forge_s4_recovery_operator;
 
+-- Exhaustive local recovery disposition/action matrix. The local marker's CAS
+-- token is the canonical evidence fingerprint, so each cartesian case uses a
+-- distinct fixture actor while still calling the installed protected routine.
+INSERT INTO public.users (id, display_name) VALUES
+  ('27000000-0000-4000-8000-00000000e901', 'local matrix 01'),
+  ('27000000-0000-4000-8000-00000000e902', 'local matrix 02'),
+  ('27000000-0000-4000-8000-00000000e903', 'local matrix 03'),
+  ('27000000-0000-4000-8000-00000000e904', 'local matrix 04'),
+  ('27000000-0000-4000-8000-00000000e905', 'local matrix 05'),
+  ('27000000-0000-4000-8000-00000000e906', 'local matrix 06'),
+  ('27000000-0000-4000-8000-00000000e907', 'local matrix 07'),
+  ('27000000-0000-4000-8000-00000000e908', 'local matrix 08'),
+  ('27000000-0000-4000-8000-00000000e909', 'local matrix 09'),
+  ('27000000-0000-4000-8000-00000000e910', 'local matrix 10'),
+  ('27000000-0000-4000-8000-00000000e911', 'local matrix 11'),
+  ('27000000-0000-4000-8000-00000000e912', 'local matrix 12'),
+  ('27000000-0000-4000-8000-00000000e913', 'local matrix 13'),
+  ('27000000-0000-4000-8000-00000000e914', 'local matrix 14'),
+  ('27000000-0000-4000-8000-00000000e915', 'local matrix 15'),
+  ('27000000-0000-4000-8000-00000000e916', 'local matrix 16');
+CREATE FUNCTION public.forge_proof_local_action_matrix_v1()
+RETURNS void LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, public, forge AS $$
+DECLARE
+  v_base jsonb;
+  v_marker jsonb;
+  v_disposition text;
+  v_action text;
+  v_allowed boolean;
+  v_actor uuid;
+  v_index integer := 0;
+  v_before_actions integer;
+  v_before_metadata jsonb;
+  v_before_status text;
+  v_actors uuid[] := ARRAY[
+    '27000000-0000-4000-8000-00000000e901'::uuid,'27000000-0000-4000-8000-00000000e902'::uuid,
+    '27000000-0000-4000-8000-00000000e903'::uuid,'27000000-0000-4000-8000-00000000e904'::uuid,
+    '27000000-0000-4000-8000-00000000e905'::uuid,'27000000-0000-4000-8000-00000000e906'::uuid,
+    '27000000-0000-4000-8000-00000000e907'::uuid,'27000000-0000-4000-8000-00000000e908'::uuid,
+    '27000000-0000-4000-8000-00000000e909'::uuid,'27000000-0000-4000-8000-00000000e910'::uuid,
+    '27000000-0000-4000-8000-00000000e911'::uuid,'27000000-0000-4000-8000-00000000e912'::uuid,
+    '27000000-0000-4000-8000-00000000e913'::uuid,'27000000-0000-4000-8000-00000000e914'::uuid,
+    '27000000-0000-4000-8000-00000000e915'::uuid,'27000000-0000-4000-8000-00000000e916'::uuid
+  ];
+BEGIN
+  SELECT metadata->'local_effect_recovery' INTO STRICT v_base
+  FROM public.work_packages WHERE id = '27000000-0000-4000-8000-00000000e101';
+  FOREACH v_disposition IN ARRAY ARRAY[
+    'review_local_changes','acknowledge_possible_local_invocation','retry_local_execution','dependent_packet'
+  ] LOOP
+    FOREACH v_action IN ARRAY ARRAY[
+      'review_local_changes','acknowledge_possible_local_invocation','retry_local_execution','decline_local_retry'
+    ] LOOP
+      v_index := v_index + 1; v_actor := v_actors[v_index];
+      v_marker := v_base || pg_catalog.jsonb_build_object(
+        'disposition', v_disposition, 'nextDisposition', 'retry_local_execution',
+        'matrixCase', v_disposition || ':' || v_action
+      );
+      UPDATE public.work_packages SET status = 'blocked',
+        metadata = pg_catalog.jsonb_set(metadata, '{local_effect_recovery}', v_marker, true)
+      WHERE id = '27000000-0000-4000-8000-00000000e101';
+      v_allowed := (v_action = 'review_local_changes' AND v_disposition = 'review_local_changes')
+        OR (v_action = 'acknowledge_possible_local_invocation' AND v_disposition = 'acknowledge_possible_local_invocation')
+        OR (v_action = 'retry_local_execution' AND v_disposition = 'retry_local_execution')
+        OR (v_action = 'decline_local_retry' AND v_disposition IN ('acknowledge_possible_local_invocation','retry_local_execution'));
+      SELECT count(*)::integer, metadata, status INTO v_before_actions, v_before_metadata, v_before_status
+      FROM public.local_effect_recovery_actions action CROSS JOIN public.work_packages package
+      WHERE action.local_run_evidence_id = '27000000-0000-4000-8000-00000000e301'
+        AND package.id = '27000000-0000-4000-8000-00000000e101'
+      GROUP BY package.metadata, package.status;
+      BEGIN
+        PERFORM 1 FROM forge.apply_local_effect_recovery_action_v2(
+          '27000000-0000-4000-8000-00000000e001', '27000000-0000-4000-8000-00000000e101',
+          '27000000-0000-4000-8000-00000000e301', v_action,
+          v_marker->>'evidenceFingerprint', v_actor
+        );
+        IF NOT v_allowed THEN RAISE EXCEPTION 'disallowed local matrix pair passed: %/%', v_disposition, v_action; END IF;
+        PERFORM 1 FROM forge.apply_local_effect_recovery_action_v2(
+          '27000000-0000-4000-8000-00000000e001', '27000000-0000-4000-8000-00000000e101',
+          '27000000-0000-4000-8000-00000000e301', v_action,
+          v_marker->>'evidenceFingerprint', v_actor
+        );
+      EXCEPTION WHEN serialization_failure OR SQLSTATE 'P1726' THEN
+        IF v_allowed THEN RAISE; END IF;
+      END;
+      IF NOT v_allowed AND (
+        (SELECT count(*) FROM public.local_effect_recovery_actions
+         WHERE local_run_evidence_id = '27000000-0000-4000-8000-00000000e301') <> v_before_actions
+        OR (SELECT metadata FROM public.work_packages WHERE id = '27000000-0000-4000-8000-00000000e101') IS DISTINCT FROM v_before_metadata
+        OR (SELECT status FROM public.work_packages WHERE id = '27000000-0000-4000-8000-00000000e101') IS DISTINCT FROM v_before_status
+      ) THEN RAISE EXCEPTION 'rejected local matrix pair mutated state: %/%', v_disposition, v_action; END IF;
+    END LOOP;
+  END LOOP;
+  UPDATE public.work_packages SET status = 'blocked',
+    metadata = pg_catalog.jsonb_set(metadata, '{local_effect_recovery}', v_base, true)
+  WHERE id = '27000000-0000-4000-8000-00000000e101';
+END;
+$$;
+ALTER FUNCTION public.forge_proof_local_action_matrix_v1() OWNER TO forge_s4_routines_owner;
+GRANT EXECUTE ON FUNCTION public.forge_proof_local_action_matrix_v1() TO forge_s4_recovery_operator;
+SET SESSION AUTHORIZATION forge_s4_recovery_operator;
+SELECT public.forge_proof_local_action_matrix_v1();
+RESET SESSION AUTHORIZATION;
+REVOKE EXECUTE ON FUNCTION public.forge_proof_local_action_matrix_v1() FROM forge_s4_recovery_operator;
+
 UPDATE public.work_packages
 SET metadata = pg_catalog.jsonb_set(
   metadata, '{local_effect_recovery}',
