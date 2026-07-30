@@ -874,7 +874,7 @@ export function canonicalTaskPresentationProjection(state: S5AuthoritativeTaskSt
     admission: state.packages.map((pkg) => ({
       workPackageId: pkg.workPackageId,
       title: pkg.title,
-      requiresMcp: pkg.requestedCapabilities.length > 0,
+      requiresMcp: pkg.boundedRuntimeRequestedCapabilities.length > 0,
       decision: s5EffectiveAdmissionDecision(pkg),
     })),
     recoveries,
