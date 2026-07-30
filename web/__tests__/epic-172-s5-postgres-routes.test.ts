@@ -80,6 +80,7 @@ run('S5 real PostgreSQL HTTP authorization boundary', () => {
     signerKey: randomUUID(),
     enablementReceipt: randomUUID(),
     readinessReceipt: randomUUID(),
+    openingAuthorization: randomUUID(),
   }
   const ownerCredential = randomUUID()
   const otherCredential = randomUUID()
@@ -257,6 +258,30 @@ run('S5 real PostgreSQL HTTP authorization boundary', () => {
         )
       `
       await tx`
+        insert into forge_epic_172_transition_authorizations (
+          id, target_node, transition_identity_digest, source_receipt_ids,
+          source_receipt_set_digest, owner_issue, owner_slice, exact_builds,
+          reviewed_sha, epoch, operation_id, operation, controller_login_id,
+          controller_run_id, signer_key_id, signer_generation, envelope_digest,
+          detached_signature, nonce, issued_at, expires_at, envelope
+        ) values (
+          ${ids.openingAuthorization}::uuid, 'ingress_and_issuance_enabled',
+          ${'2'.repeat(64)},
+          ${JSON.stringify([ids.enablementReceipt, ids.readinessReceipt])}::text::jsonb,
+          ${'3'.repeat(64)}, 179, 's4',
+          ${JSON.stringify([
+            `issue_179_s4@${'a'.repeat(40)}`,
+            `issue_180_s5@${'a'.repeat(40)}`,
+            `issue_181_s6@${'a'.repeat(40)}`,
+          ])}::text::jsonb,
+          ${'a'.repeat(40)}, 2, 's5-postgres-proof', 'enable',
+          's5-postgres-proof', 's5-postgres-proof', ${ids.signerKey}::uuid, 1,
+          ${'4'.repeat(64)}, decode(repeat('cc', 64), 'hex'),
+          ${randomUUID()}::uuid, transaction_timestamp() - interval '1 minute',
+          transaction_timestamp() + interval '15 minutes', '{}'::jsonb
+        )
+      `
+      await tx`
         update forge_epic_172_enablement_state
         set state = 'active', owner_operation_id = 's5-postgres-proof',
             exact_builds = ${JSON.stringify([
@@ -265,8 +290,14 @@ run('S5 real PostgreSQL HTTP authorization boundary', () => {
               `issue_181_s6@${'a'.repeat(40)}`,
             ])}::text::jsonb,
             reviewed_sha = ${'a'.repeat(40)}, epoch = 2,
+            started_at = transaction_timestamp(), expires_at = null,
             enablement_receipt_id = ${ids.enablementReceipt}::uuid,
             final_readiness_receipt_id = ${ids.readinessReceipt}::uuid,
+            opening_authorization_id = ${ids.openingAuthorization}::uuid,
+            controller_login_id = 's5-postgres-proof',
+            controller_run_id = 's5-postgres-proof',
+            controller_token_digest = null, lease_generation = null,
+            last_heartbeat_at = null, lease_expires_at = null,
             state_fingerprint = ${'9'.repeat(64)}, updated_at = clock_timestamp()
         where singleton_id = 'epic-172'
       `
