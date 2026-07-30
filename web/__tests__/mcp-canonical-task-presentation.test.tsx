@@ -90,24 +90,26 @@ describe('canonical task MCP presentation', () => {
   })
 
   it('rejects mixed action families in both directions and never creates a request', () => {
-    const packetActionWithLocalIdentity = {
-      action: 'retry_execution',
-      label: 'Invalid mixed action',
-      identity: { schemaVersion: 1, localRunEvidenceId: evidenceId, evidenceFingerprint: evidence },
-    }
-    const localActionWithPacketIdentity = {
-      action: 'retry_local_execution',
-      label: 'Invalid mixed action',
-      identity: { schemaVersion: 2, priorRuntimeAuditId: auditId, markerFingerprint: marker },
-    }
-    for (const action of [packetActionWithLocalIdentity, localActionWithPacketIdentity]) {
+    const invalidActions = [
+      {
+        action: 'retry_execution',
+        label: 'Invalid mixed action',
+        identity: { schemaVersion: 1, localRunEvidenceId: evidenceId, evidenceFingerprint: evidence },
+      },
+      {
+        action: 'retry_local_execution',
+        label: 'Invalid mixed action',
+        identity: { schemaVersion: 2, priorRuntimeAuditId: auditId, markerFingerprint: marker },
+      },
+    ] satisfies readonly CanonicalMcpOperatorAction[]
+    for (const action of invalidActions) {
       expect(canonicalMcpTaskPresentationFromUnknown(packet({
         recoveries: [{ ...packet().recoveries[0], actions: [action] }],
       }))).toBeNull()
-      expect(canonicalMcpOperatorActionRequest(action as never, freshness)).toBeNull()
+      expect(canonicalMcpOperatorActionRequest(action, freshness)).toBeNull()
       const forgedMarkup = renderToStaticMarkup(
         <CanonicalMcpOperatorPanel
-          presentation={packet({ recoveries: [{ ...packet().recoveries[0], actions: [action as never] }] })}
+          presentation={packet({ recoveries: [{ ...packet().recoveries[0], actions: [action] }] })}
           pending={false}
           onAction={() => undefined}
         />,
