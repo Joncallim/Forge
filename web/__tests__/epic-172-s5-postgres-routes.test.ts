@@ -390,8 +390,13 @@ run('S5 real PostgreSQL HTTP authorization boundary', () => {
     const ownedAction = await POST(actionRequest(ownerCredential, ids.ownerTask), {
       params: Promise.resolve({ taskId: ids.ownerTask }),
     })
-    expect(ownedAction.status).toBe(409)
-    expect(await ownedAction.json()).toMatchObject({ code: 'stale_state' })
+    const ownedActionBody = await ownedAction.json()
+    const ownedActionCategory = [
+      typeof ownedActionBody.code === 'string' ? ownedActionBody.code : 'missing_code',
+      typeof ownedActionBody.reason === 'string' ? ownedActionBody.reason : 'missing_reason',
+    ].join(':')
+    expect(ownedAction.status, `owner action category ${ownedActionCategory}`).toBe(409)
+    expect(ownedActionBody).toMatchObject({ code: 'stale_state' })
 
     const nonOwnerAction = await POST(actionRequest(otherCredential, ids.ownerTask), {
       params: Promise.resolve({ taskId: ids.ownerTask }),
