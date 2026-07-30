@@ -2022,6 +2022,75 @@ describe.skipIf(!enabled)('queue occurrence and recovery real Redis proof', () =
     expect(await admin.get('forge:answers:malformed-recovery-receipts')).toBe('wrong-type')
     console.info('QUEUE_OCCURRENCE_REDIS_QUARANTINE_OK')
 
+    const legacyRecoveryCases = [
+      {
+        claims: 'forge:tasks:claims',
+        create: () => queue(),
+        job: { taskId: TASK_ID, attempt: 41 },
+        processing: 'forge:tasks:processing',
+        ready: 'forge:tasks',
+      },
+      {
+        claims: 'forge:approvals:claims',
+        create: () => approvalQueue(),
+        job: { taskId: TASK_ID, action: 'approve' as const, attempt: 42 },
+        processing: 'forge:approvals:processing',
+        ready: 'forge:approvals',
+      },
+      {
+        claims: 'forge:answers:claims',
+        create: () => answersQueue(),
+        job: { taskId: TASK_ID, attempt: 43 },
+        processing: 'forge:answers:processing',
+        ready: 'forge:answers',
+      },
+    ]
+    for (const legacyCase of legacyRecoveryCases) {
+      await admin.del(...QUEUE_KEYS)
+      const raw = JSON.stringify(legacyCase.job)
+      const staleTimestamp = String((await redisTimeMs()) - 2_000)
+      await admin.rpush(legacyCase.processing, raw)
+      await admin.hset(legacyCase.claims, raw, staleTimestamp)
+      const recoveryQueue = legacyCase.create()
+
+      await expect(recoveryQueue.recoverStuckJobs(1_000)).resolves.toBe(1)
+      const [recoveredRaw] = await admin.lrange(legacyCase.ready, 0, -1)
+      expect(parseOccurrence(recoveredRaw).job).toEqual(legacyCase.job)
+      expect(await admin.llen(legacyCase.processing)).toBe(0)
+      expect(await admin.hexists(legacyCase.claims, raw)).toBe(0)
+      await expect(recoveryQueue.recoverStuckJobs(1_000)).resolves.toBe(0)
+
+      await admin.del(...QUEUE_KEYS)
+      const freshTimestamp = String(await redisTimeMs())
+      await admin.rpush(legacyCase.processing, raw)
+      await admin.hset(legacyCase.claims, raw, freshTimestamp)
+      await expect(recoveryQueue.recoverStuckJobs(60_000)).resolves.toBe(0)
+      expect(await admin.lrange(legacyCase.processing, 0, -1)).toEqual([raw])
+      expect(await admin.hget(legacyCase.claims, raw)).toBe(freshTimestamp)
+      expect(await admin.llen(legacyCase.ready)).toBe(0)
+    }
+
+    const malformedLegacyMarkers = [
+      '0',
+      '01',
+      '1.5',
+      'NaN',
+      '9007199254740992',
+      String((await redisTimeMs()) + 10_000),
+      `${await redisTimeMs()}:11111111-1111-4111-8111-111111111111`,
+    ]
+    for (const marker of malformedLegacyMarkers) {
+      await admin.del(...QUEUE_KEYS)
+      const raw = JSON.stringify({ taskId: TASK_ID, attempt: 44 })
+      await admin.rpush('forge:tasks:processing', raw)
+      await admin.hset('forge:tasks:claims', raw, marker)
+      await expect(queue().recoverStuckJobs(0))
+        .rejects.toThrow('Queue legacy occurrence recovery failed')
+      expect(await admin.lrange('forge:tasks:processing', 0, -1)).toEqual([raw])
+      expect(await admin.hget('forge:tasks:claims', raw)).toBe(marker)
+      expect(await admin.llen('forge:tasks')).toBe(0)
+    }
+
     const markerCases = [
       '0:11111111-1111-4111-8111-111111111111',
       '9007199254740992:11111111-1111-4111-8111-111111111111',
