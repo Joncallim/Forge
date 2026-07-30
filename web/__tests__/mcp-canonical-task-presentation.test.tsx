@@ -6,8 +6,10 @@ import {
 } from '@/app/dashboard/tasks/[id]/page'
 import {
   CANONICAL_MCP_PRESENTATION_MAX_AGE_MS,
+  canonicalMcpPresentationAgeMs,
   canonicalMcpPresentationIsFresh,
   canonicalMcpTaskPresentationFromUnknown,
+  type CanonicalMcpOperatorAction,
   type CanonicalMcpTaskPresentation,
 } from '@/lib/mcps/admission-copy'
 
@@ -132,6 +134,33 @@ describe('canonical task MCP presentation', () => {
     expect(staleMarkup).not.toContain('<button')
     expect(staleMarkup).toContain('Recovery actions are hidden')
     vi.useRealTimers()
+  })
+
+  it('fails closed for future observations and client clock rollback', () => {
+    const observedAt = new Date('2026-07-31T00:00:30.000Z')
+    const presentation = packet({ computedAt: observedAt.toISOString() })
+
+    expect(canonicalMcpPresentationAgeMs(presentation, observedAt.getTime() - 1)).toBeNull()
+    expect(canonicalMcpPresentationIsFresh(presentation, observedAt.getTime() - 1)).toBe(false)
+    expect(canonicalMcpPresentationIsFresh(
+      packet({ computedAt: new Date(observedAt.getTime() + CANONICAL_MCP_PRESENTATION_MAX_AGE_MS + 1).toISOString() }),
+      observedAt.getTime(),
+    )).toBe(false)
+  })
+
+  it('keeps ticking freshness text out of live regions and announces only stale state', () => {
+    const observedAt = new Date()
+    const currentMarkup = renderToStaticMarkup(
+      <CanonicalMcpOperatorPanel presentation={packet({ computedAt: observedAt.toISOString() })} pending={false} onAction={() => undefined} />,
+    )
+    expect(currentMarkup).toContain('aria-hidden="true"')
+    expect(currentMarkup).not.toContain('role="status"')
+
+    const staleMarkup = renderToStaticMarkup(
+      <CanonicalMcpOperatorPanel presentation={packet({ computedAt: new Date(0).toISOString() })} pending={false} onAction={() => undefined} />,
+    )
+    expect(staleMarkup).toContain('role="status"')
+    expect(staleMarkup).toContain('Recovery actions are hidden')
   })
 
   it('hides controls for unavailable, terminal, and stale/unknown server presentations while branding terminal evidence', () => {

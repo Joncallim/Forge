@@ -193,7 +193,9 @@ export function canonicalMcpPresentationAgeMs(
 ): number | null {
   const computedAt = Date.parse(presentation.computedAt)
   if (!Number.isFinite(computedAt) || !Number.isFinite(now)) return null
-  return Math.max(0, now - computedAt)
+  const age = now - computedAt
+  // A browser clock behind the server observation cannot safely authorize an action.
+  return age < 0 ? null : age
 }
 
 export function canonicalMcpPresentationIsFresh(
