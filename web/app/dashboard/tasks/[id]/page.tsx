@@ -28,6 +28,7 @@ import {
 } from '@/components/ui/select'
 import { MarkdownView } from '@/components/MarkdownView'
 import { McpPresentation } from '@/components/mcps/McpPresentation'
+import { BrandedTerminalJoin } from '@/components/mcps/BrandedTerminalJoin'
 import { PlanDiffView } from '@/components/PlanDiffView'
 import { mergeAgentRun, useTaskStream } from '@/hooks/useTaskStream'
 import type { AgentRun, Artifact, TaskQuestion } from '@/hooks/useTaskStream'
@@ -42,7 +43,9 @@ import {
 } from '@/lib/mcps/execution-design-metadata'
 import {
   admissionPresentationFromUnknown,
-  type PresentationCta,
+  canonicalMcpTaskPresentationFromUnknown,
+  type CanonicalMcpOperatorAction,
+  type CanonicalMcpTaskPresentation,
 } from '@/lib/mcps/admission-copy'
 import {
   latestMcpPlanReviewForDisplay,
@@ -1723,69 +1726,130 @@ function BrokerRetrySummary({ broker }: { broker: WorkforceRecord | null }) {
   )
 }
 
-function PresentationActionButton({
-  action,
-  onActivate,
+export function CanonicalMcpOperatorPanel({
+  presentation,
+  pending,
+  onAction,
 }: {
-  action: PresentationCta
-  onActivate: (action: PresentationCta) => void
+  presentation: CanonicalMcpTaskPresentation | null
+  pending: boolean
+  onAction: (action: CanonicalMcpOperatorAction) => void
 }) {
-  const decline = action.kind === 'decline_packet_recovery' || action.kind === 'decline_local_retry'
+  if (presentation === null) return null
   return (
-    <Button
-      type="button"
-      size="sm"
-      variant={decline ? 'outline' : 'secondary'}
-      className="w-full sm:w-auto"
-      onClick={() => onActivate(action)}
-    >
-      {action.label}
-    </Button>
+    <section aria-labelledby="mcp-runtime-state-heading" className="rounded-lg border border-border p-4">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h2 id="mcp-runtime-state-heading" className="text-sm font-medium text-muted-foreground uppercase tracking-wide">
+            MCP runtime state
+          </h2>
+          <p className="mt-1 text-xs text-muted-foreground">
+            This view is one server observation. Recovery controls disappear if its evidence or terminal state cannot be verified.
+          </p>
+        </div>
+        <BrandedTerminalJoin presentation={{ state: 'current', freshnessSeconds: 0, fingerprint: presentation.freshnessFingerprint }}>
+          Server observed
+        </BrandedTerminalJoin>
+      </div>
+
+      {!presentation.localEvidenceAvailable && (
+        <p role="status" className="mt-3 text-xs text-muted-foreground">
+          Protected local evidence is unavailable. Recovery actions are hidden until Forge can verify it again.
+        </p>
+      )}
+
+      {presentation.admission.some((item) => item.requiresMcp) && (
+        <dl className="mt-3 grid gap-2 text-xs sm:grid-cols-2" aria-label="Current MCP admission">
+          {presentation.admission.filter((item) => item.requiresMcp).map((item) => (
+            <div key={item.workPackageId} className="rounded-md border border-border bg-muted/20 px-3 py-2">
+              <dt className="font-medium text-foreground">{item.title}</dt>
+              <dd className="mt-1 text-muted-foreground">
+                {item.decision === 'approved' ? 'Current admission approved' : item.decision === 'denied' ? 'Current admission denied' : 'Current admission unavailable'}
+              </dd>
+            </div>
+          ))}
+        </dl>
+      )}
+
+      {presentation.recoveries.length > 0 && (
+        <div className="mt-3 grid gap-2">
+          {presentation.recoveries.map((recovery) => (
+            <McpPresentation
+              key={`${recovery.workPackageId}-${recovery.headline}`}
+              presentation={{
+                statusKey: recovery.actions.length > 0 ? 'action_required' : 'deferred',
+                tone: recovery.tone,
+                badgeText: recovery.badgeText,
+                headline: `${recovery.title}: ${recovery.headline}`,
+                body: recovery.body,
+                actions: [],
+              }}
+            />
+          ))}
+        </div>
+      )}
+
+      {presentation.recoveries.some((recovery) => recovery.actions.length > 0) && (
+        <div className="mt-3 grid gap-2">
+          {presentation.recoveries.flatMap((recovery) => recovery.actions.map((action) => (
+            <Button
+              key={`${recovery.workPackageId}-${action.action}`}
+              type="button"
+              size="sm"
+              variant={action.action.startsWith('decline_') ? 'outline' : 'secondary'}
+              className="w-full justify-start sm:w-fit"
+              disabled={pending}
+              onClick={() => onAction(action)}
+            >
+              {action.label}
+            </Button>
+          )))}
+        </div>
+      )}
+
+      {presentation.terminals.length > 0 && (
+        <div className="mt-3 grid gap-2">
+          {presentation.terminals.map((terminal) => terminal.state === 'terminal' ? (
+            <BrandedTerminalJoin
+              key={terminal.workPackageId}
+              presentation={{ state: 'terminal', terminalAt: formatDatetime(terminal.terminalAt ?? ''), outcome: terminal.outcome ?? 'unknown' }}
+            >
+              {terminal.title}: {terminal.outcome === 'succeeded' ? 'completed' : 'failed'}
+            </BrandedTerminalJoin>
+          ) : (
+            <BrandedTerminalJoin
+              key={terminal.workPackageId}
+              presentation={{ state: 'terminal_only', message: 'Terminal evidence unavailable' }}
+            >
+              {terminal.title}: terminal evidence unavailable
+            </BrandedTerminalJoin>
+          ))}
+        </div>
+      )}
+    </section>
   )
 }
 
-function McpGrantCards({
-  grants,
-  onAction,
-  packageId,
-  projectId,
-}: {
-  grants: WorkforceRecord[]
-  onAction: (action: PresentationCta) => void
-  packageId: string
-  projectId: string
-}) {
-  if (grants.length === 0) return null
-  const packageGrantTargetId = packageId === '' ? undefined : `filesystem-grant-${packageId}`
-
-  return (
-    <div>
-      <p className="font-medium text-muted-foreground">Current MCP admission</p>
-      <p className="mt-1 text-muted-foreground">
-        Current package admission is separate from plan history and run evidence. No live MCP tool handles are issued in beta.
-      </p>
-      <div className="mt-2 grid gap-2">
-        {grants.map((grant, index) => {
-          const presentation = admissionPresentationFromUnknown({
-            ...grant,
-            retryable: booleanField(grant, ['retryable']) ?? false,
-          }, {
-            projectId,
-            ...(packageGrantTargetId ? { packageGrantTargetId } : {}),
-          })
-          return (
-            <McpPresentation
-              key={recordKey(grant, 'mcp-grant', index)}
-              presentation={presentation}
-              renderAction={(action) => (
-                <PresentationActionButton action={action} onActivate={onAction} />
-              )}
-            />
-          )
-        })}
-      </div>
-    </div>
-  )
+export function canonicalMcpOperatorActionRequest(
+  action: CanonicalMcpOperatorAction,
+  expectedFreshnessFingerprint: string,
+): Record<string, unknown> {
+  const identity = action.identity
+  return identity.schemaVersion === 1
+    ? {
+        schemaVersion: 1,
+        action: action.action,
+        expectedFreshnessFingerprint,
+        localRunEvidenceId: identity.localRunEvidenceId,
+        evidenceFingerprint: identity.evidenceFingerprint,
+      }
+    : {
+        schemaVersion: 1,
+        action: action.action,
+        expectedFreshnessFingerprint,
+        priorRuntimeAuditId: identity.priorRuntimeAuditId,
+        markerFingerprint: identity.markerFingerprint,
+      }
 }
 
 function filesystemEffectiveState(pkg: WorkPackage): {
@@ -2727,7 +2791,6 @@ function WorkforcePanel({
   filesystemAudits,
   fallbackAgents,
   onGateDecided,
-  onMcpAction,
   projectId,
   taskId,
   taskStatus,
@@ -2741,7 +2804,6 @@ function WorkforcePanel({
   filesystemAudits: FilesystemAudit[]
   fallbackAgents: PlannedAgent[]
   onGateDecided: () => Promise<void>
-  onMcpAction: (action: PresentationCta) => void
   projectId: string
   taskId: string
   taskStatus: string | null
@@ -2808,7 +2870,6 @@ function WorkforcePanel({
                   const harnessName = stringField(pkg, ['harnessDisplayName', 'harnessRole'])
                   const mcpRequirements = jsonArrayField(pkg, ['mcpRequirements'])
                   const pkgMetadata = recordField(pkg, ['metadata'])
-                  const mcpGrants = pkgMetadata ? jsonArrayField(pkgMetadata, ['mcpGrants', 'grants']) : []
                   const mcpSubtasks = pkgMetadata ? jsonArrayField(pkgMetadata, ['mcpAwareSubtasks', 'mcpSubtasks']) : []
                   const broker = mcpBrokerMetadata(pkg)
                   const packageArtifacts = packageArtifactsFor(pkg, artifacts)
@@ -3002,12 +3063,6 @@ function WorkforcePanel({
                             pkg={pkg}
                             taskId={taskId}
                             taskStatus={taskStatus}
-                          />
-                          <McpGrantCards
-                            grants={mcpGrants}
-                            onAction={onMcpAction}
-                            packageId={pkgId}
-                            projectId={projectId}
                           />
                           <McpSubtaskCards subtasks={mcpSubtasks} />
                           {packageArtifacts.length > 0 && (
@@ -3416,7 +3471,6 @@ export function initialMcpReviewItems(
 function McpAccessPlanPanel({
   approvalGate,
   design,
-  onAction,
   onSaved,
   projectId,
   status,
@@ -3424,7 +3478,6 @@ function McpAccessPlanPanel({
 }: {
   approvalGate: ApprovalGate | null
   design: McpExecutionDesignMetadata | null
-  onAction: (action: PresentationCta) => void
   onSaved: () => Promise<void>
   projectId: string
   status: string
@@ -3577,9 +3630,6 @@ function McpAccessPlanPanel({
                 <li key={decision.decisionId}>
                   <McpPresentation
                     presentation={presentation}
-                    renderAction={(action) => (
-                      <PresentationActionButton action={action} onActivate={onAction} />
-                    )}
                   />
                 </li>
               )
@@ -4229,7 +4279,8 @@ export default function TaskDetailPage() {
   const [attempts, setAttempts] = useState<TaskAttempt[]>([])
   const [workPackages, setWorkPackages] = useState<WorkPackage[]>([])
   const [approvalGates, setApprovalGates] = useState<ApprovalGate[]>([])
-  const [mcpFreshness, setMcpFreshness] = useState<string | null>(null)
+  const [mcpPresentation, setMcpPresentation] = useState<CanonicalMcpTaskPresentation | null>(null)
+  const [mcpPresentationLoading, setMcpPresentationLoading] = useState(true)
   const [mcpActionError, setMcpActionError] = useState<string | null>(null)
   const [mcpActionPending, setMcpActionPending] = useState(false)
   const [vcsChanges, setVcsChanges] = useState<VcsChange[]>([])
@@ -4398,16 +4449,19 @@ export default function TaskDetailPage() {
   // state the operator is looking at; every operator action echoes it back so
   // the server can refuse (409, zero mutation) if anything moved underneath.
   const loadMcpPresentation = useCallback(async () => {
+    setMcpPresentationLoading(true)
     try {
       const res = await fetch(`/api/mcps/presentation/${taskId}`)
       if (!res.ok) {
-        setMcpFreshness(null)
+        setMcpPresentation(null)
         return
       }
       const body = await res.json().catch(() => null)
-      setMcpFreshness(typeof body?.freshnessFingerprint === 'string' ? body.freshnessFingerprint : null)
+      setMcpPresentation(canonicalMcpTaskPresentationFromUnknown(body))
     } catch {
-      setMcpFreshness(null)
+      setMcpPresentation(null)
+    } finally {
+      setMcpPresentationLoading(false)
     }
   }, [taskId])
 
@@ -4659,63 +4713,9 @@ export default function TaskDetailPage() {
     }
   }
 
-  function handleMcpPresentationAction(action: PresentationCta) {
-    if (action.kind === 'link') {
-      router.push(action.href)
-      return
-    }
-
-    // Packet-context reapproval is deliberately not an S5 recovery action.
-    // It is completed through the existing project filesystem decision
-    // control below, which owns the current decision/version compare-and-set.
-    if (
-      action.kind !== 'reapprove_packet_context'
-      && mcpFreshness !== null
-      && 'request' in action
-      && action.request
-    ) {
-      const identity = action.request
-      if (identity.schemaVersion === 1) {
-        void submitMcpOperatorAction({
-          schemaVersion: 1,
-          action: action.kind,
-          expectedFreshnessFingerprint: mcpFreshness,
-          localRunEvidenceId: identity.localRunEvidenceId,
-          evidenceFingerprint: identity.evidenceFingerprint,
-        })
-      } else {
-        void submitMcpOperatorAction({
-          schemaVersion: 1,
-          action: action.kind === 'retry_packet_execution'
-            ? 'retry_execution'
-            : action.kind === 'review_submission'
-              ? 'acknowledge_possible_submission'
-              : action.kind,
-          expectedFreshnessFingerprint: mcpFreshness,
-          priorRuntimeAuditId: identity.priorRuntimeAuditId,
-          markerFingerprint: identity.markerFingerprint,
-        })
-      }
-    }
-
-    const targetId = action.kind === 'scroll'
-      ? action.targetId
-      : action.kind === 'request_changes'
-        ? 'task-plan-actions'
-        : action.kind === 'reapprove_packet_context'
-          ? action.targetId
-          : null
-    if (action.kind === 'request_changes') {
-      setActionMode('replan')
-      setActionError(null)
-    }
-    if (targetId) {
-      window.requestAnimationFrame(() => {
-        const target = document.getElementById(targetId)
-        target?.scrollIntoView({ behavior: 'smooth', block: 'center' })
-        target?.focus({ preventScroll: true })
-      })
-    }
+  function handleCanonicalMcpOperatorAction(action: CanonicalMcpOperatorAction) {
+    if (mcpPresentation === null) return
+    void submitMcpOperatorAction(canonicalMcpOperatorActionRequest(action, mcpPresentation.freshnessFingerprint))
   }
 
   if (loading) {
@@ -5224,10 +5224,19 @@ export default function TaskDetailPage() {
                 Applying the MCP recovery action…
               </p>
             )}
+            <CanonicalMcpOperatorPanel
+              presentation={mcpPresentation}
+              pending={mcpActionPending}
+              onAction={handleCanonicalMcpOperatorAction}
+            />
+            {!mcpPresentationLoading && mcpPresentation === null && (
+              <p role="status" className="text-xs text-muted-foreground">
+                Current MCP runtime state is unavailable. Recovery controls are hidden until Forge can load one verified observation.
+              </p>
+            )}
             <McpAccessPlanPanel
               approvalGate={planApprovalGate}
               design={mcpExecutionDesign}
-              onAction={handleMcpPresentationAction}
               onSaved={loadTask}
               projectId={task.projectId}
               status={effectiveTaskStatus}
@@ -5285,7 +5294,6 @@ export default function TaskDetailPage() {
             commandAudits={commandAudits}
             filesystemAudits={filesystemAudits}
             fallbackAgents={plannedAgents}
-            onMcpAction={handleMcpPresentationAction}
             projectId={task.projectId}
             taskId={taskId}
             taskStatus={currentStatus}

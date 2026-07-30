@@ -31,6 +31,10 @@ import {
   localEffectRecoveryActionsForDisposition,
   packetIssuanceRecoveryActionsForDisposition,
 } from '@/lib/mcps/recovery-action-contract'
+import type {
+  CanonicalMcpOperatorAction,
+  CanonicalMcpTaskPresentation,
+} from '@/lib/mcps/admission-copy'
 
 const SHA256 = /^sha256:[0-9a-f]{64}$/
 
@@ -664,5 +668,115 @@ export function terminalProjection(state: S5AuthoritativeTaskState): S5TerminalP
     localEvidenceAvailable: state.localEvidenceAvailable,
     taskId: state.taskId,
     terminalPackages: state.terminalPackages.map(safeTerminalPackagePresenter),
+  }
+}
+
+const CANONICAL_ACTION_LABELS: Record<CanonicalMcpOperatorAction['action'], string> = {
+  review_local_changes: 'I reviewed the local changes',
+  acknowledge_possible_local_invocation: 'I understand the prior local invocation may have happened',
+  retry_local_execution: 'Start another local attempt',
+  decline_local_retry: 'Do not retry — close this package',
+  acknowledge_possible_submission: 'I understand the prior submission may have happened',
+  retry_execution: 'Retry packet execution',
+  decline_packet_recovery: 'Do not retry this package',
+}
+
+function canonicalRecoveryAction(marker: S5RecoveryMarkerPresenter, action: string): CanonicalMcpOperatorAction | null {
+  if (!(action in CANONICAL_ACTION_LABELS) || marker.evidenceId === null || marker.evidenceFingerprint === null) return null
+  const operatorAction = action as CanonicalMcpOperatorAction['action']
+  if (marker.kind === 'local_effect_recovery' && [
+    'review_local_changes', 'acknowledge_possible_local_invocation', 'retry_local_execution', 'decline_local_retry',
+  ].includes(operatorAction)) {
+    return {
+      action: operatorAction,
+      label: CANONICAL_ACTION_LABELS[operatorAction],
+      identity: { schemaVersion: 1, localRunEvidenceId: marker.evidenceId, evidenceFingerprint: marker.evidenceFingerprint },
+    }
+  }
+  if (marker.kind === 'packet_issuance' && [
+    'acknowledge_possible_submission', 'retry_execution', 'decline_packet_recovery',
+  ].includes(operatorAction)) {
+    return {
+      action: operatorAction,
+      label: CANONICAL_ACTION_LABELS[operatorAction],
+      identity: { schemaVersion: 2, priorRuntimeAuditId: marker.evidenceId, markerFingerprint: marker.evidenceFingerprint },
+    }
+  }
+  return null
+}
+
+/**
+ * The task UI's single S5 DTO. Recovery availability and terminal status are
+ * joined while the authoritative state is still in memory, preventing the
+ * browser from combining unrelated admission, recovery, and terminal reads.
+ */
+export function canonicalTaskPresentationProjection(state: S5AuthoritativeTaskState): CanonicalMcpTaskPresentation {
+  const packageById = new Map(state.packages.map((pkg) => [pkg.workPackageId, pkg]))
+  const terminalByPackage = new Map(
+    state.terminalPackages
+      .filter((terminal) => packageById.has(terminal.workPackageId))
+      .map((terminal) => [terminal.workPackageId, terminal]),
+  )
+  const terminalTask = ['completed', 'failed', 'cancelled', 'rejected'].includes(state.taskStatus)
+  const recoveries = state.recoveryMarkers.flatMap((marker) => {
+    const pkg = packageById.get(marker.workPackageId)
+    if (!pkg) return []
+    const terminal = terminalByPackage.get(marker.workPackageId)
+    const terminalized = terminalTask || terminal?.state === 'terminal'
+    const actions = !state.localEvidenceAvailable || terminalized || marker.state !== 'current'
+      ? []
+      : marker.allowedActions.map((action) => canonicalRecoveryAction(marker, action)).filter((action): action is CanonicalMcpOperatorAction => action !== null)
+    const unavailable = marker.state !== 'current' || !state.localEvidenceAvailable
+    return [{
+      workPackageId: pkg.workPackageId,
+      title: pkg.title,
+      badgeText: terminalized ? 'Terminal' : unavailable ? 'Status unavailable' : actions.length > 0 ? 'Recovery available' : 'Recovery unavailable',
+      headline: terminalized
+        ? 'Package reached a terminal state'
+        : unavailable
+          ? 'Recovery state cannot be verified'
+          : actions.length > 0
+            ? 'Operator recovery is available'
+            : 'Recovery is not available',
+      body: terminalized
+        ? 'This package has retained terminal evidence. Forge does not offer a recovery control from this observation.'
+        : unavailable
+          ? 'Forge cannot prove the required recovery evidence is current. No operator action is available.'
+          : actions.length > 0
+            ? 'Choose a server-authorized action. Forge will re-check this exact observation before changing the package.'
+            : 'The current server observation does not authorize an operator recovery action.',
+      tone: terminalized ? 'neutral' as const : unavailable ? 'danger' as const : actions.length > 0 ? 'warning' as const : 'neutral' as const,
+      actions,
+    }]
+  })
+  const terminals = state.terminalPackages.flatMap((terminal) => {
+    const pkg = packageById.get(terminal.workPackageId)
+    if (!pkg) return []
+    return [{
+      workPackageId: terminal.workPackageId,
+      title: pkg.title,
+      state: terminal.state,
+      outcome: terminal.terminalOutcome,
+      terminalAt: terminal.terminalAt,
+    }]
+  })
+  return {
+    schemaVersion: 1,
+    computedAt: state.computedAt,
+    freshnessFingerprint: state.freshnessFingerprint,
+    taskId: state.taskId,
+    localEvidenceAvailable: state.localEvidenceAvailable,
+    admission: state.packages.map((pkg) => ({
+      workPackageId: pkg.workPackageId,
+      title: pkg.title,
+      requiresMcp: pkg.requestedCapabilities.length > 0,
+      decision: pkg.currentDecision?.decision === 'approved'
+        ? 'approved' as const
+        : pkg.currentDecision?.decision === 'denied'
+          ? 'denied' as const
+          : 'unavailable' as const,
+    })),
+    recoveries,
+    terminals,
   }
 }

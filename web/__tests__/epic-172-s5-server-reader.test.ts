@@ -4,12 +4,45 @@ vi.mock('server-only', () => ({ default: {} }))
 
 import {
   computeFreshnessFingerprint,
+  canonicalTaskPresentationProjection,
   isS5FreshnessFingerprint,
   normalizeS5RecoveryMarkers,
   normalizeS5TerminalAudit,
 } from '@/lib/mcps/s5-server-reader'
 
 describe('S5 authoritative reader identities', () => {
+  it('joins recovery actions and terminal evidence into one fail-closed task DTO', () => {
+    const taskId = '00000000-0000-4000-8000-000000000001'
+    const packageId = '00000000-0000-4000-8000-000000000002'
+    const auditId = '00000000-0000-4000-8000-000000000003'
+    const fingerprint = `sha256:${'a'.repeat(64)}`
+    const state = {
+      computedAt: '2026-07-30T00:00:00.000Z', observedAtMs: 0, localEvidenceAvailable: true,
+      taskId, projectId: '00000000-0000-4000-8000-000000000004', taskStatus: 'approved', freshnessFingerprint: fingerprint,
+      packages: [{
+        workPackageId: packageId, title: 'Packet package', assignedRole: 'backend', status: 'blocked',
+        requestedCapabilities: [], boundedRuntimeRequestedCapabilities: [], blockingCapabilities: [],
+        currentDecision: null, decisionHistory: [], blockMetadata: null, pointerFingerprint: '', pointerVersion: '0',
+      }],
+      projectGrant: null,
+      recoveryMarkers: [{
+        workPackageId: packageId, kind: 'packet_issuance' as const, state: 'current' as const, action: 'retry_execution',
+        allowedActions: ['retry_execution', 'decline_packet_recovery'], evidenceId: auditId, evidenceFingerprint: fingerprint,
+      }],
+      terminalPackages: [{
+        runtimeAuditId: auditId, workPackageId: packageId, state: 'terminal' as const, assemblyState: 'assembled' as const,
+        deliveryOutcome: 'submitted' as const, terminalOutcome: 'succeeded' as const, terminalAt: '2026-07-30T00:00:00.000Z',
+      }], evidenceRecords: [],
+    }
+
+    const projection = canonicalTaskPresentationProjection(state)
+    expect(projection.freshnessFingerprint).toBe(fingerprint)
+    expect(projection.admission).toEqual([{ workPackageId: packageId, title: 'Packet package', requiresMcp: false, decision: 'unavailable' }])
+    expect(projection.recoveries[0].actions).toEqual([])
+    expect(projection.terminals[0]).toMatchObject({ workPackageId: packageId, state: 'terminal', outcome: 'succeeded' })
+    expect(JSON.stringify(projection)).not.toContain('claimToken')
+  })
+
   it('canonicalizes nested mutable state independent of object insertion order', () => {
     expect(computeFreshnessFingerprint({
       task: { status: 'approved', id: 'task-1' },
