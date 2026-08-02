@@ -789,6 +789,7 @@ jobs:
             throw new Error('The mandatory cross-sink proof must run exactly one file and one passing test with one terminal marker and no skips.')
           }
           NODE
+      - run: npm run test:mcp:contract
       - run: npm run build
       - run: npx playwright install chromium
       - name: Run mandatory S3 PostgreSQL concurrency proof
@@ -809,6 +810,12 @@ jobs:
             echo 'The mandatory S3 PostgreSQL concurrency proof did not report a passing test.' >&2
             exit 1
           fi
+      - name: Run manifest-bound PostgreSQL admission sentinels
+        run: npm run test:mcp:postgres
+        env:
+          RUN_FORGE_POSTGRES_TESTS: '1'
+      - name: Run manifest-bound operator recovery on desktop and mobile
+        run: npm run e2e:mcp-operator
       - name: Prove Epic 172 Step 0 disabled ingress and mixed-lock recovery
         run: npm run e2e:epic-172-disabled-ingress
       - name: Run the fail-closed Epic 172 Step 0 E2E bridge suite
@@ -816,3 +823,12 @@ jobs:
         env:
           FORGE_EPIC_172_STEP0_E2E_BRIDGE: '1'
           FORGE_E2E_AUDIT_OBSERVER_DATABASE_URL: postgresql://forge_e2e_audit_observer:forge_e2e_audit_observer_test@localhost:5432/forge_epic_172_ci_test
+      # Deliberately no raw Playwright report or result-tree export step here.
+      # Those trees carry raw traces, screenshots, video, and child stdout/
+      # stderr, which the Epic 172 S6 output-quarantine contract forbids
+      # exporting. Only the signed sanitized evidence bundle may leave the
+      # runner. See __tests__/epic-172-s6-ci-contract.test.ts for the sentinel.
+      - name: Reject whitespace errors in the pushed commit
+        if: github.event_name == 'push'
+        working-directory: .
+        run: git diff --check HEAD^...HEAD

@@ -1,0 +1,37 @@
+{
+  "schemaVersion": 2,
+  "deploymentMode": "disabled",
+  "requiredCheck": {
+    "name": "forge/host-boundary-controller",
+    "conclusionOwner": "external_github_app",
+    "runnerMayConclude": false,
+    "checkoutMayConclude": false
+  },
+  "trustedExecution": {
+    "operatingSystem": "ubuntu-24.04",
+    "minimumKernel": "6.8",
+    "runnerLabels": [
+      "forge-host-boundary",
+      "linux",
+      "self-hosted",
+      "x64"
+    ],
+    "allowedEvents": [
+      "merge_group",
+      "protected_workflow_dispatch"
+    ],
+    "forbiddenEvents": [
+      "pull_request",
+      "pull_request_target"
+    ],
+    "checkoutEgress": "none",
+    "retries": 0,
+    "runnerReuse": "forbidden"
+  },
+  "authority": {
+    "activation": false,
+    "ingress": false,
+    "issuance": false,
+    "evidenceStore": "step0_import_only"
+  }
+}

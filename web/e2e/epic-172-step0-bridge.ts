@@ -42,7 +42,7 @@ export const EPIC_172_STEP0_E2E_INVENTORY = [
     classification: 'run-disabled-safe',
   },
   {
-    id: 'filesystem-grant-lifecycle-concurrency.spec.ts::mcp-admission.real-approval-route: concurrent reapproval has one CAS winner and immutable history',
+    id: 'filesystem-grant-lifecycle-concurrency.spec.ts::mcp-admission.real-approval-route: authenticated route stays fail-closed and service CAS preserves immutable history',
     classification: 'run-disabled-safe',
   },
   {
@@ -183,6 +183,38 @@ export const EPIC_172_STEP0_E2E_INVENTORY = [
     id: 'task-detail-controls.spec.ts::refreshes a stale pointer and waits for a second explicit confirmation',
     // Fully route-mocked: it never calls an ingress-gated endpoint, so the
     // pointer compare-and-set contract is provable while ingress is disabled.
+    classification: 'run-disabled-safe',
+  },
+  {
+    id: 'mcp-host-boundary.spec.ts::epic-172.cgroup-descendant-containment',
+    classification: 'signed-activation-required',
+  },
+  {
+    id: 'mcp-host-boundary.spec.ts::epic-172.failure-injection-quiescence',
+    classification: 'signed-activation-required',
+  },
+  {
+    id: 'mcp-host-boundary.spec.ts::epic-172.peer-credential-boundary',
+    classification: 'signed-activation-required',
+  },
+  {
+    id: 'mcp-host-boundary.spec.ts::epic-172.protected-fence-service',
+    classification: 'signed-activation-required',
+  },
+  {
+    id: 'mcp-host-boundary.spec.ts::epic-172.supported-host-preflight',
+    classification: 'signed-activation-required',
+  },
+  {
+    id: 'mcp-host-boundary.spec.ts::epic-172.teardown-zero-residue',
+    classification: 'signed-activation-required',
+  },
+  {
+    id: 'mcp-host-boundary.spec.ts::epic-172.uid-credential-isolation',
+    classification: 'signed-activation-required',
+  },
+  {
+    id: 'mcp-operator-recovery.spec.ts::mcp-admission.operator-recovery: presents authenticated filesystem recovery controls',
     classification: 'run-disabled-safe',
   },
 ] as const satisfies readonly Epic172Step0E2EEntry[]
