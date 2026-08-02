@@ -31,8 +31,11 @@ describe('Epic 172 S6 release adapter', () => {
   it('[scenarioId=epic-172.signed-evidence-step0-adapter] rejects transition without database URL', async () => {
     delete process.env.FORGE_EPIC_172_TRANSITION_DATABASE_URL
     await expect(executeEpic172S6AtomicTransition({
-      authorizationAttemptId: 'auth-1', buildSha: 'sha', consumerNode: 's6_pre_activation_green',
-      controllerIdentity: 'ctrl', operationId: 'op-1', reviewedSha: 'reviewed-sha',
+      authorizationId: '11111111-1111-4111-8111-111111111111',
+      receiptIds: ['22222222-2222-4222-8222-222222222222'],
+      consumerNode: 's6_pre_activation_green',
+      transitionIdentityDigest: `sha256:${'a'.repeat(64)}`,
+      operationId: 's6-transition-test',
     })).rejects.toThrow('FORGE_EPIC_172_TRANSITION_DATABASE_URL')
   })
 })

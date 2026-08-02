@@ -8,6 +8,7 @@ import {
   verifyEpic172ReleaseEvidence,
   verifyEpic172TransitionAuthorization,
 } from './epic-172-release-verifier'
+import { runEpic172AuthorizedTransition } from './epic-172-release-recorder'
 
 export const EPIC_172_S6_OWNED_NODE_IDS = Object.freeze([
   's6_pre_activation_green',
@@ -82,47 +83,42 @@ export function verifyEpic172S6TransitionAuthorizationInput(
 }
 
 /**
- * Concrete called function that performs the atomic S6 DB transition using the
- * fixed forge_release_transition principal. No adapter indirection; this is the
- * single production implementation called by the release controller.
+ * The durable S6 boundary is consumption of its already-verified release
+ * receipts. The generic recorder owns the transaction: it authenticates the
+ * dedicated transition login, re-verifies retained signed inputs, consumes the
+ * exact receipt set, and checks authorization liveness before committing.
  */
 export async function executeEpic172S6AtomicTransition(input: {
-  authorizationAttemptId: string
-  buildSha: string
+  authorizationId: string
+  receiptIds: readonly string[]
   consumerNode: Epic172S6OwnedNodeId
-  controllerIdentity: string
+  transitionIdentityDigest: string
   operationId: string
-  reviewedSha: string
-}): Promise<{ receiptId: string; transitionIdentityDigest: string }> {
+}): Promise<{
+  consumedReceiptIds: readonly string[]
+  consumptionIds: readonly string[]
+  transitionIdentityDigest: string
+}> {
   assertEpic172S6ReleaseOrderOwnership()
 
   const dbUrl = process.env.FORGE_EPIC_172_TRANSITION_DATABASE_URL
   if (!dbUrl) throw new Error('FORGE_EPIC_172_TRANSITION_DATABASE_URL is required.')
 
-  const { default: postgres } = await import('postgres')
-  const sql = postgres(dbUrl, { max: 1, onnotice: () => {}, transform: { undefined: null } })
+  const transition = await runEpic172AuthorizedTransition({
+    databaseUrl: dbUrl,
+    authorizationId: input.authorizationId,
+    receiptIds: input.receiptIds,
+    consumerNode: input.consumerNode,
+    transitionIdentityDigest: input.transitionIdentityDigest,
+    operationId: input.operationId,
+    // S6 has no separate SQL state transition. Receipt consumption is its
+    // durable boundary, so this callback intentionally adds no extra write.
+    applyTransition: async () => undefined,
+  })
 
-  try {
-    await sql.unsafe('set local role forge_release_transition')
-
-    const result = await sql.begin(async (tx) => {
-      const rows = await tx<{ receipt_id: string; transition_identity_digest: string }[]>`
-        select receipt_id, transition_identity_digest
-        from forge.lock_epic_172_s3_completion_v1(
-          ${input.operationId}::uuid,
-          ${input.authorizationAttemptId}::uuid,
-          ${input.controllerIdentity}::uuid
-        )
-      `
-      if (!rows.length) throw new Error('S6 transition failed: no receipt returned.')
-      return rows[0]
-    })
-
-    return {
-      receiptId: result.receipt_id,
-      transitionIdentityDigest: result.transition_identity_digest,
-    }
-  } finally {
-    await sql.end({ timeout: 5 })
+  return {
+    consumedReceiptIds: [...input.receiptIds],
+    consumptionIds: transition.consumptions.map((consumption) => consumption.consumptionId),
+    transitionIdentityDigest: input.transitionIdentityDigest,
   }
 }
