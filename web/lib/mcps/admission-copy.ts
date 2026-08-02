@@ -128,6 +128,84 @@ export type LocalEffectRecoveryRequestIdentity = Readonly<{
   evidenceFingerprint: string
 }>
 
+/**
+ * The task-detail page receives this compact DTO from the S5 presentation
+ * route. It is deliberately a wire contract rather than a second recovery
+ * state machine: the server decides whether an action exists, and the browser
+ * can only echo its exact endpoint identity with this observation's freshness
+ * fingerprint.
+ */
+export type CanonicalMcpOperatorAction = Readonly<{
+  action:
+    | 'review_local_changes'
+    | 'acknowledge_possible_local_invocation'
+    | 'retry_local_execution'
+    | 'decline_local_retry'
+    | 'acknowledge_possible_submission'
+    | 'retry_execution'
+    | 'decline_packet_recovery'
+  label: string
+  identity: LocalEffectRecoveryRequestIdentity | PacketRecoveryRequestIdentity
+}>
+
+export type CanonicalMcpRecoveryPresentation = Readonly<{
+  workPackageId: string
+  title: string
+  headline: string
+  body: string
+  badgeText: string
+  tone: AdmissionPresentation['tone']
+  actions: readonly CanonicalMcpOperatorAction[]
+}>
+
+export type CanonicalMcpAdmissionPresentation = Readonly<{
+  workPackageId: string
+  title: string
+  requiresMcp: boolean
+  decision: 'approved' | 'denied' | 'unavailable'
+}>
+
+export type CanonicalMcpTerminalPresentation = Readonly<{
+  workPackageId: string
+  title: string
+  state: 'terminal' | 'unavailable'
+  outcome: 'succeeded' | 'failed' | null
+  terminalAt: string | null
+}>
+
+export type CanonicalMcpTaskPresentation = Readonly<{
+  schemaVersion: 1
+  computedAt: string
+  freshnessFingerprint: string
+  taskId: string
+  localEvidenceAvailable: boolean
+  admission: readonly CanonicalMcpAdmissionPresentation[]
+  recoveries: readonly CanonicalMcpRecoveryPresentation[]
+  terminals: readonly CanonicalMcpTerminalPresentation[]
+}>
+
+/** Browser observations expire quickly so a delayed tab cannot submit stale evidence. */
+export const CANONICAL_MCP_PRESENTATION_MAX_AGE_MS = 30_000
+
+export function canonicalMcpPresentationAgeMs(
+  presentation: Pick<CanonicalMcpTaskPresentation, 'computedAt'>,
+  now = Date.now(),
+): number | null {
+  const computedAt = Date.parse(presentation.computedAt)
+  if (!Number.isFinite(computedAt) || !Number.isFinite(now)) return null
+  const age = now - computedAt
+  // A browser clock behind the server observation cannot safely authorize an action.
+  return age < 0 ? null : age
+}
+
+export function canonicalMcpPresentationIsFresh(
+  presentation: Pick<CanonicalMcpTaskPresentation, 'computedAt'>,
+  now = Date.now(),
+): boolean {
+  const age = canonicalMcpPresentationAgeMs(presentation, now)
+  return age !== null && age <= CANONICAL_MCP_PRESENTATION_MAX_AGE_MS
+}
+
 export type PresentationCta =
   | { kind: 'scroll'; label: string; targetId: string }
   | { kind: 'link'; label: string; href: string }
@@ -1506,4 +1584,129 @@ export function catalogMcpPresentationFromUnknown(
 ): McpSurfacePresentation {
   if (!isRecord(value) || !isRecord(value.runtime)) return unavailablePresentation()
   return catalogMcpPresentation(value as CatalogMcpPresentationInput)
+}
+
+const CANONICAL_OPERATOR_ACTIONS = new Set<CanonicalMcpOperatorAction['action']>([
+  'review_local_changes',
+  'acknowledge_possible_local_invocation',
+  'retry_local_execution',
+  'decline_local_retry',
+  'acknowledge_possible_submission',
+  'retry_execution',
+  'decline_packet_recovery',
+])
+
+function actionMatchesIdentity(action: CanonicalMcpOperatorAction['action'], schemaVersion: number): boolean {
+  return schemaVersion === 1
+    ? LOCAL_EFFECT_RECOVERY_ACTIONS.includes(action as typeof LOCAL_EFFECT_RECOVERY_ACTIONS[number])
+    : schemaVersion === 2 && PACKET_ISSUANCE_RECOVERY_ACTIONS.includes(action as typeof PACKET_ISSUANCE_RECOVERY_ACTIONS[number])
+}
+
+/** The DTO action name and its evidence family are a single closed contract. */
+export function canonicalMcpOperatorActionIsBound(action: CanonicalMcpOperatorAction): boolean {
+  return actionMatchesIdentity(action.action, action.identity.schemaVersion)
+}
+
+function canonicalActionFromUnknown(value: unknown): CanonicalMcpOperatorAction | null {
+  if (!isRecord(value) || !CANONICAL_OPERATOR_ACTIONS.has(value.action as CanonicalMcpOperatorAction['action'])) return null
+  if (typeof value.label !== 'string' || value.label.length === 0 || value.label.length > 160 || !isRecord(value.identity)) return null
+  const identity = value.identity
+  if (
+    identity.schemaVersion === 1 &&
+    actionMatchesIdentity(value.action as CanonicalMcpOperatorAction['action'], 1) &&
+    UUID.test(identity.localRunEvidenceId as string) &&
+    FINGERPRINT.test(identity.evidenceFingerprint as string)
+  ) {
+    return {
+      action: value.action as CanonicalMcpOperatorAction['action'],
+      label: value.label,
+      identity: {
+        schemaVersion: 1,
+        localRunEvidenceId: identity.localRunEvidenceId as string,
+        evidenceFingerprint: identity.evidenceFingerprint as string,
+      },
+    }
+  }
+  if (
+    identity.schemaVersion === 2 &&
+    actionMatchesIdentity(value.action as CanonicalMcpOperatorAction['action'], 2) &&
+    UUID.test(identity.priorRuntimeAuditId as string) &&
+    FINGERPRINT.test(identity.markerFingerprint as string)
+  ) {
+    return {
+      action: value.action as CanonicalMcpOperatorAction['action'],
+      label: value.label,
+      identity: {
+        schemaVersion: 2,
+        priorRuntimeAuditId: identity.priorRuntimeAuditId as string,
+        markerFingerprint: identity.markerFingerprint as string,
+      },
+    }
+  }
+  return null
+}
+
+/** Returns null for any incomplete or mismatched server DTO, so controls fail closed. */
+export function canonicalMcpTaskPresentationFromUnknown(value: unknown): CanonicalMcpTaskPresentation | null {
+  if (!isRecord(value) || value.schemaVersion !== 1 || !UUID.test(value.taskId as string)) return null
+  if (typeof value.computedAt !== 'string' || Number.isNaN(Date.parse(value.computedAt))) return null
+  if (!FINGERPRINT.test(value.freshnessFingerprint as string) || typeof value.localEvidenceAvailable !== 'boolean') return null
+  if (!Array.isArray(value.admission) || !Array.isArray(value.recoveries) || !Array.isArray(value.terminals)) return null
+
+  const admission: CanonicalMcpAdmissionPresentation[] = []
+  for (const item of value.admission) {
+    if (!isRecord(item) || !UUID.test(item.workPackageId as string) || typeof item.title !== 'string' || typeof item.requiresMcp !== 'boolean') return null
+    if (!['approved', 'denied', 'unavailable'].includes(item.decision as string)) return null
+    admission.push({
+      workPackageId: item.workPackageId as string,
+      title: item.title,
+      requiresMcp: item.requiresMcp,
+      decision: item.decision as CanonicalMcpAdmissionPresentation['decision'],
+    })
+  }
+
+  const recoveries: CanonicalMcpRecoveryPresentation[] = []
+  for (const recovery of value.recoveries) {
+    if (!isRecord(recovery) || !UUID.test(recovery.workPackageId as string)) return null
+    if (typeof recovery.title !== 'string' || typeof recovery.headline !== 'string' || typeof recovery.body !== 'string' || typeof recovery.badgeText !== 'string') return null
+    if (!['neutral', 'positive', 'warning', 'danger'].includes(recovery.tone as string) || !Array.isArray(recovery.actions)) return null
+    const actions = recovery.actions.map(canonicalActionFromUnknown)
+    if (actions.some((action) => action === null)) return null
+    recoveries.push({
+      workPackageId: recovery.workPackageId as string,
+      title: recovery.title,
+      headline: recovery.headline,
+      body: recovery.body,
+      badgeText: recovery.badgeText,
+      tone: recovery.tone as AdmissionPresentation['tone'],
+      actions: actions as CanonicalMcpOperatorAction[],
+    })
+  }
+
+  const terminals: CanonicalMcpTerminalPresentation[] = []
+  for (const terminal of value.terminals) {
+    if (!isRecord(terminal) || !UUID.test(terminal.workPackageId as string)) return null
+    if (typeof terminal.title !== 'string' || !['terminal', 'unavailable'].includes(terminal.state as string)) return null
+    if (terminal.outcome !== null && terminal.outcome !== 'succeeded' && terminal.outcome !== 'failed') return null
+    if (terminal.terminalAt !== null && (typeof terminal.terminalAt !== 'string' || Number.isNaN(Date.parse(terminal.terminalAt)))) return null
+    if (terminal.state === 'terminal' && (terminal.outcome === null || terminal.terminalAt === null)) return null
+    if (terminal.state === 'unavailable' && (terminal.outcome !== null || terminal.terminalAt !== null)) return null
+    terminals.push({
+      workPackageId: terminal.workPackageId as string,
+      title: terminal.title,
+      state: terminal.state as CanonicalMcpTerminalPresentation['state'],
+      outcome: terminal.outcome as CanonicalMcpTerminalPresentation['outcome'],
+      terminalAt: terminal.terminalAt as string | null,
+    })
+  }
+  return {
+    schemaVersion: 1,
+    computedAt: value.computedAt,
+    freshnessFingerprint: value.freshnessFingerprint as string,
+    taskId: value.taskId as string,
+    localEvidenceAvailable: value.localEvidenceAvailable,
+    admission,
+    recoveries,
+    terminals,
+  }
 }
