@@ -25,7 +25,7 @@ psql "${DATABASE_URL}" \
 
 echo 'Bootstrapping the versioned 0026 owner handoff and applying the normal migrator.'
 npm run protocol:bootstrap-epic-172-s3-release-owner
-npm run db:migrate
+npx tsx scripts/ci/migrate-through-0026.ts
 assert_upgrade_state
 migration_count_before_rerun="$(
   psql "${DATABASE_URL}" --no-align --tuples-only \
@@ -33,7 +33,7 @@ migration_count_before_rerun="$(
 )"
 
 echo 'Re-running the normal migrator to prove upgrade idempotency.'
-npm run db:migrate
+npx tsx scripts/ci/migrate-through-0026.ts
 assert_upgrade_state
 migration_count_after_rerun="$(
   psql "${DATABASE_URL}" --no-align --tuples-only \

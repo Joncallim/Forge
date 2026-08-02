@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
+import fs from 'node:fs'
+import path from 'node:path'
 
 vi.mock('next/navigation', () => ({
   useParams: vi.fn(),
@@ -32,6 +34,21 @@ import {
 } from '@/app/dashboard/tasks/[id]/page'
 
 describe('task page retry handoff controls', () => {
+  it('loads authorized legacy clarification text when protected history has no plan version', () => {
+    const source = fs.readFileSync(
+      path.join(process.cwd(), 'app/dashboard/tasks/[id]/page.tsx'),
+      'utf8',
+    )
+    const loader = source.slice(
+      source.indexOf('const loadClarificationHistory'),
+      source.indexOf('const loadTask = useCallback'),
+    )
+    expect(loader).toContain('if (!planVersion)')
+    expect(loader).toContain('fetch(`/api/tasks/${taskId}/questions`)')
+    expect(loader).toContain('setClarificationQuestions(body.questions ?? [])')
+    expect(loader).toContain('fetch(`/api/tasks/${taskId}/architect-plan-history/${planVersion}`)')
+  })
+
   it('omits a pointer for D1 and preserves the exact D1 tuple for D2 reapproval', () => {
     expect(filesystemGrantExpectedPointerFromState({
       currentDecision: null,
@@ -71,15 +88,14 @@ describe('task page retry handoff controls', () => {
     expect(canRetryHandoffForTaskStatus('awaiting_review', false)).toBe(false)
   })
 
-  it('shows stop only for active tasks and never offers deletion', () => {
+  it('shows stop only for active tasks and never offers deletion for non-terminal', () => {
     expect(canStopTaskStatus('running')).toBe(true)
     expect(canStopTaskStatus('approved')).toBe(true)
     expect(canStopTaskStatus('failed')).toBe(false)
     expect(canStopTaskStatus('cancelled')).toBe(false)
-    expect(canDeleteTaskStatus('running')).toBe(false)
-    expect(canDeleteTaskStatus('approved')).toBe(false)
-    expect(canDeleteTaskStatus('failed')).toBe(false)
-    expect(canDeleteTaskStatus('cancelled')).toBe(false)
+    // Deletion is never offered, for any status: the retention contract answers
+    // 409 for terminal tasks too, so a Delete control could only ever fail.
+    expect(canDeleteTaskStatus()).toBe(false)
   })
 
   it('finds required filesystem grants that still need explicit approval', () => {
@@ -294,6 +310,8 @@ describe('task page Workforce beta presentation helpers', () => {
         commandResults: [{ command: ['npm', 'test'], exitCode: 0 }],
         files: ['src/app.tsx'],
         generatedBy: 'work-package-executor',
+        hostRepositoryWritePaths: ['src/app.tsx'],
+        hostRepositoryWrites: true,
         sandboxPath: '/repo/.forge/task-runs/task-1/pkg-1',
         validationStatus: 'passed',
         workPackageId: 'pkg-1',
@@ -306,16 +324,18 @@ describe('task page Workforce beta presentation helpers', () => {
       commandCount: 1,
       fileCount: 1,
       files: ['src/app.tsx'],
-      hostRepositoryWritePaths: [],
-      hostRepositoryWrites: false,
       sandboxPath: '/repo/.forge/task-runs/task-1/pkg-1',
       validationStatus: 'passed',
     }])
-    expect(workforceExecutionSummary({
+    const summary = workforceExecutionSummary({
       artifacts: [sandboxArtifact],
       runs: [],
       workPackages: [packageBase],
-    }).mode).toBe('sandbox_output')
+    })
+    expect(summary.mode).toBe('sandbox_output')
+    expect(summary.detail).toContain('apply accepted changes manually')
+    expect(summary.detail).not.toContain('host-write')
+    expect(summary.detail).not.toContain('applied')
   })
 
   it('merges streamed runs with initial DB runs while preserving package execution fields', () => {

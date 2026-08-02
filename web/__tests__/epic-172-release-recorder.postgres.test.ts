@@ -13,6 +13,7 @@ import {
   getEpic172RequiredEvidenceNames,
   type Epic172ReleaseNodeId,
 } from '@/lib/mcps/epic-172-release-order'
+import { executeEpic172S6AtomicTransition } from '@/lib/mcps/epic-172-s6-release-adapter'
 import {
   activateEpic172ReleaseSigner,
   completeEpic172S3ReleaseTransition,
@@ -644,23 +645,32 @@ describe.skipIf(!hasPostgresFixture)('Epic 172 release recorder PostgreSQL contr
     })
   })
 
-  it('atomically consumes both final-readiness receipts with one race winner', async () => {
+  it('executes the S6 adapter under its dedicated principal with atomic final-readiness consumption', async () => {
     const receiptIds = await seedFinalReadinessSources()
     const authorization = makeFinalReadinessAuthorization(receiptIds)
     await recordAuthorization(authorization)
+    expect(authorization.targetNode).toBe('s5_s6_release_ready')
     const transitionInput = {
-      databaseUrl: TRANSITION_URL!,
       receiptIds,
       authorizationId: authorization.authorizationId,
-      consumerNode: authorization.targetNode,
+      consumerNode: 's5_s6_release_ready' as const,
       transitionIdentityDigest: authorization.transitionIdentityDigest,
       operationId: authorization.operationId,
     }
+    process.env.FORGE_EPIC_172_TRANSITION_DATABASE_URL = TRANSITION_URL!
 
-    await expect(runEpic172AuthorizedTransition({
+    const [identity] = await transition<{ sessionUser: string; currentUser: string }[]>`
+      select session_user as "sessionUser", current_user as "currentUser"
+    `
+    expect(identity).toEqual({
+      sessionUser: 'forge_release_transition',
+      currentUser: 'forge_release_transition',
+    })
+
+    await expect(executeEpic172S6AtomicTransition({
       ...transitionInput,
-      applyTransition: async () => { throw new Error('injected final-readiness failure') },
-    })).rejects.toThrow(/injected final-readiness failure/)
+      transitionIdentityDigest: `sha256:${'f'.repeat(64)}`,
+    })).rejects.toThrow()
     const [{ afterRollback }] = await transition<{ afterRollback: number }[]>`
       select count(*)::integer as "afterRollback"
       from public.forge_epic_172_release_evidence_consumptions
@@ -669,14 +679,15 @@ describe.skipIf(!hasPostgresFixture)('Epic 172 release recorder PostgreSQL contr
     expect(afterRollback).toBe(0)
 
     const outcomes = await Promise.allSettled([
-      runEpic172AuthorizedTransition({ ...transitionInput, applyTransition: async () => 'first' }),
-      runEpic172AuthorizedTransition({ ...transitionInput, applyTransition: async () => 'second' }),
+      executeEpic172S6AtomicTransition(transitionInput),
+      executeEpic172S6AtomicTransition(transitionInput),
     ])
     const fulfilled = outcomes.filter((outcome) => outcome.status === 'fulfilled')
     expect(fulfilled).toHaveLength(1)
     expect(outcomes.filter((outcome) => outcome.status === 'rejected')).toHaveLength(1)
     if (fulfilled[0]?.status !== 'fulfilled') throw new Error('expected one final-readiness race winner')
-    expect(fulfilled[0]?.value.consumptions).toHaveLength(2)
+    expect(fulfilled[0]?.value.consumedReceiptIds).toEqual(receiptIds)
+    expect(fulfilled[0]?.value.consumptionIds).toHaveLength(2)
 
     const committed = await transition<{ receiptId: string }[]>`
       select receipt_id::text as "receiptId"

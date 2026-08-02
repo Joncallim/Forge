@@ -9,13 +9,12 @@ Forge is a Next.js app with a background worker. The dashboard records what the
 operator wants. The worker does the queued work and saves evidence for review.
 
 The current worker starts with the Architect planning stage. Workforce data
-structures now exist for work packages, harnesses, approval gates, and VCS
-summaries. Work-package handoff, sequential specialist execution, and local
-repository edits are default-on unless explicitly disabled. Executable packages
-may receive bounded read-only host-repository context. Generated files are first
-written to per-package sandboxes under
-`.forge/task-runs/<task-id>/<work-package-id>/attempt-<attempt-number>/`, then
-repository-affecting files are applied to the local project after the package execution step.
+structures now exist for work packages, harnesses, approval gates, and version
+control summaries. Work-package handoff is available after approval.
+Specialist execution and file materialization are currently unavailable because
+Forge does not yet have an operating-system-enforced confined writer. The
+normal path produces handoff artifacts for review only. Direct host repository
+writes remain unavailable.
 Forge still does not grant MCP runtime access to specialists, create branches or
 commits, open pull requests, merge work, run autonomous reviewer agents, or run
 specialists in parallel.
@@ -56,9 +55,9 @@ back through the same provider interface used by the worker. The currently wired
 Agent Client Protocol adapters wrap local tools such as Codex CLI and Claude
 Code; the underlying CLI must already be installed, authenticated, and runnable
 on the worker host. Architect ACP calls run in an isolated runtime directory.
-Executable work-package ACP calls are enabled after task approval. ACP adapters
-are local processes, not OS-confined sandboxes. Operators can opt out with
-`FORGE_ACP_WORK_PACKAGE_EXECUTION=0` when that risk is not acceptable. See [ACP
+Specialist ACP execution is currently unavailable. The ACP flag is reserved
+and cannot override the missing confined writer. ACP adapters are local
+processes, not OS-confined sandboxes. See [ACP
 and the Zed connector](acp-zed-connector.md).
 
 ## Local Development
@@ -71,6 +70,31 @@ npm run db:migrate
 npm run db:seed-agents
 npm run dev
 ```
+
+### PostgreSQL proof commands
+
+The ordinary zero-skip unit command excludes the database-backed S4 file so it
+does not reuse the release-recorder database:
+
+```bash
+npm run test:unit:zero-skip
+```
+
+The mandatory S4 proof must use a freshly migrated database and all six
+dedicated URLs (`FORGE_S4_POSTGRES_TEST_DATABASE_URL`,
+`FORGE_EPIC_172_TEST_APP_DATABASE_URL`, `FORGE_PACKET_ISSUER_DATABASE_URL`,
+`FORGE_ARCHITECT_PLAN_WRITER_DATABASE_URL`,
+`FORGE_ARCHITECT_PLAN_RESOLVER_DATABASE_URL`, and
+`FORGE_ARCHITECT_PLAN_HISTORY_READER_DATABASE_URL`). CI runs:
+
+```bash
+FORGE_S4_REQUIRE_POSTGRES_TEST=1 npm run test:mcp:s4-postgres -- --reporter=line
+```
+
+The command fails when required URLs are missing. CI also fails if the Vitest
+report contains a skipped S4 test or does not report a passing test. This is a
+database-boundary regression proof, not proof that every production path is
+safe.
 
 Common commands:
 
@@ -152,8 +176,8 @@ POST /api/tasks
   -> approval job releases ready work packages
   -> MCP/capability broker validates the next handoff before ready/claim
   -> execution reads bounded host context, writes generated output to
-     `.forge/task-runs/<task-id>/<work-package-id>/attempt-<attempt-number>/`,
-     and applies local repository edits unless `FORGE_HOST_REPOSITORY_WRITES=0`
+     `.forge/task-runs/<task-id>/<work-package-id>/attempt-<attempt-number>/`
+     for review and manual application
   -> manual package QA/Reviewer/Security review gates complete when required
   -> task completes after all work packages and review gates are complete
 ```
@@ -174,20 +198,20 @@ Feature flag defaults:
 |---|---|---|
 | `FORGE_WORKFORCE_MATERIALIZATION` | enabled | Set `0` or `false` to skip durable work-package/gate records. |
 | `FORGE_WORK_PACKAGE_HANDOFF` | enabled | Set `0` or `false` to stop package handoff claims. |
-| `FORGE_WORK_PACKAGE_EXECUTION` | enabled | Set `0`, `false`, `off`, `no`, or `disabled` to stop specialist package execution and create handoff artifacts only. |
-| `FORGE_HOST_REPOSITORY_WRITES` | enabled | Set `0`, `false`, `off`, `no`, or `disabled` to keep generated files sandbox-only and skip local project edits. |
-| `FORGE_ACP_WORK_PACKAGE_EXECUTION` | enabled | Set `0`, `false`, `off`, `no`, or `disabled` to block ACP package execution when local adapter process access is not acceptable. |
+| `FORGE_WORK_PACKAGE_EXECUTION` | reserved/unavailable | Does not enable specialist execution today; the normal path creates handoff artifacts only. |
+| `FORGE_HOST_REPOSITORY_WRITES` | unavailable | Leave unset or disabled. Enable values still fail closed because path validation is not an operating-system sandbox. |
+| `FORGE_ACP_WORK_PACKAGE_EXECUTION` | reserved/unavailable | Does not enable ACP package execution today; a real confined writer is required first. |
 | `FORGE_RUNNING_WORK_PACKAGE_STALE_SECONDS` | `900` | Recovery window before a retry marks an interrupted running work package blocked and starts the next eligible attempt. |
 
 ### Executable Workforce Beta
 
-`FORGE_WORK_PACKAGE_EXECUTION=0` changes only the final package execution step:
-approval records reviewable handoff artifacts but does not call a specialist
-package model. `FORGE_HOST_REPOSITORY_WRITES=0` still lets package models run,
-but keeps generated files under `.forge/task-runs` instead of applying them to
-the local project.
+The current final package step is handoff-only. Approval records reviewable
+handoff artifacts and does not call a specialist package model. An enable value
+such as `FORGE_WORK_PACKAGE_EXECUTION=1` is reserved and cannot override the
+unavailable materialization boundary.
 
-When execution is enabled:
+When a real confined writer is available in a future release, the intended
+execution flow is:
 
 1. Forge claims at most one eligible non-review specialist package at a time
    after plan approval and broker admission.
@@ -205,13 +229,11 @@ When execution is enabled:
    `npm run lint`. In the beta, Forge performs static validation of the
    generated sandbox output for those command labels, including script safety,
    placeholder checks, and JavaScript syntax checks; it does not run arbitrary
-   package scripts. Repository-affecting packages must include at least one
-   validation command before Forge applies generated files to the host
-   repository.
-8. If host repository writes are enabled, Forge applies generated files only
-   after sandbox validation passes and the host working tree is clean. Forge
-   writes each file through a temporary sibling file and atomic rename; a
-   mid-batch failure records which paths were already written in the error.
+   package scripts.
+8. Direct host repository application is unavailable. If an operator requests
+   it with an enable value, Forge preserves the sandbox output and returns a
+   fail-closed unavailable result. A hardened repository-write adapter is
+   required before this boundary can change.
 9. Package artifacts record the generated file list, sandbox path, command
    results, model/provider snapshot, and review source artifact.
 
@@ -275,12 +297,17 @@ forge:approvals:dead
 The worker uses PostgreSQL as the source of truth. Redis carries wake-up jobs,
 retry timing, and dead-letter transport.
 
-## ACP Provider Path
+## ACP Provider Path (planned execution surface)
 
 ACP is the Agent Client Protocol. Forge uses it to call local coding agents
 through adapter processes instead of direct cloud API calls.
 
-Current ACP flow:
+The provider and health-check code exists, but specialist ACP execution is
+currently unavailable. The following is the planned flow after Forge has a
+real operating-system-enforced confined writer; the current task path remains
+handoff-only.
+
+Planned ACP flow:
 
 ```text
 getModel(providerConfigId, { cwd })

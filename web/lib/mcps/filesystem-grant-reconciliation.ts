@@ -619,6 +619,8 @@ async function applyCanonicalProjection(input: {
   taskProjectionScopeById: ReadonlyMap<string, string>
   transitionAuthorityByPackageId?: ReadonlyMap<string, OperatorHoldProjectionAuthority>
   forcePackageIds?: ReadonlySet<string>
+  /** Internal root-journal mode; never sourced from an operator request. */
+  suppressPhasePersistence?: boolean
   tx: GrantTransaction
 }): Promise<Set<string>> {
   const recoveredTaskIds = new Set<string>()
@@ -641,9 +643,11 @@ async function applyCanonicalProjection(input: {
     if (!check.blocked) {
       if (!parsedMarker && !forcePersist) continue
       const grant = projectFilesystemGrantFromAuthority(input.projectAuthority)
-      const effective = grant
-        ? phasesWithEffective(pkg.metadata, projectFilesystemEffectivePhase(grant))
-        : forcePersist ? currentPhases : undefined
+      const effective = input.suppressPhasePersistence
+        ? undefined
+        : grant
+          ? phasesWithEffective(pkg.metadata, projectFilesystemEffectivePhase(grant))
+          : forcePersist ? currentPhases : undefined
       const recovering = Boolean(parsedMarker)
       const [updated] = await input.tx
         .update(workPackages)
@@ -806,6 +810,7 @@ async function reconcileLockedProjectRows(input: {
   projectAuthority: ProjectFilesystemDecisionAuthority | null
   taskRows: readonly LockedTask[]
   transitionAuthorityByPackageId?: ReadonlyMap<string, OperatorHoldProjectionAuthority>
+  suppressPhasePersistence?: boolean
   trigger: FilesystemGrantProjectReconciliationTrigger
   tx: GrantTransaction
   now: Date
@@ -830,6 +835,7 @@ async function reconcileLockedProjectRows(input: {
       input.taskRows.map((task) => [task.id, task.localProjectionScopeState]),
     ),
     transitionAuthorityByPackageId: input.transitionAuthorityByPackageId,
+    suppressPhasePersistence: input.suppressPhasePersistence,
     tx: input.tx,
   })
   for (const task of input.taskRows) {
@@ -864,6 +870,8 @@ export async function reconcileFilesystemGrantsForProject(
     lockedProject: LockedProject
     nextMcpConfig: ProjectMcpConfig
     trigger: FilesystemGrantProjectReconciliationTrigger
+    suppressPhasePersistence?: boolean
+    rootReconciliationContext?: { operationId: string; actorId: string; generation: string; projectId: string }
   },
 ): Promise<FilesystemGrantProjectReconciliationResult> {
   if (!input.actorId.trim()) throw new Error('Grant reconciliation requires an actor.')
@@ -896,18 +904,23 @@ export async function reconcileFilesystemGrantsForProject(
       .where(inArray(workPackages.taskId, taskRows.map((task) => task.id)))
       .orderBy(workPackages.id)
       .for('update')
-  const packageDecisionRows = await tx.select()
+  if (input.rootReconciliationContext) {
+    const context = input.rootReconciliationContext
+    if (context.projectId !== input.lockedProject.id) throw httpError('Root reconciliation context project changed.', 409)
+    await tx.execute(sql`select forge.lock_project_root_reconciliation_authority_v1(${context.operationId}::uuid, ${context.actorId}::uuid, ${context.generation}::bigint, ${context.projectId}::uuid)`)
+  }
+  const packageDecisionQuery = tx.select()
     .from(filesystemMcpGrantApprovals)
     .where(eq(filesystemMcpGrantApprovals.projectId, input.lockedProject.id))
     .orderBy(filesystemMcpGrantApprovals.id)
-    .for('update')
-  const projectDecisionRows = await tx.select().from(projectFilesystemGrantDecisions)
+  const packageDecisionRows = await (input.rootReconciliationContext ? packageDecisionQuery : packageDecisionQuery.for('update'))
+  const projectDecisionQuery = tx.select().from(projectFilesystemGrantDecisions)
     .where(eq(projectFilesystemGrantDecisions.projectId, input.lockedProject.id))
     .orderBy(projectFilesystemGrantDecisions.id)
-    .for('update')
-  const [projectPointer] = await tx.select().from(projectFilesystemCurrentDecisionPointers)
+  const projectDecisionRows = await (input.rootReconciliationContext ? projectDecisionQuery : projectDecisionQuery.for('update'))
+  const projectPointerQuery = tx.select().from(projectFilesystemCurrentDecisionPointers)
     .where(eq(projectFilesystemCurrentDecisionPointers.projectId, input.lockedProject.id))
-    .for('update')
+  const [projectPointer] = await (input.rootReconciliationContext ? projectPointerQuery : projectPointerQuery.for('update'))
   if (!projectPointer) throw httpError('Project filesystem decision authority is not initialized.', 409)
   const currentProjectDecision = projectDecisionPointerParent(projectPointer, projectDecisionRows)
   if (currentProjectDecision === undefined) {
@@ -915,14 +928,19 @@ export async function reconcileFilesystemGrantsForProject(
   }
   const pointerRows = packageRows.length === 0
     ? []
-    : await tx.select()
+    : await (input.rootReconciliationContext
+      ? tx.select()
       .from(filesystemMcpCurrentDecisionPointers)
       .where(inArray(
         filesystemMcpCurrentDecisionPointers.workPackageId,
         packageRows.map((pkg) => pkg.id),
       ))
       .orderBy(filesystemMcpCurrentDecisionPointers.workPackageId)
-      .for('update')
+      : tx.select()
+      .from(filesystemMcpCurrentDecisionPointers)
+      .where(inArray(filesystemMcpCurrentDecisionPointers.workPackageId, packageRows.map((pkg) => pkg.id)))
+      .orderBy(filesystemMcpCurrentDecisionPointers.workPackageId)
+      .for('update'))
   if (pointerRows.length !== packageRows.length) {
     throw httpError('Filesystem decision authority is not initialized for every package.', 409)
   }
@@ -961,6 +979,7 @@ export async function reconcileFilesystemGrantsForProject(
     projectAuthority: currentProjectDecision ? projectDecisionAuthority(currentProjectDecision) : null,
     taskRows,
     transitionAuthorityByPackageId,
+    suppressPhasePersistence: input.suppressPhasePersistence,
     trigger: input.trigger,
     tx,
   })
@@ -1409,8 +1428,12 @@ export async function mutateTaskFilesystemGrants(input: {
 
 export async function mutateProjectFilesystemGrant(input: {
   actorId: string
+  assertCurrentFilesystemHealth?: (project: LockedProject) => Promise<void>
   capabilities: readonly string[]
   enabled: boolean
+  expectedAuthority?: Pick<ProjectFilesystemDecisionAuthority,
+    'decisionId' | 'grantDecisionRevision' | 'rootBindingRevision' | 'decisionFingerprint' | 'decisionGeneration'
+  > | null
   projectId: string
   reason: string
 }): Promise<{
@@ -1426,6 +1449,23 @@ export async function mutateProjectFilesystemGrant(input: {
       projectWide: true,
       tx,
     })
+    const actualAuthority = locked.projectAuthority
+    const expectedAuthority = input.expectedAuthority
+    if (expectedAuthority !== undefined) {
+      const exactAuthorityMatch = actualAuthority !== null && expectedAuthority !== null &&
+        actualAuthority.decisionId === expectedAuthority.decisionId &&
+        actualAuthority.grantDecisionRevision === expectedAuthority.grantDecisionRevision &&
+        actualAuthority.rootBindingRevision === expectedAuthority.rootBindingRevision &&
+        actualAuthority.decisionFingerprint === expectedAuthority.decisionFingerprint &&
+        actualAuthority.decisionGeneration === expectedAuthority.decisionGeneration
+      if ((actualAuthority === null) !== (expectedAuthority === null) ||
+        (actualAuthority !== null && !exactAuthorityMatch)) {
+        throw httpError('Project filesystem decision changed concurrently. Reload and retry.', 409)
+      }
+    }
+    // The route may have read health before waiting on these locks. Re-read it
+    // after the authority CAS and before appending any immutable decision.
+    await input.assertCurrentFilesystemHealth?.(locked.project)
     const now = await lockedTransactionNow(tx)
     if (locked.project.rootBindingRevision <= BigInt(0)) {
       throw httpError('The project root is not bound to protocol v2. Filesystem decisions remain disabled.', 409)

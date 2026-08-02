@@ -5,10 +5,12 @@ import { publishTaskEvent, type TaskEventPayload } from './events'
 import { sanitizeWorkerMessage } from './redaction'
 import { updateTaskStatusIfCurrent } from './task-state'
 import { convergeRecognizedOperatorHoldTask } from '../lib/mcps/filesystem-grant-reconciliation'
+import { resolveS4ReviewSourceV1 } from '../lib/mcps/review-source-resolver'
 
 export const REVIEW_GATE_TYPES = ['qa_review', 'reviewer_review', 'security_review'] as const
 export type ReviewGateType = typeof REVIEW_GATE_TYPES[number]
 export type ReviewGateDecision = 'completed' | 'needs_rework'
+export type ReviewGateOwnershipOptions = { assertOwned?: () => void }
 export type ReviewRequirement = 'none' | 'qa_only' | 'reviewer_only' | 'both'
 export type ReviewGateRequiredRole = 'qa' | 'reviewer' | 'security'
 
@@ -483,6 +485,7 @@ async function loadPackage(taskId: string, workPackageId: string): Promise<Revie
 }
 
 export async function materializeReviewGatesForWorkPackageCompletion(input: {
+  assertOwned?: () => void
   completeSourceRun?: SourceRunCompletion
   requireExecutionLease?: boolean
   sourceAgentRunId: string
@@ -490,7 +493,9 @@ export async function materializeReviewGatesForWorkPackageCompletion(input: {
   taskId: string
   workPackageId: string
 }): Promise<ReviewGateMaterializationResult> {
+  input.assertOwned?.()
   const pkg = await loadPackage(input.taskId, input.workPackageId)
+  input.assertOwned?.()
   if (!pkg) {
     return { status: 'not_found', packageStatus: null, createdGates: [] }
   }
@@ -503,6 +508,7 @@ export async function materializeReviewGatesForWorkPackageCompletion(input: {
   let materialized: { createdGates: MaterializedGate[]; sourceArtifact: MaterializedSourceArtifact | null }
   try {
     materialized = await db.transaction(async (tx) => {
+    input.assertOwned?.()
     const ownershipGuard = input.requireExecutionLease
       ? [
           eq(workPackages.status, 'running'),
@@ -519,6 +525,7 @@ export async function materializeReviewGatesForWorkPackageCompletion(input: {
       })
       .where(and(eq(workPackages.id, pkg.id), ...ownershipGuard))
       .returning({ id: workPackages.id })
+    input.assertOwned?.()
 
     if (!updatedPackage) {
       throw new ReviewGateMaterializationOwnershipLost()
@@ -535,6 +542,7 @@ export async function materializeReviewGatesForWorkPackageCompletion(input: {
         })
         .where(and(eq(agentRuns.id, input.sourceAgentRunId), eq(agentRuns.status, 'running')))
         .returning({ id: agentRuns.id })
+      input.assertOwned?.()
 
       if (!completedRun) throw new ReviewGateMaterializationOwnershipLost()
 
@@ -547,6 +555,7 @@ export async function materializeReviewGatesForWorkPackageCompletion(input: {
           metadata: input.completeSourceRun.metadata,
         })
         .returning()
+      input.assertOwned?.()
       if (!artifact) throw new ReviewGateMaterializationOwnershipLost()
       sourceArtifact = artifact ?? null
       sourceArtifactId = sourceArtifact?.id ?? null
@@ -571,6 +580,7 @@ export async function materializeReviewGatesForWorkPackageCompletion(input: {
           inArray(approvalGates.gateType, REVIEW_GATE_TYPE_VALUES),
         ),
       )
+    input.assertOwned?.()
 
     // Stale gates from a prior rework cycle (needs_rework/cancelled) must not
     // block re-materialization of a fresh pending gate for the new attempt. A
@@ -603,6 +613,7 @@ export async function materializeReviewGatesForWorkPackageCompletion(input: {
             inArray(approvalGates.gateType, stalePendingGateTypes),
           ),
         )
+      input.assertOwned?.()
     }
 
     const existingGateTypes = new Set(
@@ -636,6 +647,7 @@ export async function materializeReviewGatesForWorkPackageCompletion(input: {
           gateType: approvalGates.gateType,
           title: approvalGates.title,
         })
+      input.assertOwned?.()
 
       if (gate && isReviewGateType(gate.gateType)) {
         inserted.push({
@@ -655,6 +667,7 @@ export async function materializeReviewGatesForWorkPackageCompletion(input: {
   }
   const { createdGates, sourceArtifact } = materialized
 
+  input.assertOwned?.()
   await publishTaskEventBestEffort(input.taskId, 'work_package:status', {
     status: packageStatus,
     updatedAt: now.toISOString(),
@@ -662,6 +675,7 @@ export async function materializeReviewGatesForWorkPackageCompletion(input: {
   })
 
   for (const gate of createdGates) {
+    input.assertOwned?.()
     await publishTaskEventBestEffort(input.taskId, 'approval_gate:created', {
       gateId: gate.id,
       gateType: gate.gateType,
@@ -683,10 +697,11 @@ export async function materializeReviewGatesForWorkPackageCompletion(input: {
   }
 }
 
-export async function completeTaskIfReviewGatesSatisfied(taskId: string): Promise<{
+export async function completeTaskIfReviewGatesSatisfied(taskId: string, options: ReviewGateOwnershipOptions = {}): Promise<{
   status: 'completed' | 'blocked' | 'failed' | 'no_work_packages'
   reason?: string
 }> {
+  options.assertOwned?.()
   const packages = await db
     .select({
       id: workPackages.id,
@@ -695,6 +710,7 @@ export async function completeTaskIfReviewGatesSatisfied(taskId: string): Promis
     .from(workPackages)
     .where(eq(workPackages.taskId, taskId))
     .orderBy(asc(workPackages.sequence), asc(workPackages.createdAt))
+  options.assertOwned?.()
 
   if (packages.length === 0) return { status: 'no_work_packages' }
 
@@ -706,9 +722,12 @@ export async function completeTaskIfReviewGatesSatisfied(taskId: string): Promis
   const failedPackage = packages.find((pkg) => pkg.status === 'failed')
   if (failedPackage) {
     const reason = `Work package ${failedPackage.id} failed and cannot be completed. Resolve the cause and retry the task.`
-    const failed =
-      (await updateTaskStatusIfCurrent(taskId, 'running', 'failed', reason)) ||
-      (await updateTaskStatusIfCurrent(taskId, 'approved', 'failed', reason))
+    options.assertOwned?.()
+    let failed = await updateTaskStatusIfCurrent(taskId, 'running', 'failed', reason)
+    if (!failed) {
+      options.assertOwned?.()
+      failed = await updateTaskStatusIfCurrent(taskId, 'approved', 'failed', reason)
+    }
     return { status: failed ? 'failed' : 'blocked', reason }
   }
 
@@ -732,6 +751,7 @@ export async function completeTaskIfReviewGatesSatisfied(taskId: string): Promis
     .from(approvalGates)
     .where(and(eq(approvalGates.taskId, taskId), inArray(approvalGates.gateType, REVIEW_GATE_TYPE_VALUES)))
     .orderBy(desc(approvalGates.createdAt))
+  options.assertOwned?.()
 
   // Only the latest gate per work package + gate type matters: a rework cycle
   // leaves stale cancelled/completed gates from earlier attempts behind, and
@@ -750,6 +770,7 @@ export async function completeTaskIfReviewGatesSatisfied(taskId: string): Promis
     return { status: 'blocked', reason: `${blockingGate.gateType} gate ${blockingGate.id} is ${blockingGate.status}` }
   }
 
+  options.assertOwned?.()
   const completed = await updateTaskStatusIfCurrent(taskId, 'running', 'completed')
   return completed ? { status: 'completed' } : { status: 'blocked', reason: 'task is no longer running' }
 }
@@ -870,7 +891,7 @@ export async function decideReviewGate(input: {
   const requiredGateTypes = requiredGateTypesForPackage(workPackage ?? null)
 
   const [sourceArtifact] = await db
-    .select({ id: artifacts.id })
+    .select({ id: artifacts.id, content: artifacts.content, metadata: artifacts.metadata })
     .from(artifacts)
     .where(
       and(
@@ -884,6 +905,32 @@ export async function decideReviewGate(input: {
     return {
       status: 'source_artifact_mismatch',
       message: 'Review gate source artifact is not available. Reload the task before deciding this review.',
+    }
+  }
+
+  const protectedReviewSource = sourceArtifact.content === 'Protected review source available through its approval gate.'
+    || (metadataRecord(sourceArtifact.metadata).protectedReviewSource === true)
+  let protectedReviewSourceFingerprint: string | null = null
+  if (protectedReviewSource) {
+    try {
+      const resolved = await resolveS4ReviewSourceV1({ approvalGateId: gate.id })
+      if (
+        resolved.sourceArtifactId !== gate.sourceArtifactId
+        || resolved.sourceAgentRunId !== sourceAgentRunId
+      ) {
+        return {
+          status: 'source_artifact_mismatch',
+          message: 'Review gate source artifact changed. Reload the task before deciding this review.',
+        }
+      }
+      // Content and metadata are purpose-bound and deliberately discarded at
+      // this boundary. Only the safe digest is retained on the gate decision.
+      protectedReviewSourceFingerprint = resolved.contentFingerprint
+    } catch {
+      return {
+        status: 'source_artifact_mismatch',
+        message: 'Review gate source artifact is not available. Reload the task before deciding this review.',
+      }
     }
   }
 
@@ -944,6 +991,7 @@ export async function decideReviewGate(input: {
       decidedAt: now.toISOString(),
       decidedBy: input.userId,
       ...(stampedSecurityReviewPayload ? { securityReview: stampedSecurityReviewPayload } : {}),
+      ...(protectedReviewSourceFingerprint ? { protectedReviewSourceFingerprint } : {}),
       source: 'review-gates',
     }
 

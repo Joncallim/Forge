@@ -27,6 +27,8 @@ import {
   SelectTrigger,
 } from '@/components/ui/select'
 import { MarkdownView } from '@/components/MarkdownView'
+import { McpPresentation } from '@/components/mcps/McpPresentation'
+import { BrandedTerminalJoinView } from '@/components/mcps/BrandedTerminalJoinView'
 import { PlanDiffView } from '@/components/PlanDiffView'
 import { mergeAgentRun, useTaskStream } from '@/hooks/useTaskStream'
 import type { AgentRun, Artifact, TaskQuestion } from '@/hooks/useTaskStream'
@@ -40,7 +42,16 @@ import {
   type McpExecutionDesignMetadata,
 } from '@/lib/mcps/execution-design-metadata'
 import {
-  approvedGrantsForDisplay,
+  admissionPresentationFromUnknown,
+  CANONICAL_MCP_PRESENTATION_MAX_AGE_MS,
+  canonicalMcpOperatorActionIsBound,
+  canonicalMcpPresentationAgeMs,
+  canonicalMcpPresentationIsFresh,
+  canonicalMcpTaskPresentationFromUnknown,
+  type CanonicalMcpOperatorAction,
+  type CanonicalMcpTaskPresentation,
+} from '@/lib/mcps/admission-copy'
+import {
   latestMcpPlanReviewForDisplay,
   mcpCapabilityCeilingForAgent,
   mcpPlanOverlayCount,
@@ -54,6 +65,10 @@ import {
   type WorkforceRecord,
 } from '@/lib/task-artifacts'
 import { acpProviderDisplay } from '@/lib/providers/acp/catalog'
+import {
+  clarificationQuestionsFromHistory,
+  type TaskQuestionSummary,
+} from '@/lib/mcps/clarification-projection'
 
 interface Task {
   id: string
@@ -137,7 +152,13 @@ interface TaskDetailResponse {
   task?: Task | null
   runs?: AgentRun[]
   artifacts?: Artifact[]
-  questions?: TaskQuestion[]
+  questions?: TaskQuestionSummary[]
+  clarification?: {
+    planVersion: string | null
+    questionCount: number
+    openCount: number
+    answeredCount: number
+  }
   attempts?: TaskAttempt[]
   workPackages?: WorkPackage[]
   approvalGates?: ApprovalGate[]
@@ -156,6 +177,7 @@ function statusLabel(status: string): string {
     awaiting_answers: 'Needs answers',
     awaiting_approval: 'Needs approval',
     dead_lettered: 'Stopped after retries',
+    indeterminate: 'Retry status unknown',
     pending: 'Pending execution',
   }
   if (labels[status]) return labels[status]
@@ -524,8 +546,6 @@ type SandboxOutputSummary = {
   commandCount: number
   fileCount: number
   files: string[]
-  hostRepositoryWritePaths: string[]
-  hostRepositoryWrites: boolean
   sandboxPath: string
   validationStatus: string
 }
@@ -537,8 +557,6 @@ function sandboxOutputFromArtifact(artifact: Artifact): SandboxOutputSummary | n
   const sandboxPath = stringField(metadata, ['sandboxPath', 'sandboxRoot', 'outputPath'])
   const files = stringArrayField(metadata, ['files', 'generatedFiles', 'paths'])
   const generatedBy = stringField(metadata, ['generatedBy'])
-  const hostRepositoryWritePaths = stringArrayField(metadata, ['hostRepositoryWritePaths'])
-  const hostRepositoryWrites = booleanField(metadata, ['hostRepositoryWrites', 'repositoryWrites']) === true
   const commandResults = jsonArrayField(metadata, ['commandResults', 'commands'])
   const fileCount = Math.max(0, numberField(metadata, ['fileCount']) ?? files.length)
   const validationStatus = stringField(metadata, ['validationStatus'])
@@ -550,8 +568,6 @@ function sandboxOutputFromArtifact(artifact: Artifact): SandboxOutputSummary | n
     commandCount: commandResults.length,
     fileCount,
     files,
-    hostRepositoryWritePaths,
-    hostRepositoryWrites,
     sandboxPath,
     validationStatus,
   }
@@ -633,7 +649,7 @@ export function workforceExecutionSummary(input: {
   })
   if (runningPackage || runningImplementationRun) {
     return {
-      detail: 'A package execution run is active. Forge writes sandbox artifacts first and may apply successful output to the local project.',
+      detail: 'A package execution run is active. Forge keeps generated files under .forge/task-runs for review and manual application.',
       label: 'Running sandbox package',
       mode: 'running_package',
       status: 'running',
@@ -646,7 +662,7 @@ export function workforceExecutionSummary(input: {
   )
   if (sandboxOutputCount > 0) {
     return {
-      detail: `${pluralize(sandboxOutputCount, 'sandbox output')} generated under .forge/task-runs. Review generated files, host-write metadata, and validation artifacts before approving gates.`,
+      detail: `${pluralize(sandboxOutputCount, 'sandbox output')} generated under .forge/task-runs. Review the files and validation artifacts, then apply accepted changes manually.`,
       label: 'Sandbox output generated',
       mode: 'sandbox_output',
       status: 'completed',
@@ -654,7 +670,7 @@ export function workforceExecutionSummary(input: {
   }
 
   return {
-    detail: 'Ready packages execute by default. Forge keeps generated files under .forge/task-runs and applies successful repository-affecting output to the local project unless host repository writes are disabled.',
+    detail: 'Ready packages execute in sandbox-only mode. Forge keeps generated files under .forge/task-runs for review and manual application; direct host repository writes are unavailable.',
     label: 'Executable packages',
     mode: 'opt_in_sandbox',
     status: 'ready',
@@ -1226,6 +1242,7 @@ function statusBadgeClass(status: string): string {
     case 'skipped':
     case 'validation_skipped':
     case 'warning':
+    case 'indeterminate':
       return 'border-amber-200 bg-amber-50 text-amber-900 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-200'
     case 'completed':
     case 'success':
@@ -1562,8 +1579,10 @@ export function canStopTaskStatus(status: string): boolean {
   return !TERMINAL_TASK_STATUSES.has(status)
 }
 
-export function canDeleteTaskStatus(status: string): boolean {
-  void status
+// Forge retains task, run, review, and immutable filesystem-grant evidence, so
+// `DELETE ?mode=delete` always answers 409 — for terminal statuses too. Never
+// offer a control that cannot succeed: terminal tasks stay in history.
+export function canDeleteTaskStatus(): boolean {
   return false
 }
 
@@ -1641,7 +1660,6 @@ function RetryHandoffControls({
 
 function SandboxOutputList({ outputs }: { outputs: SandboxOutputSummary[] }) {
   if (outputs.length === 0) return null
-  const hostWriteCount = outputs.reduce((count, output) => count + output.hostRepositoryWritePaths.length, 0)
 
   return (
     <div className="mt-3 rounded-md border border-border bg-muted/20 px-3 py-2">
@@ -1650,10 +1668,8 @@ function SandboxOutputList({ outputs }: { outputs: SandboxOutputSummary[] }) {
         <Badge variant="outline" className={statusBadgeClass('completed')}>{outputs.length}</Badge>
       </div>
       <p className="mt-1 text-xs text-muted-foreground">
-        Forge keeps package output under <span className="font-mono">.forge/task-runs</span>
-        {hostWriteCount > 0
-          ? ' and applied the listed host repository files to the local project.'
-          : '. No host repository files were recorded for these artifacts.'}
+        Forge keeps package output under <span className="font-mono">.forge/task-runs</span> for
+        review and manual application. Direct host repository writes are unavailable.
       </p>
       <ul className="mt-2 grid gap-2">
         {outputs.map((output) => (
@@ -1666,9 +1682,6 @@ function SandboxOutputList({ outputs }: { outputs: SandboxOutputSummary[] }) {
                   Validation: {statusLabel(output.validationStatus)}
                 </Badge>
               )}
-              {output.hostRepositoryWrites && (
-                <Badge variant="outline" className={statusBadgeClass('completed')}>host writes</Badge>
-              )}
             </div>
             {output.sandboxPath !== '' && (
               <p className="mt-1 break-all font-mono text-[11px] text-muted-foreground">{output.sandboxPath}</p>
@@ -1676,11 +1689,6 @@ function SandboxOutputList({ outputs }: { outputs: SandboxOutputSummary[] }) {
             {output.files.length > 0 && (
               <p className="mt-1 break-words font-mono text-[11px] text-muted-foreground">
                 {previewList(output.files, 5)}
-              </p>
-            )}
-            {output.hostRepositoryWritePaths.length > 0 && (
-              <p className="mt-1 break-words font-mono text-[11px] text-foreground">
-                Host: {previewList(output.hostRepositoryWritePaths, 5)}
               </p>
             )}
           </li>
@@ -1722,41 +1730,173 @@ function BrokerRetrySummary({ broker }: { broker: WorkforceRecord | null }) {
   )
 }
 
-function McpGrantCards({ grants }: { grants: WorkforceRecord[] }) {
-  if (grants.length === 0) return null
-
+export function CanonicalMcpOperatorPanel({
+  presentation,
+  pending,
+  refreshPending = false,
+  onAction,
+  onRefresh = () => undefined,
+}: {
+  presentation: CanonicalMcpTaskPresentation | null
+  pending: boolean
+  refreshPending?: boolean
+  onAction: (action: CanonicalMcpOperatorAction) => void
+  onRefresh?: () => void
+}) {
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 1000)
+    return () => window.clearInterval(timer)
+  }, [])
+  if (presentation === null) return null
+  const freshnessAge = canonicalMcpPresentationAgeMs(presentation, now)
+  const isFresh = canonicalMcpPresentationIsFresh(presentation, now)
+  const freshnessSeconds = freshnessAge === null ? -1 : Math.floor(freshnessAge / 1000)
+  const terminalPackageIds = new Set(presentation.terminals.map((terminal) => terminal.workPackageId))
+  const actionableRecoveries = presentation.recoveries.filter((recovery) => !terminalPackageIds.has(recovery.workPackageId))
   return (
-    <div>
-      <p className="font-medium text-muted-foreground">Brokered MCP grant decisions</p>
-      <p className="mt-1 text-muted-foreground">
-        No live MCP tool handles are issued in beta. These brokered decisions only shape run-scoped package instructions.
-      </p>
-      <div className="mt-2 grid gap-2">
-        {grants.map((grant, index) => {
-          const mcpId = stringField(grant, ['mcpId', 'id']) || 'MCP'
-          const status = stringField(grant, ['status', 'state']) || 'proposed'
-          const requirement = stringField(grant, ['requirement'])
-          const reason = stringField(grant, ['reason'])
-          const capabilities = stringArrayField(grant, ['capabilities', 'permissions'])
-          const fallback = describeMcpFallback(grant.fallback)
-          return (
-            <div key={recordKey(grant, 'mcp-grant', index)} className="rounded-md border border-border bg-background px-2 py-1.5">
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="font-mono text-xs font-medium text-foreground">{mcpId}</span>
-                <Badge variant="outline" className={statusBadgeClass(status)}>{statusLabel(status)}</Badge>
-                {requirement !== '' && <Badge variant="secondary">{requirement}</Badge>}
-              </div>
-              {reason !== '' && <p className="mt-1 text-muted-foreground">{reason}</p>}
-              {capabilities.length > 0 && (
-                <p className="mt-1 break-words font-mono text-[11px] text-muted-foreground">{capabilities.join(', ')}</p>
-              )}
-              {fallback !== '' && <p className="mt-1 text-muted-foreground">Fallback: {fallback}</p>}
-            </div>
-          )
-        })}
+    <section aria-labelledby="mcp-runtime-state-heading" className="rounded-lg border border-border p-4">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h2 id="mcp-runtime-state-heading" className="text-sm font-medium text-muted-foreground uppercase tracking-wide">
+            MCP runtime state
+          </h2>
+          <p className="mt-1 text-xs text-muted-foreground">
+            This view is one server observation. Recovery controls disappear if its evidence or terminal state cannot be verified.
+          </p>
+        </div>
+        <BrandedTerminalJoinView presentation={isFresh
+          ? { state: 'current', freshnessSeconds, fingerprint: presentation.freshnessFingerprint }
+          : { state: 'terminal_only', message: 'Server observation is stale' }}>
+          Server observed
+        </BrandedTerminalJoinView>
       </div>
-    </div>
+
+      {!isFresh && (
+        <div className="mt-3 flex flex-wrap items-center gap-3">
+          <p role="status" aria-live="polite" className="text-xs text-muted-foreground">
+            This observation is older than {CANONICAL_MCP_PRESENTATION_MAX_AGE_MS / 1000} seconds. Recovery actions are hidden until Forge refreshes it.
+          </p>
+          <Button type="button" size="sm" variant="outline" onClick={onRefresh} disabled={pending || refreshPending} aria-busy={refreshPending}>
+            {refreshPending ? 'Refreshing runtime state…' : 'Refresh runtime state'}
+          </Button>
+        </div>
+      )}
+
+      {!presentation.localEvidenceAvailable && (
+        <p role="status" className="mt-3 text-xs text-muted-foreground">
+          Protected local evidence is unavailable. Recovery actions are hidden until Forge can verify it again.
+        </p>
+      )}
+
+      {presentation.admission.some((item) => item.requiresMcp) && (
+        <dl className="mt-3 grid gap-2 text-xs sm:grid-cols-2" aria-label="Current MCP admission">
+          {presentation.admission.filter((item) => item.requiresMcp).map((item) => (
+            <div key={item.workPackageId} className="rounded-md border border-border bg-muted/20 px-3 py-2">
+              <dt className="font-medium text-foreground">{item.title}</dt>
+              <dd className="mt-1 text-muted-foreground">
+                {item.decision === 'approved' ? 'Current admission approved' : item.decision === 'denied' ? 'Current admission denied' : 'Current admission unavailable'}
+              </dd>
+            </div>
+          ))}
+        </dl>
+      )}
+
+      {actionableRecoveries.length > 0 && (
+        <div className="mt-3 grid gap-2">
+          {actionableRecoveries.map((recovery) => {
+            const recoveryActions = isFresh ? recovery.actions.filter(canonicalMcpOperatorActionIsBound) : []
+            const headingId = `mcp-recovery-${recovery.workPackageId}-heading`
+            return (
+              <section key={`${recovery.workPackageId}-${recovery.headline}`} aria-labelledby={headingId} className="rounded-md border border-border p-3">
+                <h3 id={headingId} className="sr-only">{recovery.title}: {recovery.headline}</h3>
+                <McpPresentation
+                  presentation={{
+                    statusKey: recoveryActions.length > 0 ? 'action_required' : 'deferred',
+                    tone: recovery.tone,
+                    badgeText: recovery.badgeText,
+                    headline: `${recovery.title}: ${recovery.headline}`,
+                    body: recovery.body,
+                    actions: [],
+                  }}
+                />
+                {recoveryActions.length > 0 && (
+                  <div className="mt-3 flex flex-wrap gap-2" aria-label={`${recovery.title}: recovery actions`}>
+                    {recoveryActions.map((action) => (
+                      <Button
+                        key={`${action.action}-${action.identity.schemaVersion === 1 ? action.identity.localRunEvidenceId : action.identity.priorRuntimeAuditId}`}
+                        type="button"
+                        size="sm"
+                        variant={action.action.startsWith('decline_') ? 'outline' : 'secondary'}
+                        className="w-full justify-start sm:w-fit"
+                        disabled={pending}
+                        aria-label={`${recovery.title}: ${recovery.headline}: ${action.label}`}
+                        onClick={() => onAction(action)}
+                      >
+                        {action.label}
+                      </Button>
+                    ))}
+                  </div>
+                )}
+              </section>
+            )
+          })}
+        </div>
+      )}
+
+      {presentation.terminals.length > 0 && (
+        <div className="mt-3 grid gap-2">
+          {presentation.terminals.map((terminal) => terminal.state === 'terminal' ? (
+            <BrandedTerminalJoinView
+              key={terminal.workPackageId}
+              presentation={{ state: 'terminal', terminalAt: formatDatetime(terminal.terminalAt ?? ''), outcome: terminal.outcome ?? 'unknown' }}
+            >
+              {terminal.title}: {terminal.outcome === 'succeeded' ? 'completed' : 'failed'}
+            </BrandedTerminalJoinView>
+          ) : (
+            <BrandedTerminalJoinView
+              key={terminal.workPackageId}
+              presentation={{ state: 'terminal_only', message: 'Terminal evidence unavailable' }}
+            >
+              {terminal.title}: terminal evidence unavailable
+            </BrandedTerminalJoinView>
+          ))}
+        </div>
+      )}
+    </section>
   )
+}
+
+export function canonicalMcpOperatorActionRequest(
+  action: CanonicalMcpOperatorAction,
+  expectedFreshnessFingerprint: string,
+): Record<string, unknown> | null {
+  if (!canonicalMcpOperatorActionIsBound(action)) return null
+  const identity = action.identity
+  return identity.schemaVersion === 1
+    ? {
+        schemaVersion: 1,
+        action: action.action,
+        expectedFreshnessFingerprint,
+        localRunEvidenceId: identity.localRunEvidenceId,
+        evidenceFingerprint: identity.evidenceFingerprint,
+      }
+    : {
+        schemaVersion: 1,
+        action: action.action,
+        expectedFreshnessFingerprint,
+        priorRuntimeAuditId: identity.priorRuntimeAuditId,
+        markerFingerprint: identity.markerFingerprint,
+      }
+}
+
+/** Monotonic client request ordering prevents an older presentation response from winning. */
+export function createMcpPresentationRequestSequencer() {
+  let latestRequest = 0
+  return {
+    begin: () => ++latestRequest,
+    isCurrent: (requestId: number) => requestId === latestRequest,
+  }
 }
 
 function filesystemEffectiveState(pkg: WorkPackage): {
@@ -1958,14 +2098,21 @@ function FilesystemGrantControls({
     }
   }, [applyGrantState, packageId, taskId])
 
+  // Only packages that actually render this control need the task's grant
+  // state. Without the capability guard every work package on the task fetched
+  // the same endpoint on mount and then failed normalization, because the
+  // server omits packages that have neither requested capabilities nor prior
+  // decisions.
+  const rendersGrantControl = summary.requestedCapabilities.length > 0 && packageId !== ''
+
   useEffect(() => {
-    if (packageId === '') return
+    if (!rendersGrantControl) return
     const controller = new AbortController()
     void loadGrantState(controller.signal).catch(() => undefined)
     return () => controller.abort()
-  }, [loadGrantState, packageId])
+  }, [loadGrantState, rendersGrantControl])
 
-  if (summary.requestedCapabilities.length === 0 || packageId === '') return null
+  if (!rendersGrantControl) return null
 
   const canEdit = (
     (taskStatus === 'awaiting_approval' || taskStatus === 'approved') &&
@@ -2046,11 +2193,24 @@ function FilesystemGrantControls({
   }
 
   return (
-    <div className="rounded-md border border-border bg-background px-2.5 py-2">
+    <div
+      id={`filesystem-grant-${packageId}`}
+      tabIndex={-1}
+      className="scroll-mt-24 rounded-md border border-border bg-background px-2.5 py-2 outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
+    >
       <div className="flex flex-wrap items-center gap-2">
         <p className="font-medium text-muted-foreground">Filesystem context grant</p>
-        <Badge variant="outline" className={statusBadgeClass(grantState?.currentDecision?.decision ?? effective.status)}>
-          {statusLabel(grantState?.currentDecision?.decision ?? effective.status)}
+        {/*
+          The badge shows the reconciled effective phase, never the pointer's
+          raw decision. A pointer only records approved/denied, so a consumed
+          allow-once grant or one revoked by a project change still points at an
+          "approved" decision while access is gone — and a package denial that a
+          later project-wide always-allow supersedes still points at "denied".
+          Current grant phases are the display authority; the pointer identity
+          is rendered separately below as evidence of what is being acted on.
+        */}
+        <Badge variant="outline" className={statusBadgeClass(effective.status)}>
+          {statusLabel(effective.status)}
         </Badge>
         {effective.grantMode !== '' && <Badge variant="secondary">{statusLabel(effective.grantMode)}</Badge>}
         {summary.blockingCapabilities.length > 0 && <Badge variant="secondary">required</Badge>}
@@ -2137,7 +2297,22 @@ function FilesystemGrantControls({
       {effective.grantApprovalId !== '' && (
         <p className="mt-2 break-all font-mono text-[11px] text-muted-foreground">Grant {effective.grantApprovalId}</p>
       )}
-      {grantStateError !== null && <p role="alert" className="mt-2 text-xs text-destructive">{grantStateError}</p>}
+      {grantStateError !== null && (
+        <div role="alert" className="mt-2 flex flex-wrap items-center gap-2 text-xs text-destructive">
+          <span>
+            {grantStateError} Forge will not submit a decision without the current pointer, so the controls stay disabled until this loads.
+          </span>
+          <Button
+            disabled={grantStateLoading}
+            onClick={() => void loadGrantState().catch(() => undefined)}
+            size="sm"
+            type="button"
+            variant="outline"
+          >
+            {grantStateLoading ? 'Retrying…' : 'Retry loading the decision'}
+          </Button>
+        </div>
+      )}
       {error !== null && <p role="alert" className="mt-2 text-xs text-destructive">{error}</p>}
     </div>
   )
@@ -2156,17 +2331,17 @@ function ApprovedGrantSnapshot({ packages }: { packages: WorkforceRecord[] }) {
         {packages.map((pkg, index) => {
           const packageId = stringField(pkg, ['workPackageId', 'id']) || `Package ${index + 1}`
           const assignedRole = stringField(pkg, ['assignedRole', 'role'])
-          const approvedGrants = approvedGrantsForDisplay(pkg)
-          const proposedRequirements = jsonArrayField(pkg, ['approvedRequirements', 'proposedRequirements', 'requirements'])
+          const proposedGrants = jsonArrayField(pkg, ['proposedGrants', 'grants'])
+          const proposedRequirements = jsonArrayField(pkg, ['proposedRequirements', 'requirements'])
           return (
             <div key={recordKey(pkg, 'approved-grant-package', index)} className="rounded-md border border-border bg-background px-2 py-1.5">
               <div className="flex flex-wrap items-center gap-2">
                 <span className="break-all font-mono text-[11px] text-foreground">{packageId}</span>
                 {assignedRole !== '' && <Badge variant="secondary">{assignedRole}</Badge>}
               </div>
-              {approvedGrants.length > 0 && (
+              {proposedGrants.length > 0 && (
                 <p className="mt-1 text-muted-foreground">
-                  Grants: {approvedGrants.map((grant) => stringField(grant, ['mcpId', 'id']) || 'MCP').join(', ')}
+                  Grants: {proposedGrants.map((grant) => stringField(grant, ['mcpId', 'id']) || 'MCP').join(', ')}
                 </p>
               )}
               {proposedRequirements.length > 0 && (
@@ -2636,7 +2811,9 @@ function QuestionsPanel({
               {answeredQuestions.map((q) => (
                 <li key={q.id} className="border-b border-border px-4 py-3 last:border-0">
                   <p className="text-sm font-medium text-foreground">{q.question}</p>
-                  <p className="mt-1 text-sm text-muted-foreground">{q.answer}</p>
+                  <p className="mt-1 text-sm text-muted-foreground">
+                    {q.answer ?? 'Answer submitted; protected history update pending.'}
+                  </p>
                 </li>
               ))}
             </ul>
@@ -2738,7 +2915,6 @@ function WorkforcePanel({
                   const harnessName = stringField(pkg, ['harnessDisplayName', 'harnessRole'])
                   const mcpRequirements = jsonArrayField(pkg, ['mcpRequirements'])
                   const pkgMetadata = recordField(pkg, ['metadata'])
-                  const mcpGrants = pkgMetadata ? jsonArrayField(pkgMetadata, ['mcpGrants', 'grants']) : []
                   const mcpSubtasks = pkgMetadata ? jsonArrayField(pkgMetadata, ['mcpAwareSubtasks', 'mcpSubtasks']) : []
                   const broker = mcpBrokerMetadata(pkg)
                   const packageArtifacts = packageArtifactsFor(pkg, artifacts)
@@ -2933,7 +3109,6 @@ function WorkforcePanel({
                             taskId={taskId}
                             taskStatus={taskStatus}
                           />
-                          <McpGrantCards grants={mcpGrants} />
                           <McpSubtaskCards subtasks={mcpSubtasks} />
                           {packageArtifacts.length > 0 && (
                             <div>
@@ -3309,7 +3484,7 @@ function CapabilityClassificationPanel({ classification }: { classification: Cap
   )
 }
 
-function initialMcpReviewItems(
+export function initialMcpReviewItems(
   design: McpExecutionDesignMetadata | null,
   existing: ReturnType<typeof latestMcpPlanReviewForDisplay>,
 ): McpPlanReviewDisplayItem[] {
@@ -3342,12 +3517,14 @@ function McpAccessPlanPanel({
   approvalGate,
   design,
   onSaved,
+  projectId,
   status,
   workPackages,
 }: {
   approvalGate: ApprovalGate | null
   design: McpExecutionDesignMetadata | null
   onSaved: () => Promise<void>
+  projectId: string
   status: string
   workPackages: WorkPackage[]
 }) {
@@ -3356,6 +3533,10 @@ function McpAccessPlanPanel({
   const overlayCount = mcpPlanOverlayCount(design)
   const subtaskCount = proposed?.mcpAwareSubtasks.length ?? 0
   const grantPreview = design?.grantDecisions
+  // The approve route rejects a plan with MCP requirements until a valid
+  // operator review exists, so this editor is the only way to make such a task
+  // approvable from the task page. It composes with the S5 presentation below
+  // rather than replacing it.
   const existingReview = useMemo(() => latestMcpPlanReviewForDisplay(approvalGate), [approvalGate])
   const [draftItems, setDraftItems] = useState<McpPlanReviewDisplayItem[]>(() => initialMcpReviewItems(design, existingReview))
   const [reviewSaving, setReviewSaving] = useState(false)
@@ -3395,6 +3576,7 @@ function McpAccessPlanPanel({
       setReviewSaving(false)
     }
   }
+
   if (!design) return null
   const missingDesignOnly =
     requirements.length === 0 &&
@@ -3476,31 +3658,24 @@ function McpAccessPlanPanel({
           </div>
           <ul className="grid gap-2 text-xs">
             {grantPreview.decisions.map((decision) => {
-              const statusText = decision.status === 'blocked'
-                ? 'Do not assign MCP-backed work until this MCP issue is resolved.'
-                : decision.status === 'warning'
-                  ? 'Optional MCP access is unavailable. Continue using the Architect fallback.'
-                  : 'Plan-approved for prompt context only. Forge does not attach live MCP tools in beta.'
+              const primaryDecisionId = grantPreview.primaryDecision?.decisionId
+              const presentationGrantState = (
+                decision.mode === 'planning_only' ||
+                decision.mode === 'blocked' ||
+                decision.mode === 'deferred_live_mcp' ||
+                decision.mode === 'unknown_legacy'
+              ) ? { kind: 'not_applicable' } : decision.grantState
+              const presentation = admissionPresentationFromUnknown({
+                ...decision,
+                grantState: presentationGrantState,
+                retryable: grantPreview.retryable && primaryDecisionId === decision.decisionId,
+              }, { projectId })
 
               return (
-                <li key={decision.decisionId} className="rounded-md border border-border bg-muted/20 px-2.5 py-2">
-                  <div className="mb-1 flex flex-wrap items-center gap-2">
-                    <Badge variant="outline" className={statusBadgeClass(decision.status)}>{decision.status}</Badge>
-                    <span className="font-medium text-foreground">{decision.agent}</span>
-                    <span className="text-muted-foreground">{decision.mcpId}</span>
-                  </div>
-                  <p className="text-muted-foreground">{statusText}</p>
-                  {decision.capabilities.length > 0 && (
-                    <p className="mt-1 break-words text-muted-foreground">
-                      Proposed capabilities: {decision.capabilities.join(', ')}
-                    </p>
-                  )}
-                  {decision.health.status !== 'healthy' && (
-                    <p className="mt-1 text-muted-foreground">
-                      Status: {decision.health.installState}/{decision.health.status}
-                      {decision.health.error ? `: ${decision.health.error}` : ''}
-                    </p>
-                  )}
+                <li key={decision.decisionId}>
+                  <McpPresentation
+                    presentation={presentation}
+                  />
                 </li>
               )
             })}
@@ -3529,8 +3704,6 @@ function McpAccessPlanPanel({
                   <Badge variant={requirement.requirement === 'required' ? 'outline' : 'secondary'}>
                     {requirement.requirement}
                   </Badge>
-                  <Badge variant="outline">Confidence: {requirement.confidence}</Badge>
-                  <Badge variant="secondary">Project scope · planning instruction</Badge>
                 </div>
                 {requirement.reason && (
                   <p className="text-sm text-muted-foreground">{requirement.reason}</p>
@@ -3695,42 +3868,6 @@ function McpAccessPlanPanel({
             )
           })}
         </ul>
-      )}
-
-      {proposed && proposed.requirementContexts.length > 0 && (
-        <div className="mt-3 border-t border-border pt-3 text-xs">
-          <p className="font-medium text-foreground">Requirement-scoped package context</p>
-          <ul className="mt-2 grid gap-2">
-            {proposed.requirementContexts.map((context, index) => (
-              <li key={duplicateSafeKey('mcp-context', `${context.requirementKey}-${context.agent}`, index)} className="rounded-md border border-border px-2 py-1.5">
-                <p className="font-medium text-foreground">{context.agent} · {context.mcpId}</p>
-                <p className="mt-1 text-muted-foreground">{context.promptOverlay}</p>
-              </li>
-            ))}
-          </ul>
-        </div>
-      )}
-
-      {proposed && proposed.mcpAwareSubtasks.length > 0 && (
-        <div className="mt-3 border-t border-border pt-3 text-xs">
-          <p className="font-medium text-foreground">Full MCP-aware subtask instructions</p>
-          <ul className="mt-2 grid gap-2">
-            {proposed.mcpAwareSubtasks.map((subtask) => (
-              <li key={subtask.id} className="rounded-md border border-border px-2 py-2">
-                <p className="font-medium text-foreground">{subtask.id} · {subtask.agent}</p>
-                <p className="mt-1 font-mono text-[11px] text-muted-foreground">{subtask.mcpCapabilities.join(', ')}</p>
-                <dl className="mt-2 grid gap-1 text-muted-foreground">
-                  <div><dt className="font-medium text-foreground">Depends on</dt><dd>{subtask.dependsOn.join(', ') || 'None'}</dd></div>
-                  <div><dt className="font-medium text-foreground">Inputs</dt><dd>{subtask.inputs.join(', ') || 'None'}</dd></div>
-                  <div><dt className="font-medium text-foreground">Outputs</dt><dd>{subtask.outputs.join(', ') || 'None'}</dd></div>
-                  <div><dt className="font-medium text-foreground">Verification</dt><dd>{subtask.verification.join(', ') || 'None'}</dd></div>
-                  <div><dt className="font-medium text-foreground">Stopping condition</dt><dd>{subtask.stoppingCondition || 'Not specified'}</dd></div>
-                  <div><dt className="font-medium text-foreground">Fallback</dt><dd>{subtask.fallback || 'Not specified'}</dd></div>
-                </dl>
-              </li>
-            ))}
-          </ul>
-        </div>
       )}
 
       {reviewEnabled && (
@@ -4018,7 +4155,7 @@ export function taskProgressSummary(input: {
       nextAction: 'Review package output, then approve, request changes, or reject it.',
       detail: executionDisabled
         ? 'Execution is disabled; this review covers handoff output and no repository files were changed.'
-        : 'Review gates cover generated output, host-write metadata, and validation evidence.',
+        : 'Review gates cover generated sandbox output and validation evidence before manual application.',
     }
   }
 
@@ -4036,7 +4173,7 @@ export function taskProgressSummary(input: {
       nextAction: 'Wait for output and review gates.',
       detail: executionDisabled
         ? 'Execution is disabled; Forge is creating reviewable handoff output without sandbox files or host repository writes.'
-        : 'A specialist package is running. Forge will keep sandbox artifacts and apply successful local repository edits when enabled.',
+        : 'A specialist package is running. Forge will keep generated files under .forge/task-runs for review and manual application.',
     }
   }
 
@@ -4183,10 +4320,15 @@ export default function TaskDetailPage() {
   const [task, setTask] = useState<Task | null>(null)
   const [initialRuns, setInitialRuns] = useState<AgentRun[]>([])
   const [initialArtifacts, setInitialArtifacts] = useState<Artifact[]>([])
-  const [initialQuestions, setInitialQuestions] = useState<TaskQuestion[]>([])
+  const [clarificationQuestions, setClarificationQuestions] = useState<TaskQuestion[]>([])
   const [attempts, setAttempts] = useState<TaskAttempt[]>([])
   const [workPackages, setWorkPackages] = useState<WorkPackage[]>([])
   const [approvalGates, setApprovalGates] = useState<ApprovalGate[]>([])
+  const [mcpPresentation, setMcpPresentation] = useState<CanonicalMcpTaskPresentation | null>(null)
+  const [mcpPresentationLoading, setMcpPresentationLoading] = useState(true)
+  const [mcpPresentationError, setMcpPresentationError] = useState<string | null>(null)
+  const [mcpActionError, setMcpActionError] = useState<string | null>(null)
+  const [mcpActionPending, setMcpActionPending] = useState(false)
   const [vcsChanges, setVcsChanges] = useState<VcsChange[]>([])
   const [commandAudits, setCommandAudits] = useState<CommandAudit[]>([])
   const [filesystemAudits, setFilesystemAudits] = useState<FilesystemAudit[]>([])
@@ -4215,6 +4357,7 @@ export default function TaskDetailPage() {
   const [retrySubmitted, setRetrySubmitted] = useState(false)
   const liveLogTimersRef = useRef<Map<string, number>>(new Map())
   const lastLogSequenceRef = useRef(0)
+  const mcpPresentationRequestRef = useRef(createMcpPresentationRequestSequencer())
 
   // SSE stream
   const {
@@ -4222,7 +4365,6 @@ export default function TaskDetailPage() {
     artifacts: streamArtifacts,
     taskStatus,
     error: streamError,
-    questions: streamQuestions,
     refreshRevision: streamRefreshRevision,
     taskLogRevision,
   } = useTaskStream(taskId)
@@ -4230,11 +4372,7 @@ export default function TaskDetailPage() {
   // Merge initial data with live stream data
   const mergedRuns: AgentRun[] = mergeTaskRuns(initialRuns, streamRuns)
   const mergedArtifacts: Artifact[] = mergeArtifacts(initialArtifacts, streamArtifacts)
-  // streamQuestions is null until the SSE layer has reported a definitive
-  // question set (even an empty one); only fall back to the once-fetched
-  // initialQuestions while that hasn't happened yet, so an explicitly-empty
-  // stream result isn't overridden by stale data from a prior plan round.
-  const mergedQuestions: TaskQuestion[] = streamQuestions ?? initialQuestions
+  const mergedQuestions: TaskQuestion[] = clarificationQuestions
   const currentStatus = optimisticTaskStatus ?? taskStatus ?? task?.status ?? null
 
   const loadProjectFilesystemGrant = useCallback(async (projectId: string | null | undefined) => {
@@ -4259,6 +4397,31 @@ export default function TaskDetailPage() {
     }
   }, [])
 
+  const loadClarificationHistory = useCallback(async (
+    planVersion: string | null | undefined,
+    summaries: TaskQuestionSummary[],
+  ) => {
+    if (!planVersion) {
+      try {
+        const response = await fetch(`/api/tasks/${taskId}/questions`)
+        if (!response.ok) throw new Error('Legacy clarification history is unavailable')
+        const body = await response.json() as { questions?: TaskQuestion[] }
+        setClarificationQuestions(body.questions ?? [])
+      } catch {
+        setClarificationQuestions([])
+      }
+      return
+    }
+    try {
+      const response = await fetch(`/api/tasks/${taskId}/architect-plan-history/${planVersion}`)
+      if (!response.ok) throw new Error('Protected clarification history is unavailable')
+      const body = await response.json() as { entries?: Array<{ entryId: string; entryKind: string; content: string }> }
+      setClarificationQuestions(clarificationQuestionsFromHistory(body.entries ?? [], summaries))
+    } catch {
+      setClarificationQuestions([])
+    }
+  }, [taskId])
+
   const loadTask = useCallback(async () => {
     setLoading(true)
     setFetchError(null)
@@ -4274,7 +4437,7 @@ export default function TaskDetailPage() {
       setRetryProviderId(data.task?.pmProviderConfigId ?? null)
       setInitialRuns(data.runs ?? [])
       setInitialArtifacts(data.artifacts ?? [])
-      setInitialQuestions(data.questions ?? [])
+      void loadClarificationHistory(data.clarification?.planVersion, data.questions ?? [])
       setAttempts(data.attempts ?? [])
       setWorkPackages(data.workPackages ?? [])
       setApprovalGates(data.approvalGates ?? [])
@@ -4286,7 +4449,7 @@ export default function TaskDetailPage() {
     } finally {
       setLoading(false)
     }
-  }, [loadProjectFilesystemGrant, taskId])
+  }, [loadClarificationHistory, loadProjectFilesystemGrant, taskId])
 
   const loadProviders = useCallback(async () => {
     try {
@@ -4329,6 +4492,36 @@ export default function TaskDetailPage() {
     liveLogTimersRef.current.clear()
   }, [])
 
+  // The canonical server presentation. Its freshness fingerprint is the exact
+  // state the operator is looking at; every operator action echoes it back so
+  // the server can refuse (409, zero mutation) if anything moved underneath.
+  const loadMcpPresentation = useCallback(async (options: { preserveOnError?: boolean } = {}) => {
+    const requestId = mcpPresentationRequestRef.current.begin()
+    setMcpPresentationLoading(true)
+    setMcpPresentationError(null)
+    try {
+      const res = await fetch(`/api/mcps/presentation/${taskId}`)
+      if (!res.ok) {
+        if (mcpPresentationRequestRef.current.isCurrent(requestId)) {
+          if (!options.preserveOnError) setMcpPresentation(null)
+          setMcpPresentationError('Current MCP runtime state could not be refreshed. Try again.')
+        }
+        return
+      }
+      const body = await res.json().catch(() => null)
+      if (mcpPresentationRequestRef.current.isCurrent(requestId)) {
+        setMcpPresentation(canonicalMcpTaskPresentationFromUnknown(body))
+      }
+    } catch {
+      if (mcpPresentationRequestRef.current.isCurrent(requestId)) {
+        if (!options.preserveOnError) setMcpPresentation(null)
+        setMcpPresentationError('Current MCP runtime state could not be refreshed. Try again.')
+      }
+    } finally {
+      if (mcpPresentationRequestRef.current.isCurrent(requestId)) setMcpPresentationLoading(false)
+    }
+  }, [taskId])
+
   const loadLogs = useCallback(async (options: { append?: boolean } = {}) => {
     const append = options.append === true
     if (!append) setLogsLoading(true)
@@ -4367,8 +4560,9 @@ export default function TaskDetailPage() {
   useEffect(() => {
     loadTask()
     loadLogs()
+    loadMcpPresentation()
     loadProviders()
-  }, [loadLogs, loadProviders, loadTask])
+  }, [loadLogs, loadMcpPresentation, loadProviders, loadTask])
 
   // Refresh task when SSE reports a state where persisted side data may have changed.
   useEffect(() => {
@@ -4384,14 +4578,16 @@ export default function TaskDetailPage() {
     if (taskStatus && REFRESH_STATUSES.has(taskStatus)) {
       loadTask()
       loadLogs()
+      loadMcpPresentation()
     }
-  }, [taskStatus, loadLogs, loadTask])
+  }, [taskStatus, loadLogs, loadMcpPresentation, loadTask])
 
   useEffect(() => {
     if (streamRefreshRevision > 0) {
       loadTask()
+      loadMcpPresentation()
     }
-  }, [streamRefreshRevision, loadTask])
+  }, [streamRefreshRevision, loadMcpPresentation, loadTask])
 
   useEffect(() => {
     if (taskLogRevision > 0) {
@@ -4542,6 +4738,48 @@ export default function TaskDetailPage() {
     }
   }
 
+  // Dispatches a recovery CTA to the one authenticated operator action
+  // endpoint. The request carries only the exact evidence identity the
+  // presentation was built from plus the fingerprint of the state the operator
+  // saw; it never carries capabilities, revisions, or any other authority.
+  async function submitMcpOperatorAction(body: Record<string, unknown>) {
+    setMcpActionPending(true)
+    setMcpActionError(null)
+    try {
+      const res = await fetch(`/api/mcps/actions/${taskId}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      const payload = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        // A stale refusal must reload and stop. The operator has to see what
+        // replaced their view and act again deliberately.
+        if (res.status === 409) {
+          await loadMcpPresentation()
+          await loadTask()
+        }
+        setMcpActionError(typeof payload.error === 'string' ? payload.error : 'The action could not be applied.')
+        return
+      }
+      await loadMcpPresentation()
+      await loadTask()
+      if (res.status === 202 && typeof payload.error === 'string') setMcpActionError(payload.error)
+    } catch (err) {
+      setMcpActionError(err instanceof Error ? err.message : 'An unexpected error occurred')
+    } finally {
+      setMcpActionPending(false)
+    }
+  }
+
+  function handleCanonicalMcpOperatorAction(action: CanonicalMcpOperatorAction) {
+    if (mcpPresentation === null) return
+    if (!canonicalMcpPresentationIsFresh(mcpPresentation)) return
+    const request = canonicalMcpOperatorActionRequest(action, mcpPresentation.freshnessFingerprint)
+    if (request === null) return
+    void submitMcpOperatorAction(request)
+  }
+
   if (loading) {
     return (
       <div className="flex items-center justify-center px-4 py-16" role="status" aria-live="polite">
@@ -4586,8 +4824,12 @@ export default function TaskDetailPage() {
   const canRetryTask = ['failed', 'cancelled', 'rejected'].includes(effectiveTaskStatus)
   const canShowRetryTask = canRetryTask || retryCardCollapsing
   const canStopTask = canStopTaskStatus(effectiveTaskStatus)
+  const isTerminalTaskStatus = !canStopTaskStatus(effectiveTaskStatus)
   const plannedAgents = plannedAgentsFromArtifacts(mergedArtifacts)
   const capabilityClassification = latestCapabilityClassificationFromArtifacts(mergedArtifacts)
+  // Bind the review and the presented design to the exact plan version behind
+  // the current approval gate, so an operator never reviews one immutable plan
+  // while approving another.
   const planApprovalGate = approvalGates.find((gate) => (
     stringField(gate, ['gateType', 'type']) === 'plan_approval' &&
     stringField(gate, ['status', 'state']) === 'pending'
@@ -4657,7 +4899,7 @@ export default function TaskDetailPage() {
                 Stop
               </Button>
             )}
-            {TERMINAL_TASK_STATUSES.has(effectiveTaskStatus) && (
+            {isTerminalTaskStatus && (
               <p className="text-xs text-muted-foreground">
                 Task history is retained for audit.
               </p>
@@ -4809,7 +5051,11 @@ export default function TaskDetailPage() {
 
           {/* Approve / Change plan / Restart actions */}
           {isAwaitingApproval && (
-            <div className="mb-6 rounded-lg border border-border bg-card p-4">
+            <div
+              id="task-plan-actions"
+              tabIndex={-1}
+              className="mb-6 scroll-mt-24 rounded-lg border border-border bg-card p-4 outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
+            >
               <p className="mb-3 text-sm font-medium text-foreground">
                 Review the plan. You can approve it, request changes, or restart the task.
               </p>
@@ -5030,10 +5276,38 @@ export default function TaskDetailPage() {
               the prompt rather than the workforce execution column. */}
           <div className="mb-6 grid gap-6">
             <CapabilityClassificationPanel classification={capabilityClassification} />
+            {mcpActionError !== null && (
+              <p role="alert" aria-live="assertive" className="text-sm text-destructive">
+                {mcpActionError}
+              </p>
+            )}
+            {mcpPresentationError !== null && (
+              <p role="alert" className="text-sm text-destructive">
+                {mcpPresentationError}
+              </p>
+            )}
+            {mcpActionPending && (
+              <p role="status" aria-live="polite" className="text-sm text-muted-foreground">
+                Applying the MCP recovery action…
+              </p>
+            )}
+            <CanonicalMcpOperatorPanel
+              presentation={mcpPresentation}
+              pending={mcpActionPending}
+              refreshPending={mcpPresentationLoading}
+              onAction={handleCanonicalMcpOperatorAction}
+              onRefresh={() => { void loadMcpPresentation({ preserveOnError: true }) }}
+            />
+            {!mcpPresentationLoading && mcpPresentation === null && (
+              <p role="status" className="text-xs text-muted-foreground">
+                Current MCP runtime state is unavailable. Recovery controls are hidden until Forge can load one verified observation.
+              </p>
+            )}
             <McpAccessPlanPanel
               approvalGate={planApprovalGate}
               design={mcpExecutionDesign}
               onSaved={loadTask}
+              projectId={task.projectId}
               status={effectiveTaskStatus}
               workPackages={workPackages}
             />

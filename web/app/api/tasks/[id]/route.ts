@@ -21,6 +21,18 @@ import { recordTaskLogBestEffort } from '@/worker/task-logs'
 import { accessibleTaskCondition, getAccessibleTask } from '@/lib/task-access'
 import { validateMcpOperatorReviewHistory } from '@/worker/mcp-plan-review'
 import { guardEpic172ProjectManagementIngress } from '@/lib/projects/epic-172-project-ingress'
+import {
+  projectTaskCompatibilityArtifact,
+  projectTaskCompatibilityAttempt,
+  projectTaskCompatibilityCommandAudit,
+  projectTaskCompatibilityFilesystemAudit,
+  projectTaskCompatibilityRun,
+  projectTaskCompatibilityTask,
+  projectTaskCompatibilityVcsChange,
+  projectTaskCompatibilityWorkPackage,
+  sanitizeWorkPackageMetadata,
+} from '@/lib/mcps/leakage-drain'
+import { taskQuestionSummary } from '@/lib/mcps/clarification-projection'
 
 // ---------------------------------------------------------------------------
 // GET /api/tasks/:id
@@ -32,26 +44,118 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
-function metadataString(metadata: unknown, key: string): string | null {
-  if (!isRecord(metadata)) return null
-  const value = metadata[key]
-  return typeof value === 'string' && value.trim().length > 0 ? value : null
-}
-
 function taskDetailWorkPackageMetadata(metadata: unknown): unknown {
-  if (!isRecord(metadata)) return metadata
-  const phases = metadata.mcpGrantPhases
+  const sanitized = sanitizeWorkPackageMetadata(metadata)
+  if (!isRecord(sanitized)) return sanitized
+  const phases = sanitized.mcpGrantPhases
   if (!isRecord(phases) || !isRecord(phases.effective) || !Object.hasOwn(phases.effective, 'grantNonce')) {
-    return metadata
+    return sanitized
   }
   const safeEffective = { ...phases.effective }
   delete safeEffective.grantNonce
   return {
-    ...metadata,
+    ...sanitized,
     mcpGrantPhases: {
       ...phases,
       effective: safeEffective,
     },
+  }
+}
+
+function latestProtectedPlanVersion(
+  taskArtifacts: readonly { artifactType: string; metadata: unknown }[],
+): string | null {
+  for (let index = taskArtifacts.length - 1; index >= 0; index -= 1) {
+    const artifact = taskArtifacts[index]
+    if (artifact.artifactType !== 'adr_text' || !isRecord(artifact.metadata)) continue
+    if (artifact.metadata.historyAvailable !== true) continue
+    const planVersion = artifact.metadata.planVersion
+    if (typeof planVersion === 'string' && /^[1-9][0-9]{0,18}$/.test(planVersion)) return planVersion
+  }
+  return null
+}
+
+function taskDetailApprovalGateMetadata(metadata: unknown): Record<string, unknown> {
+  if (!isRecord(metadata)) return {}
+  const projected: Record<string, unknown> = {}
+  if (typeof metadata.mcpOperatorReviewRequired === 'boolean') {
+    projected.mcpOperatorReviewRequired = metadata.mcpOperatorReviewRequired
+  }
+  if (typeof metadata.required === 'boolean') projected.required = metadata.required
+  if (typeof metadata.planVersion === 'string' && /^\d{1,20}$/.test(metadata.planVersion)) {
+    projected.planVersion = metadata.planVersion
+  }
+  for (const key of ['requiredRole', 'sourcePackageId', 'sourceRunId', 'sourceArtifactId'] as const) {
+    const value = metadata[key]
+    if (typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/.test(value)) {
+      projected[key] = value
+    }
+  }
+  return projected
+}
+
+const TASK_DETAIL_TOKEN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/
+const TASK_DETAIL_DIGEST = /^(?:(?:hmac-)?sha256:)?[0-9a-f]{64}$/
+
+function taskDetailToken(value: unknown): string | null {
+  return typeof value === 'string' && TASK_DETAIL_TOKEN.test(value) ? value : null
+}
+
+function taskDetailDigest(value: unknown): string | null {
+  return typeof value === 'string' && TASK_DETAIL_DIGEST.test(value) ? value : null
+}
+
+function taskDetailValidatedReview(head: unknown): Record<string, unknown> | null {
+  if (!isRecord(head)) return null
+  const items = Array.isArray(head.items) ? head.items : []
+  return {
+    schemaVersion: head.schemaVersion === 1 ? 1 : null,
+    sourceArtifactId: typeof head.sourceArtifactId === 'string' ? head.sourceArtifactId : null,
+    revision: typeof head.revision === 'number' ? head.revision : null,
+    previousDigest: taskDetailDigest(head.previousDigest),
+    digest: taskDetailDigest(head.digest),
+    createdAt: typeof head.createdAt === 'string' && Number.isFinite(Date.parse(head.createdAt))
+      ? head.createdAt
+      : null,
+    createdBy: taskDetailToken(head.createdBy),
+    accessMode: taskDetailToken(head.accessMode),
+    itemCount: items.length,
+    approvedCount: items.filter((item) => isRecord(item) && item.decision === 'approved').length,
+    deniedCount: items.filter((item) => isRecord(item) && item.decision === 'denied').length,
+    blockerCount: Array.isArray(head.blockers) ? head.blockers.length : 0,
+  }
+}
+
+function taskDetailApprovalGate(gate: typeof approvalGates.$inferSelect): Record<string, unknown> {
+  const validation = validateMcpOperatorReviewHistory(gate.metadata, gate.sourceArtifactId)
+  return {
+    id: gate.id,
+    taskId: gate.taskId,
+    workPackageId: gate.workPackageId,
+    gateType: gate.gateType,
+    status: gate.status,
+    sourceAgentRunId: gate.sourceAgentRunId,
+    sourceArtifactId: gate.sourceArtifactId,
+    metadata: taskDetailApprovalGateMetadata(gate.metadata),
+    protectedReviewRevision: gate.protectedReviewRevision,
+    protectedReviewSetDigest: taskDetailDigest(gate.protectedReviewSetDigest),
+    protectedReviewItemCount: gate.protectedReviewItemCount,
+    protectedReviewApprovedCount: gate.protectedReviewApprovedCount,
+    protectedReviewDeniedCount: gate.protectedReviewDeniedCount,
+    protectedReviewBlockerCodes: Array.isArray(gate.protectedReviewBlockerCodes)
+      ? gate.protectedReviewBlockerCodes.slice(0, 256).flatMap((code) => {
+        const token = taskDetailToken(code)
+        return token === null ? [] : [token]
+      })
+      : null,
+    decidedAt: gate.decidedAt,
+    decidedBy: gate.decidedBy,
+    createdAt: gate.createdAt,
+    updatedAt: gate.updatedAt,
+    validatedMcpOperatorReview: validation.valid
+      ? taskDetailValidatedReview(validation.head)
+      : null,
+    mcpOperatorReviewIntegrity: validation.valid ? 'valid' : 'invalid',
   }
 }
 
@@ -156,11 +260,17 @@ export async function GET(
       .where(eq(taskAttempts.taskId, id))
       .orderBy(asc(taskAttempts.createdAt))
 
-    const questions = await db
-      .select()
+    const questionRows = await db
+      .select({
+        id: taskQuestions.id,
+        status: taskQuestions.status,
+        createdAt: taskQuestions.createdAt,
+        answeredAt: taskQuestions.answeredAt,
+      })
       .from(taskQuestions)
       .where(eq(taskQuestions.taskId, id))
       .orderBy(asc(taskQuestions.createdAt))
+    const questions = questionRows.map(taskQuestionSummary)
 
     // Fetch artifacts for all runs
     const runIds = runs.map((r) => r.id)
@@ -177,9 +287,15 @@ export async function GET(
         .where(inArray(artifacts.agentRunId, runIds))
         .orderBy(asc(artifacts.createdAt))
     }
-    const artifactsByWorkPackageId = new Map<string, typeof taskArtifacts>()
-    for (const artifact of taskArtifacts) {
-      const workPackageId = workPackageIdByRunId.get(artifact.agentRunId)
+    const runById = new Map(runs.map((run) => [run.id, run]))
+    const safeTaskArtifacts = taskArtifacts.map((artifact) => projectTaskCompatibilityArtifact(
+      artifact,
+      runById.get(artifact.agentRunId),
+    ))
+    const artifactsByWorkPackageId = new Map<string, typeof safeTaskArtifacts>()
+    for (const artifact of safeTaskArtifacts) {
+      const agentRunId = typeof artifact.agentRunId === 'string' ? artifact.agentRunId : null
+      const workPackageId = agentRunId ? workPackageIdByRunId.get(agentRunId) : undefined
       if (!workPackageId) continue
       const existing = artifactsByWorkPackageId.get(workPackageId) ?? []
       existing.push(artifact)
@@ -226,39 +342,36 @@ export async function GET(
     const harnessById = new Map(taskHarnesses.map((harness) => [harness.id, harness]))
     const taskWorkPackagesWithPrompts = taskWorkPackages.map((pkg) => {
       const harness = pkg.harnessId ? harnessById.get(pkg.harnessId) : undefined
-      return {
-        ...pkg,
+      return projectTaskCompatibilityWorkPackage(pkg, {
         metadata: taskDetailWorkPackageMetadata(pkg.metadata),
         harnessRole: harness?.role ?? null,
         harnessDisplayName: harness?.displayName ?? null,
         harnessDescription: harness?.description ?? null,
-        promptOverlay: metadataString(pkg.metadata, 'promptOverlay'),
         artifacts: artifactsByWorkPackageId.get(pkg.id) ?? [],
-      }
+      })
     })
-    const taskApprovalGatesWithValidatedReviews = taskApprovalGates.map((gate) => {
-      const validation = validateMcpOperatorReviewHistory(gate.metadata, gate.sourceArtifactId)
-      return {
-        ...gate,
-        validatedMcpOperatorReview: validation.valid ? validation.head : null,
-        mcpOperatorReviewIntegrity: validation.valid ? 'valid' : 'invalid',
-      }
-    })
+    const taskApprovalGatesWithValidatedReviews = taskApprovalGates.map(taskDetailApprovalGate)
 
     return NextResponse.json({
-      task,
-      runs,
-      artifacts: taskArtifacts,
-      attempts,
+      task: projectTaskCompatibilityTask(task),
+      runs: runs.map(projectTaskCompatibilityRun),
+      artifacts: safeTaskArtifacts,
+      attempts: attempts.map(projectTaskCompatibilityAttempt),
       questions,
+      clarification: {
+        planVersion: latestProtectedPlanVersion(taskArtifacts),
+        questionCount: questions.length,
+        openCount: questions.filter((question) => question.status !== 'answered').length,
+        answeredCount: questions.filter((question) => question.status === 'answered').length,
+      },
       workPackages: taskWorkPackagesWithPrompts,
       approvalGates: taskApprovalGatesWithValidatedReviews,
-      commandAudits: taskCommandAudits,
-      filesystemAudits: taskFilesystemAudits,
-      vcsChanges: taskVcsChanges,
+      commandAudits: taskCommandAudits.map(projectTaskCompatibilityCommandAudit),
+      filesystemAudits: taskFilesystemAudits.map(projectTaskCompatibilityFilesystemAudit),
+      vcsChanges: taskVcsChanges.map(projectTaskCompatibilityVcsChange),
     })
-  } catch (err) {
-    console.error('[GET /api/tasks/:id] Unexpected error', err)
+  } catch {
+    console.error('[GET /api/tasks/:id] Unexpected error')
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }
@@ -396,8 +509,8 @@ export async function DELETE(
 
     console.info('[DELETE /api/tasks/:id] Cancelled task', { id })
     return NextResponse.json({ ok: true, mode: 'cancel' })
-  } catch (err) {
-    console.error('[DELETE /api/tasks/:id] Unexpected error', err)
+  } catch {
+    console.error('[DELETE /api/tasks/:id] Unexpected error')
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }

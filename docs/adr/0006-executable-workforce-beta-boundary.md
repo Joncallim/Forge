@@ -17,44 +17,41 @@ Forge is trusted with commits or PR automation.
 
 ## Decision
 
-Forge will allow executable Workforce beta runs with default-on local project
-edits and a reviewable sandbox copy of every generated file.
+Forge currently keeps the specialist Workforce path handoff-only. Specialist
+execution and file materialization are unavailable because Forge does not yet
+have an operating-system-enforced confined writer. Direct host repository
+writes are also unavailable.
 
 ### Execution Boundary
 
-- Work-package materialization, handoff, model execution, and local repository
-  writes are enabled by default.
-- `FORGE_WORK_PACKAGE_EXECUTION=0`, `false`, `off`, `no`, or `disabled`
-  disables model execution and keeps the handoff-artifact-only path.
-- `FORGE_HOST_REPOSITORY_WRITES=0`, `false`, `off`, `no`, or `disabled` lets
-  package models run but keeps generated files sandbox-only.
-- ACP-backed work-package execution is enabled after an operator configures an
-  ACP provider and approves the task. ACP adapters are local processes and are
-  not OS-confined by Forge. Set `FORGE_ACP_WORK_PACKAGE_EXECUTION=0`, `false`,
-  `off`, `no`, or `disabled` to prevent ACP package execution.
-- After Architect plan approval, Forge may execute one eligible specialist work
-  package at a time. Parallel specialist execution remains out of scope.
+- Work-package materialization and handoff are available after approval; model
+  execution and file materialization are unavailable. The normal path creates
+  handoff artifacts only.
+- `FORGE_WORK_PACKAGE_EXECUTION` is a reserved setting. No value can override
+  the missing confined writer or enable specialist execution today.
+- `FORGE_HOST_REPOSITORY_WRITES` is unavailable. Enable values fail closed;
+  the legacy `FORGE_REPOSITORY_EDITS` alias follows the same rule.
+- `FORGE_ACP_WORK_PACKAGE_EXECUTION` is also reserved and cannot enable ACP
+  package execution. ACP adapters are local processes and are not OS-confined
+  by Forge.
+- A future security-reviewed slice may execute one eligible specialist package
+  at a time after it supplies a real confined writer. Parallel specialist
+  execution remains out of scope.
 - Forge may collect bounded read-only host-repository context before a package
   runs. That context is limited to inspectable evidence such as a bounded file
   list, selected source/context artifacts, git status evidence, previous run
   artifacts, package inputs, acceptance criteria, and review feedback. It must
   not give the specialist an unbounded filesystem view.
-- Generated output is first written under the validated project root at
-  `.forge/task-runs/<task-id>/<work-package-id>/attempt-<attempt-number>/`.
-- After the package execution step, repository-affecting package output is
-  applied to the local project unless host repository writes are explicitly
-  disabled. This is a local file edit, not a branch, commit, pull request,
-  merge, or issue update. Forge blocks this path when the working tree is dirty
-  so generated output does not interleave with operator edits.
+- A future confined execution surface may write output under a per-attempt
+  directory for review. The current path creates no generated execution
+  sandbox files.
 - File writes must use relative paths. Absolute paths, path traversal, `.git`,
   `.forge`, `node_modules`, symlink targets, and local conflict-copy names are
   outside the beta boundary.
 - Package validation requests are limited to the approved validation surface,
   currently `npm test`, `npm run build`, and `npm run lint`. In the beta,
   Forge performs static validation for those command labels against generated
-  sandbox output; it does not run arbitrary package scripts. Repository-
-  affecting packages that provide no validation commands fail before host files
-  are applied.
+  sandbox output; it does not run arbitrary package scripts.
 - Repository evidence commands are limited to read-only Git status/diff
   evidence, redacted, bounded, and audited. Host package-manager validation is
   blocked in repository evidence; package validation remains inside the sandbox.
@@ -138,14 +135,15 @@ The executable Workforce beta explicitly defers:
 - user-edited grant scopes,
 - autonomous QA, Reviewer, or Security agent-run gates,
 - harness-enforced execution policy,
+- direct host repository writes,
 - remote repository writes.
 
 ## Consequences
 
-Operators can review generated sandbox files, applied host-file metadata, static
-validation results, repository evidence, proposed and brokered grants, blocked
-reasons, prompt overlays, review gates, rework reasons, and structured security
-findings before deciding whether output is useful.
+Operators can review generated sandbox files, static validation results,
+repository evidence, proposed and brokered grants, blocked reasons, prompt
+overlays, review gates, rework reasons, and structured security findings before
+manually applying useful output.
 
 The cost is extra terminology and a stricter product boundary. That cost is
 intentional: Forge should prove sequential execution and manual review before

@@ -1,12 +1,33 @@
+import { performance } from 'node:perf_hooks'
 import { sanitizeWorkerMessage } from './redaction'
-import { defaultOnFeatureFlagState } from './feature-flags'
+import { defaultOnFeatureFlagState, explicitOptInFeatureFlagEnabled } from './feature-flags'
+import { hostRepositoryWritePolicyState } from './repository-edit-policy'
+import type { QueueClaimRenewalResult, QueueRetryResult } from './queue'
+import {
+  ClaimLeaseFence,
+  isClaimLeaseLostError,
+  type QueueClaimBusinessDisposition,
+  type QueueClaimExecutionContext,
+} from './claim-lease-fence'
 
 const DEFAULT_CLAIM_TIMEOUT_SECONDS = 5
 const APPROVAL_CLAIM_TIMEOUT_SECONDS = 1
 const DEFAULT_MAX_ATTEMPTS = 3
 const DEFAULT_STUCK_JOB_RECOVERY_SECONDS = 15 * 60
+const MIN_CLAIM_RENEWAL_INTERVAL_MS = 100
+const MAX_QUEUE_RECOVERY_INTERVAL_MS = 60_000
+const MIN_QUEUE_COMMAND_TIMEOUT_HEADROOM_MS = 1_000
+const DEFAULT_QUEUE_COMMAND_TIMEOUT_HEADROOM_MS = 5_000
+const NODE_TIMER_MAX_MS = 2_147_483_647
+// FORGE_WORKER_SHUTDOWN_TIMEOUT_MS defaults to 30 seconds: healthy work may
+// drain during this window before shutdown fences claims and closes Redis.
+const DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_MS = 30_000
+const FORCED_SHUTDOWN_SETTLE_MARGIN_MS = 250
 const DEFAULT_PROVIDER_HEALTH_INTERVAL_SECONDS = 5 * 60
 const DEFAULT_BLOCKED_HANDOFF_SWEEP_INTERVAL_SECONDS = 5 * 60
+const DEFAULT_SESSION_CACHE_PURGE_INTERVAL_SECONDS = 60
+const ADOPTION_PENDING_OCCURRENCE_MESSAGE =
+  'Queue occurrence is retained pending a verified recovery claim.'
 
 type WorkerSource = 'standalone' | 'embedded'
 
@@ -46,7 +67,7 @@ function getPositiveIntegerEnv(name: string, defaultValue: number): number {
   if (!raw) return defaultValue
 
   const parsed = Number(raw)
-  if (!Number.isInteger(parsed) || parsed < 1) {
+  if (!Number.isSafeInteger(parsed) || parsed < 1) {
     throw new Error(`${name} must be a positive integer`)
   }
 
@@ -58,19 +79,41 @@ function getNonNegativeIntegerEnv(name: string, defaultValue: number): number {
   if (!raw) return defaultValue
 
   const parsed = Number(raw)
-  if (!Number.isInteger(parsed) || parsed < 0) {
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
     throw new Error(`${name} must be a non-negative integer`)
   }
 
   return parsed
 }
 
+function getPositiveTimerMsEnv(name: string, defaultValue: number): number {
+  const value = getPositiveIntegerEnv(name, defaultValue)
+  if (value > NODE_TIMER_MAX_MS) {
+    throw new Error(`${name} must be within the Node timer range`)
+  }
+  return value
+}
+
+function timerSecondsToMs(name: string, seconds: number): number {
+  if (!Number.isSafeInteger(seconds)
+    || seconds < 0
+    || seconds > Math.floor(NODE_TIMER_MAX_MS / 1000)) {
+    throw new Error(`${name} must be within the Node timer range`)
+  }
+  return seconds * 1000
+}
+
 function backoffDelayMs(attempt: number): number {
   return Math.min(2 ** Math.max(attempt - 1, 0) * 1000, 30_000)
 }
 
-function errorMessage(err: unknown): string {
+function retainedErrorMessage(err: unknown): string {
   return sanitizeWorkerMessage(err instanceof Error ? err.message : String(err))
+}
+
+function isTerminalStaleOwnerError(error: unknown): boolean {
+  return error instanceof Error
+    && (error as Error & { code?: unknown }).code === 'queue_stale_not_owner'
 }
 
 export async function startWorker(source: WorkerSource = 'standalone'): Promise<WorkerHandle> {
@@ -92,7 +135,16 @@ async function startWorkerOnce(
   source: WorkerSource,
   currentState: WorkerState,
 ): Promise<WorkerHandle> {
-  const [{ AnswersQueue, ApprovalQueue, TaskQueue }, { processAnsweredQuestions, processApproval, processTask }] = await Promise.all([
+  const [{
+    AnswersQueue,
+    ApprovalQueue,
+    RetryPromotionConflictError,
+    TaskQueue,
+  }, {
+    processAnsweredQuestions,
+    processApproval,
+    processTask,
+  }] = await Promise.all([
     import('./queue'),
     import('./orchestrator'),
   ])
@@ -103,14 +155,47 @@ async function startWorkerOnce(
     import('drizzle-orm'),
   ])
 
-  const taskQueue = new TaskQueue()
-  const approvalQueue = new ApprovalQueue()
-  const answersQueue = new AnswersQueue()
   const claimTimeoutSeconds = getClaimTimeoutSeconds()
+  const taskClaimTimeoutMs = Math.ceil(claimTimeoutSeconds * 1000)
+  if (!Number.isSafeInteger(taskClaimTimeoutMs)
+    || taskClaimTimeoutMs < 1
+    || taskClaimTimeoutMs > NODE_TIMER_MAX_MS - MIN_QUEUE_COMMAND_TIMEOUT_HEADROOM_MS) {
+    throw new Error(
+      'FORGE_WORKER_CLAIM_TIMEOUT_SECONDS exceeds the supported timer range',
+    )
+  }
+  const minimumQueueCommandTimeoutMs =
+    taskClaimTimeoutMs + MIN_QUEUE_COMMAND_TIMEOUT_HEADROOM_MS
+  const defaultQueueCommandTimeoutMs = Math.min(
+    NODE_TIMER_MAX_MS,
+    taskClaimTimeoutMs + DEFAULT_QUEUE_COMMAND_TIMEOUT_HEADROOM_MS,
+  )
+  const queueCommandTimeoutMs = getPositiveTimerMsEnv(
+    'FORGE_WORKER_REDIS_COMMAND_TIMEOUT_MS',
+    defaultQueueCommandTimeoutMs,
+  )
+  if (queueCommandTimeoutMs < minimumQueueCommandTimeoutMs) {
+    throw new Error(
+      'FORGE_WORKER_REDIS_COMMAND_TIMEOUT_MS must exceed the task claim timeout',
+    )
+  }
+  const gracefulShutdownTimeoutMs = getPositiveTimerMsEnv(
+    'FORGE_WORKER_SHUTDOWN_TIMEOUT_MS',
+    DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_MS,
+  )
   const maxAttempts = getPositiveIntegerEnv('FORGE_WORKER_MAX_ATTEMPTS', DEFAULT_MAX_ATTEMPTS)
-  const stuckJobRecoveryMs =
-    getPositiveIntegerEnv('FORGE_WORKER_STUCK_JOB_RECOVERY_SECONDS', DEFAULT_STUCK_JOB_RECOVERY_SECONDS) *
-    1000
+  const stuckJobRecoverySeconds = getPositiveIntegerEnv(
+    'FORGE_WORKER_STUCK_JOB_RECOVERY_SECONDS',
+    DEFAULT_STUCK_JOB_RECOVERY_SECONDS,
+  )
+  const stuckJobRecoveryMs = timerSecondsToMs(
+    'FORGE_WORKER_STUCK_JOB_RECOVERY_SECONDS',
+    stuckJobRecoverySeconds,
+  )
+  const claimRenewalIntervalMs = Math.max(
+    MIN_CLAIM_RENEWAL_INTERVAL_MS,
+    Math.min(MAX_QUEUE_RECOVERY_INTERVAL_MS, Math.floor(stuckJobRecoveryMs / 3)),
+  )
   const providerHealthIntervalSeconds = getNonNegativeIntegerEnv(
     'FORGE_PROVIDER_HEALTH_INTERVAL_SECONDS',
     DEFAULT_PROVIDER_HEALTH_INTERVAL_SECONDS,
@@ -119,12 +204,38 @@ async function startWorkerOnce(
     'FORGE_BLOCKED_HANDOFF_SWEEP_INTERVAL_SECONDS',
     DEFAULT_BLOCKED_HANDOFF_SWEEP_INTERVAL_SECONDS,
   )
+  const sessionCachePurgeIntervalSeconds = getNonNegativeIntegerEnv(
+    'FORGE_SESSION_CACHE_PURGE_INTERVAL_SECONDS',
+    DEFAULT_SESSION_CACHE_PURGE_INTERVAL_SECONDS,
+  )
+  const providerHealthIntervalMs = timerSecondsToMs(
+    'FORGE_PROVIDER_HEALTH_INTERVAL_SECONDS',
+    providerHealthIntervalSeconds,
+  )
+  const blockedHandoffSweepIntervalMs = timerSecondsToMs(
+    'FORGE_BLOCKED_HANDOFF_SWEEP_INTERVAL_SECONDS',
+    blockedHandoffSweepIntervalSeconds,
+  )
+  const sessionCachePurgeIntervalMs = timerSecondsToMs(
+    'FORGE_SESSION_CACHE_PURGE_INTERVAL_SECONDS',
+    sessionCachePurgeIntervalSeconds,
+  )
+  const queueOptions = { commandTimeoutMs: queueCommandTimeoutMs }
+  const taskQueue = new TaskQueue(undefined, queueOptions)
+  const approvalQueue = new ApprovalQueue(undefined, queueOptions)
+  const answersQueue = new AnswersQueue(undefined, queueOptions)
   const workerId = `${source}-${process.pid}-${Date.now().toString(36)}`
   let shuttingDown = false
   let providerHealthTimer: ReturnType<typeof setInterval> | null = null
   let providerHealthRunning = false
   let blockedHandoffSweepTimer: ReturnType<typeof setInterval> | null = null
   let blockedHandoffSweepRunning = false
+  let sessionCachePurgeTimer: ReturnType<typeof setInterval> | null = null
+  let sessionCachePurgeRunning = false
+  let queueRecoveryTimer: ReturnType<typeof setInterval> | null = null
+  let queueRecoveryRun: Promise<void> | null = null
+  let queuesDisconnected = false
+  let shutdownTimedOut = false
 
   const taskExists = async (taskId: string): Promise<boolean> => {
     const [row] = await db
@@ -135,20 +246,545 @@ async function startWorkerOnce(
     return row !== undefined
   }
 
-  const acknowledgeMissingTaskJob = async (
-    queueName: 'approval' | 'answers' | 'task',
-    taskId: string,
-    ack: () => Promise<void>,
-  ): Promise<boolean> => {
-    if (await taskExists(taskId)) return false
+  type RuntimeJob = {
+    attempt: number
+    taskId: string
+  }
+  type RuntimeQueue<TJob extends RuntimeJob> = {
+    ack: (raw: string) => Promise<unknown>
+    deadLetter: (raw: string, job: TJob) => Promise<unknown>
+    release: (raw: string) => Promise<unknown>
+    renewClaim: (raw: string) => Promise<QueueClaimRenewalResult>
+    retry: (raw: string, job: TJob, delayMs: number) => Promise<QueueRetryResult>
+  }
+  type QueueOperation = 'approval' | 'answers' | 'task'
+  type QueueInfrastructurePhase =
+    | 'ack_after_success'
+    | 'ack_missing_task'
+    | 'claim_renewal_initial'
+    | 'claim_renewal_deadline'
+    | 'claim_renewal_periodic'
+    | 'dead_letter'
+    | 'release_after_shutdown'
+    | 'retry'
+    | 'retry_reconciliation'
+    | 'task_lookup'
+  type AttemptInfrastructurePhase =
+    | 'finish_after_failure'
+    | 'finish_after_success'
+    | 'retain_for_adoption'
+    | 'start'
+  type ActiveClaimRenewal = {
+    dispose: () => void
+    forceUnavailable: () => void
+    pause: () => Promise<void>
+  }
+  const activeClaimFences = new Set<ClaimLeaseFence>()
+  const activeClaimRenewals = new Set<ActiveClaimRenewal>()
 
-    await ack()
-    console.info('[worker] Dropped job for deleted task', {
+  const logQueueInfrastructureFailure = (
+    phase: QueueInfrastructurePhase,
+    queueName: QueueOperation,
+    taskId: string,
+  ): void => {
+    console.error('[worker] Queue infrastructure failure', {
+      phase,
       queueName,
       taskId,
       workerId,
     })
-    return true
+  }
+
+  const logAttemptInfrastructureFailure = (
+    phase: AttemptInfrastructurePhase,
+    queueName: QueueOperation,
+    taskId: string,
+  ): void => {
+    console.error('[worker] Attempt persistence failure', {
+      phase,
+      queueName,
+      taskId,
+      workerId,
+    })
+  }
+
+  const logClaimLeaseLost = (
+    queueName: QueueOperation,
+    taskId: string,
+  ): void => {
+    console.warn('[worker] Queue claim lease lost', {
+      phase: 'claim_lease_lost',
+      queueName,
+      taskId,
+      workerId,
+    })
+  }
+
+  const logShutdownTimeout = (): void => {
+    console.error('[worker] Queue infrastructure failure', {
+      phase: 'shutdown_timeout',
+      workerId,
+    })
+  }
+
+  const acknowledgeMissingTaskJob = async (
+    queueName: QueueOperation,
+    taskId: string,
+    ack: () => Promise<unknown>,
+    claimLeaseFence?: ClaimLeaseFence,
+  ): Promise<'acknowledged' | 'present' | 'retained'> => {
+    let exists: boolean
+    try {
+      exists = await taskExists(taskId)
+    } catch {
+      logQueueInfrastructureFailure('task_lookup', queueName, taskId)
+      return 'retained'
+    }
+    if (exists) return 'present'
+
+    try {
+      await ack()
+      console.info('[worker] Dropped job for deleted task', {
+        queueName,
+        taskId,
+        workerId,
+      })
+      return 'acknowledged'
+    } catch (err) {
+      if (isTerminalStaleOwnerError(err)) {
+        if (claimLeaseFence?.markLost()) {
+          logClaimLeaseLost(queueName, taskId)
+        }
+        return 'retained'
+      }
+      if (claimLeaseFence?.lost || isClaimLeaseLostError(err)) return 'retained'
+      logQueueInfrastructureFailure('ack_missing_task', queueName, taskId)
+      return 'retained'
+    }
+  }
+
+  const startClaimRenewal = async <TJob extends RuntimeJob>(input: {
+    claimed: { job: TJob; raw: string }
+    fence: ClaimLeaseFence
+    queue: RuntimeQueue<TJob>
+    queueName: QueueOperation
+  }): Promise<{
+    dispose: () => void
+    forceUnavailable: () => void
+    pause: () => Promise<void>
+    startDisposition: 'established' | 'lost' | 'unavailable'
+  }> => {
+    const { claimed, fence, queue, queueName } = input
+    let disposed = false
+    let heartbeatPaused = false
+    let timer: ReturnType<typeof setInterval> | null = null
+    let deadlineTimer: ReturnType<typeof setTimeout> | null = null
+    let inFlight: Promise<'lost' | 'renewed' | 'transient_error'> | null = null
+    let pausePromise: Promise<void> | null = null
+    let safetyDeadline = 0
+
+    const clearRenewalTimer = (): void => {
+      if (timer) {
+        clearInterval(timer)
+        timer = null
+      }
+    }
+
+    const clearDeadlineTimer = (): void => {
+      if (deadlineTimer) {
+        clearTimeout(deadlineTimer)
+        deadlineTimer = null
+      }
+    }
+
+    const pauseScheduling = (): void => {
+      heartbeatPaused = true
+      clearRenewalTimer()
+    }
+
+    const markLost = (reason: 'deadline' | 'ownership' | 'shutdown'): void => {
+      pauseScheduling()
+      if (!fence.markLost()) return
+      if (reason === 'deadline') {
+        logQueueInfrastructureFailure(
+          'claim_renewal_deadline',
+          queueName,
+          claimed.job.taskId,
+        )
+      }
+      if (reason !== 'shutdown') {
+        logClaimLeaseLost(queueName, claimed.job.taskId)
+      }
+    }
+
+    const armDeadlineWatchdog = (): void => {
+      clearDeadlineTimer()
+      if (disposed || fence.lost) return
+      const remainingMs = Math.max(0, safetyDeadline - performance.now())
+      deadlineTimer = setTimeout(() => {
+        deadlineTimer = null
+        if (performance.now() >= safetyDeadline) {
+          markLost('deadline')
+          return
+        }
+        armDeadlineWatchdog()
+      }, remainingMs)
+    }
+
+    const renew = async (
+      phase: 'claim_renewal_initial' | 'claim_renewal_periodic',
+    ): Promise<'lost' | 'renewed' | 'transient_error'> => {
+      const requestStartedAt = performance.now()
+      if (safetyDeadline === 0) {
+        safetyDeadline = requestStartedAt + stuckJobRecoveryMs
+        armDeadlineWatchdog()
+      } else if (requestStartedAt >= safetyDeadline) {
+        markLost('deadline')
+        return 'lost'
+      }
+
+      try {
+        const result = await queue.renewClaim(claimed.raw)
+        if (fence.lost) return 'lost'
+        if (performance.now() >= safetyDeadline) {
+          markLost('deadline')
+          return 'lost'
+        }
+        if (result === 'renewed') {
+          safetyDeadline = requestStartedAt + stuckJobRecoveryMs
+          armDeadlineWatchdog()
+          return 'renewed'
+        }
+        markLost('ownership')
+        return 'lost'
+      } catch {
+        if (fence.lost) return 'lost'
+        if (performance.now() >= safetyDeadline) {
+          markLost('deadline')
+          return 'lost'
+        }
+        logQueueInfrastructureFailure(phase, queueName, claimed.job.taskId)
+        return 'transient_error'
+      }
+    }
+
+    const beginRenewal = (
+      phase: 'claim_renewal_initial' | 'claim_renewal_periodic',
+    ): Promise<'lost' | 'renewed' | 'transient_error'> => {
+      const current = renew(phase)
+      inFlight = current
+      void current.finally(() => {
+        if (inFlight === current) inFlight = null
+      })
+      return current
+    }
+
+    const tick = (): void => {
+      if (heartbeatPaused || inFlight) return
+      void beginRenewal('claim_renewal_periodic')
+    }
+
+    const pause = (): Promise<void> => {
+      if (pausePromise) return pausePromise
+      pausePromise = (async () => {
+        pauseScheduling()
+        const pending = inFlight
+        if (pending && !fence.lost) {
+          await Promise.race([
+            pending,
+            new Promise<void>((resolve) => {
+              if (fence.lost) {
+                resolve()
+                return
+              }
+              fence.signal.addEventListener('abort', () => resolve(), { once: true })
+            }),
+          ])
+        }
+      })()
+      return pausePromise
+    }
+
+    const control: ActiveClaimRenewal = {
+      dispose: () => {
+        if (disposed) return
+        disposed = true
+        pauseScheduling()
+        clearDeadlineTimer()
+        activeClaimRenewals.delete(control)
+      },
+      forceUnavailable: () => {
+        pauseScheduling()
+        clearDeadlineTimer()
+        markLost('shutdown')
+      },
+      pause,
+    }
+    activeClaimRenewals.add(control)
+
+    const initialRenewal = beginRenewal('claim_renewal_initial')
+    const initialDisposition = await Promise.race([
+      initialRenewal,
+      new Promise<'lost'>((resolve) => {
+        if (fence.lost) {
+          resolve('lost')
+          return
+        }
+        fence.signal.addEventListener('abort', () => resolve('lost'), { once: true })
+      }),
+    ])
+    if (initialDisposition !== 'renewed') {
+      pauseScheduling()
+      control.dispose()
+    }
+
+    if (initialDisposition === 'renewed') {
+      timer = setInterval(tick, claimRenewalIntervalMs)
+    }
+
+    return {
+      dispose: control.dispose,
+      forceUnavailable: control.forceUnavailable,
+      pause,
+      startDisposition: initialDisposition === 'renewed'
+        ? 'established'
+        : initialDisposition === 'lost'
+          ? 'lost'
+          : 'unavailable',
+    }
+  }
+
+  const processClaimedJob = async <TJob extends RuntimeJob>(input: {
+    attemptQueueName: 'answers' | 'approvals' | 'tasks'
+    claimed: { job: TJob; occurrenceId: string; raw: string }
+    processBusiness: (
+      finalAttempt: boolean,
+      fence: ClaimLeaseFence,
+      executionContext: QueueClaimExecutionContext,
+    ) => Promise<QueueClaimBusinessDisposition>
+    queue: RuntimeQueue<TJob>
+    queueName: QueueOperation
+  }): Promise<void> => {
+    const { claimed, queue, queueName } = input
+    const { job, raw } = claimed
+    const finalAttempt = job.attempt >= maxAttempts
+    const claimLeaseFence = new ClaimLeaseFence()
+    activeClaimFences.add(claimLeaseFence)
+    const claimRenewal = await startClaimRenewal({
+      claimed,
+      fence: claimLeaseFence,
+      queue,
+      queueName,
+    })
+    if (claimRenewal.startDisposition !== 'established') {
+      activeClaimFences.delete(claimLeaseFence)
+      return
+    }
+    const pauseClaimRenewal = async (): Promise<void> => {
+      await claimRenewal.pause()
+    }
+    const terminalOwnershipLost = (error: unknown): boolean => {
+      if (!isTerminalStaleOwnerError(error)) return false
+      if (claimLeaseFence.markLost()) {
+        logClaimLeaseLost(queueName, job.taskId)
+      }
+      return true
+    }
+
+    try {
+      const missingTaskDisposition = await acknowledgeMissingTaskJob(
+        queueName,
+        job.taskId,
+        async () => {
+          await pauseClaimRenewal()
+          claimLeaseFence.assertOwned()
+          return queue.ack(raw)
+        },
+        claimLeaseFence,
+      )
+      if (missingTaskDisposition !== 'present') return
+
+      let attemptId: string
+      let executionContext: QueueClaimExecutionContext
+      try {
+        claimLeaseFence.assertOwned()
+        const startedAttempt = await startTaskAttempt({
+          attemptNumber: job.attempt,
+          jobPayload: job,
+          occurrenceId: claimed.occurrenceId,
+          queueName: input.attemptQueueName,
+          taskId: job.taskId,
+          workerId,
+        })
+        attemptId = startedAttempt.attemptId
+        executionContext = {
+          occurrenceId: claimed.occurrenceId,
+          recoveredOccurrence: startedAttempt.recoveredOccurrence,
+        }
+      } catch (err) {
+        if (claimLeaseFence.lost || isClaimLeaseLostError(err)) return
+        logAttemptInfrastructureFailure('start', queueName, job.taskId)
+        return
+      }
+
+      console.info('[worker] Processing job', {
+        attempt: job.attempt,
+        finalAttempt,
+        queueName,
+        taskId: job.taskId,
+        workerId,
+      })
+
+      try {
+        claimLeaseFence.assertOwned()
+        const businessDisposition = await input.processBusiness(
+          finalAttempt,
+          claimLeaseFence,
+          executionContext,
+        )
+        claimLeaseFence.assertOwned()
+        if (businessDisposition === 'retained') {
+          // Do not leave a refused occurrence running: a later recovery of Y
+          // must not adopt Y's own prior ledger row. This follows the ownership
+          // fence so a genuine loss still preserves A for B's recovery of A.
+          try {
+            await finishTaskAttempt({
+              attemptId,
+              errorMessage: ADOPTION_PENDING_OCCURRENCE_MESSAGE,
+              status: 'indeterminate',
+            })
+          } catch (err) {
+            if (claimLeaseFence.lost || isClaimLeaseLostError(err)) return
+            logAttemptInfrastructureFailure('retain_for_adoption', queueName, job.taskId)
+          }
+          await pauseClaimRenewal()
+          return
+        }
+        if (businessDisposition !== 'completed') {
+          throw new Error('Queue business disposition is invalid.')
+        }
+      } catch (err) {
+        if (claimLeaseFence.lost || isClaimLeaseLostError(err)) return
+        const message = retainedErrorMessage(err)
+        console.error('[worker] Job processing failed', {
+          attempt: job.attempt,
+          finalAttempt,
+          queueName,
+          taskId: job.taskId,
+          workerId,
+        })
+
+        if (finalAttempt) {
+          claimLeaseFence.assertOwned()
+          try {
+            await finishTaskAttempt({
+              attemptId,
+              errorMessage: message,
+              nextRetryAt: null,
+              status: 'dead_lettered',
+            })
+          } catch (err) {
+            if (claimLeaseFence.lost || isClaimLeaseLostError(err)) return
+            logAttemptInfrastructureFailure('finish_after_failure', queueName, job.taskId)
+          }
+          await pauseClaimRenewal()
+          claimLeaseFence.assertOwned()
+          try {
+            await queue.deadLetter(raw, job)
+          } catch (err) {
+            if (terminalOwnershipLost(err)) return
+            if (claimLeaseFence.lost || isClaimLeaseLostError(err)) return
+            logQueueInfrastructureFailure('dead_letter', queueName, job.taskId)
+          }
+          return
+        }
+
+        const retryDelayMs = backoffDelayMs(job.attempt)
+        await pauseClaimRenewal()
+        claimLeaseFence.assertOwned()
+        let retryResult: QueueRetryResult
+        try {
+          retryResult = await queue.retry(raw, job, retryDelayMs)
+        } catch (err) {
+          if (terminalOwnershipLost(err)) return
+          if (claimLeaseFence.lost || isClaimLeaseLostError(err)) return
+          logQueueInfrastructureFailure('retry', queueName, job.taskId)
+          try {
+            retryResult = await queue.retry(raw, job, retryDelayMs)
+          } catch (reconciliationError) {
+            if (terminalOwnershipLost(reconciliationError)) return
+            if (claimLeaseFence.lost || isClaimLeaseLostError(reconciliationError)) return
+            logQueueInfrastructureFailure('retry_reconciliation', queueName, job.taskId)
+            claimLeaseFence.assertOwned()
+            try {
+              await finishTaskAttempt({
+                attemptId,
+                errorMessage: message,
+                nextRetryAt: null,
+                status: 'indeterminate',
+              })
+            } catch (finishError) {
+              if (claimLeaseFence.lost || isClaimLeaseLostError(finishError)) return
+              logAttemptInfrastructureFailure('finish_after_failure', queueName, job.taskId)
+            }
+            return
+          }
+        }
+        claimLeaseFence.assertOwned()
+        try {
+          await finishTaskAttempt({
+            attemptId,
+            errorMessage: message,
+            nextRetryAt: retryResult.nextRetryAt,
+            status: 'failed',
+          })
+        } catch (err) {
+          if (claimLeaseFence.lost || isClaimLeaseLostError(err)) return
+          logAttemptInfrastructureFailure('finish_after_failure', queueName, job.taskId)
+        }
+        return
+      }
+
+      claimLeaseFence.assertOwned()
+      try {
+        await finishTaskAttempt({ attemptId, status: 'completed' })
+      } catch (err) {
+        if (claimLeaseFence.lost || isClaimLeaseLostError(err)) return
+        logAttemptInfrastructureFailure('finish_after_success', queueName, job.taskId)
+      }
+      await pauseClaimRenewal()
+      claimLeaseFence.assertOwned()
+      try {
+        await queue.ack(raw)
+      } catch (err) {
+        if (terminalOwnershipLost(err)) return
+        if (claimLeaseFence.lost || isClaimLeaseLostError(err)) return
+        logQueueInfrastructureFailure('ack_after_success', queueName, job.taskId)
+      }
+    } catch (err) {
+      if (claimLeaseFence.lost || isClaimLeaseLostError(err)) return
+      throw err
+    } finally {
+      await pauseClaimRenewal()
+      claimRenewal.dispose()
+      activeClaimFences.delete(claimLeaseFence)
+    }
+  }
+
+  const releaseClaimAfterShutdown = async <TJob extends RuntimeJob>(input: {
+    claimed: { job: TJob; raw: string }
+    queue: RuntimeQueue<TJob>
+    queueName: QueueOperation
+  }): Promise<void> => {
+    try {
+      await input.queue.release(input.claimed.raw)
+    } catch {
+      logQueueInfrastructureFailure(
+        'release_after_shutdown',
+        input.queueName,
+        input.claimed.job.taskId,
+      )
+    }
   }
 
   const refreshProviderHealth = async (): Promise<void> => {
@@ -156,15 +792,12 @@ async function startWorkerOnce(
     providerHealthRunning = true
     try {
       const { refreshStaleProviderHealth } = await import('../lib/providers/health')
-      const checked = await refreshStaleProviderHealth(providerHealthIntervalSeconds * 1000)
+      const checked = await refreshStaleProviderHealth(providerHealthIntervalMs)
       if (checked > 0) {
         console.info('[worker] Refreshed provider health cache', { checked, workerId })
       }
-    } catch (err) {
-      console.warn('[worker] Provider health refresh failed', {
-        err: errorMessage(err),
-        workerId,
-      })
+    } catch {
+      console.warn('[worker] Provider health refresh failed', { workerId })
     } finally {
       providerHealthRunning = false
     }
@@ -174,8 +807,8 @@ async function startWorkerOnce(
   // (e.g. a transiently-unhealthy MCP). The task is left at `approved`, so we
   // re-enqueue an approval job and let processApproval re-run the broker — if the
   // block still applies it simply re-blocks, so this never bypasses the gate.
-  const sweepBlockedHandoffs = async (): Promise<void> => {
-    if (blockedHandoffSweepIntervalSeconds === 0 || blockedHandoffSweepRunning) return
+  const sweepBlockedHandoffs = async (options: { startup?: boolean } = {}): Promise<void> => {
+    if ((!options.startup && blockedHandoffSweepIntervalSeconds === 0) || blockedHandoffSweepRunning) return
     blockedHandoffSweepRunning = true
     try {
       const [
@@ -183,12 +816,14 @@ async function startWorkerOnce(
         { tasks, workPackages },
         { enqueueDueBlockedHandoffRetries },
         { convergeRecognizedOperatorHolds },
+        { reconcilePendingS4CompletionHandoffs },
         { and, eq },
       ] = await Promise.all([
         import('../db'),
         import('../db/schema'),
         import('./blocked-handoff-retry'),
         import('../lib/mcps/filesystem-grant-reconciliation'),
+        import('./work-package-handoff'),
         import('drizzle-orm'),
       ])
       const stuck = await db
@@ -200,6 +835,10 @@ async function startWorkerOnce(
         .innerJoin(tasks, eq(tasks.id, workPackages.taskId))
         .where(and(eq(workPackages.status, 'blocked'), eq(tasks.status, 'approved')))
 
+      const recoveredS4Handoffs = await reconcilePendingS4CompletionHandoffs(100, {
+        drain: options.startup === true,
+        workerId,
+      })
       const enqueued = await enqueueDueBlockedHandoffRetries(stuck)
       const converged = await convergeRecognizedOperatorHolds()
       if (enqueued > 0) {
@@ -208,67 +847,186 @@ async function startWorkerOnce(
       if (converged > 0) {
         console.info('[worker] Converged running tasks with operator holds', { count: converged, workerId })
       }
-    } catch (err) {
-      console.warn('[worker] Blocked-handoff sweep failed', { err: errorMessage(err), workerId })
+      if (recoveredS4Handoffs > 0) {
+        console.info('[worker] Recovered protected completion handoffs', { count: recoveredS4Handoffs, workerId })
+      }
+    } catch {
+      console.warn('[worker] Blocked-handoff sweep failed', { workerId })
     } finally {
       blockedHandoffSweepRunning = false
     }
   }
 
+  // This maintenance path is deliberately independent of handoff/S4 recovery:
+  // a failed handoff sweep must never strand a revoked session cache key.
+  const sweepSessionCachePurges = async (options: { startup?: boolean } = {}): Promise<void> => {
+    if ((!options.startup && sessionCachePurgeIntervalSeconds === 0) || sessionCachePurgeRunning) return
+    sessionCachePurgeRunning = true
+    try {
+      const { reconcilePendingSessionCacheInvalidations } = await import('../lib/session')
+      const reconciled = await reconcilePendingSessionCacheInvalidations(100)
+      if (reconciled.claimed > 0) {
+        console.info('[worker] Reconciled revoked session caches', {
+          claimed: reconciled.claimed,
+          completed: reconciled.completed,
+          deferred: reconciled.deferred,
+          stale: reconciled.stale,
+          workerId,
+        })
+      }
+    } catch {
+      console.warn('[worker] Session cache purge sweep failed', { workerId })
+    } finally {
+      sessionCachePurgeRunning = false
+    }
+  }
+
+  const recoverQueueWork = (options: { drain?: boolean } = {}): Promise<void> => {
+    if (queueRecoveryRun) return queueRecoveryRun
+    queueRecoveryRun = (async () => {
+      try {
+        const [recoveredApprovals, recoveredAnswers, recoveredTasks] = await Promise.all([
+          approvalQueue.recoverStuckJobs(stuckJobRecoveryMs, options),
+          answersQueue.recoverStuckJobs(stuckJobRecoveryMs, options),
+          taskQueue.recoverStuckJobs(stuckJobRecoveryMs, options),
+        ])
+        if (recoveredApprovals > 0 || recoveredAnswers > 0 || recoveredTasks > 0) {
+          console.warn('[worker] Recovered stuck jobs', {
+            approvals: recoveredApprovals,
+            answers: recoveredAnswers,
+            tasks: recoveredTasks,
+            workerId,
+          })
+        }
+      } catch {
+        console.error('[worker] Queue recovery fault', { workerId })
+      }
+    })().finally(() => {
+      queueRecoveryRun = null
+    })
+    return queueRecoveryRun
+  }
+
+  const clearWorkerTimers = (): void => {
+    if (providerHealthTimer !== null) {
+      clearInterval(providerHealthTimer)
+      providerHealthTimer = null
+    }
+    if (blockedHandoffSweepTimer !== null) {
+      clearInterval(blockedHandoffSweepTimer)
+      blockedHandoffSweepTimer = null
+    }
+    if (sessionCachePurgeTimer !== null) {
+      clearInterval(sessionCachePurgeTimer)
+      sessionCachePurgeTimer = null
+    }
+    if (queueRecoveryTimer !== null) {
+      clearInterval(queueRecoveryTimer)
+      queueRecoveryTimer = null
+    }
+  }
+
+  const disconnectQueues = (): void => {
+    if (queuesDisconnected) return
+    queuesDisconnected = true
+    taskQueue.disconnect()
+    approvalQueue.disconnect()
+    answersQueue.disconnect()
+  }
+
+  const forceQueueShutdown = (): void => {
+    if (shutdownTimedOut) return
+    shutdownTimedOut = true
+    logShutdownTimeout()
+    clearWorkerTimers()
+    for (const renewal of activeClaimRenewals) renewal.forceUnavailable()
+    for (const fence of activeClaimFences) fence.markLost()
+    disconnectQueues()
+  }
+
   const run = async (): Promise<void> => {
-    const executionMode = defaultOnFeatureFlagState(process.env.FORGE_WORK_PACKAGE_EXECUTION)
-    const hostWriteMode = defaultOnFeatureFlagState(
-      process.env.FORGE_HOST_REPOSITORY_WRITES ?? process.env.FORGE_REPOSITORY_EDITS,
-    )
+    const executionRequestFlag = defaultOnFeatureFlagState(process.env.FORGE_WORK_PACKAGE_EXECUTION)
+    const executionMode = {
+      enabled: false,
+      recognized: executionRequestFlag.recognized,
+      requested: explicitOptInFeatureFlagEnabled(process.env.FORGE_WORK_PACKAGE_EXECUTION),
+    }
+    const hostWriteMode = hostRepositoryWritePolicyState()
     console.info('[worker] Started', {
       claimTimeoutSeconds,
+      hostRepositoryWritesAvailable: hostWriteMode.available,
       hostRepositoryWritesEnabled: hostWriteMode.enabled,
       hostRepositoryWritesFlagRecognized: hostWriteMode.recognized,
+      hostRepositoryWritesRequested: hostWriteMode.requested,
       maxAttempts,
       providerHealthIntervalSeconds,
+      sessionCachePurgeIntervalSeconds,
       source,
       stuckJobRecoveryMs,
       workPackageExecutionEnabled: executionMode.enabled,
       workPackageExecutionFlagRecognized: executionMode.recognized,
+      workPackageExecutionRequested: executionMode.requested,
       workerId,
     })
+
+    if (hostWriteMode.requested) {
+      console.warn('[worker] Host repository writes are unavailable; enabled requests fail closed after sandbox output is preserved', {
+        flag: hostWriteMode.source,
+        workerId,
+      })
+    }
 
     try {
       if (providerHealthIntervalSeconds > 0) {
         void refreshProviderHealth()
         providerHealthTimer = setInterval(
           () => void refreshProviderHealth(),
-          providerHealthIntervalSeconds * 1000,
+          providerHealthIntervalMs,
         )
       }
 
+      void sweepBlockedHandoffs({ startup: true })
       if (blockedHandoffSweepIntervalSeconds > 0) {
-        void sweepBlockedHandoffs()
         blockedHandoffSweepTimer = setInterval(
           () => void sweepBlockedHandoffs(),
-          blockedHandoffSweepIntervalSeconds * 1000,
+          blockedHandoffSweepIntervalMs,
+        )
+      }
+      void sweepSessionCachePurges({ startup: true })
+      if (sessionCachePurgeIntervalSeconds > 0) {
+        sessionCachePurgeTimer = setInterval(
+          () => void sweepSessionCachePurges(),
+          sessionCachePurgeIntervalMs,
         )
       }
 
-      const [recoveredApprovals, recoveredAnswers, recoveredTasks] = await Promise.all([
-        approvalQueue.recoverStuckJobs(stuckJobRecoveryMs),
-        answersQueue.recoverStuckJobs(stuckJobRecoveryMs),
-        taskQueue.recoverStuckJobs(stuckJobRecoveryMs),
-      ])
-      if (recoveredApprovals > 0 || recoveredAnswers > 0 || recoveredTasks > 0) {
-        console.warn('[worker] Recovered stuck jobs', {
-          approvals: recoveredApprovals,
-          answers: recoveredAnswers,
-          tasks: recoveredTasks,
-          workerId,
-        })
+      await recoverQueueWork({ drain: true })
+      queueRecoveryTimer = setInterval(
+        () => void recoverQueueWork(),
+        Math.min(stuckJobRecoveryMs, MAX_QUEUE_RECOVERY_INTERVAL_MS),
+      )
+
+      const promoteQueueRetries = async (
+        queueName: 'answers' | 'approvals' | 'tasks',
+        queue: { promoteDueRetries(): Promise<number> },
+      ): Promise<number> => {
+        try {
+          return await queue.promoteDueRetries()
+        } catch (error) {
+          if (!(error instanceof RetryPromotionConflictError)) throw error
+          console.warn('[worker] Retry promotion compatibility conflict', {
+            category: 'mixed_version_retry_promotion',
+            queue: queueName,
+          })
+          return 0
+        }
       }
 
       while (!shuttingDown) {
         const [promotedApprovals, promotedAnswers, promotedTasks] = await Promise.all([
-          approvalQueue.promoteDueRetries(),
-          answersQueue.promoteDueRetries(),
-          taskQueue.promoteDueRetries(),
+          promoteQueueRetries('approvals', approvalQueue),
+          promoteQueueRetries('answers', answersQueue),
+          promoteQueueRetries('tasks', taskQueue),
         ])
         if (promotedApprovals > 0 || promotedAnswers > 0 || promotedTasks > 0) {
           console.info('[worker] Promoted retry jobs', {
@@ -278,296 +1036,164 @@ async function startWorkerOnce(
             workerId,
           })
         }
+        if (shuttingDown) break
 
         let claimedApproval = null as Awaited<ReturnType<InstanceType<typeof ApprovalQueue>['claim']>>
 
         try {
           claimedApproval = await approvalQueue.claim(APPROVAL_CLAIM_TIMEOUT_SECONDS)
-        } catch (err) {
+        } catch {
           if (shuttingDown) break
-          console.error('[worker] Failed to claim approval', { err: errorMessage(err), workerId })
+          console.error('[worker] Failed to claim approval', { workerId })
         }
 
-        if (claimedApproval !== null) {
-          let ackedApproval = false
-          let approvalAttemptId: string | null = null
-          const finalAttempt = claimedApproval.job.attempt >= maxAttempts
-          try {
-            if (await acknowledgeMissingTaskJob(
-              'approval',
-              claimedApproval.job.taskId,
-              () => approvalQueue.ack(claimedApproval.raw),
-            )) {
-              ackedApproval = true
-            } else {
-              approvalAttemptId = await startTaskAttempt({
-                attemptNumber: claimedApproval.job.attempt,
-                jobPayload: claimedApproval.job,
-                queueName: 'approvals',
-                taskId: claimedApproval.job.taskId,
-                workerId,
-              })
-              console.info('[worker] Processing approval', {
-                attempt: claimedApproval.job.attempt,
-                taskId: claimedApproval.job.taskId,
-                workerId,
-              })
-              await processApproval(claimedApproval.job.taskId, { finalAttempt })
-              if (approvalAttemptId) {
-                await finishTaskAttempt({ attemptId: approvalAttemptId, status: 'completed' })
-              }
-              await approvalQueue.ack(claimedApproval.raw)
-              ackedApproval = true
-            }
-          } catch (err) {
-            const message = errorMessage(err)
-            const nextRetryAt = finalAttempt
-              ? null
-              : new Date(Date.now() + backoffDelayMs(claimedApproval.job.attempt))
-            if (approvalAttemptId) {
-              await finishTaskAttempt({
-                attemptId: approvalAttemptId,
-                errorMessage: message,
-                nextRetryAt,
-                status: finalAttempt ? 'dead_lettered' : 'failed',
-              })
-            }
-            if (finalAttempt) {
-              await approvalQueue.deadLetter(claimedApproval.raw, message)
-            } else {
-              await approvalQueue.retry(
-                claimedApproval.raw,
-                claimedApproval.job,
-                backoffDelayMs(claimedApproval.job.attempt),
-              )
-            }
-            ackedApproval = true
-            console.error('[worker] Approval failed', {
-              attempt: claimedApproval.job.attempt,
-              finalAttempt,
-              taskId: claimedApproval.job.taskId,
-              err: message,
-              workerId,
+        if (shuttingDown) {
+          if (claimedApproval !== null) {
+            await releaseClaimAfterShutdown({
+              claimed: claimedApproval,
+              queue: approvalQueue,
+              queueName: 'approval',
             })
-          } finally {
-            if (!ackedApproval) {
-              try {
-                await approvalQueue.ack(claimedApproval.raw)
-              } catch (err) {
-                console.error('[worker] Failed to acknowledge approval', {
-                  taskId: claimedApproval.job.taskId,
-                  err: errorMessage(err),
-                  workerId,
-                })
-              }
-            }
           }
+          break
         }
+        if (claimedApproval !== null) {
+          await processClaimedJob({
+            attemptQueueName: 'approvals',
+            claimed: claimedApproval,
+            processBusiness: (finalAttempt, claimLeaseFence, executionContext) =>
+              processApproval(claimedApproval.job.taskId, {
+                claimLeaseFence,
+                executionContext,
+                finalAttempt,
+              }),
+            queue: approvalQueue,
+            queueName: 'approval',
+          })
+        }
+        if (shuttingDown) break
 
         let claimedAnswers = null as Awaited<ReturnType<InstanceType<typeof AnswersQueue>['claim']>>
 
         try {
           claimedAnswers = await answersQueue.claim(APPROVAL_CLAIM_TIMEOUT_SECONDS)
-        } catch (err) {
+        } catch {
           if (shuttingDown) break
-          console.error('[worker] Failed to claim answers job', { err: errorMessage(err), workerId })
+          console.error('[worker] Failed to claim answers job', { workerId })
         }
 
-        if (claimedAnswers !== null) {
-          let ackedAnswers = false
-          let answersAttemptId: string | null = null
-          const finalAttempt = claimedAnswers.job.attempt >= maxAttempts
-          try {
-            if (await acknowledgeMissingTaskJob(
-              'answers',
-              claimedAnswers.job.taskId,
-              () => answersQueue.ack(claimedAnswers.raw),
-            )) {
-              ackedAnswers = true
-            } else {
-              answersAttemptId = await startTaskAttempt({
-                attemptNumber: claimedAnswers.job.attempt,
-                jobPayload: claimedAnswers.job,
-                queueName: 'answers',
-                taskId: claimedAnswers.job.taskId,
-                workerId,
-              })
-              console.info('[worker] Processing answered questions', {
-                attempt: claimedAnswers.job.attempt,
-                taskId: claimedAnswers.job.taskId,
-                workerId,
-              })
-              await processAnsweredQuestions(claimedAnswers.job.taskId, { finalAttempt })
-              if (answersAttemptId) {
-                await finishTaskAttempt({ attemptId: answersAttemptId, status: 'completed' })
-              }
-              await answersQueue.ack(claimedAnswers.raw)
-              ackedAnswers = true
-            }
-          } catch (err) {
-            const message = errorMessage(err)
-            const nextRetryAt = finalAttempt
-              ? null
-              : new Date(Date.now() + backoffDelayMs(claimedAnswers.job.attempt))
-            if (answersAttemptId) {
-              await finishTaskAttempt({
-                attemptId: answersAttemptId,
-                errorMessage: message,
-                nextRetryAt,
-                status: finalAttempt ? 'dead_lettered' : 'failed',
-              })
-            }
-            if (finalAttempt) {
-              await answersQueue.deadLetter(claimedAnswers.raw, message)
-            } else {
-              await answersQueue.retry(
-                claimedAnswers.raw,
-                claimedAnswers.job,
-                backoffDelayMs(claimedAnswers.job.attempt),
-              )
-            }
-            ackedAnswers = true
-            console.error('[worker] Answered-questions re-plan failed', {
-              attempt: claimedAnswers.job.attempt,
-              finalAttempt,
-              taskId: claimedAnswers.job.taskId,
-              err: message,
-              workerId,
+        if (shuttingDown) {
+          if (claimedAnswers !== null) {
+            await releaseClaimAfterShutdown({
+              claimed: claimedAnswers,
+              queue: answersQueue,
+              queueName: 'answers',
             })
-          } finally {
-            if (!ackedAnswers) {
-              try {
-                await answersQueue.ack(claimedAnswers.raw)
-              } catch (err) {
-                console.error('[worker] Failed to acknowledge answers job', {
-                  taskId: claimedAnswers.job.taskId,
-                  err: errorMessage(err),
-                  workerId,
-                })
-              }
-            }
           }
+          break
         }
+        if (claimedAnswers !== null) {
+          await processClaimedJob({
+            attemptQueueName: 'answers',
+            claimed: claimedAnswers,
+            processBusiness: async (finalAttempt, claimLeaseFence, executionContext) =>
+              await processAnsweredQuestions(claimedAnswers.job.taskId, {
+                claimLeaseFence,
+                executionContext,
+                finalAttempt,
+              }),
+            queue: answersQueue,
+            queueName: 'answers',
+          })
+        }
+        if (shuttingDown) break
 
         let claimedTask = null as Awaited<ReturnType<InstanceType<typeof TaskQueue>['claim']>>
 
         try {
           claimedTask = await taskQueue.claim(claimTimeoutSeconds)
-        } catch (err) {
+        } catch {
           if (shuttingDown) break
-          console.error('[worker] Failed to claim task', { err: errorMessage(err), workerId })
+          console.error('[worker] Failed to claim task', { workerId })
           continue
         }
 
+        if (shuttingDown) {
+          if (claimedTask !== null) {
+            await releaseClaimAfterShutdown({
+              claimed: claimedTask,
+              queue: taskQueue,
+              queueName: 'task',
+            })
+          }
+          break
+        }
         if (claimedTask === null) continue
 
-        let ackedTask = false
-        let taskAttemptId: string | null = null
-        try {
-          const finalAttempt = claimedTask.job.attempt >= maxAttempts
-          if (await acknowledgeMissingTaskJob(
-            'task',
-            claimedTask.job.taskId,
-            () => taskQueue.ack(claimedTask.raw),
-          )) {
-            ackedTask = true
-          } else {
-            taskAttemptId = await startTaskAttempt({
-              attemptNumber: claimedTask.job.attempt,
-              jobPayload: claimedTask.job,
-              queueName: 'tasks',
-              taskId: claimedTask.job.taskId,
-              workerId,
-            })
-            console.info('[worker] Processing task', {
-              attempt: claimedTask.job.attempt,
+        await processClaimedJob({
+          attemptQueueName: 'tasks',
+          claimed: claimedTask,
+          processBusiness: (finalAttempt, claimLeaseFence, executionContext) =>
+            processTask(claimedTask.job.taskId, {
+              claimLeaseFence,
+              executionContext,
               finalAttempt,
-              taskId: claimedTask.job.taskId,
-              workerId,
-            })
-            await processTask(claimedTask.job.taskId, { finalAttempt })
-            if (taskAttemptId) {
-              await finishTaskAttempt({ attemptId: taskAttemptId, status: 'completed' })
-            }
-            await taskQueue.ack(claimedTask.raw)
-            ackedTask = true
-          }
-        } catch (err) {
-          const message = errorMessage(err)
-          const finalAttempt = claimedTask.job.attempt >= maxAttempts
-          const nextRetryAt = finalAttempt
-            ? null
-            : new Date(Date.now() + backoffDelayMs(claimedTask.job.attempt))
-          if (taskAttemptId) {
-            await finishTaskAttempt({
-              attemptId: taskAttemptId,
-              errorMessage: message,
-              nextRetryAt,
-              status: finalAttempt ? 'dead_lettered' : 'failed',
-            })
-          }
-          if (finalAttempt) {
-            await taskQueue.deadLetter(claimedTask.raw, message)
-          } else {
-            await taskQueue.retry(
-              claimedTask.raw,
-              claimedTask.job,
-              backoffDelayMs(claimedTask.job.attempt),
-            )
-          }
-          ackedTask = true
-          console.error('[worker] Task failed', {
-            attempt: claimedTask.job.attempt,
-            finalAttempt,
-            taskId: claimedTask.job.taskId,
-            err: message,
-            workerId,
-          })
-        } finally {
-          if (!ackedTask) {
-            try {
-              await taskQueue.ack(claimedTask.raw)
-            } catch (err) {
-              console.error('[worker] Failed to acknowledge task', {
-                taskId: claimedTask.job.taskId,
-                err: errorMessage(err),
-                workerId,
-              })
-            }
-          }
-        }
+            }),
+          queue: taskQueue,
+          queueName: 'task',
+        })
       }
     } finally {
-      if (providerHealthTimer !== null) {
-        clearInterval(providerHealthTimer)
-        providerHealthTimer = null
-      }
-      if (blockedHandoffSweepTimer !== null) {
-        clearInterval(blockedHandoffSweepTimer)
-        blockedHandoffSweepTimer = null
-      }
-      taskQueue.disconnect()
-      approvalQueue.disconnect()
-      answersQueue.disconnect()
+      clearWorkerTimers()
+      for (const renewal of activeClaimRenewals) renewal.forceUnavailable()
+      for (const fence of activeClaimFences) fence.markLost()
+      disconnectQueues()
+      await queueRecoveryRun?.catch(() => {})
       currentState.handle = null
       console.info('[worker] Stopped')
     }
   }
 
   const done = run()
-  done.catch((err) => {
-    console.error('[worker] Fatal error', { err: errorMessage(err), workerId })
+  done.catch(() => {
+    if (!shuttingDown) console.error('[worker] Fatal error', { workerId })
   })
 
+  let stopPromise: Promise<void> | null = null
   const handle: WorkerHandle = {
     done,
-    stop: async () => {
-      if (shuttingDown) return
-      shuttingDown = true
-      taskQueue.disconnect()
-      approvalQueue.disconnect()
-      answersQueue.disconnect()
-      await done.catch(() => {})
+    stop: () => {
+      if (stopPromise) return stopPromise
+      stopPromise = (async () => {
+        if (!shuttingDown) {
+          shuttingDown = true
+          clearWorkerTimers()
+        }
+
+        let shutdownTimer: ReturnType<typeof setTimeout> | null = null
+        const drained = await Promise.race([
+          done.then(
+            () => true,
+            () => true,
+          ),
+          new Promise<false>((resolve) => {
+            shutdownTimer = setTimeout(() => resolve(false), gracefulShutdownTimeoutMs)
+          }),
+        ])
+        if (shutdownTimer) clearTimeout(shutdownTimer)
+        if (drained) return
+
+        forceQueueShutdown()
+        let settleTimer: ReturnType<typeof setTimeout> | null = null
+        await Promise.race([
+          done.catch(() => {}),
+          new Promise<void>((resolve) => {
+            settleTimer = setTimeout(resolve, FORCED_SHUTDOWN_SETTLE_MARGIN_MS)
+          }),
+        ])
+        if (settleTimer) clearTimeout(settleTimer)
+      })()
+      return stopPromise
     },
   }
 
