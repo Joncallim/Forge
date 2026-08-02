@@ -21,7 +21,17 @@ import { recordTaskLogBestEffort } from '@/worker/task-logs'
 import { accessibleTaskCondition, getAccessibleTask } from '@/lib/task-access'
 import { validateMcpOperatorReviewHistory } from '@/worker/mcp-plan-review'
 import { guardEpic172ProjectManagementIngress } from '@/lib/projects/epic-172-project-ingress'
-import { sanitizeWorkPackageMetadata } from '@/lib/mcps/leakage-drain'
+import {
+  projectTaskCompatibilityArtifact,
+  projectTaskCompatibilityAttempt,
+  projectTaskCompatibilityCommandAudit,
+  projectTaskCompatibilityFilesystemAudit,
+  projectTaskCompatibilityRun,
+  projectTaskCompatibilityTask,
+  projectTaskCompatibilityVcsChange,
+  projectTaskCompatibilityWorkPackage,
+  sanitizeWorkPackageMetadata,
+} from '@/lib/mcps/leakage-drain'
 import { taskQuestionSummary } from '@/lib/mcps/clarification-projection'
 
 // ---------------------------------------------------------------------------
@@ -49,17 +59,6 @@ function taskDetailWorkPackageMetadata(metadata: unknown): unknown {
       ...phases,
       effective: safeEffective,
     },
-  }
-}
-
-function taskDetailArtifact<T extends { artifactType: string; metadata: unknown }>(artifact: T): T {
-  const sanitized = sanitizeWorkPackageMetadata(artifact.metadata)
-  const protectedArchitectHistory = artifact.artifactType === 'adr_text'
-    && isRecord(sanitized)
-    && sanitized.historyAvailable === true
-  return {
-    ...artifact,
-    metadata: protectedArchitectHistory ? { historyAvailable: true } : sanitized,
   }
 }
 
@@ -288,10 +287,15 @@ export async function GET(
         .where(inArray(artifacts.agentRunId, runIds))
         .orderBy(asc(artifacts.createdAt))
     }
-    const safeTaskArtifacts = taskArtifacts.map(taskDetailArtifact)
-    const artifactsByWorkPackageId = new Map<string, typeof taskArtifacts>()
+    const runById = new Map(runs.map((run) => [run.id, run]))
+    const safeTaskArtifacts = taskArtifacts.map((artifact) => projectTaskCompatibilityArtifact(
+      artifact,
+      runById.get(artifact.agentRunId),
+    ))
+    const artifactsByWorkPackageId = new Map<string, typeof safeTaskArtifacts>()
     for (const artifact of safeTaskArtifacts) {
-      const workPackageId = workPackageIdByRunId.get(artifact.agentRunId)
+      const agentRunId = typeof artifact.agentRunId === 'string' ? artifact.agentRunId : null
+      const workPackageId = agentRunId ? workPackageIdByRunId.get(agentRunId) : undefined
       if (!workPackageId) continue
       const existing = artifactsByWorkPackageId.get(workPackageId) ?? []
       existing.push(artifact)
@@ -338,22 +342,21 @@ export async function GET(
     const harnessById = new Map(taskHarnesses.map((harness) => [harness.id, harness]))
     const taskWorkPackagesWithPrompts = taskWorkPackages.map((pkg) => {
       const harness = pkg.harnessId ? harnessById.get(pkg.harnessId) : undefined
-      return {
-        ...pkg,
+      return projectTaskCompatibilityWorkPackage(pkg, {
         metadata: taskDetailWorkPackageMetadata(pkg.metadata),
         harnessRole: harness?.role ?? null,
         harnessDisplayName: harness?.displayName ?? null,
         harnessDescription: harness?.description ?? null,
         artifacts: artifactsByWorkPackageId.get(pkg.id) ?? [],
-      }
+      })
     })
     const taskApprovalGatesWithValidatedReviews = taskApprovalGates.map(taskDetailApprovalGate)
 
     return NextResponse.json({
-      task,
-      runs,
+      task: projectTaskCompatibilityTask(task),
+      runs: runs.map(projectTaskCompatibilityRun),
       artifacts: safeTaskArtifacts,
-      attempts,
+      attempts: attempts.map(projectTaskCompatibilityAttempt),
       questions,
       clarification: {
         planVersion: latestProtectedPlanVersion(taskArtifacts),
@@ -363,12 +366,12 @@ export async function GET(
       },
       workPackages: taskWorkPackagesWithPrompts,
       approvalGates: taskApprovalGatesWithValidatedReviews,
-      commandAudits: taskCommandAudits,
-      filesystemAudits: taskFilesystemAudits,
-      vcsChanges: taskVcsChanges,
+      commandAudits: taskCommandAudits.map(projectTaskCompatibilityCommandAudit),
+      filesystemAudits: taskFilesystemAudits.map(projectTaskCompatibilityFilesystemAudit),
+      vcsChanges: taskVcsChanges.map(projectTaskCompatibilityVcsChange),
     })
-  } catch (err) {
-    console.error('[GET /api/tasks/:id] Unexpected error', err)
+  } catch {
+    console.error('[GET /api/tasks/:id] Unexpected error')
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }
@@ -506,8 +509,8 @@ export async function DELETE(
 
     console.info('[DELETE /api/tasks/:id] Cancelled task', { id })
     return NextResponse.json({ ok: true, mode: 'cancel' })
-  } catch (err) {
-    console.error('[DELETE /api/tasks/:id] Unexpected error', err)
+  } catch {
+    console.error('[DELETE /api/tasks/:id] Unexpected error')
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }

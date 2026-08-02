@@ -2,11 +2,17 @@ import { pathToFileURL } from 'node:url'
 import Redis from 'ioredis'
 import postgres from 'postgres'
 import { getRequiredEnv } from '../lib/env'
+import { scanJsonObjectKeys } from '../lib/json-object-key-scan'
 import { ARCHITECT_PLAN_HEADER } from '../lib/mcps/architect-plan-entries'
 import {
+  LEGACY_TASK_EVENT_STORAGE_PATTERN,
+  TASK_EVENT_V2_STORAGE_PATTERN,
+  parseLegacyTaskEventStorageKey,
+  parseV2TaskEventStorageKey,
+  taskEventRedisKeys,
+} from '../lib/task-event-redis'
+import {
   LEGACY_LEAKAGE_SCRUB_CHECKPOINT_PREFIX,
-  LEGACY_TASK_EVENT_PATTERNS,
-  V2_TASK_EVENT_HISTORY_PATTERN,
   containsForbiddenV2EventData,
   legacyLeakageRowFingerprint,
   runLegacyLeakageScrub,
@@ -30,6 +36,27 @@ export type LegacyLeakageScrubCli = Readonly<{
   sentinels: readonly string[]
 }>
 
+function requiredFingerprintKey(): Buffer {
+  const encoded = process.env.FORGE_LEGACY_LEAKAGE_SCRUB_FINGERPRINT_KEY?.trim()
+  if (!encoded) throw new Error('FORGE_LEGACY_LEAKAGE_SCRUB_FINGERPRINT_KEY is required.')
+  const key = /^[0-9a-f]{64}$/iu.test(encoded)
+    ? Buffer.from(encoded, 'hex')
+    : Buffer.from(encoded, 'base64')
+  if (key.length !== 32) {
+    throw new Error('FORGE_LEGACY_LEAKAGE_SCRUB_FINGERPRINT_KEY must encode exactly 32 bytes.')
+  }
+  return key
+}
+
+function requiredFingerprintKeyId(): string {
+  const keyId = process.env.FORGE_LEGACY_LEAKAGE_SCRUB_FINGERPRINT_KEY_ID?.trim()
+  if (!keyId) throw new Error('FORGE_LEGACY_LEAKAGE_SCRUB_FINGERPRINT_KEY_ID is required.')
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$/.test(keyId)) {
+    throw new Error('FORGE_LEGACY_LEAKAGE_SCRUB_FINGERPRINT_KEY_ID must be a bounded non-secret key identifier.')
+  }
+  return keyId
+}
+
 export function legacyLeakageScrubUsage(): string {
   return `Legacy task-log, artifact, and Redis leakage scrub
 
@@ -50,13 +77,21 @@ Options:
   --max-batches N      Phase batches processed per invocation (default 10, maximum 1000)
   --sentinel TEXT      Fail the v2 Redis scan if TEXT appears; may be repeated
 
-Apply and resume mutate only task_logs, artifacts, work_packages, the operation
-checkpoint in app_settings, and legacy forge:task:{taskId}:history/:seq Redis
-keys. Protected Architect plan entries are never selected or updated.
+Database mutation inventory: task_logs; eligible, unversioned legacy Architect
+artifacts; work_packages; approval_gates; and the operation-scoped app_settings
+checkpoint key (${LEGACY_LEAKAGE_SCRUB_CHECKPOINT_PREFIX}<operation-id>).
+Redis is separate: apply/resume purge only legacy forge:task:*:history and
+forge:task:*:seq keys and exhaustively validate (but never delete) stored v2
+forge:task-events:v2:* keys. Protected Architect plan entries are
+never selected or updated.
 
 Environment:
   FORGE_DATABASE_ADMIN_URL  privileged PostgreSQL connection for the scrub
-  REDIS_URL                 Redis connection whose legacy task history is purged`
+  REDIS_URL                 Redis connection whose legacy task history is purged
+  FORGE_LEGACY_LEAKAGE_SCRUB_FINGERPRINT_KEY
+                            dedicated 32-byte server-private HMAC key
+  FORGE_LEGACY_LEAKAGE_SCRUB_FINGERPRINT_KEY_ID
+                            bounded non-secret key identifier`
 }
 
 function positiveInteger(flag: string, value: string | undefined, fallback: number): number {
@@ -128,12 +163,88 @@ function requiredAdminDatabaseUrl(): string {
   return value
 }
 
-function parseCheckpoint(value: string): LegacyLeakageScrubCheckpoint {
-  const parsed = JSON.parse(value) as Partial<LegacyLeakageScrubCheckpoint>
-  if (parsed.schemaVersion !== 1 || typeof parsed.operationId !== 'string' || typeof parsed.phase !== 'string') {
-    throw new Error('Stored leakage scrub checkpoint is malformed.')
+export function parseLegacyLeakageScrubCheckpoint(value: string): LegacyLeakageScrubCheckpoint {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(value)
+  } catch {
+    throw new Error('Stored leakage scrub checkpoint is malformed; start a new --apply operation.')
   }
-  return parsed as LegacyLeakageScrubCheckpoint
+  if (!isCheckpointRecord(parsed)) {
+    throw new Error('Stored leakage scrub checkpoint is malformed; start a new --apply operation.')
+  }
+  if (parsed.schemaVersion === 1) {
+    throw new Error('Stored leakage scrub checkpoint uses an unsafe legacy format; start a new --apply operation.')
+  }
+  if (parsed.schemaVersion !== 2 || !isClosedCheckpointRecord(parsed)) {
+    throw new Error('Stored leakage scrub checkpoint is malformed; start a new --apply operation.')
+  }
+  if (!isValidCheckpointV2(parsed)) {
+    throw new Error('Stored leakage scrub checkpoint is malformed; start a new --apply operation.')
+  }
+  return parsed
+}
+
+const CHECKPOINT_V2_KEYS = [
+  'schemaVersion', 'operationId', 'actor', 'authorizationReceiptId', 'fingerprintKeyId', 'sentinelSetFingerprint',
+  'phase', 'state', 'lastKey', 'rowsExamined', 'rowsChanged', 'conflicts', 'redisKeysExamined', 'redisKeysDeleted',
+  'redisV2ValuesExamined', 'lastPreFingerprint', 'lastPostFingerprint', 'databaseTime',
+] as const
+const CHECKPOINT_PHASES = new Set(['task_logs', 'artifacts', 'work_packages', 'approval_gates', 'redis_legacy', 'redis_v2_verify', 'complete'])
+const CHECKPOINT_STATES = new Set(['running', 'paused_conflict', 'complete'])
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu
+const HEX_FINGERPRINT = /^[0-9a-f]{64}$/iu
+
+function isCheckpointRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null
+    && typeof value === 'object'
+    && !Array.isArray(value)
+}
+
+function isClosedCheckpointRecord(value: unknown): value is Record<string, unknown> {
+  return isCheckpointRecord(value)
+    && Object.keys(value).length === CHECKPOINT_V2_KEYS.length
+    && Object.keys(value).every((key) => (CHECKPOINT_V2_KEYS as readonly string[]).includes(key))
+}
+
+function isBoundedIdentity(value: unknown): value is string {
+  return typeof value === 'string' && value.length >= 1 && value.length <= 200 && value.trim() === value
+}
+
+function isNullableFingerprint(value: unknown): value is string | null {
+  return value === null || (typeof value === 'string' && HEX_FINGERPRINT.test(value))
+}
+
+function isNonNegativeSafeInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+}
+
+function isValidCheckpointV2(value: Record<string, unknown>): value is LegacyLeakageScrubCheckpoint {
+  const phase = value.phase
+  const state = value.state
+  const timestamp = value.databaseTime
+  const counters = ['rowsExamined', 'rowsChanged', 'conflicts', 'redisKeysExamined', 'redisKeysDeleted', 'redisV2ValuesExamined']
+  return value.schemaVersion === 2
+    && isBoundedIdentity(value.operationId)
+    && isBoundedIdentity(value.actor)
+    && typeof value.authorizationReceiptId === 'string' && UUID.test(value.authorizationReceiptId)
+    && typeof value.fingerprintKeyId === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$/.test(value.fingerprintKeyId)
+    && typeof value.sentinelSetFingerprint === 'string' && HEX_FINGERPRINT.test(value.sentinelSetFingerprint)
+    && typeof phase === 'string' && CHECKPOINT_PHASES.has(phase)
+    && typeof state === 'string' && CHECKPOINT_STATES.has(state)
+    && ((phase === 'complete') === (state === 'complete'))
+    && (value.lastKey === null || (typeof value.lastKey === 'string' && UUID.test(value.lastKey)))
+    && isNullableFingerprint(value.lastPreFingerprint)
+    && isNullableFingerprint(value.lastPostFingerprint)
+    && counters.every((counter) => isNonNegativeSafeInteger(value[counter]))
+    && (value.rowsChanged as number) <= (value.rowsExamined as number)
+    && (value.redisKeysDeleted as number) <= (value.redisKeysExamined as number)
+    && (phase !== 'complete' || value.lastKey === null)
+    && typeof timestamp === 'string'
+    && timestamp.length >= 1
+    && timestamp.length <= 128
+    && timestamp.trim() === timestamp
+    && Number.isFinite(Date.parse(timestamp))
 }
 
 function taskLogRow(row: Record<string, unknown>): LegacyLeakageScrubRow {
@@ -174,6 +285,7 @@ function approvalGateRow(row: Record<string, unknown>): LegacyLeakageScrubRow {
 
 export function createLegacyLeakagePostgresAdapter(
   sql: ReturnType<typeof postgres>,
+  fingerprintKey: Buffer,
 ): LegacyLeakageScrubDatabase {
   return {
     async databaseTime() {
@@ -199,7 +311,7 @@ export function createLegacyLeakagePostgresAdapter(
           and jsonb_typeof(receipt.exact_builds) = 'array'
           and jsonb_array_length(receipt.exact_builds) > 0
           and receipt.reviewed_sha ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'
-          and receipt.epoch > 0
+          and receipt.epoch is null
           and receipt.signature_domain = 'forge:epic-172-release-evidence:v1'
           and receipt.envelope_version = 1
           and receipt.envelope_digest ~ '^[0-9a-f]{64}$'
@@ -209,7 +321,7 @@ export function createLegacyLeakagePostgresAdapter(
           and predecessor.owner_slice = 's4'
           and predecessor.exact_builds = receipt.exact_builds
           and predecessor.reviewed_sha = receipt.reviewed_sha
-          and predecessor.epoch = receipt.epoch
+          and predecessor.epoch is not distinct from receipt.epoch
           and enablement.state = 'disabled'
           and (
             select array_agg(claim.value ->> 'name' order by claim.ordinal)
@@ -234,7 +346,7 @@ export function createLegacyLeakagePostgresAdapter(
         from app_settings
         where key = ${checkpointKey(operationId)}
       `
-      return row ? { checkpoint: parseCheckpoint(row.value), token: row.value } : null
+      return row ? { checkpoint: parseLegacyLeakageScrubCheckpoint(row.value), token: row.value } : null
     },
 
     async createCheckpoint(checkpoint) {
@@ -299,6 +411,7 @@ export function createLegacyLeakagePostgresAdapter(
             left join (
               select distinct plan_artifact_id from architect_plan_versions
             ) version on version.plan_artifact_id = a.id
+            where version.plan_artifact_id is null
             order by a.id limit ${limit}
           `
         : await sql<Record<string, unknown>[]>`
@@ -314,7 +427,9 @@ export function createLegacyLeakagePostgresAdapter(
             left join (
               select distinct plan_artifact_id from architect_plan_versions
             ) version on version.plan_artifact_id = a.id
-            where a.id > ${afterId}::uuid order by a.id limit ${limit}
+            where a.id > ${afterId}::uuid
+              and version.plan_artifact_id is null
+            order by a.id limit ${limit}
           `
       return rows.map(artifactRow)
     },
@@ -327,6 +442,18 @@ export function createLegacyLeakagePostgresAdapter(
           for update
         `
         if (checkpointRows[0]?.value !== input.current.token) return 'checkpoint_conflict' as const
+
+        if (input.row.kind === 'artifact') {
+          // Lock identity without projecting protected bytes. A subsequent READ COMMITTED
+          // statement observes a plan-version link that committed while this lock waited.
+          const artifactIdentityRows = await transaction<{ id: string }[]>`
+            select a.id::text as id
+            from artifacts a
+            where a.id = ${input.row.id}::uuid
+            for update
+          `
+          if (artifactIdentityRows.length !== 1) return 'row_conflict' as const
+        }
 
         const sourceRows = input.row.kind === 'task_log'
           ? await transaction<Record<string, unknown>[]>`
@@ -349,15 +476,15 @@ export function createLegacyLeakagePostgresAdapter(
                   a.artifact_type = 'adr_text'
                   and r.agent_type = 'architect'
                   and a.content <> ${ARCHITECT_PLAN_HEADER}
-                  and version.plan_artifact_id is null
                 ) as "replaceContent"
               from artifacts a
               join agent_runs r on r.id = a.agent_run_id
-              left join (
-                select distinct plan_artifact_id from architect_plan_versions
-              ) version on version.plan_artifact_id = a.id
               where a.id = ${input.row.id}::uuid
-              for update of a
+                and not exists (
+                  select 1
+                  from architect_plan_versions version
+                  where version.plan_artifact_id = a.id
+                )
             `
         if (sourceRows.length !== 1) return 'row_conflict' as const
         const source = input.row.kind === 'task_log'
@@ -367,7 +494,7 @@ export function createLegacyLeakagePostgresAdapter(
             : input.row.kind === 'approval_gate'
               ? approvalGateRow(sourceRows[0])
               : artifactRow(sourceRows[0])
-        if (legacyLeakageRowFingerprint(source) !== input.expectedRowFingerprint) return 'row_conflict' as const
+        if (legacyLeakageRowFingerprint(source, fingerprintKey) !== input.expectedRowFingerprint) return 'row_conflict' as const
 
         if (input.row.kind === 'task_log') {
           await transaction`
@@ -438,12 +565,17 @@ async function scanKeys(
   let cursor = '0'
   let iterations = 0
   let keysExamined = 0
+  const seenNonterminalCursors = new Set<string>()
   do {
     const [next, keys] = await redis.scan(cursor, 'MATCH', pattern, 'COUNT', 250)
-    cursor = next
     iterations += 1
     keysExamined += keys.length
     if (keys.length > 0) await visit(keys)
+    if (next !== '0' && (next === cursor || seenNonterminalCursors.has(next))) {
+      return { complete: false, keysExamined }
+    }
+    if (next !== '0') seenNonterminalCursors.add(next)
+    cursor = next
     if (iterations >= MAX_REDIS_SCAN_ITERATIONS && cursor !== '0') {
       return { complete: false, keysExamined }
     }
@@ -451,89 +583,195 @@ async function scanKeys(
   return { complete: true, keysExamined }
 }
 
-async function countLegacyKeys(redis: Redis): Promise<{ complete: boolean; keysExamined: number }> {
-  let complete = true
-  let keysExamined = 0
-  for (const pattern of LEGACY_TASK_EVENT_PATTERNS) {
-    const evidence = await scanKeys(redis, pattern, async () => undefined)
-    complete &&= evidence.complete
-    keysExamined += evidence.keysExamined
+function emptyRedisEvidence(): RedisScanEvidence {
+  return {
+    complete: true,
+    keysExamined: 0,
+    keysDeleted: 0,
+    remainingKeys: 0,
+    valuesExamined: 0,
+    violations: 0,
   }
-  return { complete, keysExamined }
+}
+
+function addRedisEvidence(left: RedisScanEvidence, right: RedisScanEvidence): RedisScanEvidence {
+  return {
+    complete: left.complete && right.complete,
+    keysExamined: left.keysExamined + right.keysExamined,
+    keysDeleted: left.keysDeleted + right.keysDeleted,
+    remainingKeys: right.remainingKeys,
+    valuesExamined: left.valuesExamined + right.valuesExamined,
+    violations: left.violations + right.violations,
+  }
+}
+
+function canonicalSequence(value: unknown): number | null {
+  if (typeof value !== 'string' || !/^[1-9][0-9]*$/.test(value)) return null
+  const parsed = Number(value)
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+function validateStoredV2Envelope(
+  raw: string,
+  score: string,
+  taskId: string,
+  sentinels: readonly string[],
+): boolean {
+  const parsedScore = Number(score)
+  if (!Number.isSafeInteger(parsedScore) || parsedScore < 1) return false
+  if (scanJsonObjectKeys(raw) !== 'valid') return false
+  try {
+    const envelope: unknown = JSON.parse(raw)
+    if (!isRecord(envelope)
+      || Object.keys(envelope).length !== 4
+      || envelope.schemaVersion !== 2
+      || !Number.isSafeInteger(envelope.id)
+      || envelope.id !== parsedScore
+      || typeof envelope.type !== 'string'
+      || !isRecord(envelope.data)) return false
+    // Current production envelopes do not carry taskId. If a future closed
+    // schema adds it, it must agree with the task identity encoded by the key.
+    if (Object.hasOwn(envelope.data, 'taskId') && envelope.data.taskId !== taskId) return false
+    return !containsForbiddenV2EventData({ type: envelope.type, data: envelope.data }, sentinels)
+  } catch {
+    return false
+  }
 }
 
 async function scanSortedSetValues(
   redis: Redis,
   key: string,
+  taskId: string,
   sentinels: readonly string[],
-): Promise<{ complete: boolean; valuesExamined: number; violations: number }> {
+): Promise<{ complete: boolean; valuesExamined: number; violations: number; maxSequence: number }> {
   let cursor = '0'
   let iterations = 0
   let valuesExamined = 0
   let violations = 0
+  let maxSequence = 0
+  const seenNonterminalCursors = new Set<string>()
   do {
     const [next, entries] = await redis.zscan(key, cursor, 'COUNT', 250)
-    cursor = next
     iterations += 1
+    if (entries.length % 2 !== 0) violations += 1
     for (let index = 0; index < entries.length; index += 2) {
+      if (index + 1 >= entries.length) break
       valuesExamined += 1
-      try {
-        if (containsForbiddenV2EventData(JSON.parse(entries[index]), sentinels)) violations += 1
-      } catch {
-        violations += 1
-      }
+      const parsedScore = Number(entries[index + 1])
+      if (Number.isSafeInteger(parsedScore) && parsedScore > maxSequence) maxSequence = parsedScore
+      if (!validateStoredV2Envelope(entries[index], entries[index + 1], taskId, sentinels)) violations += 1
     }
+    if (next !== '0' && (next === cursor || seenNonterminalCursors.has(next))) {
+      return { complete: false, valuesExamined, violations, maxSequence }
+    }
+    if (next !== '0') seenNonterminalCursors.add(next)
+    cursor = next
     if (iterations >= MAX_REDIS_SCAN_ITERATIONS && cursor !== '0') {
-      return { complete: false, valuesExamined, violations }
+      return { complete: false, valuesExamined, violations, maxSequence }
     }
   } while (cursor !== '0')
-  return { complete: true, valuesExamined, violations }
+  return { complete: true, valuesExamined, violations, maxSequence }
+}
+
+async function scanLegacyStorage(redis: Redis, apply: boolean): Promise<RedisScanEvidence> {
+  let evidence = emptyRedisEvidence()
+  let remainingKeys = 0
+  const scan = await scanKeys(redis, LEGACY_TASK_EVENT_STORAGE_PATTERN, async (keys) => {
+    const exactKeys: string[] = []
+    for (const key of keys) {
+      if (parseLegacyTaskEventStorageKey(key) === null) {
+        evidence = addRedisEvidence(evidence, { ...emptyRedisEvidence(), violations: 1 })
+      } else {
+        exactKeys.push(key)
+        if (!apply) remainingKeys += 1
+      }
+    }
+    if (apply && exactKeys.length > 0) {
+      const deleted = await redis.del(...exactKeys)
+      evidence = addRedisEvidence(evidence, { ...emptyRedisEvidence(), keysDeleted: deleted })
+    }
+  })
+  return {
+    ...evidence,
+    complete: evidence.complete && scan.complete,
+    keysExamined: evidence.keysExamined + scan.keysExamined,
+    remainingKeys,
+  }
+}
+
+async function scanV2Storage(redis: Redis, sentinels: readonly string[]): Promise<RedisScanEvidence> {
+  let evidence = emptyRedisEvidence()
+  // Validate each discovered key against its direct companion. This avoids an
+  // unbounded task-id map while still proving both sides of every pair.
+  const scan = await scanKeys(redis, TASK_EVENT_V2_STORAGE_PATTERN, async (keys) => {
+    for (const key of keys) {
+      const parsed = parseV2TaskEventStorageKey(key)
+      if (!parsed) {
+        evidence = addRedisEvidence(evidence, { ...emptyRedisEvidence(), violations: 1 })
+        continue
+      }
+      const type = await redis.type(key)
+      if ((parsed.kind === 'history' && type !== 'zset') || (parsed.kind === 'seq' && type !== 'string')) {
+        evidence = addRedisEvidence(evidence, { ...emptyRedisEvidence(), violations: 1 })
+        continue
+      }
+      const pair = taskEventRedisKeys(parsed.taskId)
+      if (parsed.kind === 'history') {
+        const values = await scanSortedSetValues(redis, key, parsed.taskId, sentinels)
+        const pairType = await redis.type(pair.sequence)
+        const sequence = pairType === 'string'
+          ? canonicalSequence(await redis.get(pair.sequence))
+          : null
+        evidence = addRedisEvidence(evidence, {
+          ...emptyRedisEvidence(),
+          complete: values.complete,
+          valuesExamined: values.valuesExamined,
+          violations: values.violations
+            + (pairType === 'string' && sequence !== null && sequence >= values.maxSequence ? 0 : 1),
+        })
+      } else {
+        const sequence = canonicalSequence(await redis.get(key))
+        const pairType = await redis.type(pair.history)
+        evidence = addRedisEvidence(evidence, {
+          ...emptyRedisEvidence(),
+          violations: sequence === null || pairType !== 'zset' ? 1 : 0,
+        })
+      }
+    }
+  })
+  return {
+    ...evidence,
+    complete: evidence.complete && scan.complete,
+    keysExamined: evidence.keysExamined + scan.keysExamined,
+  }
 }
 
 export function createLegacyLeakageRedisAdapter(redis: Redis): LegacyLeakageScrubRedis {
   return {
-    async purgeLegacyTaskEventKeys({ apply }): Promise<RedisScanEvidence> {
-      let complete = true
-      let keysExamined = 0
-      let keysDeleted = 0
-      for (const pattern of LEGACY_TASK_EVENT_PATTERNS) {
-        const evidence = await scanKeys(redis, pattern, async (keys) => {
-          if (!apply) return
-          keysDeleted += await redis.del(...keys)
-        })
-        complete &&= evidence.complete
-        keysExamined += evidence.keysExamined
+    async purgeLegacyTaskEventKeys({ apply, sentinels = [] }): Promise<RedisScanEvidence> {
+      const preflight = await scanLegacyStorage(redis, false)
+      if (!apply || !preflight.complete || preflight.violations > 0) {
+        return preflight
       }
-      const remaining = await countLegacyKeys(redis)
+      const v2Preflight = await scanV2Storage(redis, sentinels)
+      if (!v2Preflight.complete || v2Preflight.violations > 0) {
+        return addRedisEvidence(preflight, { ...v2Preflight, remainingKeys: preflight.remainingKeys })
+      }
+      const deleted = await scanLegacyStorage(redis, true)
+      const postLegacy = await scanLegacyStorage(redis, false)
+      const postV2 = await scanV2Storage(redis, sentinels)
       return {
-        complete: complete && remaining.complete,
-        keysExamined,
-        keysDeleted,
-        remainingKeys: remaining.keysExamined,
-        valuesExamined: 0,
-        violations: 0,
+        ...addRedisEvidence(addRedisEvidence(deleted, postLegacy), postV2),
+        remainingKeys: postLegacy.remainingKeys,
       }
     },
 
     async scanV2TaskEventHistory(sentinels): Promise<RedisScanEvidence> {
-      let valuesExamined = 0
-      let violations = 0
-      const keyScan = await scanKeys(redis, V2_TASK_EVENT_HISTORY_PATTERN, async (keys) => {
-        for (const key of keys) {
-          const evidence = await scanSortedSetValues(redis, key, sentinels)
-          valuesExamined += evidence.valuesExamined
-          violations += evidence.violations
-          if (!evidence.complete) violations += 1
-        }
-      })
-      return {
-        complete: keyScan.complete,
-        keysExamined: keyScan.keysExamined,
-        keysDeleted: 0,
-        remainingKeys: 0,
-        valuesExamined,
-        violations,
-      }
+      return scanV2Storage(redis, sentinels)
     },
   }
 }
@@ -542,8 +780,13 @@ export async function runLegacyLeakageScrubCli(cli: LegacyLeakageScrubCli): Prom
   const sql = postgres(requiredAdminDatabaseUrl(), { max: 1 })
   const redis = new Redis(getRequiredEnv('REDIS_URL'), { lazyConnect: true, maxRetriesPerRequest: 3 })
   try {
-    const result = await runLegacyLeakageScrub(cli, {
-      database: createLegacyLeakagePostgresAdapter(sql),
+    const fingerprintKey = requiredFingerprintKey()
+    const result = await runLegacyLeakageScrub({
+      ...cli,
+      fingerprintKey,
+      fingerprintKeyId: requiredFingerprintKeyId(),
+    }, {
+      database: createLegacyLeakagePostgresAdapter(sql, fingerprintKey),
       redis: createLegacyLeakageRedisAdapter(redis),
     })
     process.stdout.write(`${JSON.stringify(result)}\n`)

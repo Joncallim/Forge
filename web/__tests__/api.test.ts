@@ -17,6 +17,27 @@ import path from 'node:path'
 import { getTableName } from 'drizzle-orm'
 import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { canonicalS3Marker } from '../test-support/filesystem-grant-marker-fixtures'
+import { LEGACY_CLARIFICATION_MAX_TEXT_BYTES } from '@/lib/mcps/legacy-clarification'
+
+const taskEventRedisEnvironment = {
+  publisher: process.env.FORGE_TASK_EVENT_PUBLISHER_REDIS_URL,
+  subscriber: process.env.FORGE_TASK_EVENT_SUBSCRIBER_REDIS_URL,
+}
+
+beforeEach(() => {
+  // This suite's S4 authority mock is protected by default. Give every
+  // task-event-producing route the same authenticated, distinct-principal
+  // provisioned shape that protected runtime requires.
+  process.env.FORGE_TASK_EVENT_PUBLISHER_REDIS_URL = 'redis://api-event-publisher:publisher-password@events.example.test/0'
+  process.env.FORGE_TASK_EVENT_SUBSCRIBER_REDIS_URL = 'redis://api-event-subscriber:subscriber-password@events.example.test/0'
+})
+
+afterEach(() => {
+  if (taskEventRedisEnvironment.publisher === undefined) delete process.env.FORGE_TASK_EVENT_PUBLISHER_REDIS_URL
+  else process.env.FORGE_TASK_EVENT_PUBLISHER_REDIS_URL = taskEventRedisEnvironment.publisher
+  if (taskEventRedisEnvironment.subscriber === undefined) delete process.env.FORGE_TASK_EVENT_SUBSCRIBER_REDIS_URL
+  else process.env.FORGE_TASK_EVENT_SUBSCRIBER_REDIS_URL = taskEventRedisEnvironment.subscriber
+})
 
 // ---------------------------------------------------------------------------
 // Module-level mocks
@@ -43,12 +64,18 @@ vi.mock('@/lib/session', () => ({
 const mockLoadProtectedApprovalReviewPreflight = vi.fn().mockResolvedValue(null)
 const mockReadProtectedMcpOperatorReview = vi.fn().mockResolvedValue([])
 const mockListApprovedPackagePlanRegistrations = vi.fn().mockResolvedValue([])
-const { mockAppendArchitectClarificationAnswer, mockReadS4RuntimeModeV1, mockArchitectPlanStorageConfiguration } = vi.hoisted(() => ({
-  mockAppendArchitectClarificationAnswer: vi.fn(),
+const {
+  mockAppendArchitectClarificationAnswers,
+  mockReadS4RuntimeModeV1,
+  mockArchitectPlanStorageConfiguration,
+  mockGenerateTaskTitle,
+} = vi.hoisted(() => ({
+  mockAppendArchitectClarificationAnswers: vi.fn(),
   mockReadS4RuntimeModeV1: vi.fn().mockResolvedValue('protected'),
   mockArchitectPlanStorageConfiguration: vi.fn().mockReturnValue({
     mode: 'protected', digestKey: Buffer.alloc(32, 7), digestKeyId: 'test-v1',
   }),
+  mockGenerateTaskTitle: vi.fn().mockResolvedValue('Generated task title'),
 }))
 vi.mock('@/lib/mcps/protected-review-preflight', () => ({
   loadProtectedApprovalReviewPreflight: mockLoadProtectedApprovalReviewPreflight,
@@ -56,7 +83,7 @@ vi.mock('@/lib/mcps/protected-review-preflight', () => ({
 vi.mock('@/lib/mcps/history-reader', () => ({
   listApprovedPackagePlanRegistrations: mockListApprovedPackagePlanRegistrations,
   readProtectedMcpOperatorReview: mockReadProtectedMcpOperatorReview,
-  appendArchitectClarificationAnswer: mockAppendArchitectClarificationAnswer,
+  appendArchitectClarificationAnswers: mockAppendArchitectClarificationAnswers,
 }))
 vi.mock('@/lib/mcps/s4-lease', async (importOriginal) => ({
   ...await importOriginal<typeof import('@/lib/mcps/s4-lease')>(),
@@ -65,6 +92,10 @@ vi.mock('@/lib/mcps/s4-lease', async (importOriginal) => ({
 vi.mock('@/lib/mcps/s4-protocol-store', async (importOriginal) => ({
   ...await importOriginal<typeof import('@/lib/mcps/s4-protocol-store')>(),
   architectPlanStorageConfiguration: mockArchitectPlanStorageConfiguration,
+}))
+vi.mock('@/lib/task-title', () => ({
+  generateTaskTitle: mockGenerateTaskTitle,
+  UNTITLED_TASK_TITLE: 'Untitled task',
 }))
 
 // Existing route-contract cases exercise behavior behind the release gate.
@@ -146,6 +177,20 @@ vi.mock('@/lib/redis', () => ({
     publish: mockRedisPublish,
   },
 }))
+
+// API contract tests exercise a protected runtime without a Redis server. The
+// dedicated publisher selection is covered in task-event-focused tests; this
+// narrow transport double keeps these route contracts deterministic.
+vi.mock('@/lib/task-event-redis', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/task-event-redis')>()
+  return {
+    ...actual,
+    taskEventPublisherRedis: () => ({
+      eval: (...args: unknown[]) => mockRedisEval(...args),
+      on: vi.fn(),
+    }),
+  }
+})
 
 const mockExecFile = vi.fn()
 vi.mock('node:child_process', () => ({
@@ -2526,7 +2571,7 @@ describe('GET /api/tasks/:id — task details', () => {
       pmProviderConfigId: null,
       githubBranch: null,
       githubPrUrl: null,
-      errorMessage: null,
+      errorMessage: 'RAW-TASK-ERROR-SENTINEL /private/secret',
       createdAt: new Date(),
       updatedAt: new Date(),
       completedAt: null,
@@ -2539,6 +2584,12 @@ describe('GET /api/tasks/:id — task details', () => {
       summary: 'Update the Providers page.',
       sequence: 1,
       status: 'pending',
+      assignedRole: 'frontend',
+      steps: ['Update the page.'],
+      requiredCapabilities: { required: ['repository.read'] },
+      acceptanceCriteria: ['The page is updated.'],
+      reviewRequirement: 'both',
+      blockedReason: 'RAW-BLOCKED-REASON-SENTINEL /private/package/path',
       dependsOn: [],
       targetFiles: ['web/app/dashboard/providers/page.tsx'],
       targetAreas: ['Providers'],
@@ -2552,6 +2603,7 @@ describe('GET /api/tasks/:id — task details', () => {
       },
       createdAt: new Date(),
       updatedAt: new Date(),
+      futureDatabaseColumn: 'RAW-FUTURE-WORK-PACKAGE-COLUMN',
     }
     const qaWorkPackage = {
       ...workPackage,
@@ -2580,7 +2632,7 @@ describe('GET /api/tasks/:id — task details', () => {
       costUsd: null,
       startedAt: new Date(),
       completedAt: new Date(),
-      errorMessage: null,
+      errorMessage: 'RAW-RUN-ERROR-SENTINEL prompt text',
       createdAt: new Date(),
     }
     const qaPackageRun = {
@@ -2654,7 +2706,23 @@ describe('GET /api/tasks/:id — task details', () => {
       .mockReturnValueOnce(chain([packageArtifact, qaPackageArtifact, taskLevelArtifact]))
       .mockReturnValueOnce(chain([workPackage, qaWorkPackage]))
       .mockReturnValueOnce(chain([]))
-      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([{
+        id: 'vcs-local-path',
+        taskId: task.id,
+        workPackageId: 'package-1',
+        agentRunId: 'run-1',
+        changeType: 'branch',
+        status: 'created',
+        repository: '/private/forge/RAW-LOCAL-PATH-SENTINEL',
+        branchName: 'safe-branch',
+        baseBranch: 'main',
+        commitSha: null,
+        pullRequestUrl: null,
+        diffSummary: 'RAW-DIFF-SENTINEL',
+        metadata: { selectedPath: '/private/forge/RAW-METADATA-PATH-SENTINEL' },
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      }]))
       .mockReturnValueOnce(chain([]))
       .mockReturnValueOnce(chain([]))
       .mockReturnValueOnce(chain([
@@ -2679,11 +2747,13 @@ describe('GET /api/tasks/:id — task details', () => {
 
     expect(res.status).toBe(200)
     const body = await res.json()
+    expect(body.workPackages[0]).not.toHaveProperty('futureDatabaseColumn')
     expect(body.workPackages).toMatchObject([{
       id: 'package-1',
       harnessRole: 'frontend',
       harnessDisplayName: 'Frontend',
       harnessDescription: 'Dashboard UI specialist.',
+      blockedReason: 'legacy_task_log_unavailable',
       metadata: { safeCount: 1 },
       artifacts: [{
         id: 'artifact-1',
@@ -2696,6 +2766,7 @@ describe('GET /api/tasks/:id — task details', () => {
       harnessRole: 'qa',
       harnessDisplayName: 'QA',
       harnessDescription: 'Regression specialist.',
+      blockedReason: 'legacy_task_log_unavailable',
       metadata: { safeCount: 2 },
       artifacts: [{
         id: 'artifact-2',
@@ -2712,14 +2783,28 @@ describe('GET /api/tasks/:id — task details', () => {
     expect(body.artifacts.find((artifact: { id: string }) => artifact.id === 'artifact-task').metadata).toEqual({
       historyAvailable: true,
     })
+    expect(body.artifacts.find((artifact: { id: string }) => artifact.id === 'artifact-task').content).toBe(
+      'Architect plan available in protected history',
+    )
+    expect(body.task.errorMessage).toBe('legacy_task_log_unavailable')
+    expect(body.runs.find((run: { id: string }) => run.id === 'run-1').errorMessage).toBe('legacy_task_log_unavailable')
     expect(JSON.stringify(body.artifacts)).not.toContain('planVersion')
     expect(JSON.stringify(body.artifacts)).not.toContain('entryCount')
     expect(JSON.stringify(body.artifacts)).not.toContain('RAW-')
+    expect(JSON.stringify(body)).not.toContain('/private/secret')
+    expect(body.vcsChanges[0]).toMatchObject({
+      repository: 'legacy_task_log_unavailable',
+      diffSummary: 'legacy_task_log_unavailable',
+      metadata: {},
+    })
+    expect(JSON.stringify(body.vcsChanges)).not.toContain('RAW-LOCAL-PATH-SENTINEL')
     expect(body.workPackages.flatMap(
       (pkg: { artifacts: Array<{ id: string }> }) => pkg.artifacts.map((artifact) => artifact.id),
     )).toEqual(['artifact-1', 'artifact-2'])
     expect(JSON.stringify(body.workPackages)).not.toContain('RAW-')
     expect(body.workPackages[0]).not.toHaveProperty('promptOverlay')
+    expect(JSON.stringify(body.workPackages)).not.toContain('RAW-BLOCKED-REASON-SENTINEL')
+    expect(JSON.stringify(body.workPackages)).not.toContain('RAW-FUTURE-WORK-PACKAGE-COLUMN')
     expect(body.questions).toEqual([{
       id: questionRow.id,
       status: 'answered',
@@ -2924,6 +3009,7 @@ describe('GET /api/tasks/:id — task details', () => {
       .mockReturnValueOnce(chain([]))
       .mockReturnValueOnce(chain([]))
       .mockReturnValueOnce(rejectingChain(missingTableError))
+      .mockReturnValueOnce(chain([]))
 
     const { GET } = await import('@/app/api/tasks/[id]/route')
     const res = await GET(authRequest(`/api/tasks/${task.id}`) as never, {
@@ -3026,7 +3112,7 @@ describe('DELETE /api/tasks/:id — stop or delete a task', () => {
       'forge:task-events:v2:task-1:history',
       'task:status',
       expect.stringContaining('"status":"cancelled"'),
-      'forge:task:task-1',
+      'forge:task-events:v2:task-1:live',
       '4096',
     )
   })
@@ -7103,7 +7189,13 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
 // ---------------------------------------------------------------------------
 
 describe('POST /api/tasks/:id/questions', () => {
-  beforeEach(() => { vi.clearAllMocks() })
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mockReadS4RuntimeModeV1.mockResolvedValue('protected')
+    mockArchitectPlanStorageConfiguration.mockReturnValue({
+      mode: 'protected', digestKey: Buffer.alloc(32, 7), digestKeyId: 'test-v1',
+    })
+  })
 
   it('returns 401 when not authenticated', async () => {
     mockGetSession.mockResolvedValue(null)
@@ -7160,6 +7252,66 @@ describe('POST /api/tasks/:id/questions', () => {
     expect(JSON.stringify(body)).not.toContain('RAW-')
   })
 
+  it('presents an encrypted legacy clarification only through the authorized question route', async () => {
+    const previousSecret = process.env.SESSION_SECRET
+    process.env.SESSION_SECRET = 'legacy-question-route-test-secret'
+    try {
+      const taskId = '11111111-1111-4111-8111-111111111111'
+      const questionId = '77777777-7777-4777-8777-777777777777'
+      const agentRunId = '88888888-8888-4888-8888-888888888888'
+      const question = 'RAW-LEGACY-QUESTION-SENTINEL'
+      const suggestion = 'RAW-LEGACY-SUGGESTION-SENTINEL'
+      const { sealLegacyClarification } = await import('@/lib/mcps/legacy-clarification')
+      const metadata = {
+        historyAvailable: false,
+        planVersion: '1',
+        storageMode: 'legacy',
+        legacyClarificationV1: sealLegacyClarification({
+          schemaVersion: 1,
+          taskId,
+          agentRunId,
+          planVersion: '1',
+          questions: [{ id: questionId, question, suggestions: [suggestion], answer: null }],
+        }),
+      }
+      mockGetSession.mockResolvedValue(FAKE_SESSION)
+      mockReadS4RuntimeModeV1.mockResolvedValueOnce('legacy')
+      mockArchitectPlanStorageConfiguration.mockReturnValueOnce({ mode: 'legacy' })
+      mockDbSelect
+        .mockReturnValueOnce(chain([{ id: taskId, status: 'awaiting_answers' }]))
+        .mockReturnValueOnce(chain([{
+          id: questionId,
+          status: 'open',
+          createdAt: new Date('2026-07-30T00:00:00.000Z'),
+          answeredAt: null,
+        }]))
+        .mockReturnValueOnce(chain([{ id: 'artifact-1', agentRunId, metadata }]))
+
+      const { GET } = await import('@/app/api/tasks/[id]/questions/route')
+      const response = await GET(authRequest(`/api/tasks/${taskId}/questions`) as never, {
+        params: Promise.resolve({ id: taskId }),
+      })
+
+      expect(response.status).toBe(200)
+      expect(await response.json()).toEqual({
+        questions: [{
+          id: questionId,
+          status: 'open',
+          createdAt: '2026-07-30T00:00:00.000Z',
+          answeredAt: null,
+          question,
+          suggestions: [suggestion],
+          answer: null,
+        }],
+      })
+      expect(JSON.stringify(metadata)).not.toContain(question)
+      expect(JSON.stringify(metadata)).not.toContain(suggestion)
+    } finally {
+      if (previousSecret === undefined) delete process.env.SESSION_SECRET
+      else process.env.SESSION_SECRET = previousSecret
+    }
+  })
+
   it('accepts an opaque question id and answer but returns only content-free summaries', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     const questionId = '77777777-7777-4777-8777-777777777777'
@@ -7168,6 +7320,9 @@ describe('POST /api/tasks/:id/questions', () => {
       .mockReturnValueOnce(chain([{ id: 'task-1', status: 'awaiting_answers' }]))
       .mockReturnValueOnce(chain([{
         id: questionId,
+        status: 'open',
+        answerReferenceId: null,
+        questionEntryId: `clarification_question:${questionId}`,
         sourcePlanArtifactId: '88888888-8888-4888-8888-888888888888',
         sourcePlanVersion: 1,
       }]))
@@ -7177,7 +7332,7 @@ describe('POST /api/tasks/:id/questions', () => {
         createdAt: new Date('2026-07-22T00:00:00.000Z'),
         answeredAt: new Date('2026-07-22T00:01:00.000Z'),
       }]))
-    mockAppendArchitectClarificationAnswer.mockResolvedValue({ answerId: 'answer-1', allAnswered: true })
+    mockAppendArchitectClarificationAnswers.mockResolvedValue([{ answerId: 'answer-1', allAnswered: true }])
     mockRedisLpush.mockResolvedValue(1)
     mockRedisEval.mockResolvedValue(1)
 
@@ -7200,14 +7355,262 @@ describe('POST /api/tasks/:id/questions', () => {
       allAnswered: true,
     })
     expect(JSON.stringify(body)).not.toContain('RAW-')
-    expect(mockAppendArchitectClarificationAnswer).toHaveBeenCalledWith(expect.objectContaining({
-      answer, questionId, taskId: 'task-1',
-    }))
+    expect(mockAppendArchitectClarificationAnswers).toHaveBeenCalledWith([
+      expect.objectContaining({ answer, questionId, taskId: 'task-1' }),
+    ])
     expect(mockDbUpdate).not.toHaveBeenCalled()
     expect(mockRedisPublish).not.toHaveBeenCalled()
     const answeredEvent = mockRedisEval.mock.calls.find((call) => call[4] === 'questions:answered')
     expect(JSON.parse(answeredEvent?.[5] as string)).toEqual({ answeredCount: 1, allAnswered: true })
     expect(JSON.stringify(mockRedisEval.mock.calls)).not.toContain('RAW-')
+  })
+
+  it('records a legacy answer in the encrypted artifact and queues re-plan without public plaintext', async () => {
+    const previousSecret = process.env.SESSION_SECRET
+    process.env.SESSION_SECRET = 'legacy-question-answer-test-secret'
+    try {
+      const taskId = '11111111-1111-4111-8111-111111111111'
+      const questionId = '77777777-7777-4777-8777-777777777777'
+      const agentRunId = '88888888-8888-4888-8888-888888888888'
+      const question = 'RAW-LEGACY-QUESTION-SENTINEL'
+      const answer = 'RAW-LEGACY-ANSWER-SENTINEL'
+      const { readLegacyClarification, sealLegacyClarification } = await import('@/lib/mcps/legacy-clarification')
+      const metadata = {
+        historyAvailable: false,
+        planVersion: '1',
+        storageMode: 'legacy',
+        legacyClarificationV1: sealLegacyClarification({
+          schemaVersion: 1,
+          taskId,
+          agentRunId,
+          planVersion: '1',
+          questions: [{ id: questionId, question, suggestions: ['main'], answer: null }],
+        }),
+      }
+      const artifactUpdate = chain([{ id: 'artifact-1' }])
+      let artifactSet: Record<string, unknown> = {}
+      artifactUpdate.set = vi.fn((value: Record<string, unknown>) => {
+        artifactSet = value
+        return artifactUpdate
+      })
+      const questionUpdate = chain([{
+        id: questionId,
+        status: 'answered',
+        createdAt: new Date('2026-07-30T00:00:00.000Z'),
+        answeredAt: new Date('2026-07-30T00:01:00.000Z'),
+      }])
+      let questionSet: Record<string, unknown> = {}
+      questionUpdate.set = vi.fn((value: Record<string, unknown>) => {
+        questionSet = value
+        return questionUpdate
+      })
+
+      mockGetSession.mockResolvedValue(FAKE_SESSION)
+      mockReadS4RuntimeModeV1.mockResolvedValueOnce('legacy')
+      mockArchitectPlanStorageConfiguration.mockReturnValueOnce({ mode: 'legacy' })
+      mockDbSelect
+        .mockReturnValueOnce(chain([{ id: taskId, status: 'awaiting_answers' }]))
+        .mockReturnValueOnce(chain([{
+          id: questionId,
+          status: 'open',
+          createdAt: new Date('2026-07-30T00:00:00.000Z'),
+          answeredAt: null,
+          answerReferenceId: null,
+          questionEntryId: null,
+          sourcePlanArtifactId: null,
+          sourcePlanVersion: null,
+        }]))
+        .mockReturnValueOnce(chain([{ id: 'artifact-1', agentRunId, metadata }]))
+      mockDbUpdate
+        .mockReturnValueOnce(artifactUpdate)
+        .mockReturnValueOnce(questionUpdate)
+      mockRedisLpush.mockResolvedValue(1)
+      mockRedisEval.mockResolvedValue(1)
+
+      const { POST } = await import('@/app/api/tasks/[id]/questions/route')
+      const response = await POST(authRequest(`/api/tasks/${taskId}/questions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ answers: [{ id: questionId, answer }] }),
+      }) as never, { params: Promise.resolve({ id: taskId }) })
+
+      expect(response.status).toBe(200)
+      expect(await response.json()).toEqual({
+        questions: [{
+          id: questionId,
+          status: 'answered',
+          createdAt: '2026-07-30T00:00:00.000Z',
+          answeredAt: '2026-07-30T00:01:00.000Z',
+        }],
+        allAnswered: true,
+      })
+      expect(questionSet).toEqual(expect.objectContaining({
+        status: 'answered',
+        answeredBy: FAKE_SESSION.userId,
+        answeredAt: expect.any(Date),
+      }))
+      const storedMetadata = artifactSet.metadata as Record<string, unknown>
+      expect(JSON.stringify(storedMetadata)).not.toContain(question)
+      expect(JSON.stringify(storedMetadata)).not.toContain(answer)
+      const persisted = readLegacyClarification(storedMetadata, {
+        taskId,
+        agentRunId,
+        planVersion: '1',
+      })
+      expect(persisted?.questions).toEqual([{
+        id: questionId,
+        question,
+        suggestions: ['main'],
+        answer,
+      }])
+      expect(mockAppendArchitectClarificationAnswers).not.toHaveBeenCalled()
+      expect(mockRedisLpush).toHaveBeenCalledWith('forge:answers', JSON.stringify({ taskId }))
+      expect(JSON.stringify(mockRedisLpush.mock.calls)).not.toContain(answer)
+      expect(JSON.stringify(mockRedisEval.mock.calls)).not.toContain(answer)
+    } finally {
+      if (previousSecret === undefined) delete process.env.SESSION_SECRET
+      else process.env.SESSION_SECRET = previousSecret
+    }
+  })
+
+  it('does not fall back to legacy answering for a protected clarification', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const taskId = '11111111-1111-4111-8111-111111111111'
+    const questionId = '77777777-7777-4777-8777-777777777777'
+    mockDbSelect
+      .mockReturnValueOnce(chain([{ id: taskId, status: 'awaiting_answers' }]))
+      .mockReturnValueOnce(chain([{
+        id: questionId,
+        status: 'open',
+        answerReferenceId: null,
+        questionEntryId: `clarification_question:${questionId}`,
+        sourcePlanArtifactId: null,
+        sourcePlanVersion: null,
+      }]))
+
+    const { POST } = await import('@/app/api/tasks/[id]/questions/route')
+    const response = await POST(authRequest(`/api/tasks/${taskId}/questions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ answers: [{ id: questionId, answer: 'protected answer' }] }),
+    }) as never, { params: Promise.resolve({ id: taskId }) })
+
+    expect(response.status).toBe(409)
+    expect(mockDbTransaction).not.toHaveBeenCalled()
+    expect(mockDbUpdate).not.toHaveBeenCalled()
+    expect(mockAppendArchitectClarificationAnswers).not.toHaveBeenCalled()
+  })
+
+  it('validates the whole protected form before calling the atomic writer', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const firstQuestionId = '77777777-7777-4777-8777-777777777777'
+    const secondQuestionId = '99999999-9999-4999-8999-999999999999'
+    mockDbSelect
+      .mockReturnValueOnce(chain([{ id: 'task-1', status: 'awaiting_answers' }]))
+      .mockReturnValueOnce(chain([{
+        id: firstQuestionId,
+        status: 'open',
+        answerReferenceId: null,
+        questionEntryId: `clarification_question:${firstQuestionId}`,
+        sourcePlanArtifactId: '88888888-8888-4888-8888-888888888888',
+        sourcePlanVersion: 1,
+      }, {
+        id: secondQuestionId,
+        status: 'answered',
+        answerReferenceId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+        questionEntryId: `clarification_question:${secondQuestionId}`,
+        sourcePlanArtifactId: '88888888-8888-4888-8888-888888888888',
+        sourcePlanVersion: 1,
+      }]))
+
+    const { POST } = await import('@/app/api/tasks/[id]/questions/route')
+    const response = await POST(authRequest('/api/tasks/task-1/questions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ answers: [
+        { id: firstQuestionId, answer: 'first' },
+        { id: secondQuestionId, answer: 'second' },
+      ] }),
+    }) as never, { params: Promise.resolve({ id: 'task-1' }) })
+
+    expect(response.status).toBe(409)
+    expect(mockAppendArchitectClarificationAnswers).not.toHaveBeenCalled()
+    expect(mockRedisLpush).not.toHaveBeenCalled()
+    expect(mockRedisEval).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    {
+      name: 'duplicate ids',
+      answers: [
+        { id: '77777777-7777-4777-8777-777777777777', answer: 'first' },
+        { id: '77777777-7777-4777-8777-777777777777', answer: 'second' },
+      ],
+    },
+    {
+      name: 'oversized answer',
+      answers: [{
+        id: '77777777-7777-4777-8777-777777777777',
+        answer: 'x'.repeat(LEGACY_CLARIFICATION_MAX_TEXT_BYTES + 1),
+      }],
+    },
+  ])('rejects $name before any protected write or continuation', async ({ answers }) => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbSelect.mockReturnValueOnce(chain([{ id: 'task-1', status: 'awaiting_answers' }]))
+
+    const { POST } = await import('@/app/api/tasks/[id]/questions/route')
+    const response = await POST(authRequest('/api/tasks/task-1/questions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ answers }),
+    }) as never, { params: Promise.resolve({ id: 'task-1' }) })
+
+    expect(response.status).toBe(400)
+    expect(mockAppendArchitectClarificationAnswers).not.toHaveBeenCalled()
+    expect(mockRedisLpush).not.toHaveBeenCalled()
+    expect(mockRedisEval).not.toHaveBeenCalled()
+  })
+
+  it('durably queues re-plan before best-effort progress publication', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const questionId = '77777777-7777-4777-8777-777777777777'
+    mockDbSelect
+      .mockReturnValueOnce(chain([{ id: 'task-1', status: 'awaiting_answers' }]))
+      .mockReturnValueOnce(chain([{
+        id: questionId,
+        status: 'open',
+        answerReferenceId: null,
+        questionEntryId: `clarification_question:${questionId}`,
+        sourcePlanArtifactId: '88888888-8888-4888-8888-888888888888',
+        sourcePlanVersion: 1,
+      }]))
+      .mockReturnValueOnce(chain([{
+        id: questionId,
+        status: 'answered',
+        createdAt: new Date('2026-07-30T00:00:00.000Z'),
+        answeredAt: new Date('2026-07-30T00:01:00.000Z'),
+      }]))
+    mockAppendArchitectClarificationAnswers.mockResolvedValue([{
+      answerId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      allAnswered: true,
+    }])
+    mockRedisLpush.mockResolvedValue(1)
+    mockRedisEval.mockRejectedValueOnce(new Error('RAW-EVENT-OUTAGE-SENTINEL'))
+
+    const { POST } = await import('@/app/api/tasks/[id]/questions/route')
+    const response = await POST(authRequest('/api/tasks/task-1/questions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ answers: [{ id: questionId, answer: 'RAW-ANSWER-SENTINEL' }] }),
+    }) as never, { params: Promise.resolve({ id: 'task-1' }) })
+
+    expect(response.status).toBe(200)
+    expect(mockRedisLpush).toHaveBeenCalledTimes(1)
+    expect(mockRedisLpush.mock.invocationCallOrder[0]).toBeLessThan(
+      mockRedisEval.mock.invocationCallOrder[0],
+    )
+    expect(JSON.stringify(mockRedisLpush.mock.calls)).not.toContain('RAW-ANSWER-SENTINEL')
+    expect(JSON.stringify(mockRedisEval.mock.calls)).not.toContain('RAW-ANSWER-SENTINEL')
   })
 })
 
@@ -8394,6 +8797,14 @@ describe('POST /api/providers — baseUrl requirement', () => {
 // ---------------------------------------------------------------------------
 
 describe('POST /api/tasks — enqueues to Redis', () => {
+  function captureTaskInsert(returnedTask: Record<string, unknown>) {
+    const insertChain = chain([returnedTask]) as Record<string, unknown>
+    const values = vi.fn(() => insertChain)
+    insertChain.values = values
+    mockDbInsert.mockReturnValue(insertChain)
+    return values
+  }
+
   beforeEach(() => {
     vi.clearAllMocks()
     mockGetSession.mockReset()
@@ -8402,6 +8813,17 @@ describe('POST /api/tasks — enqueues to Redis', () => {
     mockDbUpdate.mockReset()
     mockRedisLpush.mockReset()
     mockRedisPublish.mockReset()
+    mockGenerateTaskTitle.mockReset()
+    mockGenerateTaskTitle.mockResolvedValue('Generated task title')
+    mockReadS4RuntimeModeV1.mockReset()
+    mockReadS4RuntimeModeV1.mockResolvedValue('protected')
+  })
+
+  afterEach(() => {
+    mockGenerateTaskTitle.mockReset()
+    mockGenerateTaskTitle.mockResolvedValue('Generated task title')
+    mockReadS4RuntimeModeV1.mockReset()
+    mockReadS4RuntimeModeV1.mockResolvedValue('protected')
   })
 
   it('calls redis.lpush("forge:tasks", ...) when task is created', async () => {
@@ -8467,6 +8889,122 @@ describe('POST /api/tasks — enqueues to Redis', () => {
     expect(res.status).toBe(404)
     const body = await res.json()
     expect(body.error).toMatch(/project not found/i)
+    expect(mockDbInsert).not.toHaveBeenCalled()
+    expect(mockRedisLpush).not.toHaveBeenCalled()
+  })
+
+  it('uses the fixed protected title without exposing the prompt to title generation', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbSelect.mockReturnValue(chain([{ id: 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11' }]))
+    const createdTask = {
+      id: 'task-protected-title',
+      projectId: 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
+      title: 'Untitled task',
+      prompt: 'RAW-PROMPT-MUST-NOT-REACH-TITLE-PROVIDER',
+      status: 'pending',
+    }
+    const values = captureTaskInsert(createdTask)
+    mockRedisLpush.mockResolvedValue(1)
+
+    const { POST } = await import('@/app/api/tasks/route')
+    const res = await POST(authRequest('/api/tasks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        projectId: createdTask.projectId,
+        prompt: createdTask.prompt,
+      }),
+    }) as never)
+
+    expect(res.status).toBe(201)
+    expect(mockReadS4RuntimeModeV1).toHaveBeenCalledOnce()
+    expect(mockGenerateTaskTitle).not.toHaveBeenCalled()
+    expect(values).toHaveBeenCalledWith(expect.objectContaining({ title: 'Untitled task' }))
+    expect((await res.json()).task).toMatchObject({
+      title: 'Untitled task',
+      prompt: createdTask.prompt,
+    })
+  })
+
+  it('retains an explicit protected title without invoking title generation', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbSelect.mockReturnValue(chain([{ id: 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11' }]))
+    const createdTask = {
+      id: 'task-explicit-title',
+      projectId: 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
+      title: 'Operator supplied title',
+      prompt: 'Prompt stays authoritative.',
+      status: 'pending',
+    }
+    const values = captureTaskInsert(createdTask)
+    mockRedisLpush.mockResolvedValue(1)
+
+    const { POST } = await import('@/app/api/tasks/route')
+    const res = await POST(authRequest('/api/tasks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        projectId: createdTask.projectId,
+        title: '  Operator supplied title  ',
+        prompt: createdTask.prompt,
+      }),
+    }) as never)
+
+    expect(res.status).toBe(201)
+    expect(mockReadS4RuntimeModeV1).not.toHaveBeenCalled()
+    expect(mockGenerateTaskTitle).not.toHaveBeenCalled()
+    expect(values).toHaveBeenCalledWith(expect.objectContaining({ title: 'Operator supplied title' }))
+    expect((await res.json()).task.title).toBe('Operator supplied title')
+  })
+
+  it('preserves legacy title generation when no title is supplied', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockReadS4RuntimeModeV1.mockResolvedValue('legacy')
+    mockGenerateTaskTitle.mockResolvedValue('Legacy generated title')
+    mockDbSelect.mockReturnValue(chain([{ id: 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11' }]))
+    const createdTask = {
+      id: 'task-legacy-title',
+      projectId: 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
+      title: 'Legacy generated title',
+      prompt: 'Generate a legacy task title.',
+      status: 'pending',
+    }
+    const values = captureTaskInsert(createdTask)
+    mockRedisLpush.mockResolvedValue(1)
+
+    const { POST } = await import('@/app/api/tasks/route')
+    const res = await POST(authRequest('/api/tasks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        projectId: createdTask.projectId,
+        prompt: createdTask.prompt,
+      }),
+    }) as never)
+
+    expect(res.status).toBe(201)
+    expect(mockGenerateTaskTitle).toHaveBeenCalledWith(createdTask.prompt, undefined)
+    expect(values).toHaveBeenCalledWith(expect.objectContaining({ title: 'Legacy generated title' }))
+  })
+
+  it('fails closed before title generation or persistence when runtime authority is unavailable', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockReadS4RuntimeModeV1.mockRejectedValue(new Error('authority unavailable'))
+    mockDbSelect.mockReturnValue(chain([{ id: 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11' }]))
+
+    const { POST } = await import('@/app/api/tasks/route')
+    const res = await POST(authRequest('/api/tasks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        projectId: 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
+        prompt: 'Prompt must not reach a provider.',
+      }),
+    }) as never)
+
+    expect(res.status).toBe(500)
+    expect(await res.json()).toEqual({ error: 'Internal server error' })
+    expect(mockGenerateTaskTitle).not.toHaveBeenCalled()
     expect(mockDbInsert).not.toHaveBeenCalled()
     expect(mockRedisLpush).not.toHaveBeenCalled()
   })
@@ -8566,7 +9104,7 @@ describe('POST /api/tasks/:id/retry', () => {
       'forge:task-events:v2:task-failed:history',
       'task:status',
       expect.stringContaining('"status":"pending"'),
-      'forge:task:task-failed',
+      'forge:task-events:v2:task-failed:live',
       '4096',
     )
   })
@@ -8611,7 +9149,7 @@ describe('POST /api/tasks/:id/retry', () => {
       'forge:task-events:v2:task-failed:history',
       'task:status',
       expect.stringContaining('"status":"approved"'),
-      'forge:task:task-failed',
+      'forge:task-events:v2:task-failed:live',
       '4096',
     )
   })

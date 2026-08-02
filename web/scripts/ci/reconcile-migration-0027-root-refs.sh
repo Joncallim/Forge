@@ -1,43 +1,27 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-: "${FORGE_DATABASE_ADMIN_URL:?Set the short-lived PostgreSQL administrator URL.}"
-batch_size="${FORGE_ROOT_REF_RECONCILE_BATCH_SIZE:-100}"
-if [[ ! "${batch_size}" =~ ^[0-9]+$ ]] || (( batch_size < 1 || batch_size > 1000 )); then
-  echo 'FORGE_ROOT_REF_RECONCILE_BATCH_SIZE must be an integer from 1 to 1000.' >&2
-  exit 1
-fi
-
-preflight="$(psql "${FORGE_DATABASE_ADMIN_URL}" --no-align --tuples-only --set ON_ERROR_STOP=1 --command "
-  SELECT state FROM public.forge_epic_172_enablement_state WHERE singleton_id = 'epic-172';
-")"
-if [[ "${preflight}" != 'disabled' ]]; then
-  echo "Root-reference reconciliation requires the existing Step 0 state disabled; got ${preflight}." >&2
-  exit 1
-fi
-
-for ((attempt = 1; attempt <= 100000; attempt += 1)); do
-  result="$(psql "${FORGE_DATABASE_ADMIN_URL}" --no-align --tuples-only --field-separator '|' --set ON_ERROR_STOP=1 \
-    --command "SELECT * FROM forge.reconcile_project_root_refs_v1(${batch_size});")"
-  IFS='|' read -r batch_rows remaining state <<<"${result}"
-  if [[ ! "${batch_rows}" =~ ^[0-9]+$ || ! "${remaining}" =~ ^[0-9]+$ ]]; then
-    echo "Unexpected reconciliation result: ${result}" >&2
+# Compatibility shim for the populated-upgrade proof. It uses the short-lived
+# admin connection only to provision the disposable login and capture a
+# watermark; the reconciliation process itself receives only the dedicated URL.
+if [[ $# -eq 0 ]]; then
+  : "${FORGE_DATABASE_ADMIN_URL:?Set the short-lived PostgreSQL administrator URL.}"
+  psql "$FORGE_DATABASE_ADMIN_URL" --set ON_ERROR_STOP=1 --command \
+    "ALTER ROLE forge_project_root_reconciler PASSWORD 'forge_project_root_reconciler_test';" >/dev/null
+  authority="${FORGE_DATABASE_ADMIN_URL#*://}"
+  export FORGE_PROJECT_ROOT_RECONCILER_DATABASE_URL="postgresql://forge_project_root_reconciler:forge_project_root_reconciler_test@${authority#*@}"
+  while :; do
+    rows="$(psql "$FORGE_PROJECT_ROOT_RECONCILER_DATABASE_URL" --no-align --tuples-only --set ON_ERROR_STOP=1 --command "SELECT forge.materialize_project_root_ref_expansion_v1(100);")"
+    [[ "$rows" =~ ^[0-9]+$ ]] || { echo 'Legacy root materialization returned an invalid row count.' >&2; exit 1; }
+    [[ "$rows" == '0' ]] && break
+  done
+  watermark="$(psql "$FORGE_DATABASE_ADMIN_URL" --no-align --tuples-only --set ON_ERROR_STOP=1 --command \
+    "SELECT last_generation FROM public.project_root_change_journal_counter WHERE singleton;")"
+  if [[ ! "$watermark" =~ ^(0|[1-9][0-9]*)$ ]]; then
+    echo 'The root journal watermark is malformed.' >&2
     exit 1
   fi
-  echo "Root-reference batch ${attempt}: updated ${batch_rows}; remaining ${remaining}."
-  if [[ "${state}" == 'complete' && "${remaining}" == '0' ]]; then
-    break
-  fi
-  if (( attempt == 100000 )); then
-    echo 'Root-reference reconciliation exceeded its deterministic batch limit.' >&2
-    exit 1
-  fi
-done
-
-zero_scan="$(psql "${FORGE_DATABASE_ADMIN_URL}" --no-align --tuples-only --set ON_ERROR_STOP=1 \
-  --command "SELECT count(*) FROM public.projects WHERE root_ref IS NULL;")"
-if [[ "${zero_scan}" != '0' ]]; then
-  echo "Root-reference zero scan failed with ${zero_scan} null rows." >&2
-  exit 1
+  exec npx tsx scripts/reconcile-project-root-expansion.ts \
+    --through "$watermark" --actor 11111111-1111-4111-8111-111111111111 --apply
 fi
-echo 'Root-reference reconciliation completed with a zero-null scan.'
+exec npx tsx scripts/reconcile-project-root-expansion.ts "$@"

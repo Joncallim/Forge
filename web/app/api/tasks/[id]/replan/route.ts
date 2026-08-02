@@ -122,8 +122,8 @@ export async function POST(
 
     console.info('[POST /api/tasks/:id/replan] Re-queued task for revised plan', { id: taskId })
     return NextResponse.json({ task })
-  } catch (err) {
-    console.error('[POST /api/tasks/:id/replan] Unexpected error', err)
+  } catch {
+    console.error('[POST /api/tasks/:id/replan] Unexpected error')
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }

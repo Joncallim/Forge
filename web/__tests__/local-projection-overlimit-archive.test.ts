@@ -378,6 +378,10 @@ describe('local-projection over-limit operator commands', () => {
       'utf8',
     )
     for (const evidence of [
+      'count(*) FROM drizzle.__drizzle_migrations) <> 29',
+      'count(DISTINCT created_at) FROM drizzle.__drizzle_migrations) <> 29',
+      'created_at = 1784270400000',
+      'created_at = 1784274000000',
       "role.rolname = 'forge_local_projection_archiver'",
       'role.rolpassword IS NULL',
       'pg_catalog.pg_db_role_setting',
@@ -392,5 +396,12 @@ describe('local-projection over-limit operator commands', () => {
       'acl.grantee = 0',
       'can execute a non-archive forge routine',
     ]) expect(proof).toContain(evidence)
+    const recoveryProof = readFileSync(
+      new URL('../scripts/ci/sql/migration-0027-recovery-assertions.sql', import.meta.url),
+      'utf8',
+    )
+    expect(recoveryProof).toContain('GRANT SELECT ON TABLE forge_proof_saved_local_marker TO forge_s4_recovery_operator;')
+    expect(recoveryProof).toContain('REVOKE SELECT ON TABLE forge_proof_saved_local_marker FROM forge_s4_recovery_operator;')
+    expect(recoveryProof).not.toContain('GRANT SELECT ON TABLE forge_proof_saved_local_marker TO PUBLIC;')
   })
 })

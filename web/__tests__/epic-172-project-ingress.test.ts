@@ -94,6 +94,26 @@ describe('Epic 172 project-management ingress decision', () => {
     })
   })
 
+  it('normalizes PostgreSQL raw timestamp and bigint values before deciding', () => {
+    const rawActive = {
+      ...activeState(),
+      epoch: '2',
+      startedAt: STARTED.toISOString(),
+    }
+    expect(decideEpic172ProjectManagementIngress(rawActive, NOW.toISOString())).toEqual({
+      allowed: true,
+      state: 'active',
+    })
+    expect(decideEpic172ProjectManagementIngress(
+      { ...rawActive, epoch: '9007199254740992' },
+      NOW.toISOString(),
+    )).toEqual({ allowed: false, reason: 'incomplete_identity' })
+    expect(decideEpic172ProjectManagementIngress(
+      { ...rawActive, startedAt: 'infinity' },
+      NOW.toISOString(),
+    )).toEqual({ allowed: false, reason: 'incomplete_identity' })
+  })
+
   it('treats equality as expired and rejects malformed provisional timelines', () => {
     expect(decideEpic172ProjectManagementIngress(provisionalState(), EXPIRES)).toEqual({
       allowed: false,

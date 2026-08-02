@@ -12,8 +12,13 @@ import {
   safeTaskEventType,
   type TaskEventEnvelopeV2,
 } from '@/worker/events'
-import { taskEventRedisConfiguration } from '@/lib/task-event-redis'
+import { taskEventRedisConfiguration, taskEventRedisKeys } from '@/lib/task-event-redis'
+import { readS4RuntimeModeV1 } from '@/lib/mcps/s4-lease'
 import { taskQuestionSummary } from '@/lib/mcps/clarification-projection'
+import {
+  projectTaskCompatibilityArtifact,
+  taskCompatibilityError,
+} from '@/lib/mcps/leakage-drain'
 
 // ---------------------------------------------------------------------------
 // SSE stream — GET /api/tasks/:id/runs
@@ -55,7 +60,7 @@ export async function GET(
       let heartbeat: ReturnType<typeof setInterval> | null = null
       let maxAgeTimer: ReturnType<typeof setTimeout> | null = null
       let sub: RedisClient | null = null
-      let historyRedis: RedisClient = redis
+      let historyRedis: RedisClient | undefined = undefined
       let ownsHistoryRedis = false
 
       const cleanup = () => {
@@ -68,7 +73,7 @@ export async function GET(
           clearTimeout(maxAgeTimer)
         }
         sub?.disconnect()
-        if (ownsHistoryRedis) historyRedis.disconnect()
+        if (ownsHistoryRedis) historyRedis?.disconnect()
         try {
           controller.close()
         } catch {
@@ -87,8 +92,9 @@ export async function GET(
         }
       }
 
-      const eventHistoryKey = `forge:task-events:v2:${taskId}:history`
-      const eventSequenceKey = `forge:task-events:v2:${taskId}:seq`
+      const eventRedisKeys = taskEventRedisKeys(taskId)
+      const eventHistoryKey = eventRedisKeys.history
+      const eventSequenceKey = eventRedisKeys.sequence
 
       // replaySend: enqueues the SSE line directly WITHOUT writing to the sorted set.
       // Used only during the replay loop to avoid re-persisting already-stored events.
@@ -152,7 +158,7 @@ export async function GET(
               id: run.id,
               runId: run.id,
               completedAt: run.completedAt,
-              errorMessage: run.errorMessage,
+              errorMessage: taskCompatibilityError(run.errorMessage),
               attemptNumber: run.attemptNumber,
               stage: run.stage,
               workPackageId: run.workPackageId,
@@ -174,25 +180,14 @@ export async function GET(
           .where(inArray(artifacts.agentRunId, runIds))
           .orderBy(asc(artifacts.createdAt))
 
+        const runById = new Map(runs.map((run) => [run.id, run]))
         for (const artifact of existingArtifacts) {
-          const protectedArchitectHistory = artifact.artifactType === 'adr_text'
-            && isRecord(artifact.metadata)
-            && artifact.metadata.historyAvailable === true
-          sendSnapshotEvent('artifact:created', protectedArchitectHistory
-            ? {
-                agentRunId: artifact.agentRunId,
-                historyAvailable: true,
-              }
-            : {
-                id: artifact.id,
-                artifactId: artifact.id,
-                agentRunId: artifact.agentRunId,
-                artifactType: artifact.artifactType,
-                content: artifact.content,
-                metadata: artifact.metadata,
-                createdAt: artifact.createdAt,
-                workPackageId: workPackageIdByRunId.get(artifact.agentRunId),
-              })
+          const compatibleArtifact = projectTaskCompatibilityArtifact(artifact, runById.get(artifact.agentRunId))
+          sendSnapshotEvent('artifact:created', {
+            ...compatibleArtifact,
+            artifactId: compatibleArtifact.id,
+            workPackageId: workPackageIdByRunId.get(artifact.agentRunId),
+          })
         }
 
         const existingQuestions = await db
@@ -236,7 +231,9 @@ export async function GET(
 
       const replayRange = async (afterId: number, throughId: number): Promise<boolean> => {
         if (throughId <= afterId) return true
-        const values = await historyRedis.zrangebyscore(
+        const activeHistoryRedis = historyRedis
+        if (!activeHistoryRedis) return false
+        const values = await activeHistoryRedis.zrangebyscore(
           eventHistoryKey,
           afterId + 1,
           throughId,
@@ -292,17 +289,19 @@ export async function GET(
       const { default: Redis } = await import('ioredis')
       let eventRedisConfiguration
       try {
-        eventRedisConfiguration = taskEventRedisConfiguration()
-      } catch (error) {
-        console.error('[SSE /api/tasks/:id/runs] Invalid task-event Redis configuration', error)
+        const runtimeMode = await readS4RuntimeModeV1()
+        eventRedisConfiguration = taskEventRedisConfiguration(runtimeMode)
+      } catch {
+        console.error('[SSE /api/tasks/:id/runs] Invalid task-event Redis configuration')
         cleanup()
         return
       }
       sub = new Redis(eventRedisConfiguration.subscriberUrl)
-      if (eventRedisConfiguration.dedicated) {
-        historyRedis = new Redis(eventRedisConfiguration.subscriberUrl)
-        ownsHistoryRedis = true
-      }
+      const activeHistoryRedis: RedisClient = eventRedisConfiguration.dedicated
+        ? new Redis(eventRedisConfiguration.subscriberUrl)
+        : redis
+      historyRedis = activeHistoryRedis
+      ownsHistoryRedis = eventRedisConfiguration.dedicated
       let publishedQueue = Promise.resolve()
       sub.on('message', (_channel: string, message: string) => {
         try {
@@ -310,26 +309,26 @@ export async function GET(
           if (!event) return
           if (replaying) buffered.push(event)
           else publishedQueue = publishedQueue.then(() => deliverPublished(event))
-        } catch (err) {
-          console.error('[SSE /api/tasks/:id/runs] Error processing message', err)
+        } catch {
+          console.error('[SSE /api/tasks/:id/runs] Error processing message')
         }
       })
-      sub.on('error', (err) => {
-        console.error('[SSE /api/tasks/:id/runs] Redis subscriber error', err)
+      sub.on('error', () => {
+        console.error('[SSE /api/tasks/:id/runs] Redis subscriber error')
         cleanup()
       })
 
       try {
-        await sub.subscribe(`forge:task:${taskId}`)
-      } catch (err) {
-        console.error('[SSE /api/tasks/:id/runs] Failed to subscribe to Redis channel', err)
+        await sub.subscribe(eventRedisKeys.live)
+      } catch {
+        console.error('[SSE /api/tasks/:id/runs] Failed to subscribe to Redis channel')
         cleanup()
         return
       }
 
       if (lastDeliveredId > 0) {
         try {
-          const rawSequence = await historyRedis.get(eventSequenceKey)
+          const rawSequence = await activeHistoryRedis.get(eventSequenceKey)
           const replayUpperBound = Number(rawSequence)
           if (Number.isSafeInteger(replayUpperBound) && replayUpperBound > lastDeliveredId) {
             const filled = await replayRange(lastDeliveredId, replayUpperBound)
@@ -338,18 +337,18 @@ export async function GET(
               lastDeliveredId = replayUpperBound
             }
           }
-        } catch (err) {
-          console.error('[SSE /api/tasks/:id/runs] Error replaying missed events', err)
+        } catch {
+          console.error('[SSE /api/tasks/:id/runs] Error replaying missed events')
         }
       } else {
         try {
-          const rawSequence = await historyRedis.get(eventSequenceKey)
+          const rawSequence = await activeHistoryRedis.get(eventSequenceKey)
           const currentSequence = Number(rawSequence)
           if (Number.isSafeInteger(currentSequence) && currentSequence > 0) {
             lastDeliveredId = currentSequence
           }
-        } catch (err) {
-          console.error('[SSE /api/tasks/:id/runs] Error reading the event baseline', err)
+        } catch {
+          console.error('[SSE /api/tasks/:id/runs] Error reading the event baseline')
         }
       }
       replaying = false
@@ -358,9 +357,9 @@ export async function GET(
 
       try {
         await sendCurrentSnapshot()
-      } catch (err) {
+      } catch {
         if (!closed) {
-          console.error('[SSE /api/tasks/:id/runs] Error sending current snapshot', err)
+          console.error('[SSE /api/tasks/:id/runs] Error sending current snapshot')
         }
       }
       if (closed) return

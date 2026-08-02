@@ -1,24 +1,40 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-const { mockEval, mockPublish, mockPublisherRedis } = vi.hoisted(() => {
+const { mockEval, mockPublish, mockPublisherRedis, mockReadS4RuntimeModeV1 } = vi.hoisted(() => {
   const mockEval = vi.fn().mockResolvedValue(7)
   const mockPublish = vi.fn().mockResolvedValue(1)
   return {
     mockEval,
     mockPublish,
     mockPublisherRedis: { eval: mockEval, publish: mockPublish },
+    mockReadS4RuntimeModeV1: vi.fn(),
   }
 })
 
 vi.mock('@/lib/task-event-redis', () => ({
+  LEGACY_TASK_EVENT_STORAGE_PATTERN: 'forge:task:*',
+  TASK_EVENT_V2_STORAGE_PATTERN: 'forge:task-events:v2:*',
   taskEventPublisherRedis: vi.fn(() => mockPublisherRedis),
+  taskEventRedisConfiguration: vi.fn((runtimeMode: string) => ({
+    dedicated: runtimeMode === 'protected',
+    publisherUrl: 'redis://publisher:publisher-password@publisher.example.test/0',
+    subscriberUrl: 'redis://subscriber:subscriber-password@subscriber.example.test/0',
+  })),
+  taskEventRedisKeys: (taskId: string) => ({
+    history: `forge:task-events:v2:${taskId}:history`,
+    live: `forge:task-events:v2:${taskId}:live`,
+    sequence: `forge:task-events:v2:${taskId}:seq`,
+  }),
 }))
+
+vi.mock('@/lib/mcps/s4-lease', () => ({ readS4RuntimeModeV1: mockReadS4RuntimeModeV1 }))
 
 describe('task-event publisher authority', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     mockEval.mockResolvedValue(7)
     mockPublish.mockResolvedValue(1)
+    mockReadS4RuntimeModeV1.mockResolvedValue('protected')
   })
 
   it('assigns, stores, bounds, and publishes one identical durable v2 envelope atomically', async () => {
@@ -43,9 +59,12 @@ describe('task-event publisher authority', () => {
       status: 'running',
       updatedAt: '2026-07-22T00:00:00.000Z',
     })
-    expect(channel).toBe('forge:task:task-1')
+    expect(channel).toBe('forge:task-events:v2:task-1:live')
     expect(limit).toBe('4096')
     expect(mockPublish).not.toHaveBeenCalled()
+    const { taskEventPublisherRedis, taskEventRedisConfiguration } = await import('@/lib/task-event-redis')
+    expect(taskEventRedisConfiguration).toHaveBeenCalledWith('protected')
+    expect(taskEventPublisherRedis).toHaveBeenCalledWith(expect.objectContaining({ dedicated: true }))
   })
 
   it('rejects run chunks before Redis so raw model output has no live bypass', async () => {
@@ -98,5 +117,20 @@ describe('task-event publisher authority', () => {
     }))
       .rejects.toThrow('publisher unavailable')
     expect(mockPublish).not.toHaveBeenCalled()
+  })
+
+  it('fails before choosing Redis when the authoritative runtime mode cannot be read', async () => {
+    mockReadS4RuntimeModeV1.mockRejectedValueOnce(new Error('runtime authority unavailable'))
+    const { publishTaskEvent } = await import('@/worker/events')
+    const { taskEventPublisherRedis, taskEventRedisConfiguration } = await import('@/lib/task-event-redis')
+
+    await expect(publishTaskEvent('task-1', 'task:status', {
+      status: 'running',
+      updatedAt: '2026-07-22T00:00:00.000Z',
+    })).rejects.toThrow(/runtime authority unavailable/i)
+
+    expect(taskEventRedisConfiguration).not.toHaveBeenCalled()
+    expect(taskEventPublisherRedis).not.toHaveBeenCalled()
+    expect(mockEval).not.toHaveBeenCalled()
   })
 })

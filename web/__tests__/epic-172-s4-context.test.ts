@@ -54,6 +54,14 @@ const s4Migration = readFileSync(
   fileURLToPath(new URL('../db/migrations/0027_epic_172_s4_packet_context.sql', import.meta.url)),
   'utf8',
 )
+const s5RecoveryMigration = readFileSync(
+  fileURLToPath(new URL('../db/migrations/0028_epic_172_s5_recovery_actions.sql', import.meta.url)),
+  'utf8',
+)
+const s5RecoveryMigrationWrapper = readFileSync(
+  fileURLToPath(new URL('../scripts/ci/apply-epic-172-s5-recovery-migration.sh', import.meta.url)),
+  'utf8',
+)
 const sessionReconciliation = readFileSync(
   fileURLToPath(new URL('../scripts/reconcile-session-credentials.ts', import.meta.url)),
   'utf8',
@@ -113,12 +121,22 @@ function admission(overrides: Partial<McpWorkPackageAdmission> = {}): McpWorkPac
 describe('Epic 172 S4 PostgreSQL CI contract', () => {
   it('bootstraps S4 before migration and makes all dedicated PostgreSQL fixtures mandatory', () => {
     const bootstrapIndex = webCiWorkflow.indexOf('name: Bootstrap migration-0027 S4 protocol ownership')
-    const migrateIndex = webCiWorkflow.indexOf('name: Apply migrations as the disposable migration owner')
+    const migrateIndex = webCiWorkflow.indexOf('name: Apply migration-0028 with failure-safe S5 recovery ownership')
     expect(bootstrapIndex).toBeGreaterThan(-1)
     expect(migrateIndex).toBeGreaterThan(bootstrapIndex)
     expect(webCiWorkflow).toContain('npm run protocol:bootstrap-epic-172-s4-roles')
     expect(webCiWorkflow).toContain('name: Create the freshly migrated isolated S4 PostgreSQL proof database')
     expect(webCiWorkflow).toContain('CREATE DATABASE forge_s4_ci_test OWNER forge_migration_test;')
+    const stage0027 = webCiWorkflow.indexOf('name: Apply migrations through 0027')
+    const handoff0028 = webCiWorkflow.indexOf('name: Apply migration-0028 with failure-safe S5 recovery ownership')
+    expect(bootstrapIndex).toBeLessThan(stage0027)
+    expect(stage0027).toBeLessThan(handoff0028)
+    expect(webCiWorkflow).toContain('run: bash scripts/ci/apply-epic-172-s5-recovery-migration.sh')
+    expect(s5RecoveryMigrationWrapper).toContain('npx tsx scripts/bootstrap-epic-172-s5-recovery-owner.ts')
+    expect(s5RecoveryMigrationWrapper).toContain('npm run db:migrate')
+    expect(s5RecoveryMigrationWrapper).toContain('trap cleanup EXIT')
+    expect(s5RecoveryMigrationWrapper).toContain('bootstrap-epic-172-s5-recovery-owner.ts --cleanup')
+    expect(handoff0028).toBeLessThan(webCiWorkflow.indexOf('name: Configure disposable release and S4 principal passwords'))
     expect(webCiWorkflow).toContain('npm run test:mcp:s4-postgres -- --reporter=default | tee "$report"')
     expect(webCiWorkflow).toContain('run: npm run test:unit:zero-skip')
     const zeroSkipStep = webCiWorkflow.slice(
@@ -167,6 +185,8 @@ describe('Epic 172 S4 PostgreSQL CI contract', () => {
       'local_projection_archive_operations',
       'local_projection_archive_operation_checkpoints',
       'filesystem_mcp_decision_nonce_claims',
+      'project_root_change_journal_counter',
+      'project_root_change_journal',
     ]) {
       expect(ordinaryInventory).not.toContain(`'${table}'`)
       expect(protectedInventory).toContain(`'${table}'`)
@@ -276,6 +296,105 @@ describe('Epic 172 S4 PostgreSQL CI contract', () => {
     expect(s4Migration).toMatch(/RETURNS TABLE \(purpose text, source_kind text, task_id uuid/)
   })
 
+  it('certifies every protected clarification table and routine in the S4 owner finalizer', () => {
+    const ownedTableInventory = s4RoleBootstrap.match(
+      /const OWNED_TABLES = \[([\s\S]*?)\] as const/,
+    )?.[1] ?? ''
+    const exactRoutineInventory = s4RoleBootstrap.match(
+      /const EXACT_CLARIFICATION_ROUTINES = \[([\s\S]*?)\] as const/,
+    )?.[1] ?? ''
+
+    for (const table of [
+      'architect_clarification_answers',
+      'architect_clarification_answer_writes',
+    ]) {
+      expect(ownedTableInventory).toContain(`'${table}'`)
+    }
+    for (const routine of [
+      {
+        identity: 'forge.bind_architect_replan_context_v3(uuid,uuid)',
+        name: 'bind_architect_replan_context_v3',
+        grantee: 'forge_architect_plan_writer',
+      },
+      {
+        identity: 'forge.resolve_architect_plan_entry_v2(uuid)',
+        name: 'resolve_architect_plan_entry_v2',
+        grantee: 'forge_architect_plan_resolver',
+      },
+      {
+        identity: 'forge.append_architect_clarification_answer_v1(bytea,uuid,uuid,uuid,bigint,uuid,text,text,text)',
+        name: 'append_architect_clarification_answer_v1',
+        grantee: 'forge_architect_plan_history_reader',
+      },
+    ]) {
+      expect(exactRoutineInventory).toContain(`identity: '${routine.identity}'`)
+      expect(exactRoutineInventory).toContain(`name: '${routine.name}'`)
+      expect(exactRoutineInventory).toContain(`grantee: '${routine.grantee}'`)
+    }
+
+    expect(s4RoleBootstrap).toContain('acl.grantee <> table_row.relowner')
+    expect(s4RoleBootstrap).toContain("acl.grantee = 0 and acl.privilege_type = 'EXECUTE'")
+    expect(s4RoleBootstrap).toContain(
+      'routine.oid = pg_catalog.to_regprocedure(expected.routine_identity)',
+    )
+    expect(s4RoleBootstrap).toMatch(
+      /if exists \(\s+with expected\(routine_identity, routine_name, expected_grantee\)/,
+    )
+    expect(s4RoleBootstrap).toContain('observed.proowner <>')
+    expect(s4RoleBootstrap).toContain('observed.acl_count <> 2')
+    expect(s4RoleBootstrap).toContain('observed.owner_execute_count <> 1')
+    expect(s4RoleBootstrap).toContain('observed.expected_execute_count <> 1')
+    expect(s4RoleBootstrap).toContain('and not acl.is_grantable')
+    expect(s4RoleBootstrap).toContain(
+      'pg_catalog.to_regprocedure(expected.routine_identity) = routine.oid',
+    )
+    expect(s4RoleBootstrap).toContain(
+      "raise exception 'The exact S4 clarification routine authority is incomplete'",
+    )
+    expect(s4RoleBootstrap).not.toContain('acl.grantee <> case routine.proname')
+    expect(s4RoleBootstrap).toContain(') <> 73 then')
+  })
+
+  it('audits the complete protected clarification history set without truncation', () => {
+    const historyReader = s4Migration.match(
+      /CREATE OR REPLACE FUNCTION forge\.read_architect_plan_history_v1\([\s\S]*?\n\$\$;/,
+    )?.[0] ?? ''
+    expect(historyReader).toContain("'sha256:' || pg_catalog.encode(pg_catalog.sha256")
+    expect(historyReader).toContain("entry_kind IN ('plan_body','requirement','routing','overlay','subtask')")
+    expect(historyReader).toContain('projection.source_plan_version <= $2')
+    expect(historyReader).toContain('answer.source_plan_version <= $2')
+    expect(historyReader).toContain('v_returned_entry_count > 256')
+    expect(historyReader).not.toMatch(/LIMIT\s+256/i)
+    expect(historyReader).not.toContain('pg_catalog.coalesce')
+    expect(s4Migration).toContain("entry_set_digest ~ '^(hmac-sha256|sha256):[0-9a-f]{64}$'")
+  })
+
+  it('rejects non-canonical protected clarification question text before auditing it', () => {
+    const historyReader = s4Migration.match(
+      /CREATE OR REPLACE FUNCTION forge\.read_architect_plan_history_v1\([\s\S]*?\n\$\$;/,
+    )?.[0] ?? ''
+
+    expect(historyReader).toBeDefined()
+    expect(historyReader).toContain("jsonb_array_length(question.content::jsonb->'suggestions') > 4")
+    expect(historyReader).toContain("jsonb_array_elements(question.content::jsonb->'suggestions')")
+    expect(historyReader).toContain("pg_catalog.jsonb_typeof(suggestion.value) IS DISTINCT FROM 'string'")
+    expect(historyReader).toContain('v_ecmascript_trim_characters text := pg_catalog.chr(9)')
+    expect(historyReader).toContain('pg_catalog.chr(5760)')
+    expect(historyReader).toContain('pg_catalog.chr(8192)')
+    expect(historyReader).toContain('pg_catalog.chr(8202)')
+    expect(historyReader).toContain('pg_catalog.chr(65279)')
+    expect(historyReader).toContain("suggestion.value #>> '{}' IS DISTINCT FROM pg_catalog.btrim(suggestion.value #>> '{}', $3)")
+    expect(historyReader).toContain('USING p_task_id, p_plan_version, v_ecmascript_trim_characters')
+    expect(historyReader).toContain("GROUP BY normalized_suggestions.normalized")
+    expect(historyReader).toContain("question.content::jsonb->>'question' IS DISTINCT FROM pg_catalog.btrim(question.content::jsonb->>'question', $3)")
+    expect(historyReader).toContain('CASE prevents jsonb_array_elements from evaluating malformed non-array JSON')
+    expect(historyReader).toContain("AND projection.status = 'open'")
+    expect(historyReader).toContain("OR projection.status IS DISTINCT FROM 'answered'")
+    const answerLinkedValidation = historyReader.slice(historyReader.indexOf('FROM public.architect_clarification_answers answer'))
+    expect(answerLinkedValidation).toContain("jsonb_array_length(question.content::jsonb->'suggestions') > 4")
+    expect(answerLinkedValidation).toContain("GROUP BY normalized_suggestions.normalized")
+  })
+
   it('exposes only atomic S4 lifecycle entry points to the packet issuer', () => {
     for (const helper of [
       'create_local_run_evidence_v1(uuid,uuid,integer)',
@@ -376,6 +495,19 @@ describe('Epic 172 S4 PostgreSQL CI contract', () => {
       ))
   })
 
+  it('replaces the S5 recovery routine only while the exact owner role is active', () => {
+    const begin = s5RecoveryMigration.indexOf('SELECT public.forge_begin_epic_172_s4_owner_bootstrap_v1();')
+    const setRole = s5RecoveryMigration.indexOf('SET ROLE forge_s4_routines_owner;')
+    const replace = s5RecoveryMigration.indexOf('CREATE OR REPLACE FUNCTION forge.apply_local_effect_recovery_action_v2(')
+    const reset = s5RecoveryMigration.indexOf('RESET ROLE;')
+    const finalize = s5RecoveryMigration.indexOf('SELECT public.forge_finalize_epic_172_s4_owner_bootstrap_v1();')
+    expect(begin).toBeGreaterThanOrEqual(0)
+    expect(begin).toBeLessThan(setRole)
+    expect(setRole).toBeLessThan(replace)
+    expect(replace).toBeLessThan(reset)
+    expect(reset).toBeLessThan(finalize)
+  })
+
   it('keeps session cutover additive until exact Redis expiry and key drain are proven', () => {
     expect(s4Migration).toContain("pg_catalog.convert_to('forge:web-session:v1', 'UTF8')")
     expect(s4Migration).toContain("|| pg_catalog.decode('00', 'hex')")
@@ -384,6 +516,11 @@ describe('Epic 172 S4 PostgreSQL CI contract', () => {
     expect(s4Migration).toContain('session_credential_reconciliation')
     expect(s4Migration).toContain("state IN ('expansion','draining','strict')")
     expect(s4Migration).toContain('sessions_credential_cutover_guard_v1')
+    expect(s4Migration).toContain('sessions_cache_purge_state_chk')
+    expect(s4Migration).toContain('sessions_cache_purge_due_idx')
+    expect(s4Migration).toContain('cache_purge_credential_digest_v1 bytea')
+    expect(s4Migration).toContain('cache_purge_credential_digest_v1 IS NOT NULL')
+    expect(s4Migration).toContain('pg_catalog.octet_length(cache_purge_credential_digest_v1) = 32')
     expect(s4Migration).not.toContain("last_seen_at + interval '7 days'")
     expect(s4Migration).not.toContain('ALTER COLUMN credential_digest_v1 SET NOT NULL')
     expect(s4Migration).not.toContain('ALTER COLUMN expires_at SET NOT NULL')
@@ -403,6 +540,7 @@ describe('Epic 172 S4 PostgreSQL CI contract', () => {
     expect(sessionReconciliation).toContain('Strict session cutover zero-scan failed')
     expect(sessionReconciliation).toContain('Strict session cutover Redis zero-scan failed')
     expect(sessionReconciliation).toContain('alter column credential_digest_v1 set not null')
+    expect(sessionReconciliation).toContain('validate constraint sessions_cache_purge_state_chk')
     expect(sessionReconciliation).toContain('alter column expires_at set not null')
   })
 })

@@ -1,17 +1,45 @@
-import { createHash } from 'node:crypto'
+import { createHmac } from 'node:crypto'
 import {
   LEGACY_TASK_LOG_UNAVAILABLE,
   classifySensitivePayloadKey,
   isUnknownLegacyDigest,
   sanitizeSensitivePayload,
 } from '@/lib/mcps/leakage-drain'
+import {
+  LEGACY_TASK_EVENT_STORAGE_PATTERN,
+  TASK_EVENT_V2_STORAGE_PATTERN,
+} from '@/lib/task-event-redis'
 
 export const LEGACY_LEAKAGE_SCRUB_CHECKPOINT_PREFIX = 'epic172:s4:legacy-leakage-scrub:v1:'
+export const LEGACY_LEAKAGE_SCRUB_FINGERPRINT_DOMAIN = 'forge:legacy-leakage-scrub:fingerprint:v2\0'
+export const LEGACY_LEAKAGE_SCRUB_SENTINEL_DOMAIN = 'forge:legacy-leakage-scrub:sentinels:v2\0'
 export const LEGACY_TASK_EVENT_PATTERNS = [
-  'forge:task:*:history',
-  'forge:task:*:seq',
+  LEGACY_TASK_EVENT_STORAGE_PATTERN,
 ] as const
-export const V2_TASK_EVENT_HISTORY_PATTERN = 'forge:task-events:v2:*:history'
+export const V2_TASK_EVENT_HISTORY_PATTERN = TASK_EVENT_V2_STORAGE_PATTERN
+
+/** The complete, closed set of durable database fields this scrub may inspect or change. */
+export const LEGACY_LEAKAGE_SCRUB_DATABASE_POLICY = {
+  task_logs: { selected: ['id', 'message', 'front_matter', 'metadata'], updated: ['message', 'front_matter', 'metadata'] },
+  artifacts: {
+    selected: ['id', 'content', 'metadata', 'artifact_type', 'agent_run_id'],
+    updated: ['content', 'metadata'],
+    excluded: ['architect_plan_versions.plan_artifact_id', 'architect_plan_entries.content'],
+  },
+  work_packages: { selected: ['id', 'metadata'], updated: ['metadata'] },
+  approval_gates: { selected: ['id', 'metadata'], updated: ['metadata'] },
+  retainedAuthorities: [
+    'tasks.prompt',
+    'task_questions',
+    'architect_clarification_answers',
+    'tasks.error_message',
+    'task_attempts.error_message',
+    'agent_runs.error_message',
+    'architect_plan_versions',
+    'architect_plan_entries',
+    'ordinary_non_plan_artifact.content',
+  ],
+} as const
 
 export type LegacyLeakageScrubPhase =
   | 'task_logs'
@@ -58,10 +86,12 @@ export type LegacyLeakageScrubRow =
   | LegacyApprovalGateScrubRow
 
 export type LegacyLeakageScrubCheckpoint = Readonly<{
-  schemaVersion: 1
+  schemaVersion: 2
   operationId: string
   actor: string
   authorizationReceiptId: string
+  fingerprintKeyId: string
+  sentinelSetFingerprint: string
   phase: LegacyLeakageScrubPhase
   state: LegacyLeakageScrubState
   lastKey: string | null
@@ -119,7 +149,7 @@ export interface LegacyLeakageScrubDatabase {
 }
 
 export interface LegacyLeakageScrubRedis {
-  purgeLegacyTaskEventKeys(options: Readonly<{ apply: boolean }>): Promise<RedisScanEvidence>
+  purgeLegacyTaskEventKeys(options: Readonly<{ apply: boolean; sentinels?: readonly string[] }>): Promise<RedisScanEvidence>
   scanV2TaskEventHistory(sentinels: readonly string[]): Promise<RedisScanEvidence>
 }
 
@@ -128,6 +158,9 @@ export type LegacyLeakageScrubMode = 'dry-run' | 'apply' | 'resume'
 export type LegacyLeakageScrubOptions = Readonly<{
   actor: string
   authorizationReceiptId: string
+  /** Required server-private 32-byte HMAC key; never persisted or emitted. */
+  fingerprintKey: Buffer
+  fingerprintKeyId: string
   batchSize?: number
   maxBatches?: number
   mode: LegacyLeakageScrubMode
@@ -157,16 +190,52 @@ function canonicalize(value: unknown): unknown {
   if (value !== null && typeof value === 'object') {
     return Object.fromEntries(
       Object.entries(value as Record<string, unknown>)
-        .sort(([left], [right]) => left.localeCompare(right))
+        .sort(([left], [right]) => compareCanonicalCodeUnits(left, right))
         .map(([key, item]) => [key, canonicalize(item)]),
     )
   }
   return value
 }
 
-export function legacyLeakageRowFingerprint(row: LegacyLeakageScrubRow): string {
+/** Stable UTF-16 code-unit ordering: independent of host locale and ICU version. */
+export function compareCanonicalCodeUnits(left: string, right: string): number {
+  if (left < right) return -1
+  if (left > right) return 1
+  return 0
+}
+
+function validateFingerprintKey(key: Buffer): Buffer {
+  if (!Buffer.isBuffer(key) || key.length !== 32) {
+    throw new Error('Legacy leakage scrub requires a dedicated 32-byte fingerprint HMAC key.')
+  }
+  return key
+}
+
+function validateFingerprintKeyId(value: string): string {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$/.test(value)) {
+    throw new Error('fingerprintKeyId must be a bounded non-secret key identifier.')
+  }
+  return value
+}
+
+function keyedFingerprint(domain: string, value: unknown, key: Buffer): string {
+  return createHmac('sha256', validateFingerprintKey(key))
+    .update(domain)
+    .update(JSON.stringify(canonicalize(value)))
+    .digest('hex')
+}
+
+export function legacyLeakageRowFingerprint(row: LegacyLeakageScrubRow, key: Buffer): string {
   const encoded = JSON.stringify(canonicalize(row))
-  return createHash('sha256').update('forge:legacy-leakage-row:v1\0').update(encoded).digest('hex')
+  return createHmac('sha256', validateFingerprintKey(key))
+    .update(LEGACY_LEAKAGE_SCRUB_FINGERPRINT_DOMAIN)
+    .update(encoded)
+    .digest('hex')
+}
+
+export function legacyLeakageSentinelSetFingerprint(sentinels: readonly string[], key: Buffer): string {
+  const canonicalSet = [...new Set(sentinels)].sort(compareCanonicalCodeUnits)
+  return keyedFingerprint(LEGACY_LEAKAGE_SCRUB_SENTINEL_DOMAIN, canonicalSet, key)
 }
 
 export function sanitizeLegacyLeakageRow(row: LegacyLeakageScrubRow): LegacyLeakageScrubRow {
@@ -193,8 +262,8 @@ export function sanitizeLegacyLeakageRow(row: LegacyLeakageScrubRow): LegacyLeak
   }
 }
 
-export function legacyLeakageRowChanged(row: LegacyLeakageScrubRow): boolean {
-  return legacyLeakageRowFingerprint(row) !== legacyLeakageRowFingerprint(sanitizeLegacyLeakageRow(row))
+export function legacyLeakageRowChanged(row: LegacyLeakageScrubRow, key: Buffer): boolean {
+  return legacyLeakageRowFingerprint(row, key) !== legacyLeakageRowFingerprint(sanitizeLegacyLeakageRow(row), key)
 }
 
 type V2EventFieldValidator = (value: unknown) => boolean
@@ -429,6 +498,32 @@ function validateIdentity(name: string, value: string | undefined): string {
   return normalized
 }
 
+function assertCheckpointLifecycle(checkpoint: LegacyLeakageScrubCheckpoint): void {
+  switch (checkpoint.phase) {
+    case 'task_logs':
+    case 'artifacts':
+    case 'work_packages':
+    case 'approval_gates':
+    case 'redis_legacy':
+    case 'redis_v2_verify':
+    case 'complete':
+      break
+    default:
+      throw new Error('Stored leakage scrub checkpoint has an unknown phase; start a new --apply operation.')
+  }
+  switch (checkpoint.state) {
+    case 'running':
+    case 'paused_conflict':
+    case 'complete':
+      break
+    default:
+      throw new Error('Stored leakage scrub checkpoint has an unknown state; start a new --apply operation.')
+  }
+  if ((checkpoint.phase === 'complete') !== (checkpoint.state === 'complete')) {
+    throw new Error('Stored leakage scrub checkpoint has an incoherent lifecycle; start a new --apply operation.')
+  }
+}
+
 function checkpointWith(
   checkpoint: LegacyLeakageScrubCheckpoint,
   changes: Partial<LegacyLeakageScrubCheckpoint>,
@@ -449,7 +544,7 @@ async function moveCheckpoint(
 }
 
 async function dryRun(
-  options: Required<Pick<LegacyLeakageScrubOptions, 'batchSize' | 'sentinels'>>,
+  options: Required<Pick<LegacyLeakageScrubOptions, 'batchSize' | 'sentinels' | 'fingerprintKey'>>,
   database: LegacyLeakageScrubDatabase,
   redis: LegacyLeakageScrubRedis,
 ): Promise<LegacyLeakageScrubResult> {
@@ -465,13 +560,13 @@ async function dryRun(
     dryRun: true,
     preview: {
       artifactRowsExamined: artifactRows.length,
-      artifactRowsChanged: artifactRows.filter(legacyLeakageRowChanged).length,
+      artifactRowsChanged: artifactRows.filter((row) => legacyLeakageRowChanged(row, options.fingerprintKey)).length,
       taskLogRowsExamined: taskLogRows.length,
-      taskLogRowsChanged: taskLogRows.filter(legacyLeakageRowChanged).length,
+      taskLogRowsChanged: taskLogRows.filter((row) => legacyLeakageRowChanged(row, options.fingerprintKey)).length,
       workPackageRowsExamined: workPackageRows.length,
-      workPackageRowsChanged: workPackageRows.filter(legacyLeakageRowChanged).length,
+      workPackageRowsChanged: workPackageRows.filter((row) => legacyLeakageRowChanged(row, options.fingerprintKey)).length,
       approvalGateRowsExamined: approvalGateRows.length,
-      approvalGateRowsChanged: approvalGateRows.filter(legacyLeakageRowChanged).length,
+      approvalGateRowsChanged: approvalGateRows.filter((row) => legacyLeakageRowChanged(row, options.fingerprintKey)).length,
       redis: redisEvidence,
       redisV2: redisV2Evidence,
     },
@@ -483,6 +578,7 @@ const MAX_FINAL_DATABASE_SCAN_BATCHES = 10_000
 async function scanDatabaseForLeakage(
   database: LegacyLeakageScrubDatabase,
   batchSize: number,
+  fingerprintKey: Buffer,
 ): Promise<DatabaseScanEvidence> {
   let rowsExamined = 0
   let violations = 0
@@ -493,7 +589,7 @@ async function scanDatabaseForLeakage(
       const rows = await database.scanRows(phase, afterId, batchSize)
       batches += 1
       rowsExamined += rows.length
-      violations += rows.filter(legacyLeakageRowChanged).length
+      violations += rows.filter((row) => legacyLeakageRowChanged(row, fingerprintKey)).length
       if (rows.length === 0) break
       afterId = rows.at(-1)?.id ?? null
     }
@@ -509,8 +605,9 @@ async function finalZeroScan(
   redis: LegacyLeakageScrubRedis,
   batchSize: number,
   sentinels: readonly string[],
+  fingerprintKey: Buffer,
 ): Promise<Readonly<{ database: DatabaseScanEvidence; legacy: RedisScanEvidence; v2: RedisScanEvidence }>> {
-  const databaseEvidence = await scanDatabaseForLeakage(database, batchSize)
+  const databaseEvidence = await scanDatabaseForLeakage(database, batchSize, fingerprintKey)
   const legacy = await redis.purgeLegacyTaskEventKeys({ apply: false })
   const v2 = await redis.scanV2TaskEventHistory(sentinels)
   return { database: databaseEvidence, legacy, v2 }
@@ -521,6 +618,7 @@ function zeroScanPassed(evidence: Awaited<ReturnType<typeof finalZeroScan>>): bo
     && evidence.database.violations === 0
     && evidence.legacy.complete
     && evidence.legacy.remainingKeys === 0
+    && evidence.legacy.violations === 0
     && evidence.v2.complete
     && evidence.v2.violations === 0
 }
@@ -540,24 +638,33 @@ export async function runLegacyLeakageScrub(
   validateBoundedInteger('maxBatches', maxBatches, 1_000)
 
   const authorizationReceiptId = validateIdentity('authorizationReceiptId', options.authorizationReceiptId)
+  const fingerprintKey = validateFingerprintKey(options.fingerprintKey)
+  const fingerprintKeyId = validateFingerprintKeyId(options.fingerprintKeyId)
+  const sentinelSetFingerprint = legacyLeakageSentinelSetFingerprint(sentinels, fingerprintKey)
   if (!await dependencies.database.verifyDrainAuthorization(authorizationReceiptId)) {
     throw new Error('The supplied authorization receipt does not satisfy the fixed S4 producers-disabled drain contract.')
   }
 
   if (options.mode === 'dry-run') {
-    return dryRun({ batchSize, sentinels }, dependencies.database, dependencies.redis)
+    return dryRun({ batchSize, sentinels, fingerprintKey }, dependencies.database, dependencies.redis)
   }
 
   const operationId = validateIdentity('operationId', options.operationId)
   let current = await dependencies.database.loadCheckpoint(operationId)
+  if (current && current.checkpoint.operationId !== operationId) {
+    throw new Error('Loaded leakage scrub checkpoint operation identity does not match its storage key.')
+  }
+  if (current) assertCheckpointLifecycle(current.checkpoint)
   if (options.mode === 'apply') {
     if (current) throw new Error('This operation already exists; use --resume.')
     const databaseTime = await dependencies.database.databaseTime()
     const initial: LegacyLeakageScrubCheckpoint = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       operationId,
       actor,
       authorizationReceiptId,
+      fingerprintKeyId,
+      sentinelSetFingerprint,
       phase: 'task_logs',
       state: 'running',
       lastKey: null,
@@ -577,12 +684,17 @@ export async function runLegacyLeakageScrub(
     throw new Error('No checkpoint exists for this operation; start with --apply.')
   }
 
-  if (current.checkpoint.actor !== actor || current.checkpoint.authorizationReceiptId !== authorizationReceiptId) {
-    throw new Error('Actor and authorization receipt must match the original scrub operation.')
+  if (
+    current.checkpoint.actor !== actor
+    || current.checkpoint.authorizationReceiptId !== authorizationReceiptId
+    || current.checkpoint.fingerprintKeyId !== fingerprintKeyId
+    || current.checkpoint.sentinelSetFingerprint !== sentinelSetFingerprint
+  ) {
+    throw new Error('Actor, authorization receipt, fingerprint key ID, and sentinel set must match the original scrub operation.')
   }
 
   if (current.checkpoint.state === 'complete') {
-    const final = await finalZeroScan(dependencies.database, dependencies.redis, batchSize, sentinels)
+    const final = await finalZeroScan(dependencies.database, dependencies.redis, batchSize, sentinels, fingerprintKey)
     if (!zeroScanPassed(final)) {
       throw new Error('Completed leakage scrub verification failed; database or Redis leakage reappeared.')
     }
@@ -617,8 +729,8 @@ export async function runLegacyLeakageScrub(
 
       for (const row of rows) {
         const sanitized = sanitizeLegacyLeakageRow(row)
-        const preFingerprint = legacyLeakageRowFingerprint(row)
-        const postFingerprint = legacyLeakageRowFingerprint(sanitized)
+        const preFingerprint = legacyLeakageRowFingerprint(row, fingerprintKey)
+        const postFingerprint = legacyLeakageRowFingerprint(sanitized, fingerprintKey)
         const changed = preFingerprint !== postFingerprint
         const nextCheckpoint = checkpointWith(current.checkpoint, {
           lastKey: row.id,
@@ -652,8 +764,21 @@ export async function runLegacyLeakageScrub(
 
     if (phase === 'redis_legacy') {
       batches += 1
-      const evidence = await dependencies.redis.purgeLegacyTaskEventKeys({ apply: true })
-      if (!evidence.complete || evidence.remainingKeys !== 0) {
+      // A complete, write-free legacy and v2 preflight must finish before any
+      // legacy deletion. The adapter repeats this boundary immediately before
+      // deletion to close a scan-to-delete race without ever touching v2 keys.
+      const legacyPreflight = await dependencies.redis.purgeLegacyTaskEventKeys({ apply: false })
+      const v2Preflight = await dependencies.redis.scanV2TaskEventHistory(sentinels)
+      if (!legacyPreflight.complete || legacyPreflight.violations > 0 || !v2Preflight.complete || v2Preflight.violations > 0) {
+        const paused = await moveCheckpoint(dependencies.database, current, {
+          state: 'paused_conflict',
+          redisKeysExamined: current.checkpoint.redisKeysExamined + legacyPreflight.keysExamined,
+          redisV2ValuesExamined: current.checkpoint.redisV2ValuesExamined + v2Preflight.valuesExamined,
+        })
+        return { checkpoint: paused.checkpoint, dryRun: false, preview: null }
+      }
+      const evidence = await dependencies.redis.purgeLegacyTaskEventKeys({ apply: true, sentinels })
+      if (!evidence.complete || evidence.violations > 0 || evidence.remainingKeys !== 0) {
         current = await moveCheckpoint(dependencies.database, current, {
           state: 'paused_conflict',
           redisKeysExamined: current.checkpoint.redisKeysExamined + evidence.keysExamined,
@@ -671,11 +796,11 @@ export async function runLegacyLeakageScrub(
 
     if (phase === 'redis_v2_verify') {
       batches += 1
-      const final = await finalZeroScan(dependencies.database, dependencies.redis, batchSize, sentinels)
+      const final = await finalZeroScan(dependencies.database, dependencies.redis, batchSize, sentinels, fingerprintKey)
       const passed = zeroScanPassed(final)
       const retryPhase: LegacyLeakageScrubPhase = !final.database.complete || final.database.violations > 0
         ? 'task_logs'
-        : !final.legacy.complete || final.legacy.remainingKeys > 0
+        : !final.legacy.complete || final.legacy.remainingKeys > 0 || final.legacy.violations > 0
           ? 'redis_legacy'
           : 'redis_v2_verify'
       current = await moveCheckpoint(dependencies.database, current, {
@@ -687,6 +812,8 @@ export async function runLegacyLeakageScrub(
       })
       return { checkpoint: current.checkpoint, dryRun: false, preview: null }
     }
+
+    throw new Error('Stored leakage scrub checkpoint has an unknown phase; start a new --apply operation.')
   }
 
   return { checkpoint: current.checkpoint, dryRun: false, preview: null }

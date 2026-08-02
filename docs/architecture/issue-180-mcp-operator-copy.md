@@ -1371,11 +1371,13 @@ disposition — otherwise `409 stale_action`. Every refusal mutates nothing.
 
 `approve_project_filesystem_context` then runs the canonical locked project grant
 mutation and enqueues recovery wake-ups only after commit; a queue failure
-returns `202` and never un-commits the decision. The six recovery dispositions
-are applied by the S4 transition routines from #179. Until those routines are
-released, the endpoint answers `503 recovery_transition_unreleased` after full
-authorization, with zero mutation, so an authorized-but-unexecutable step is
-reported rather than silently dropped.
+returns `202` and never un-commits the decision. The seven local-effect and
+packet recovery dispositions run the exact S4 transition routines from #179.
+Each routine rechecks the task, package, marker fingerprint, protected evidence,
+lease and policy state while holding its database locks. A stale or mismatched
+request returns `409` with zero mutation. A committed recovery is durable before
+Forge enqueues its continuation; an unavailable wake-up returns `202` without
+undoing the protected transition.
 
 ### Freshness identity
 
@@ -1398,6 +1400,9 @@ is unconfigured or denied, the read fails closed to "unprovable": terminal
 audits normalize to `unavailable`, evidence-dependent recovery markers normalize
 to `invalid`, and `localEvidenceAvailable:false` is carried on every projection.
 S5 never falls back to the ordinary application connection for this table.
+The URL must be passwordless and name exactly `forge_local_evidence_reader`;
+the database driver obtains its password through the deployment's separate
+secret channel.
 
 That principal is `forge_local_evidence_reader`, bootstrapped alongside the
 other dedicated S4 logins and granted a **column-scoped** `SELECT` after

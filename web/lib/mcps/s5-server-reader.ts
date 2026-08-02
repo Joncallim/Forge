@@ -2,17 +2,19 @@ import 'server-only'
 
 import { createHash } from 'node:crypto'
 import { and, asc, eq } from 'drizzle-orm'
-import { db } from '@/db'
+import { withExportedRepeatableReadSnapshot } from '@/db'
 import {
   filesystemMcpCurrentDecisionPointers,
   filesystemMcpGrantApprovals,
-  filesystemMcpRuntimeAudits,
   projectFilesystemCurrentDecisionPointers,
   projectFilesystemGrantDecisions,
+  projects,
   tasks,
   workPackages,
 } from '@/db/schema'
-import { readS5ProtectedLocalRunEvidence } from '@/lib/mcps/s5-protected-reader'
+import { admitMcpRequirement, readEffectiveGrantState, type EffectiveGrantState } from '@/lib/mcps/admission'
+import { parseProjectFilesystemDecisionAuthority } from '@/lib/mcps/filesystem-project-authority'
+import { readS5ProtectedTerminalSnapshot } from '@/lib/mcps/s5-protected-reader'
 import { summarizeFilesystemCapabilities } from '@/lib/mcps/filesystem-grants'
 import { parseFilesystemGrantBlockMetadata } from '@/lib/mcps/filesystem-grant-lifecycle'
 import {
@@ -28,6 +30,14 @@ import {
   type PacketTerminalOutcome,
   type TerminalPacketDeliveryOutcome,
 } from '@/lib/mcps/packet-issuance-v2'
+import {
+  localEffectRecoveryActionsForDisposition,
+  packetIssuanceRecoveryActionsForDisposition,
+} from '@/lib/mcps/recovery-action-contract'
+import type {
+  CanonicalMcpOperatorAction,
+  CanonicalMcpTaskPresentation,
+} from '@/lib/mcps/admission-copy'
 
 const SHA256 = /^sha256:[0-9a-f]{64}$/
 
@@ -48,6 +58,7 @@ export type S5DecisionPresenter = Readonly<{
 }>
 
 export type S5ProjectGrantPresenter = Readonly<{
+  id: string
   enabled: boolean
   capabilities: readonly string[]
   grantDecisionRevision: string
@@ -71,6 +82,15 @@ export type S5PackagePresenter = Readonly<{
   blockMetadata: Record<string, unknown> | null
   pointerFingerprint: string
   pointerVersion: string
+  effectiveAdmission?: Readonly<{
+    phase: 'none' | 'proposed' | 'approved' | 'denied' | 'revoked' | 'not_issued'
+    source: 'none' | 'package-local' | 'project-level'
+    status: 'not_issued' | 'approved' | 'denied'
+    grantMode: 'allow_once' | 'always_allow' | null
+    consumed: boolean
+    coveredCapabilities: readonly string[]
+    revocationReason: string | null
+  }>
 }>
 
 export type S5RecoveryMarkerPresenter = Readonly<{
@@ -84,6 +104,7 @@ export type S5RecoveryMarkerPresenter = Readonly<{
     | 'invalid'
   state: 'current' | 'invalid'
   action: string | null
+  allowedActions: readonly string[]
   evidenceId: string | null
   evidenceFingerprint: string | null
 }>
@@ -255,6 +276,7 @@ export function normalizeS5RecoveryMarkers(pkg: {
     kind: 'invalid',
     state: 'invalid',
     action: null,
+    allowedActions: [],
     evidenceId: null,
     evidenceFingerprint: null,
   })
@@ -266,7 +288,7 @@ export function normalizeS5RecoveryMarkers(pkg: {
       && evidence.agentRunId === marker.priorAgentRunId
     ))
     result.push(marker && evidenceMatches
-      ? { workPackageId: pkg.id, kind: 'local_effect_integrity_hold', state: 'current', action: null, evidenceId: marker.localRunEvidenceId, evidenceFingerprint: marker.evidenceFingerprint }
+      ? { workPackageId: pkg.id, kind: 'local_effect_integrity_hold', state: 'current', action: null, allowedActions: [], evidenceId: marker.localRunEvidenceId, evidenceFingerprint: marker.evidenceFingerprint }
       : invalid())
   }
   if (Object.hasOwn(metadata, 'local_effect_recovery')) {
@@ -278,7 +300,7 @@ export function normalizeS5RecoveryMarkers(pkg: {
       && evidence.state !== 'claimed'
     ))
     result.push(marker && evidenceMatches
-      ? { workPackageId: pkg.id, kind: 'local_effect_recovery', state: 'current', action: marker.disposition, evidenceId: marker.localRunEvidenceId, evidenceFingerprint: marker.evidenceFingerprint }
+      ? { workPackageId: pkg.id, kind: 'local_effect_recovery', state: 'current', action: marker.disposition, allowedActions: localEffectRecoveryActionsForDisposition(marker.disposition), evidenceId: marker.localRunEvidenceId, evidenceFingerprint: marker.evidenceFingerprint }
       : invalid())
   }
   if (Object.hasOwn(metadata, 'packet_integrity_hold')) {
@@ -289,7 +311,7 @@ export function normalizeS5RecoveryMarkers(pkg: {
       && audit.agentRunId === marker?.priorAgentRunId
     ))
     result.push(marker && auditMatches
-      ? { workPackageId: pkg.id, kind: 'packet_integrity_hold', state: 'current', action: null, evidenceId: marker.priorRuntimeAuditId, evidenceFingerprint: marker.markerFingerprint }
+      ? { workPackageId: pkg.id, kind: 'packet_integrity_hold', state: 'current', action: null, allowedActions: [], evidenceId: marker.priorRuntimeAuditId, evidenceFingerprint: marker.markerFingerprint }
       : invalid())
   }
   if (Object.hasOwn(metadata, 'packet_issuance')) {
@@ -311,12 +333,12 @@ export function normalizeS5RecoveryMarkers(pkg: {
       && evidence.agentRunId === marker.priorAgentRunId
       && evidence.state !== 'claimed'
     result.push(marker && markerFingerprintMatches && auditMatches
-      ? { workPackageId: pkg.id, kind: 'packet_issuance', state: 'current', action: marker.disposition, evidenceId: marker.priorRuntimeAuditId, evidenceFingerprint: marker.markerFingerprint }
+      ? { workPackageId: pkg.id, kind: 'packet_issuance', state: 'current', action: marker.disposition, allowedActions: packetIssuanceRecoveryActionsForDisposition(marker.disposition), evidenceId: marker.priorRuntimeAuditId, evidenceFingerprint: marker.markerFingerprint }
       : invalid())
   }
   const grant = parseFilesystemGrantBlockMetadata(metadata)
   if (grant) {
-    result.push({ workPackageId: pkg.id, kind: 'filesystem_grant', state: 'current', action: null, evidenceId: null, evidenceFingerprint: grant.blockFingerprint })
+    result.push({ workPackageId: pkg.id, kind: 'filesystem_grant', state: 'current', action: null, allowedActions: [], evidenceId: null, evidenceFingerprint: grant.blockFingerprint })
   }
   return result
 }
@@ -369,21 +391,30 @@ export function normalizeS5TerminalAudit(audit: {
 export async function readS5AuthoritativeTaskState(
   taskId: string,
   userId: string,
+  /** Fixture-only synchronization point; routes never supply this callback. */
+  afterExporterSnapshotEstablished?: () => Promise<void>,
 ): Promise<S5AuthoritativeTaskState> {
-  const [task] = await db
+  return withExportedRepeatableReadSnapshot({ run: async (tx, snapshotId, databaseUrl) => {
+  // The real PostgreSQL fixture uses this bounded server-only seam to commit a
+  // competing transition after export and before the protected import.
+  if (afterExporterSnapshotEstablished) await afterExporterSnapshotEstablished()
+  const [task] = await tx
     .select({
       id: tasks.id,
       projectId: tasks.projectId,
       status: tasks.status,
       updatedAt: tasks.updatedAt,
+      projectMcpConfig: projects.mcpConfig,
+      projectRootBindingRevision: projects.rootBindingRevision,
     })
     .from(tasks)
+    .innerJoin(projects, eq(projects.id, tasks.projectId))
     .where(and(eq(tasks.id, taskId), eq(tasks.submittedBy, userId)))
     .limit(1)
   if (!task) throw new S5TaskNotFoundError()
 
-  const [packageRows, decisions, pointers, projectPointers, projectDecisions, protectedEvidence, auditRows] = await Promise.all([
-    db.select({
+  const [packageRows, decisions, pointers, projectPointers, projectDecisions, protectedSnapshot] = await Promise.all([
+    tx.select({
       id: workPackages.id,
       title: workPackages.title,
       assignedRole: workPackages.assignedRole,
@@ -393,7 +424,7 @@ export async function readS5AuthoritativeTaskState(
       metadata: workPackages.metadata,
       updatedAt: workPackages.updatedAt,
     }).from(workPackages).where(eq(workPackages.taskId, taskId)).orderBy(asc(workPackages.sequence), asc(workPackages.id)),
-    db.select({
+    tx.select({
       id: filesystemMcpGrantApprovals.id,
       taskId: filesystemMcpGrantApprovals.taskId,
       workPackageId: filesystemMcpGrantApprovals.workPackageId,
@@ -406,7 +437,7 @@ export async function readS5AuthoritativeTaskState(
       createdAt: filesystemMcpGrantApprovals.createdAt,
       updatedAt: filesystemMcpGrantApprovals.updatedAt,
     }).from(filesystemMcpGrantApprovals).where(eq(filesystemMcpGrantApprovals.taskId, taskId)).orderBy(asc(filesystemMcpGrantApprovals.createdAt), asc(filesystemMcpGrantApprovals.id)),
-    db.select({
+    tx.select({
       taskId: filesystemMcpCurrentDecisionPointers.taskId,
       workPackageId: filesystemMcpCurrentDecisionPointers.workPackageId,
       currentDecisionId: filesystemMcpCurrentDecisionPointers.currentDecisionId,
@@ -418,28 +449,18 @@ export async function readS5AuthoritativeTaskState(
       pointerVersion: filesystemMcpCurrentDecisionPointers.pointerVersion,
       updatedAt: filesystemMcpCurrentDecisionPointers.updatedAt,
     }).from(filesystemMcpCurrentDecisionPointers).where(eq(filesystemMcpCurrentDecisionPointers.taskId, taskId)),
-    db.select().from(projectFilesystemCurrentDecisionPointers).where(eq(projectFilesystemCurrentDecisionPointers.projectId, task.projectId)).limit(1),
-    db.select().from(projectFilesystemGrantDecisions).where(eq(projectFilesystemGrantDecisions.projectId, task.projectId)).orderBy(asc(projectFilesystemGrantDecisions.decisionGeneration)),
-    readS5ProtectedLocalRunEvidence(taskId),
-    db.select({
-      id: filesystemMcpRuntimeAudits.id,
-      workPackageId: filesystemMcpRuntimeAudits.workPackageId,
-      agentRunId: filesystemMcpRuntimeAudits.agentRunId,
-      localRunEvidenceId: filesystemMcpRuntimeAudits.localRunEvidenceId,
-      assembly: filesystemMcpRuntimeAudits.assembly,
-      delivery: filesystemMcpRuntimeAudits.delivery,
-      terminal: filesystemMcpRuntimeAudits.terminal,
-      terminalAt: filesystemMcpRuntimeAudits.terminalAt,
-      updatedAt: filesystemMcpRuntimeAudits.createdAt,
-    }).from(filesystemMcpRuntimeAudits).where(eq(filesystemMcpRuntimeAudits.taskId, taskId)).orderBy(asc(filesystemMcpRuntimeAudits.createdAt), asc(filesystemMcpRuntimeAudits.id)),
+    tx.select().from(projectFilesystemCurrentDecisionPointers).where(eq(projectFilesystemCurrentDecisionPointers.projectId, task.projectId)).limit(1),
+    tx.select().from(projectFilesystemGrantDecisions).where(eq(projectFilesystemGrantDecisions.projectId, task.projectId)).orderBy(asc(projectFilesystemGrantDecisions.decisionGeneration)),
+    readS5ProtectedTerminalSnapshot(taskId, { snapshotId, databaseUrl }),
   ])
 
   // A `null` protected read is "cannot be proven right now", not "no evidence".
   // Presenting it as an empty set is exactly right: every evidence-dependent
   // join then fails its exact-match check and degrades to the non-actionable
   // `unavailable`/`invalid` state instead of asserting an unproven fact.
-  const localEvidenceAvailable = protectedEvidence !== null
-  const evidenceRows = protectedEvidence ?? []
+  const localEvidenceAvailable = protectedSnapshot !== null
+  const evidenceRows = protectedSnapshot?.evidenceRows ?? []
+  const auditRows = protectedSnapshot?.auditRows ?? []
 
   const decisionById = new Map(decisions.map((decision) => [decision.id, decision]))
   const pointerByPackage = new Map(pointers.map((pointer) => [pointer.workPackageId, pointer]))
@@ -450,36 +471,6 @@ export async function readS5AuthoritativeTaskState(
     grantDecisionRevision: decision.grantDecisionRevision?.toString() ?? null,
     rootBindingRevision: decision.rootBindingRevision?.toString() ?? null,
     decidedAt: decision.createdAt.toISOString(),
-  })
-
-  const packages = packageRows.map((pkg): S5PackagePresenter => {
-    const summary = summarizeFilesystemCapabilities({ mcpRequirements: pkg.mcpRequirements, metadata: pkg.metadata })
-    const pointer = pointerByPackage.get(pkg.id)
-    const current = pointer?.currentDecisionId ? decisionById.get(pointer.currentDecisionId) : undefined
-    const exactCurrent = current
-      && pointer?.taskId === taskId
-      && pointer.currentDecisionTaskId === taskId
-      && pointer.currentDecisionWorkPackageId === pkg.id
-      && current.taskId === taskId
-      && current.workPackageId === pkg.id
-      && current.grantDecisionRevision === pointer.currentDecisionRevision
-      && current.pointerFingerprint === pointer.currentDecisionFingerprint
-        ? current
-        : null
-    return {
-      workPackageId: pkg.id,
-      title: pkg.title,
-      assignedRole: pkg.assignedRole,
-      status: pkg.status,
-      requestedCapabilities: summary.requestedCapabilities,
-      boundedRuntimeRequestedCapabilities: summary.boundedRuntimeRequestedCapabilities,
-      blockingCapabilities: summary.blockingCapabilities,
-      currentDecision: exactCurrent ? safeDecision(exactCurrent) : null,
-      decisionHistory: decisions.filter((decision) => decision.workPackageId === pkg.id).map(safeDecision),
-      blockMetadata: parseFilesystemGrantBlockMetadata(pkg.metadata),
-      pointerFingerprint: pointer?.pointerFingerprint ?? '',
-      pointerVersion: pointer?.pointerVersion.toString() ?? '0',
-    }
   })
 
   const projectPointer = projectPointers[0]
@@ -495,7 +486,81 @@ export async function readS5AuthoritativeTaskState(
     && projectDecision.decisionGeneration === projectPointer.currentDecisionGeneration
       ? projectDecision
       : null
+
+  const packages = packageRows.map((pkg): S5PackagePresenter => {
+    const summary = summarizeFilesystemCapabilities({
+      mcpRequirements: pkg.mcpRequirements,
+      metadata: pkg.metadata,
+      projectMcpConfig: task.projectMcpConfig,
+      projectFilesystemDecision: exactProjectDecision ? {
+        schemaVersion: 2,
+        decisionId: exactProjectDecision.id,
+        projectId: exactProjectDecision.projectId,
+        decision: exactProjectDecision.decision,
+        capabilities: exactProjectDecision.capabilities,
+        grantDecisionRevision: exactProjectDecision.grantDecisionRevision.toString(),
+        rootBindingRevision: exactProjectDecision.rootBindingRevision.toString(),
+        decisionFingerprint: exactProjectDecision.decisionFingerprint,
+        decisionGeneration: exactProjectDecision.decisionGeneration.toString(),
+        decidedAt: exactProjectDecision.decidedAt.toISOString(),
+        decidedBy: exactProjectDecision.decidedBy,
+        reason: exactProjectDecision.reason,
+        revocationReason: exactProjectDecision.revocationReason,
+      } : undefined,
+      projectRootBindingRevision: task.projectRootBindingRevision,
+    })
+    const pointer = pointerByPackage.get(pkg.id)
+    const current = pointer?.currentDecisionId ? decisionById.get(pointer.currentDecisionId) : undefined
+    const exactCurrent = current
+      && pointer?.taskId === taskId
+      && pointer.currentDecisionTaskId === taskId
+      && pointer.currentDecisionWorkPackageId === pkg.id
+      && current.taskId === taskId
+      && current.workPackageId === pkg.id
+      && current.grantDecisionRevision === pointer.currentDecisionRevision
+      && current.pointerFingerprint === pointer.currentDecisionFingerprint
+        ? current
+        : null
+    const authority = exactProjectDecision ? parseProjectFilesystemDecisionAuthority({
+      schemaVersion: 2, decisionId: exactProjectDecision.id, projectId: exactProjectDecision.projectId,
+      decision: exactProjectDecision.decision, capabilities: exactProjectDecision.capabilities,
+      grantDecisionRevision: exactProjectDecision.grantDecisionRevision.toString(), rootBindingRevision: exactProjectDecision.rootBindingRevision.toString(),
+      decisionFingerprint: exactProjectDecision.decisionFingerprint, decisionGeneration: exactProjectDecision.decisionGeneration.toString(),
+      decidedAt: exactProjectDecision.decidedAt.toISOString(), decidedBy: exactProjectDecision.decidedBy,
+      reason: exactProjectDecision.reason, revocationReason: exactProjectDecision.revocationReason,
+    }) : null
+    const effective = readEffectiveGrantState({ metadata: pkg.metadata }, {
+      mcpConfig: task.projectMcpConfig,
+      filesystemGrantDecision: authority,
+      rootBindingRevision: task.projectRootBindingRevision,
+    }, summary.boundedRuntimeRequestedCapabilities)
+    return {
+      workPackageId: pkg.id,
+      title: pkg.title,
+      assignedRole: pkg.assignedRole,
+      status: pkg.status,
+      requestedCapabilities: summary.requestedCapabilities,
+      boundedRuntimeRequestedCapabilities: summary.boundedRuntimeRequestedCapabilities,
+      blockingCapabilities: summary.blockingCapabilities,
+      currentDecision: exactCurrent ? safeDecision(exactCurrent) : null,
+      decisionHistory: decisions.filter((decision) => decision.workPackageId === pkg.id).map(safeDecision),
+      blockMetadata: parseFilesystemGrantBlockMetadata(pkg.metadata),
+      pointerFingerprint: pointer?.pointerFingerprint ?? '',
+      pointerVersion: pointer?.pointerVersion.toString() ?? '0',
+      effectiveAdmission: {
+        phase: effective.phase,
+        source: effective.source,
+        status: effective.status,
+        grantMode: effective.grantMode ?? null,
+        consumed: effective.consumed === true,
+        coveredCapabilities: effective.coveredCapabilities,
+        revocationReason: effective.revocationReason ?? null,
+      },
+    }
+  })
+
   const projectGrant = exactProjectDecision ? {
+    id: exactProjectDecision.id,
     enabled: exactProjectDecision.decision === 'approved',
     capabilities: exactProjectDecision.capabilities,
     grantDecisionRevision: exactProjectDecision.grantDecisionRevision.toString(),
@@ -510,7 +575,13 @@ export async function readS5AuthoritativeTaskState(
     .filter((pkg) => pkg.status === 'blocked')
     .flatMap((pkg) => normalizeS5RecoveryMarkers(pkg, evidenceRows, auditRows))
 
-  const terminalPackages = auditRows.map((audit) => normalizeS5TerminalAudit(audit, evidenceRows))
+  const terminalStatus = new Set(['completed', 'failed', 'cancelled', 'rejected'])
+  const terminalPackages = packageRows.flatMap((pkg) => {
+    if (!terminalStatus.has(pkg.status)) return []
+    const audit = auditRows.filter((candidate) => candidate.workPackageId === pkg.id)
+      .sort((a, b) => a.updatedAt.getTime() - b.updatedAt.getTime() || a.id.localeCompare(b.id)).at(-1)
+    return audit ? [normalizeS5TerminalAudit(audit, evidenceRows)] : []
+  })
 
   const evidenceRecords = evidenceRows.map((evidence): S5LocalEvidencePresenter => ({
     id: evidence.id,
@@ -551,6 +622,7 @@ export async function readS5AuthoritativeTaskState(
     terminalPackages,
     evidenceRecords,
   }
+  }})
 }
 
 // Every projection re-materializes its rows through these explicit field
@@ -583,6 +655,10 @@ export function safePackagePresenter(pkg: S5PackagePresenter): S5PackagePresente
     blockMetadata: pkg.blockMetadata,
     pointerFingerprint: pkg.pointerFingerprint,
     pointerVersion: pkg.pointerVersion,
+    ...(pkg.effectiveAdmission ? { effectiveAdmission: {
+      ...pkg.effectiveAdmission,
+      coveredCapabilities: [...pkg.effectiveAdmission.coveredCapabilities],
+    } } : {}),
   }
 }
 
@@ -592,6 +668,7 @@ export function safeRecoveryMarkerPresenter(marker: S5RecoveryMarkerPresenter): 
     kind: marker.kind,
     state: marker.state,
     action: marker.action,
+    allowedActions: [...marker.allowedActions],
     evidenceId: marker.evidenceId,
     evidenceFingerprint: marker.evidenceFingerprint,
   }
@@ -624,6 +701,7 @@ export function safeProjectGrantPresenter(
   grant: S5ProjectGrantPresenter | null,
 ): S5ProjectGrantPresenter | null {
   return grant ? {
+    id: grant.id,
     enabled: grant.enabled,
     capabilities: [...grant.capabilities],
     grantDecisionRevision: grant.grantDecisionRevision,
@@ -665,5 +743,141 @@ export function terminalProjection(state: S5AuthoritativeTaskState): S5TerminalP
     localEvidenceAvailable: state.localEvidenceAvailable,
     taskId: state.taskId,
     terminalPackages: state.terminalPackages.map(safeTerminalPackagePresenter),
+  }
+}
+
+const CANONICAL_ACTION_LABELS: Record<CanonicalMcpOperatorAction['action'], string> = {
+  review_local_changes: 'I reviewed the local changes',
+  acknowledge_possible_local_invocation: 'I understand the prior local invocation may have happened',
+  retry_local_execution: 'Start another local attempt',
+  decline_local_retry: 'Do not retry — close this package',
+  acknowledge_possible_submission: 'I understand the prior submission may have happened',
+  retry_execution: 'Retry packet execution',
+  decline_packet_recovery: 'Do not retry this package',
+}
+
+function canonicalRecoveryAction(marker: S5RecoveryMarkerPresenter, action: string): CanonicalMcpOperatorAction | null {
+  if (!(action in CANONICAL_ACTION_LABELS) || marker.evidenceId === null || marker.evidenceFingerprint === null) return null
+  const operatorAction = action as CanonicalMcpOperatorAction['action']
+  if (marker.kind === 'local_effect_recovery' && [
+    'review_local_changes', 'acknowledge_possible_local_invocation', 'retry_local_execution', 'decline_local_retry',
+  ].includes(operatorAction)) {
+    return {
+      action: operatorAction,
+      label: CANONICAL_ACTION_LABELS[operatorAction],
+      identity: { schemaVersion: 1, localRunEvidenceId: marker.evidenceId, evidenceFingerprint: marker.evidenceFingerprint },
+    }
+  }
+  if (marker.kind === 'packet_issuance' && [
+    'acknowledge_possible_submission', 'retry_execution', 'decline_packet_recovery',
+  ].includes(operatorAction)) {
+    return {
+      action: operatorAction,
+      label: CANONICAL_ACTION_LABELS[operatorAction],
+      identity: { schemaVersion: 2, priorRuntimeAuditId: marker.evidenceId, markerFingerprint: marker.evidenceFingerprint },
+    }
+  }
+  return null
+}
+
+const S5_HEALTHY_FILESYSTEM_STATUS = {
+  mcpId: 'filesystem', displayName: 'Filesystem', description: 'S5 admission projection',
+  installPath: 'server-owned', installState: 'installed' as const, status: 'healthy' as const,
+  enabled: true, error: null, checkedAt: '1970-01-01T00:00:00.000Z',
+}
+
+/** Reuse the admission contract so S5 cannot weaken its coverage semantics. */
+export function s5EffectiveAdmissionDecision(pkg: S5PackagePresenter): 'approved' | 'denied' | 'unavailable' {
+  if (!pkg.effectiveAdmission || pkg.boundedRuntimeRequestedCapabilities.length === 0) return 'unavailable'
+  const effectiveGrant: EffectiveGrantState = {
+    phase: pkg.effectiveAdmission.phase,
+    source: pkg.effectiveAdmission.source,
+    status: pkg.effectiveAdmission.status,
+    coveredCapabilities: [...pkg.effectiveAdmission.coveredCapabilities],
+    ...(pkg.effectiveAdmission.grantMode ? { grantMode: pkg.effectiveAdmission.grantMode } : {}),
+    ...(pkg.effectiveAdmission.consumed ? { consumed: true } : {}),
+    ...(pkg.effectiveAdmission.revocationReason ? { revocationReason: pkg.effectiveAdmission.revocationReason as EffectiveGrantState['revocationReason'] } : {}),
+  }
+  const decision = admitMcpRequirement({
+    mcpId: 'filesystem', agent: pkg.assignedRole, requirement: 'required',
+    requestedCapabilities: [...pkg.boundedRuntimeRequestedCapabilities],
+    packageProhibitedKeys: new Set(), status: S5_HEALTHY_FILESYSTEM_STATUS,
+    hasPromptOnlyContext: false, effectiveGrant, fallback: { action: 'block' },
+  })
+  if (decision.status === 'allowed' && decision.mode === 'bounded_context_approved') return 'approved'
+  return pkg.effectiveAdmission.phase === 'denied' || pkg.effectiveAdmission.phase === 'revoked'
+    ? 'denied'
+    : 'unavailable'
+}
+
+/**
+ * The task UI's single S5 DTO. Recovery availability and terminal status are
+ * joined while the authoritative state is still in memory, preventing the
+ * browser from combining unrelated admission, recovery, and terminal reads.
+ */
+export function canonicalTaskPresentationProjection(state: S5AuthoritativeTaskState): CanonicalMcpTaskPresentation {
+  const packageById = new Map(state.packages.map((pkg) => [pkg.workPackageId, pkg]))
+  const terminalByPackage = new Map(
+    state.terminalPackages
+      .filter((terminal) => packageById.has(terminal.workPackageId))
+      .map((terminal) => [terminal.workPackageId, terminal]),
+  )
+  const terminalTask = ['completed', 'failed', 'cancelled', 'rejected'].includes(state.taskStatus)
+  const recoveries = state.recoveryMarkers.flatMap((marker) => {
+    const pkg = packageById.get(marker.workPackageId)
+    if (!pkg) return []
+    const terminal = terminalByPackage.get(marker.workPackageId)
+    const terminalized = terminalTask || terminal?.state === 'terminal'
+    const actions = !state.localEvidenceAvailable || terminalized || marker.state !== 'current'
+      ? []
+      : marker.allowedActions.map((action) => canonicalRecoveryAction(marker, action)).filter((action): action is CanonicalMcpOperatorAction => action !== null)
+    const unavailable = marker.state !== 'current' || !state.localEvidenceAvailable
+    return [{
+      workPackageId: pkg.workPackageId,
+      title: pkg.title,
+      badgeText: terminalized ? 'Terminal' : unavailable ? 'Status unavailable' : actions.length > 0 ? 'Recovery available' : 'Recovery unavailable',
+      headline: terminalized
+        ? 'Package reached a terminal state'
+        : unavailable
+          ? 'Recovery state cannot be verified'
+          : actions.length > 0
+            ? 'Operator recovery is available'
+            : 'Recovery is not available',
+      body: terminalized
+        ? 'This package has retained terminal evidence. Forge does not offer a recovery control from this observation.'
+        : unavailable
+          ? 'Forge cannot prove the required recovery evidence is current. No operator action is available.'
+          : actions.length > 0
+            ? 'Choose a server-authorized action. Forge will re-check this exact observation before changing the package.'
+            : 'The current server observation does not authorize an operator recovery action.',
+      tone: terminalized ? 'neutral' as const : unavailable ? 'danger' as const : actions.length > 0 ? 'warning' as const : 'neutral' as const,
+      actions,
+    }]
+  })
+  const terminals = state.terminalPackages.flatMap((terminal) => {
+    const pkg = packageById.get(terminal.workPackageId)
+    if (!pkg) return []
+    return [{
+      workPackageId: terminal.workPackageId,
+      title: pkg.title,
+      state: terminal.state,
+      outcome: terminal.terminalOutcome,
+      terminalAt: terminal.terminalAt,
+    }]
+  })
+  return {
+    schemaVersion: 1,
+    computedAt: state.computedAt,
+    freshnessFingerprint: state.freshnessFingerprint,
+    taskId: state.taskId,
+    localEvidenceAvailable: state.localEvidenceAvailable,
+    admission: state.packages.map((pkg) => ({
+      workPackageId: pkg.workPackageId,
+      title: pkg.title,
+      requiresMcp: pkg.boundedRuntimeRequestedCapabilities.length > 0,
+      decision: s5EffectiveAdmissionDecision(pkg),
+    })),
+    recoveries,
+    terminals,
   }
 }

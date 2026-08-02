@@ -106,4 +106,20 @@ describe('audited clarification history projection', () => {
       }),
     }], [])).toEqual([])
   })
+
+  it('fails closed when protected history repeats a canonical question identity', () => {
+    const question = {
+      entryId: 'clarification_question:11111111-1111-4111-8111-111111111111',
+      entryKind: 'clarification_question',
+      content: JSON.stringify({
+        schemaVersion: 1,
+        questionId: '11111111-1111-4111-8111-111111111111',
+        question: 'Which branch?',
+        suggestions: ['main'],
+      }),
+    } as const
+    expect(() => clarificationQuestionsFromHistory([question, question], [])).toThrow(
+      'Duplicate protected clarification question.',
+    )
+  })
 })

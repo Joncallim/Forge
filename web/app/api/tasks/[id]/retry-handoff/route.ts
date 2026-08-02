@@ -45,8 +45,8 @@ export async function POST(
     const retry = await enqueueBlockedHandoffRetry(taskId, { source: 'operator' })
 
     return NextResponse.json({ result: { status: retry.status === 'enqueued' ? 'retry_enqueued' : 'retry_already_queued' } })
-  } catch (err) {
-    console.error('[POST /api/tasks/:id/retry-handoff] Unexpected error', err)
+  } catch {
+    console.error('[POST /api/tasks/:id/retry-handoff] Unexpected error')
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }

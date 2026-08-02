@@ -2,18 +2,16 @@ import '../lib/load-env'
 import postgres from 'postgres'
 
 // ---------------------------------------------------------------------------
-// `work_package_local_run_evidence` is owned by `forge_s4_routines_owner` and
-// the ordinary Forge application login is denied every privilege on it. S5
-// still has to present a few facts from that table (which run produced which
-// evidence, and whether it reached a terminal state), so it reads through this
-// dedicated principal instead.
+// The protected local-evidence and runtime-audit tables carry S4 authority, so
+// the ordinary Forge application login cannot be their S5 reader. S5 still has
+// to present a few terminal facts from both tables, so it reads them together
+// through this dedicated principal instead.
 //
 // The grant is column-scoped on purpose. `claim_token` is a live ownership
-// credential and `task_id`/`work_package_id`/`agent_run_id` are the only join
-// keys S5 needs; PostgreSQL — not application code — is what refuses a query
-// that reaches for the token. That makes the redaction a property of the
-// database boundary, so a future careless SELECT fails closed rather than
-// leaking.
+// credential; the audit table also contains a grant nonce and authorization
+// snapshot. PostgreSQL — not application code — refuses any query that reaches
+// for those fields. That makes redaction a property of the database boundary,
+// so a future careless SELECT fails closed rather than leaking.
 //
 // Run this AFTER migrations: the table must exist and already belong to the S4
 // owner before the grant can be issued.
@@ -21,6 +19,7 @@ import postgres from 'postgres'
 
 const READER_ROLE = 'forge_local_evidence_reader'
 const EVIDENCE_TABLE = 'public.work_package_local_run_evidence'
+const AUDIT_TABLE = 'public.filesystem_mcp_runtime_audits'
 
 const READABLE_COLUMNS = [
   'id',
@@ -36,6 +35,18 @@ const READABLE_COLUMNS = [
 // Never readable by this principal. `claim_token` is the live lease credential;
 // the rest are protocol internals S5 has no presentation use for.
 const FORBIDDEN_COLUMNS = ['claim_token'] as const
+const AUDIT_READABLE_COLUMNS = [
+  'id',
+  'task_id',
+  'work_package_id',
+  'agent_run_id',
+  'local_run_evidence_id',
+  'assembly',
+  'delivery',
+  'terminal',
+  'terminal_at',
+  'created_at',
+] as const
 
 const FORBIDDEN_TABLE_PRIVILEGES = [
   'INSERT',
@@ -104,6 +115,9 @@ async function main(): Promise<void> {
     await admin.unsafe(
       `grant select (${READABLE_COLUMNS.join(', ')}) on ${EVIDENCE_TABLE} to ${READER_ROLE}`,
     )
+    await admin.unsafe(
+      `grant select (${AUDIT_READABLE_COLUMNS.join(', ')}) on ${AUDIT_TABLE} to ${READER_ROLE}`,
+    )
 
     // Verify the boundary rather than assuming the grants landed as intended.
     const readable = await admin<{ column: string; granted: boolean }[]>`
@@ -133,12 +147,37 @@ async function main(): Promise<void> {
       throw new Error(`${READER_ROLE} unexpectedly has SELECT on unlisted columns: ${unexpected.join(', ')}`)
     }
 
-    for (const privilege of FORBIDDEN_TABLE_PRIVILEGES) {
-      const [held] = await admin<{ granted: boolean }[]>`
-        select pg_catalog.has_table_privilege(${READER_ROLE}, ${EVIDENCE_TABLE}, ${privilege}) as "granted"
-      `
-      if (held.granted) {
-        throw new Error(`${READER_ROLE} unexpectedly has ${privilege} on ${EVIDENCE_TABLE}`)
+    const auditReadable = await admin<{ column: string; granted: boolean }[]>`
+      select column_name as "column",
+        pg_catalog.has_column_privilege(${READER_ROLE}, ${AUDIT_TABLE}, column_name, 'SELECT') as "granted"
+      from information_schema.columns
+      where table_schema = 'public' and table_name = 'filesystem_mcp_runtime_audits'
+    `
+    const missingAudit = AUDIT_READABLE_COLUMNS.filter((column) => (
+      !auditReadable.some((row) => row.column === column && row.granted)
+    ))
+    if (missingAudit.length > 0) {
+      throw new Error(`${READER_ROLE} is missing protected-audit SELECT on: ${missingAudit.join(', ')}`)
+    }
+    const unexpectedAudit = auditReadable
+      .filter((row) => row.granted && !AUDIT_READABLE_COLUMNS.includes(
+        row.column as typeof AUDIT_READABLE_COLUMNS[number],
+      ))
+      .map((row) => row.column)
+    if (unexpectedAudit.length > 0) {
+      throw new Error(
+        `${READER_ROLE} unexpectedly has protected-audit SELECT on unlisted columns: ${unexpectedAudit.join(', ')}`,
+      )
+    }
+
+    for (const table of [EVIDENCE_TABLE, AUDIT_TABLE] as const) {
+      for (const privilege of FORBIDDEN_TABLE_PRIVILEGES) {
+        const [held] = await admin<{ granted: boolean }[]>`
+          select pg_catalog.has_table_privilege(${READER_ROLE}, ${table}, ${privilege}) as "granted"
+        `
+        if (held.granted) {
+          throw new Error(`${READER_ROLE} unexpectedly has ${privilege} on ${table}`)
+        }
       }
     }
     const [schemaCreate] = await admin<{ granted: boolean }[]>`
@@ -149,7 +188,8 @@ async function main(): Promise<void> {
     }
 
     console.log(`✓ Provisioned and verified the column-scoped S5 read boundary for ${READER_ROLE}.`)
-    console.log(`  Readable: ${READABLE_COLUMNS.join(', ')}`)
+    console.log(`  Evidence columns: ${READABLE_COLUMNS.join(', ')}`)
+    console.log(`  Terminal audit columns: ${AUDIT_READABLE_COLUMNS.join(', ')}`)
     console.log(`  Denied: ${FORBIDDEN_COLUMNS.join(', ')} plus every write privilege.`)
   } finally {
     await admin.end({ timeout: 5 })

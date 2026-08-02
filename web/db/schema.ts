@@ -100,6 +100,14 @@ export const sessions = pgTable(
     credentialStorageVersion: integer('credential_storage_version').notNull().default(0),
     legacyRedisPurgePendingAt: timestamp('legacy_redis_purge_pending_at', tsOpts),
     legacyRedisInvalidatedAt: timestamp('legacy_redis_invalidated_at', tsOpts),
+    cachePurgePendingAt: timestamp('cache_purge_pending_at', tsOpts),
+    cachePurgeCredentialDigestV1: bytea('cache_purge_credential_digest_v1'),
+    cachePurgeGeneration: uuid('cache_purge_generation'),
+    cachePurgeClaimToken: uuid('cache_purge_claim_token'),
+    cachePurgeClaimExpiresAt: timestamp('cache_purge_claim_expires_at', tsOpts),
+    cachePurgeAttemptCount: integer('cache_purge_attempt_count').notNull().default(0),
+    cachePurgeNextAttemptAt: timestamp('cache_purge_next_attempt_at', tsOpts),
+    cachePurgeCompletedAt: timestamp('cache_purge_completed_at', tsOpts),
   },
   (t) => [
     index('sessions_user_id_idx').on(t.userId),
@@ -107,6 +115,35 @@ export const sessions = pgTable(
     uniqueIndex('sessions_credential_digest_v1_idx')
       .on(t.credentialDigestV1)
       .where(sql`${t.credentialDigestV1} is not null`),
+    index('sessions_cache_purge_due_idx')
+      .on(t.cachePurgeNextAttemptAt, t.cachePurgePendingAt, t.id)
+      .where(sql`${t.cachePurgePendingAt} is not null`),
+    check('sessions_cache_purge_state_chk', sql`
+      ${t.cachePurgeAttemptCount} >= 0
+      and (
+        (${t.cachePurgePendingAt} is null
+          and ${t.cachePurgeCredentialDigestV1} is null
+          and ${t.cachePurgeGeneration} is null
+          and ${t.cachePurgeClaimToken} is null
+          and ${t.cachePurgeClaimExpiresAt} is null
+          and ${t.cachePurgeNextAttemptAt} is null
+          and ${t.cachePurgeCompletedAt} is null)
+        or
+        (${t.cachePurgePendingAt} is not null
+          and ${t.cachePurgeCredentialDigestV1} is not null
+          and octet_length(${t.cachePurgeCredentialDigestV1}) = 32
+          and ${t.cachePurgeGeneration} is not null
+          and ${t.cachePurgeCompletedAt} is null)
+        or
+        (${t.cachePurgePendingAt} is null
+          and ${t.cachePurgeCredentialDigestV1} is null
+          and ${t.cachePurgeGeneration} is not null
+          and ${t.cachePurgeClaimToken} is null
+          and ${t.cachePurgeClaimExpiresAt} is null
+          and ${t.cachePurgeNextAttemptAt} is null
+          and ${t.cachePurgeCompletedAt} is not null)
+      )
+    `),
   ],
 )
 
@@ -228,20 +265,98 @@ export const projects = pgTable('projects', {
   createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
   updatedAt: timestamp('updated_at', tsOpts).defaultNow().notNull(),
   archivedAt: timestamp('archived_at', tsOpts),
-}, (t) => [
-  uniqueIndex('projects_root_ref_idx').on(t.rootRef),
-])
+})
 
 export type Project = InferSelectModel<typeof projects>
 export type NewProject = InferInsertModel<typeof projects>
 
+/** C5 compatibility tombstone; C6 never uses this singleton. */
 export const projectRootRefReconciliation = pgTable('project_root_ref_reconciliation', {
   singleton: boolean('singleton').primaryKey().default(true),
   lastProjectId: uuid('last_project_id'),
   rowsUpdated: bigint('rows_updated', { mode: 'bigint' }).notNull().default(sql`0`),
-  state: text('state').notNull().default('pending'),
+  state: text('state').notNull().default('superseded'),
   updatedAt: timestamp('updated_at', tsOpts).defaultNow().notNull(),
 })
+
+export const projectRootChangeJournalCounter = pgTable('project_root_change_journal_counter', {
+  singleton: boolean('singleton').primaryKey().default(true),
+  lastGeneration: bigint('last_generation', { mode: 'bigint' }).notNull().default(sql`0`),
+}, (t) => [
+  check('project_root_change_journal_counter_generation_chk', sql`${t.lastGeneration} >= 0`),
+])
+
+export const projectRootChangeJournal = pgTable('project_root_change_journal', {
+  generation: bigint('generation', { mode: 'bigint' }).primaryKey(),
+  operationId: uuid('operation_id').notNull().defaultRandom().unique(),
+  projectId: uuid('project_id').notNull().references(() => projects.id, {
+    onDelete: 'restrict',
+    onUpdate: 'restrict',
+  }),
+  outcome: text('outcome').notNull(),
+  rootBindingRevision: bigint('root_binding_revision', { mode: 'bigint' }),
+  grantDecisionRevision: bigint('grant_decision_revision', { mode: 'bigint' }),
+  occurredAt: timestamp('occurred_at', tsOpts).defaultNow().notNull(),
+}, (t) => [
+  check('project_root_change_journal_generation_chk', sql`${t.generation} > 0`),
+  check('project_root_change_journal_outcome_chk', sql`${t.outcome} in ('insert','root_update','archive')`),
+  check('project_root_change_journal_root_binding_revision_chk', sql`${t.rootBindingRevision} is null or ${t.rootBindingRevision} > 0`),
+  check('project_root_change_journal_grant_decision_revision_chk', sql`${t.grantDecisionRevision} is null or ${t.grantDecisionRevision} > 0`),
+])
+
+export const projectRootReconciliationOperations = pgTable('project_root_reconciliation_operations', {
+  operationId: uuid('operation_id').primaryKey(),
+  actorId: uuid('actor_id').notNull(),
+  throughGeneration: bigint('through_generation', { mode: 'bigint' }).notNull(),
+  lastProcessedGeneration: bigint('last_processed_generation', { mode: 'bigint' }).notNull().default(sql`0`),
+  lastProjectId: uuid('last_project_id'),
+  batchCount: bigint('batch_count', { mode: 'bigint' }).notNull().default(sql`0`),
+  cumulativeCount: bigint('cumulative_count', { mode: 'bigint' }).notNull().default(sql`0`),
+  state: text('state').notNull().default('running'),
+  createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
+  completedAt: timestamp('completed_at', tsOpts),
+  updatedAt: timestamp('updated_at', tsOpts).defaultNow().notNull(),
+}, (t) => [
+  uniqueIndex('project_root_reconciliation_one_live_idx').on(sql`(true)`).where(sql`${t.state} = 'running'`),
+  check('project_root_reconciliation_operation_progress_chk', sql`
+    ${t.throughGeneration} >= 0 and ${t.lastProcessedGeneration} >= 0
+    and ${t.lastProcessedGeneration} <= ${t.throughGeneration}
+    and ${t.cumulativeCount} = ${t.lastProcessedGeneration}
+    and ${t.state} in ('running','complete')
+    and ((${t.state} = 'running' and ${t.completedAt} is null) or (${t.state} = 'complete' and ${t.completedAt} is not null))
+  `),
+])
+
+export const projectRootReconciliationCheckpoints = pgTable('project_root_reconciliation_checkpoints', {
+  operationId: uuid('operation_id').notNull().references(() => projectRootReconciliationOperations.operationId, { onDelete: 'restrict' }),
+  checkpointGeneration: bigint('checkpoint_generation', { mode: 'bigint' }).notNull(),
+  actorId: uuid('actor_id').notNull(),
+  throughGeneration: bigint('through_generation', { mode: 'bigint' }).notNull(),
+  lastProcessedGeneration: bigint('last_processed_generation', { mode: 'bigint' }).notNull(),
+  lastProjectId: uuid('last_project_id'),
+  batchCount: bigint('batch_count', { mode: 'bigint' }).notNull(),
+  cumulativeCount: bigint('cumulative_count', { mode: 'bigint' }).notNull(),
+  state: text('state').notNull(),
+  checkpointedAt: timestamp('checkpointed_at', tsOpts).defaultNow().notNull(),
+}, (t) => [
+  primaryKey({ columns: [t.operationId, t.checkpointGeneration] }),
+  check('project_root_reconciliation_checkpoint_shape_chk', sql`
+    ${t.checkpointGeneration} >= 0 and ${t.throughGeneration} >= 0
+    and ${t.lastProcessedGeneration} >= 0 and ${t.lastProcessedGeneration} <= ${t.throughGeneration}
+    and ${t.cumulativeCount} = ${t.lastProcessedGeneration} and ${t.state} in ('running','complete')
+  `),
+])
+
+export const projectRootReconciliationOutcomes = pgTable('project_root_reconciliation_outcomes', {
+  generation: bigint('generation', { mode: 'bigint' }).primaryKey().references(() => projectRootChangeJournal.generation, { onDelete: 'restrict' }),
+  operationId: uuid('operation_id').notNull().references(() => projectRootReconciliationOperations.operationId, { onDelete: 'restrict' }),
+  actorId: uuid('actor_id').notNull(),
+  projectId: uuid('project_id').notNull().references(() => projects.id, { onDelete: 'restrict' }),
+  outcome: text('outcome').notNull(),
+  recordedAt: timestamp('recorded_at', tsOpts).defaultNow().notNull(),
+}, (t) => [
+  check('project_root_reconciliation_outcome_kind_chk', sql`${t.outcome} in ('insert','root_update','archive')`),
+])
 
 // ---------------------------------------------------------------------------
 // Epic 172 release authentication and transition substrate
@@ -749,6 +864,13 @@ export const taskLocalProjectionScopes = tasks
 // ---------------------------------------------------------------------------
 // taskAttempts
 // ---------------------------------------------------------------------------
+export type TaskAttemptStatus =
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'dead_lettered'
+  | 'indeterminate'
+
 export const taskAttempts = pgTable(
   'task_attempts',
   {
@@ -758,8 +880,9 @@ export const taskAttempts = pgTable(
       .references(() => tasks.id, { onDelete: 'restrict' }),
     queueName: text('queue_name').notNull(),
     attemptNumber: integer('attempt_number').notNull().default(1),
-    // 'running'|'completed'|'failed'|'dead_lettered'
-    status: text('status').notNull().default('running'),
+    // Terminal `indeterminate` means the business attempt failed but Redis retry
+    // scheduling could not be confirmed. This remains text in PostgreSQL.
+    status: text('status').$type<TaskAttemptStatus>().notNull().default('running'),
     workerId: text('worker_id'),
     jobPayload: jsonb('job_payload'),
     errorMessage: text('error_message'),
@@ -1563,7 +1686,17 @@ export const architectPlanHistoryReads = pgTable(
     entrySetDigest: text('entry_set_digest').notNull(),
     readAt: timestamp('read_at', tsOpts).defaultNow().notNull(),
   },
-  (t) => [index('architect_plan_history_reads_task_version_idx').on(t.taskId, t.planVersion)],
+  (t) => [
+    index('architect_plan_history_reads_task_version_idx').on(t.taskId, t.planVersion),
+    check(
+      'architect_plan_history_reads_count_chk',
+      sql`${t.returnedEntryCount} between 0 and 256`,
+    ),
+    check(
+      'architect_plan_history_reads_digest_chk',
+      sql`${t.entrySetDigest} ~ '^(hmac-sha256|sha256):[0-9a-f]{64}$'`,
+    ),
+  ],
 )
 
 export const workPackageLocalRunEvidence = pgTable(
@@ -1776,6 +1909,40 @@ export const s4ProtectedReviewSources = pgTable('s4_protected_review_sources', {
   contentFingerprint: text('content_fingerprint').notNull().unique(),
   createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
 })
+
+export const projectRootReconciliationWriteContexts = pgTable('project_root_reconciliation_write_contexts', {
+  operationId: uuid('operation_id').notNull(),
+  generation: bigint('generation', { mode: 'bigint' }).notNull(),
+  actorId: uuid('actor_id').notNull(),
+  projectId: uuid('project_id').notNull(),
+  backendPid: integer('backend_pid').notNull(),
+  transactionId: bigint('transaction_id', { mode: 'bigint' }).notNull(),
+  // Match the protected write-context DDL: this is wall-clock entry time,
+  // rather than PostgreSQL's transaction-start timestamp.
+  enteredAt: timestamp('entered_at', tsOpts).default(sql`pg_catalog.clock_timestamp()`).notNull(),
+  completedAt: timestamp('completed_at', tsOpts),
+}, (t) => [
+  primaryKey({ name: 'project_root_reconciliation_write_contexts_pkey', columns: [t.operationId, t.generation] }),
+  unique('project_root_reconciliation_write_context_generation_unique').on(t.generation),
+  check('project_root_reconciliation_write_context_backend_pid_chk', sql`${t.backendPid} > 0`),
+  check('project_root_reconciliation_write_context_transaction_id_chk', sql`${t.transactionId} > 0`),
+  check('project_root_reconciliation_write_context_shape_chk', sql`${t.completedAt} is null or ${t.completedAt} >= ${t.enteredAt}`),
+  foreignKey({
+    name: 'project_root_reconciliation_write_contexts_operation_id_fkey',
+    columns: [t.operationId],
+    foreignColumns: [projectRootReconciliationOperations.operationId],
+  }).onDelete('restrict'),
+  foreignKey({
+    name: 'project_root_reconciliation_write_contexts_generation_fkey',
+    columns: [t.generation],
+    foreignColumns: [projectRootChangeJournal.generation],
+  }).onDelete('restrict'),
+  foreignKey({
+    name: 'project_root_reconciliation_write_contexts_project_id_fkey',
+    columns: [t.projectId],
+    foreignColumns: [projects.id],
+  }).onDelete('restrict'),
+])
 
 export const s4ProtectedReviewSourceReads = pgTable(
   's4_protected_review_source_reads',
@@ -2156,7 +2323,7 @@ export const taskQuestions = pgTable(
     sourcePlanArtifactId: uuid('source_plan_artifact_id'),
     sourcePlanVersion: bigint('source_plan_version', { mode: 'number' }),
     answerReferenceId: uuid('answer_reference_id'),
-    // 'open'|'answered'
+    // 'open'|'answered'|'legacy_unavailable'
     status: text('status').notNull().default('open'),
     createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
     answeredAt: timestamp('answered_at', tsOpts),

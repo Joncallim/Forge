@@ -32,6 +32,15 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
+      scrub_redis:
+        image: redis:7-alpine
+        ports:
+          - 6380:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     defaults:
       run:
         working-directory: web
@@ -57,6 +66,7 @@ jobs:
       - uses: actions/checkout@v7.0.0
         with:
           fetch-depth: 0
+
       - name: Reject whitespace errors in the pull-request diff
         if: github.event_name == 'pull_request'
         working-directory: .
@@ -97,6 +107,8 @@ jobs:
           CREATE DATABASE forge_epic_172_ci_test OWNER forge_migration_test;
           CREATE DATABASE forge_migration_0026_upgrade_test OWNER forge_migration_test;
           CREATE DATABASE forge_migration_0027_upgrade_test OWNER forge_migration_test;
+          CREATE DATABASE forge_migration_0028_upgrade_test OWNER forge_migration_test;
+          CREATE DATABASE forge_s5_handoff_failure_test OWNER forge_migration_test;
           CREATE DATABASE forge_s4_ci_test OWNER forge_migration_test;
           SQL
       - name: Prove populated migration 0025 to 0026 upgrade
@@ -104,11 +116,37 @@ jobs:
         env:
           FORGE_MIGRATION_0026_DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_migration_0026_upgrade_test
           FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_migration_0026_upgrade_test
-      - name: Prove populated migration 0026 to 0027 upgrade and strict cutover
+      - name: Prove populated migration 0026 to latest recovery upgrade and strict cutover
         run: npm run test:migration-0027-upgrade
         env:
           FORGE_MIGRATION_0027_DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_migration_0027_upgrade_test
           FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_migration_0027_upgrade_test
+      - name: Prove recorded migration 0027 to 0028 recovery upgrade and strict cutover
+        run: npm run test:migration-0027-upgrade
+        env:
+          FORGE_MIGRATION_RECOVERY_BASELINE: '0027'
+          FORGE_MIGRATION_0027_DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_migration_0028_upgrade_test
+          FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_migration_0028_upgrade_test
+      - name: Prove failed S5 owner handoff is forcibly cleaned up
+        env:
+          DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_s5_handoff_failure_test
+          FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_s5_handoff_failure_test
+        run: |
+          set -euo pipefail
+          npm run protocol:bootstrap-epic-172-release-roles
+          npx tsx scripts/ci/migrate-through-0025.ts
+          npm run protocol:bootstrap-epic-172-s3-release-owner
+          npx tsx scripts/ci/migrate-through-0026.ts
+          npm run protocol:bootstrap-epic-172-s4-roles
+          npx tsx scripts/ci/migrate-through-0027.ts
+          set +e
+          # Use the same wrapper as normal migration paths; it opens the
+          # temporary edge, fails after BEGIN, and must clean it in its trap.
+          FORGE_S5_FORCE_HANDOFF_FAILURE=1 bash scripts/ci/apply-epic-172-s5-recovery-migration.sh
+          failed=$?
+          set -e
+          psql "$FORGE_DATABASE_ADMIN_URL" --set ON_ERROR_STOP=1 --command "do \$\$ begin if pg_catalog.has_function_privilege('forge_migration_test', 'public.forge_begin_epic_172_s4_owner_bootstrap_v1()', 'execute') or pg_catalog.pg_has_role('forge_migration_test', 'forge_s4_routines_owner', 'member') or pg_catalog.has_schema_privilege('forge_migration_test', 'forge', 'create') then raise exception 'S5 cleanup proof retained migration authority'; end if; end \$\$;"
+          test "$failed" -ne 0
       - name: Create the freshly migrated isolated S4 PostgreSQL proof database
         run: |
           npm run protocol:bootstrap-epic-172-release-roles
@@ -116,7 +154,8 @@ jobs:
           npm run protocol:bootstrap-epic-172-s3-release-owner
           npx tsx scripts/ci/migrate-through-0026.ts
           npm run protocol:bootstrap-epic-172-s4-roles
-          npm run db:migrate
+          npx tsx scripts/ci/migrate-through-0027.ts
+          bash scripts/ci/apply-epic-172-s5-recovery-migration.sh
         env:
           DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_s4_ci_test
           FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_s4_ci_test
@@ -132,6 +171,7 @@ jobs:
           ALTER ROLE forge_architect_plan_resolver PASSWORD 'forge_plan_resolver_test';
           ALTER ROLE forge_architect_plan_history_reader PASSWORD 'forge_plan_history_reader_test';
           ALTER ROLE forge_packet_issuer PASSWORD 'forge_packet_issuer_test';
+          ALTER ROLE forge_local_evidence_reader PASSWORD 'forge_local_evidence_reader_test';
           SQL
       - name: Provision the isolated S4 ordinary application boundary
         run: npm run protocol:provision-epic-172-application-role
@@ -164,6 +204,10 @@ jobs:
           END;
           $grant_s4_application_acl$;
           SQL
+      - name: Provision the isolated S4 S5 protected reader
+        run: npm run protocol:provision-epic-172-local-evidence-reader
+        env:
+          FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_s4_ci_test
       - name: Bootstrap Epic 172 release roles
         run: npm run protocol:bootstrap-epic-172-release-roles
         env:
@@ -189,10 +233,15 @@ jobs:
         env:
           DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_epic_172_ci_test
           FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_epic_172_ci_test
-      - name: Apply migrations as the disposable migration owner
-        run: npm run db:migrate
+      - name: Apply migrations through 0027
+        run: npx tsx scripts/ci/migrate-through-0027.ts
         env:
           DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_epic_172_ci_test
+      - name: Apply migration-0028 with failure-safe S5 recovery ownership
+        run: bash scripts/ci/apply-epic-172-s5-recovery-migration.sh
+        env:
+          DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_epic_172_ci_test
+          FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_epic_172_ci_test
       - name: Configure disposable release and S4 principal passwords
         working-directory: .
         env:
@@ -206,13 +255,38 @@ jobs:
           ALTER ROLE forge_architect_plan_history_reader PASSWORD 'forge_plan_history_reader_test';
           ALTER ROLE forge_packet_issuer PASSWORD 'forge_packet_issuer_test';
           ALTER ROLE forge_local_evidence_reader PASSWORD 'forge_local_evidence_reader_test';
+          ALTER ROLE forge_project_root_reconciler PASSWORD 'forge_project_root_reconciler_test';
           SQL
-      - name: Reconcile fresh-install root references with zero-scan proof
-        run: npm run project-roots:reconcile-expansion
+      - name: Materialize legacy root references through the dedicated principal
+        env:
+          FORGE_PROJECT_ROOT_RECONCILER_DATABASE_URL: postgresql://forge_project_root_reconciler:forge_project_root_reconciler_test@localhost:5432/forge_epic_172_ci_test
+        run: |
+          while :; do
+            rows="$(psql "$FORGE_PROJECT_ROOT_RECONCILER_DATABASE_URL" --no-align --tuples-only --set ON_ERROR_STOP=1 --command "SELECT forge.materialize_project_root_ref_expansion_v1(100);")"
+            [[ "$rows" =~ ^[0-9]+$ ]] || { echo 'Root materialization returned an invalid row count.' >&2; exit 1; }
+            [[ "$rows" == '0' ]] && break
+          done
+      - name: Capture the post-drain root journal watermark
+        id: root_journal_watermark
+        env:
+          FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_epic_172_ci_test
+        run: |
+          watermark="$(psql "$FORGE_DATABASE_ADMIN_URL" --no-align --tuples-only --set ON_ERROR_STOP=1 --command "SELECT last_generation FROM public.project_root_change_journal_counter WHERE singleton;")"
+          if [[ ! "$watermark" =~ ^(0|[1-9][0-9]*)$ ]]; then
+            echo 'The post-drain root journal watermark is malformed.' >&2
+            exit 1
+          fi
+          echo "FORGE_ROOT_REF_CUTOVER_WATERMARK=$watermark" >> "$GITHUB_ENV"
+      - name: Reconcile fresh-install root references through the dedicated principal
+        run: npm run project-roots:reconcile-expansion -- --through "$FORGE_ROOT_REF_CUTOVER_WATERMARK" --actor 11111111-1111-4111-8111-111111111111 --apply
+        env:
+          FORGE_PROJECT_ROOT_RECONCILER_DATABASE_URL: postgresql://forge_project_root_reconciler:forge_project_root_reconciler_test@localhost:5432/forge_epic_172_ci_test
+      - name: Build the separately gated concurrent root-reference index
+        run: npm run project-roots:build-concurrent-index -- --apply
         env:
           FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_epic_172_ci_test
       - name: Apply the separately gated strict root-reference cutover
-        run: npm run project-roots:strict-cutover -- --apply
+        run: npm run project-roots:strict-cutover -- --through "$FORGE_ROOT_REF_CUTOVER_WATERMARK" --apply
         env:
           FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_epic_172_ci_test
       - name: Provision the ordinary app release-reader boundary
@@ -232,11 +306,22 @@ jobs:
             --host localhost --username forge_local_evidence_reader \
             --dbname forge_epic_172_ci_test --set ON_ERROR_STOP=1 \
             -c 'select id, task_id, work_package_id, agent_run_id, state, lease_expires_at, terminal_at from public.work_package_local_run_evidence limit 1'
+          PGPASSWORD=forge_local_evidence_reader_test psql \
+            --host localhost --username forge_local_evidence_reader \
+            --dbname forge_epic_172_ci_test --set ON_ERROR_STOP=1 \
+            -c 'select id, task_id, work_package_id, agent_run_id, local_run_evidence_id, assembly, delivery, terminal, terminal_at from public.filesystem_mcp_runtime_audits limit 1'
           if PGPASSWORD=forge_local_evidence_reader_test psql \
             --host localhost --username forge_local_evidence_reader \
             --dbname forge_epic_172_ci_test --set ON_ERROR_STOP=1 \
             -c 'select claim_token from public.work_package_local_run_evidence limit 1' 2>/dev/null; then
             echo 'The S5 local-evidence reader must never be able to select claim_token.' >&2
+            exit 1
+          fi
+          if PGPASSWORD=forge_local_evidence_reader_test psql \
+            --host localhost --username forge_local_evidence_reader \
+            --dbname forge_epic_172_ci_test --set ON_ERROR_STOP=1 \
+            -c 'select claim_token, grant_decision_nonce, authorization_snapshot from public.filesystem_mcp_runtime_audits limit 1' 2>/dev/null; then
+            echo 'The S5 terminal reader must never be able to select audit authority fields.' >&2
             exit 1
           fi
           if PGPASSWORD=forge_local_evidence_reader_test psql \
@@ -302,7 +387,10 @@ jobs:
               'local_effect_recovery_actions', 's4_max_attempt_finalizations',
               'local_projection_archive_operations',
               'local_projection_archive_operation_checkpoints',
-              'filesystem_mcp_decision_nonce_claims', 'project_root_ref_reconciliation'
+              'filesystem_mcp_decision_nonce_claims', 'project_root_ref_reconciliation',
+              'project_root_change_journal_counter', 'project_root_change_journal',
+              'project_root_reconciliation_operations', 'project_root_reconciliation_checkpoints',
+              'project_root_reconciliation_outcomes', 'project_root_reconciliation_write_contexts'
             ] LOOP
               FOREACH table_privilege IN ARRAY ARRAY[
                 'SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER'
@@ -367,7 +455,10 @@ jobs:
               'local_effect_recovery_actions', 's4_max_attempt_finalizations',
               'local_projection_archive_operations',
               'local_projection_archive_operation_checkpoints',
-              'filesystem_mcp_decision_nonce_claims', 'project_root_ref_reconciliation'
+              'filesystem_mcp_decision_nonce_claims', 'project_root_ref_reconciliation',
+              'project_root_change_journal_counter', 'project_root_change_journal',
+              'project_root_reconciliation_operations', 'project_root_reconciliation_checkpoints',
+              'project_root_reconciliation_outcomes', 'project_root_reconciliation_write_contexts'
             ];
             projection_tables constant text[] := ARRAY[
               'forge_epic_172_s3_release_state', 'work_package_local_projection_sources',
@@ -483,6 +574,52 @@ jobs:
           END;
           $verify_application_acl$;
           SQL
+      - name: Create a pristine queue-adoption proof database
+        working-directory: .
+        env:
+          PGPASSWORD: forge
+        run: |
+          set -o errexit -o nounset -o pipefail
+          psql --host localhost --username forge_e2e --dbname postgres --set ON_ERROR_STOP=1 <<'SQL'
+          DO $clone_queue_adoption_database$
+          BEGIN
+            IF EXISTS (
+              SELECT 1
+              FROM pg_stat_activity
+              WHERE datname = 'forge_s4_ci_test'
+                AND pid <> pg_backend_pid()
+            ) THEN
+              RAISE EXCEPTION 'forge_s4_ci_test still has active connections';
+            END IF;
+          END;
+          $clone_queue_adoption_database$;
+          CREATE DATABASE forge_queue_adoption_ci_test
+            OWNER forge_migration_test
+            TEMPLATE forge_s4_ci_test;
+          SQL
+      - name: Create a pristine S5 HTTP authorization proof database
+        working-directory: .
+        env:
+          PGPASSWORD: forge
+        run: |
+          set -o errexit -o nounset -o pipefail
+          psql --host localhost --username forge_e2e --dbname postgres --set ON_ERROR_STOP=1 <<'SQL'
+          DO $clone_s5_database$
+          BEGIN
+            IF EXISTS (
+              SELECT 1
+              FROM pg_stat_activity
+              WHERE datname = 'forge_s4_ci_test'
+                AND pid <> pg_backend_pid()
+            ) THEN
+              RAISE EXCEPTION 'forge_s4_ci_test still has active connections';
+            END IF;
+          END;
+          $clone_s5_database$;
+          CREATE DATABASE forge_s5_http_ci_test
+            OWNER forge_migration_test
+            TEMPLATE forge_s4_ci_test;
+          SQL
       - run: npm run lint -- --max-warnings=0
       - run: npx tsc --noEmit
       - name: Run the complete zero-skip unit suite
@@ -497,6 +634,34 @@ jobs:
           FORGE_ARCHITECT_PLAN_HISTORY_READER_DATABASE_URL: postgresql://forge_architect_plan_history_reader:forge_plan_history_reader_test@localhost:5432/forge_epic_172_ci_test
           FORGE_PACKET_ISSUER_DATABASE_URL: postgresql://forge_packet_issuer:forge_packet_issuer_test@localhost:5432/forge_epic_172_ci_test
           FORGE_LOCAL_RUN_EVIDENCE_READER_DATABASE_URL: postgresql://forge_local_evidence_reader:forge_local_evidence_reader_test@localhost:5432/forge_epic_172_ci_test
+          FORGE_QUEUE_ADOPTION_POSTGRES_TEST_URL: postgresql://forge_app_test:forge_app_test@localhost:5432/forge_queue_adoption_ci_test
+          FORGE_QUEUE_ADOPTION_POSTGRES_ADMIN_TEST_URL: postgresql://forge_e2e:forge@localhost:5432/forge_queue_adoption_ci_test
+          FORGE_QUEUE_ADOPTION_WRITER_DATABASE_URL: postgresql://forge_architect_plan_writer:forge_plan_writer_test@localhost:5432/forge_queue_adoption_ci_test
+          FORGE_QUEUE_ADOPTION_RESOLVER_DATABASE_URL: postgresql://forge_architect_plan_resolver:forge_plan_resolver_test@localhost:5432/forge_queue_adoption_ci_test
+          FORGE_QUEUE_ADOPTION_HISTORY_READER_DATABASE_URL: postgresql://forge_architect_plan_history_reader:forge_plan_history_reader_test@localhost:5432/forge_queue_adoption_ci_test
+      - name: Create a pristine cross-sink proof database
+        working-directory: .
+        env:
+          PGPASSWORD: forge
+        run: |
+          set -o errexit -o nounset -o pipefail
+          psql --host localhost --username forge_e2e --dbname postgres --set ON_ERROR_STOP=1 <<'SQL'
+          DO $clone_cross_sink_database$
+          BEGIN
+            IF EXISTS (
+              SELECT 1
+              FROM pg_stat_activity
+              WHERE datname = 'forge_s4_ci_test'
+                AND pid <> pg_backend_pid()
+            ) THEN
+              RAISE EXCEPTION 'forge_s4_ci_test still has active connections';
+            END IF;
+          END;
+          $clone_cross_sink_database$;
+          CREATE DATABASE forge_cross_sink_ci_test
+            OWNER forge_migration_test
+            TEMPLATE forge_s4_ci_test;
+          SQL
       - name: Run mandatory S4 PostgreSQL zero-skip proof
         env:
           FORGE_S4_REQUIRE_POSTGRES_TEST: '1'
@@ -518,6 +683,112 @@ jobs:
             echo 'The mandatory S4 PostgreSQL proof did not report a passing test.' >&2
             exit 1
           fi
+      - name: Run mandatory S5 two-user PostgreSQL HTTP proof
+        env:
+          FORGE_S5_REQUIRE_POSTGRES_TEST: '1'
+          FORGE_S5_POSTGRES_DESTRUCTIVE_TEST: '1'
+          FORGE_S5_POSTGRES_ADMIN_TEST_URL: postgresql://forge_e2e:forge@localhost:5432/forge_s5_http_ci_test
+          FORGE_S5_POSTGRES_APP_TEST_URL: postgresql://forge_app_test:forge_app_test@localhost:5432/forge_s5_http_ci_test
+          FORGE_S5_LOCAL_EVIDENCE_READER_DATABASE_URL: postgresql://forge_local_evidence_reader@localhost:5432/forge_s5_http_ci_test
+          PGPASSWORD: forge_local_evidence_reader_test
+          REDIS_URL: redis://localhost:6379/13
+        run: |
+          set -o errexit -o nounset -o pipefail
+          report="$(mktemp)"
+          output="$(mktemp)"
+          trap 'rm -f "$report" "$output"' EXIT
+          npx vitest run __tests__/epic-172-s5-postgres-routes.test.ts \
+            --reporter=default --reporter=json --outputFile="$report" | tee "$output"
+          node - "$report" "$output" <<'NODE'
+          const fs = require('node:fs')
+          const [reportPath, outputPath] = process.argv.slice(2)
+          const report = JSON.parse(fs.readFileSync(reportPath, 'utf8'))
+          const output = fs.readFileSync(outputPath, 'utf8')
+          const marker = 'S5_POSTGRES_HTTP_AUTHORIZATION_OK'
+          const markerCount = output.split(marker).length - 1
+          const result = report.testResults?.[0]
+          if (
+            report.testResults?.length !== 1
+            || result?.status !== 'passed'
+            || result?.assertionResults?.length !== 2
+            || report.numTotalTests !== 2
+            || report.numPassedTests !== 2
+            || report.numFailedTests !== 0
+            || report.numPendingTests !== 0
+            || report.numTodoTests !== 0
+            || report.numFailedTestSuites !== 0
+            || report.numPendingTestSuites !== 0
+            || markerCount !== 1
+          ) {
+            throw new Error('The mandatory S5 PostgreSQL proof must run exactly one file, two passing tests, one terminal marker, and no skips.')
+          }
+          NODE
+      - name: Remove the disposable S5 HTTP authorization proof database
+        if: always()
+        working-directory: .
+        env:
+          PGPASSWORD: forge
+        run: |
+          psql --host localhost --username forge_e2e --dbname postgres --set ON_ERROR_STOP=1 <<'SQL'
+          SELECT pg_terminate_backend(pid)
+          FROM pg_stat_activity
+          WHERE datname = 'forge_s5_http_ci_test'
+            AND pid <> pg_backend_pid();
+          DROP DATABASE IF EXISTS forge_s5_http_ci_test;
+          SQL
+      - name: Run mandatory S4 Redis zero-skip proof
+        env:
+          FORGE_S4_REQUIRE_REDIS_TEST: '1'
+          FORGE_S4_REDIS_DESTRUCTIVE_TEST: '1'
+          FORGE_S4_REDIS_TEST_URL: redis://localhost:6380/15
+        run: |
+          npm run test:mcp:s4-redis
+      - name: Run mandatory S4 Redis ACL zero-skip proof
+        env:
+          FORGE_S4_REDIS_ACL_TEST_REQUIRED: '1'
+          FORGE_S4_REDIS_ACL_DESTRUCTIVE_TEST: '1'
+          FORGE_S4_REDIS_ACL_TEST_ADMIN_URL: redis://localhost:6380/14
+        run: |
+          npm run test:mcp:s4-redis-acl
+      - name: Run mandatory S4 cross-sink production sentinel proof
+        env:
+          DATABASE_URL: postgresql://forge_app_test:forge_app_test@localhost:5432/forge_cross_sink_ci_test
+          FORGE_CROSS_SINK_REQUIRE_TEST: '1'
+          FORGE_CROSS_SINK_DESTRUCTIVE_TEST: '1'
+          FORGE_CROSS_SINK_POSTGRES_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_cross_sink_ci_test
+          FORGE_CROSS_SINK_POSTGRES_APP_URL: postgresql://forge_app_test:forge_app_test@localhost:5432/forge_cross_sink_ci_test
+          FORGE_CROSS_SINK_REDIS_ADMIN_URL: redis://localhost:6380/12
+        run: |
+          set -o errexit -o nounset -o pipefail
+          report="$(mktemp)"
+          output="$(mktemp)"
+          trap 'rm -f "$report" "$output"' EXIT
+          npx vitest run __tests__/cross-sink-production-sentinel.postgres-redis.test.ts \
+            --reporter=default --reporter=json --outputFile="$report" | tee "$output"
+          node - "$report" "$output" <<'NODE'
+          const fs = require('node:fs')
+          const [reportPath, outputPath] = process.argv.slice(2)
+          const report = JSON.parse(fs.readFileSync(reportPath, 'utf8'))
+          const output = fs.readFileSync(outputPath, 'utf8')
+          const marker = 'S4_CROSS_SINK_PRODUCTION_SENTINEL_OK'
+          const markerCount = output.split(marker).length - 1
+          const result = report.testResults?.[0]
+          if (
+            report.testResults?.length !== 1
+            || result?.status !== 'passed'
+            || result?.assertionResults?.length !== 1
+            || report.numTotalTests !== 1
+            || report.numPassedTests !== 1
+            || report.numFailedTests !== 0
+            || report.numPendingTests !== 0
+            || report.numTodoTests !== 0
+            || report.numFailedTestSuites !== 0
+            || report.numPendingTestSuites !== 0
+            || markerCount !== 1
+          ) {
+            throw new Error('The mandatory cross-sink proof must run exactly one file and one passing test with one terminal marker and no skips.')
+          }
+          NODE
       - run: npm run test:mcp:contract
       - run: npm run build
       - run: npx playwright install chromium

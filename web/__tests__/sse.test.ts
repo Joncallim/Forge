@@ -13,7 +13,7 @@
  * factories run.
  */
 
-import { vi, describe, it, expect, beforeEach } from 'vitest'
+import { vi, describe, it, expect, afterEach, beforeEach } from 'vitest'
 import { EventEmitter } from 'events'
 
 // ---------------------------------------------------------------------------
@@ -27,6 +27,7 @@ const state = vi.hoisted(() => ({
   }) | null,
   historyGet: vi.fn().mockResolvedValue('0'),
   historyRange: vi.fn().mockResolvedValue([]),
+  constructorUrls: [] as string[],
 }))
 
 // ---------------------------------------------------------------------------
@@ -37,7 +38,8 @@ const state = vi.hoisted(() => ({
 // We must export a real class (constructor function) so `new` works.
 vi.mock('ioredis', () => {
   class RedisMock {
-    constructor() {
+    constructor(url: string) {
+      state.constructorUrls.push(url)
       // Build a fresh sub stub and store it for test access
       const sub = new EventEmitter() as EventEmitter & {
         subscribe: ReturnType<typeof vi.fn>
@@ -66,6 +68,12 @@ const mockDbSelect = vi.fn()
 vi.mock('@/db', () => ({
   db: { select: mockDbSelect },
 }))
+
+const { mockReadS4RuntimeModeV1 } = vi.hoisted(() => ({ mockReadS4RuntimeModeV1: vi.fn() }))
+vi.mock('@/lib/mcps/s4-lease', () => ({ readS4RuntimeModeV1: mockReadS4RuntimeModeV1 }))
+
+const originalPublisherRedisUrl = process.env.FORGE_TASK_EVENT_PUBLISHER_REDIS_URL
+const originalSubscriberRedisUrl = process.env.FORGE_TASK_EVENT_SUBSCRIBER_REDIS_URL
 
 // Redis singleton (used for incr/zadd/expire/zrangebyscore in the send() helper)
 vi.mock('@/lib/redis', () => ({
@@ -166,7 +174,9 @@ describe('GET /api/tasks/:id/runs — SSE stream', () => {
     state.mockSub = null
     state.historyGet.mockResolvedValue('0')
     state.historyRange.mockResolvedValue([])
+    state.constructorUrls.length = 0
     mockGetSession.mockResolvedValue({ sessionId: 'sess-abc', userId: 'user-1' })
+    mockReadS4RuntimeModeV1.mockResolvedValue('legacy')
     let selectCount = 0
     mockDbSelect.mockImplementation(() => {
       selectCount += 1
@@ -174,6 +184,13 @@ describe('GET /api/tasks/:id/runs — SSE stream', () => {
       if (selectCount === 2) return dbChain([{ status: fakeTask().status }])
       return dbChain([])
     })
+  })
+
+  afterEach(() => {
+    if (originalPublisherRedisUrl === undefined) delete process.env.FORGE_TASK_EVENT_PUBLISHER_REDIS_URL
+    else process.env.FORGE_TASK_EVENT_PUBLISHER_REDIS_URL = originalPublisherRedisUrl
+    if (originalSubscriberRedisUrl === undefined) delete process.env.FORGE_TASK_EVENT_SUBSCRIBER_REDIS_URL
+    else process.env.FORGE_TASK_EVENT_SUBSCRIBER_REDIS_URL = originalSubscriberRedisUrl
   })
 
   it('returns 401 when session is missing', async () => {
@@ -210,6 +227,36 @@ describe('GET /api/tasks/:id/runs — SSE stream', () => {
     reader.releaseLock()
     const text = new TextDecoder().decode(first.value)
     expect(text).toContain('retry: 5000')
+  })
+
+  it('uses the dedicated subscriber principal for each protected replay connection', async () => {
+    process.env.FORGE_TASK_EVENT_PUBLISHER_REDIS_URL = 'redis://event-publisher:publisher-password@publisher.example.test/0'
+    process.env.FORGE_TASK_EVENT_SUBSCRIBER_REDIS_URL = 'redis://event-subscriber:subscriber-password@subscriber.example.test/0'
+    mockReadS4RuntimeModeV1.mockResolvedValueOnce('protected')
+
+    const { GET } = await import('@/app/api/tasks/[id]/runs/route')
+    const res = await GET(sseRequest() as never, { params: Promise.resolve({ id: 'task-sse-1' }) })
+    const reader = res.body!.getReader()
+    await reader.read()
+    await vi.waitFor(() => expect(mockReadS4RuntimeModeV1).toHaveBeenCalledOnce())
+    expect(state.constructorUrls).toEqual([
+      'redis://event-subscriber:subscriber-password@subscriber.example.test/0',
+      'redis://event-subscriber:subscriber-password@subscriber.example.test/0',
+    ])
+    await reader.cancel()
+    reader.releaseLock()
+  })
+
+  it('does not construct replay Redis clients when authoritative mode is unavailable', async () => {
+    mockReadS4RuntimeModeV1.mockRejectedValueOnce(new Error('runtime authority unavailable'))
+    const { GET } = await import('@/app/api/tasks/[id]/runs/route')
+    const res = await GET(sseRequest() as never, { params: Promise.resolve({ id: 'task-sse-1' }) })
+    const reader = res.body!.getReader()
+    await reader.read()
+    await reader.read()
+    reader.releaseLock()
+
+    expect(state.constructorUrls).toEqual([])
   })
 
   it('emits the current task status snapshot on connect', async () => {
@@ -389,7 +436,7 @@ describe('GET /api/tasks/:id/runs — SSE stream', () => {
     setTimeout(() => {
       state.mockSub?.emit(
         'message',
-        'forge:task:task-sse-1',
+        'forge:task-events:v2:task-sse-1:live',
         JSON.stringify({
           schemaVersion: 2,
           id: null,
@@ -423,7 +470,7 @@ describe('GET /api/tasks/:id/runs — SSE stream', () => {
     setTimeout(() => {
       state.mockSub?.emit(
         'message',
-        'forge:task:task-sse-1',
+        'forge:task-events:v2:task-sse-1:live',
         JSON.stringify({
           schemaVersion: 2,
           id: null,
@@ -453,7 +500,7 @@ describe('GET /api/tasks/:id/runs — SSE stream', () => {
     setTimeout(() => {
       state.mockSub?.emit(
         'message',
-        'forge:task:task-sse-1',
+        'forge:task-events:v2:task-sse-1:live',
         JSON.stringify({
           schemaVersion: 2,
           id: 1,
@@ -477,7 +524,7 @@ describe('GET /api/tasks/:id/runs — SSE stream', () => {
     setTimeout(() => {
       state.mockSub?.emit(
         'message',
-        'forge:task:task-sse-1',
+        'forge:task-events:v2:task-sse-1:live',
         JSON.stringify({
           schemaVersion: 2,
           id: 1,
@@ -507,7 +554,7 @@ describe('GET /api/tasks/:id/runs — SSE stream', () => {
     const res = await GET(sseRequest() as never, { params: Promise.resolve({ id: 'task-sse-1' }) })
 
     setTimeout(() => {
-      state.mockSub?.emit('message', 'forge:task:task-sse-1', JSON.stringify({
+      state.mockSub?.emit('message', 'forge:task-events:v2:task-sse-1:live', JSON.stringify({
         schemaVersion: 2,
         id: 3,
         type: 'run:completed',
@@ -566,7 +613,7 @@ describe('GET /api/tasks/:id/runs — SSE stream', () => {
 
       state.mockSub?.emit(
         'message',
-        'forge:task:task-sse-1',
+        'forge:task-events:v2:task-sse-1:live',
         JSON.stringify({
           schemaVersion: 2,
           id: null,

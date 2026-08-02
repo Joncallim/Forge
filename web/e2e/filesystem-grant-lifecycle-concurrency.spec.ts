@@ -14,6 +14,8 @@ import {
   reconcileFilesystemGrantsForProject,
 } from '../lib/mcps/filesystem-grant-reconciliation'
 import { requiresFilesystemGrantApproval } from '../lib/mcps/filesystem-grants'
+import { filesystemGrantHealthError } from '../lib/mcps/filesystem-grants'
+import { getProjectMcpOverview } from '../lib/mcps/manager'
 import {
   buildFilesystemGrantBlockMetadata,
   canonicalPositiveDecisionRevision,
@@ -35,6 +37,12 @@ test.beforeEach(async ({}, testInfo) => {
 function sqlClient() {
   const url = process.env.DATABASE_URL
   if (!url) throw new Error('DATABASE_URL is required')
+  return postgres(url, { max: 1 })
+}
+
+function s4ProofSqlClient() {
+  const url = process.env.FORGE_S4_POSTGRES_TEST_DATABASE_URL?.trim()
+  if (!url) throw new Error('FORGE_S4_POSTGRES_TEST_DATABASE_URL is required for protected S4 assertion reads')
   return postgres(url, { max: 1 })
 }
 
@@ -1088,6 +1096,153 @@ test('project pointer retains an exact S4 parent, rejects mismatches, and rolls 
     expect(history.map((decision) => decision.grant_decision_revision)).toEqual(['1', '2'])
   } finally {
     await sql.end()
+  }
+})
+
+test('project approval CAS accepts only the exact observed authority pointer', async () => {
+  const fixture = await seed()
+  const sql = sqlClient()
+  try {
+    // none -> D1 is a distinct CAS state, not an implicit wildcard. Two
+    // simultaneous observers of none must elect exactly one writer.
+    const initial = await bounded(Promise.allSettled([0, 1].map((contender) =>
+      mutateProjectFilesystemGrant({
+        actorId: fixture.userId,
+        capabilities: ['filesystem.project.read'],
+        enabled: true,
+        expectedAuthority: null,
+        projectId: fixture.projectId,
+        reason: `none to D1 contender ${contender}`,
+      }),
+    )), 10_000, 'none to D1 authority CAS')
+    expect(initial.filter((outcome) => outcome.status === 'fulfilled')).toHaveLength(1)
+    expect(initial.filter((outcome) => outcome.status === 'rejected')).toHaveLength(1)
+    const d1 = await loadCurrentProjectFilesystemDecision(fixture.projectId)
+    expect(d1).not.toBeNull()
+    if (!d1) throw new Error('D1 project authority was not persisted')
+
+    // Two clients that both observed D1 contend for D2. The locked, complete
+    // pointer comparison elects one winner and leaves no partial history.
+    const outcomes = await Promise.allSettled([
+      mutateProjectFilesystemGrant({
+        actorId: fixture.userId,
+        capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+        enabled: true,
+        expectedAuthority: d1,
+        projectId: fixture.projectId,
+        reason: 'D1 to D2 contender one',
+      }),
+      mutateProjectFilesystemGrant({
+        actorId: fixture.userId,
+        capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+        enabled: true,
+        expectedAuthority: d1,
+        projectId: fixture.projectId,
+        reason: 'D1 to D2 contender two',
+      }),
+    ])
+    expect(outcomes.filter((outcome) => outcome.status === 'fulfilled')).toHaveLength(1)
+    expect(outcomes.filter((outcome) => outcome.status === 'rejected')).toHaveLength(1)
+
+    const d2 = await loadCurrentProjectFilesystemDecision(fixture.projectId)
+    expect(d2).not.toBeNull()
+    if (!d2) throw new Error('D2 project authority was not persisted')
+    await expect(mutateProjectFilesystemGrant({
+      actorId: fixture.userId,
+      capabilities: ['filesystem.project.read'],
+      enabled: true,
+      expectedAuthority: d1,
+      projectId: fixture.projectId,
+      reason: 'stale D1 replay',
+    })).rejects.toThrow('Project filesystem decision changed concurrently')
+    await expect(mutateProjectFilesystemGrant({
+      actorId: fixture.userId,
+      capabilities: ['filesystem.project.read'],
+      enabled: true,
+      expectedAuthority: { ...d2, decisionId: randomUUID() },
+      projectId: fixture.projectId,
+      reason: 'same revision but different decision id',
+    })).rejects.toThrow('Project filesystem decision changed concurrently')
+    const [{ count }] = await sql<{ count: number }[]>`
+      select count(*)::int as count
+      from project_filesystem_grant_decisions
+      where project_id = ${fixture.projectId}
+    `
+    expect(count).toBe(2)
+  } finally {
+    await sql.end()
+  }
+})
+
+test('locked health revalidation rejects a mutable filesystem change without durable approval writes', async () => {
+  const fixture = await seed()
+  const sql = sqlClient()
+  const proofSql = s4ProofSqlClient()
+  try {
+    // This is the route's preliminary observation. The independent SQL update
+    // is deliberately made after it and before the locked callback runs.
+    const [preliminary] = await sql<{ mcp_config: Record<string, unknown> }[]>`
+      select mcp_config from projects where id = ${fixture.projectId}
+    `
+    const baselineOverrides = preliminary.mcp_config.overrides
+    const overrides = baselineOverrides && typeof baselineOverrides === 'object' && !Array.isArray(baselineOverrides)
+      ? baselineOverrides as Record<string, unknown>
+      : {}
+    await sql`
+      update projects
+      set mcp_config = ${sql.json({
+        ...preliminary.mcp_config,
+        overrides: {
+          ...overrides,
+          filesystem: {
+            ...(overrides.filesystem && typeof overrides.filesystem === 'object' && !Array.isArray(overrides.filesystem)
+              ? overrides.filesystem as Record<string, unknown>
+              : {}),
+            enabled: false,
+          },
+        },
+      })}
+      where id = ${fixture.projectId}
+    `
+    await expect(bounded(mutateProjectFilesystemGrant({
+      actorId: fixture.userId,
+      capabilities: ['filesystem.project.read'],
+      enabled: true,
+      expectedAuthority: null,
+      projectId: fixture.projectId,
+      reason: 'must roll back after locked health change',
+      assertCurrentFilesystemHealth: async (lockedProject) => {
+        const overview = await getProjectMcpOverview(lockedProject, undefined, {
+          cache: false,
+          ensureWorkspace: false,
+        })
+        const healthError = filesystemGrantHealthError(overview.statuses)
+        if (!healthError) throw new Error('fixture did not make filesystem health unavailable')
+        throw new Error(`locked health rejected: ${healthError}`)
+      },
+    }), 10_000, 'locked filesystem health revalidation')).rejects.toThrow('locked health rejected')
+    const [{ decisions, pointerMutations, projections }] = await sql<{
+      decisions: number
+      pointerMutations: number
+      projections: number
+    }[]>`
+      select
+        (select count(*)::int from project_filesystem_grant_decisions where project_id = ${fixture.projectId}) as decisions,
+        (select count(*)::int from project_filesystem_current_decision_pointers
+         where project_id = ${fixture.projectId} and current_decision_id is not null) as "pointerMutations",
+        (select count(*)::int from work_package_local_projection_heads where task_id = ${fixture.taskId} and head_revision > 0) as projections
+    `
+    const [{ recoveryActions }] = await proofSql<{ recoveryActions: number }[]>`
+      select
+        (select count(*)::int from filesystem_mcp_issuance_recovery_actions where task_id = ${fixture.taskId}) +
+        (select count(*)::int from local_effect_recovery_actions where task_id = ${fixture.taskId}) as "recoveryActions"
+    `
+    expect({ decisions, pointerMutations, projections, recoveryActions }).toEqual({
+      decisions: 0, pointerMutations: 0, projections: 0, recoveryActions: 0,
+    })
+  } finally {
+    await sql.end()
+    await proofSql.end()
   }
 })
 
