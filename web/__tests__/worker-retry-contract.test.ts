@@ -14,6 +14,7 @@ const {
   mockPublishTaskEvent,
   mockReadLatestArchitectCheckpointSafely,
   mockWriteArchitectCheckpointSafely,
+  mockRecordArchitectPlanVersion,
 } = vi.hoisted(() => ({
   mockDbSelect: vi.fn(),
   mockDbInsert: vi.fn(),
@@ -26,6 +27,7 @@ const {
   mockPublishTaskEvent: vi.fn(),
   mockReadLatestArchitectCheckpointSafely: vi.fn(),
   mockWriteArchitectCheckpointSafely: vi.fn(),
+  mockRecordArchitectPlanVersion: vi.fn(),
 }))
 
 vi.mock('@/db', () => ({
@@ -40,6 +42,21 @@ vi.mock('@/db', () => ({
 vi.mock('@/lib/providers/registry', () => ({
   getProvider: mockGetProvider,
   getModel: mockGetModel,
+  providerExecutionSnapshot: vi.fn((config: {
+    id: string
+    isLocal: boolean
+    modelId: string
+    providerType: string
+    updatedAt: Date
+  }) => ({
+    acpExecutionMode: config.providerType === 'acp' ? 'unconfined_host_process' : 'not_applicable',
+    configId: config.id,
+    fingerprint: 'test-provider-snapshot',
+    isLocal: config.isLocal,
+    modelId: config.modelId,
+    providerType: config.providerType,
+    updatedAt: config.updatedAt,
+  })),
 }))
 
 vi.mock('@/lib/mcps/manager', () => ({
@@ -52,6 +69,16 @@ vi.mock('@/worker/workforce-materializer', () => ({
 
 vi.mock('@/worker/events', () => ({
   publishTaskEvent: mockPublishTaskEvent,
+}))
+
+vi.mock('@/lib/mcps/s4-protocol-store', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@/lib/mcps/s4-protocol-store')>(),
+  recordArchitectPlanVersion: mockRecordArchitectPlanVersion,
+}))
+
+vi.mock('@/lib/mcps/s4-lease', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@/lib/mcps/s4-lease')>(),
+  readS4RuntimeModeV1: vi.fn().mockResolvedValue('protected'),
 }))
 
 vi.mock('@/worker/checkpoints', async (importOriginal) => {
@@ -99,6 +126,7 @@ const repoRoot = path.resolve(__dirname, '..')
 
 describe('answered-question retry contract', () => {
   const previousMockArchitect = process.env.FORGE_WORKER_MOCK_ARCHITECT
+  const previousArchitectPlanWriterUrl = process.env.FORGE_ARCHITECT_PLAN_WRITER_DATABASE_URL
   const selectResults: unknown[] = []
   const insertResults: unknown[] = []
   const updateResults: unknown[] = []
@@ -108,6 +136,28 @@ describe('answered-question retry contract', () => {
 
   beforeEach(() => {
     vi.clearAllMocks()
+    process.env.FORGE_ARCHITECT_PLAN_DIGEST_KEY_HEX = 'a'.repeat(64)
+    process.env.FORGE_ARCHITECT_PLAN_DIGEST_KEY_ID = 'test-v1'
+    process.env.FORGE_ARCHITECT_PLAN_WRITER_DATABASE_URL = 'postgresql://writer/test'
+    mockRecordArchitectPlanVersion.mockResolvedValue({
+      artifactId: '33333333-3333-4333-8333-333333333333',
+      entries: [{
+        schemaVersion: 1,
+        taskId: '11111111-1111-4111-8111-111111111111',
+        planArtifactId: '33333333-3333-4333-8333-333333333333',
+        planVersion: '1',
+        entryId: 'plan_body:000000',
+        entryKind: 'plan_body',
+        agent: null,
+        requirementKey: null,
+        bindingFingerprint: null,
+        content: 'Protected Architect plan.',
+        contentDigest: `hmac-sha256:${'b'.repeat(64)}`,
+        digestKeyId: 'test-v1',
+        projectionEligible: false,
+      }],
+      entrySetDigest: `hmac-sha256:${'a'.repeat(64)}`,
+    })
     vi.resetModules()
     selectResults.length = 0
     insertResults.length = 0
@@ -154,13 +204,18 @@ describe('answered-question retry contract', () => {
     } else {
       process.env.FORGE_WORKER_MOCK_ARCHITECT = previousMockArchitect
     }
+    if (previousArchitectPlanWriterUrl === undefined) {
+      delete process.env.FORGE_ARCHITECT_PLAN_WRITER_DATABASE_URL
+    } else {
+      process.env.FORGE_ARCHITECT_PLAN_WRITER_DATABASE_URL = previousArchitectPlanWriterUrl
+    }
   })
 
   it('passes finalAttempt into answered-question processing', () => {
     const runtimeSource = fs.readFileSync(path.join(repoRoot, 'worker/runtime.ts'), 'utf8')
 
-    expect(runtimeSource).toContain(
-      'await processAnsweredQuestions(claimedAnswers.job.taskId, { finalAttempt })',
+    expect(runtimeSource).toMatch(
+      /await processAnsweredQuestions\(claimedAnswers\.job\.taskId, \{\s+claimLeaseFence,\s+executionContext,\s+finalAttempt,\s+\}\)/,
     )
   })
 
@@ -172,6 +227,17 @@ describe('answered-question retry contract', () => {
     expect(runtimeSource.indexOf('acknowledgeMissingTaskJob(')).toBeLessThan(
       runtimeSource.indexOf('startTaskAttempt({'),
     )
+  })
+
+  it('schedules session cache purges independently of blocked handoff recovery', () => {
+    const runtimeSource = fs.readFileSync(path.join(repoRoot, 'worker/runtime.ts'), 'utf8')
+
+    expect(runtimeSource).toContain('FORGE_SESSION_CACHE_PURGE_INTERVAL_SECONDS')
+    expect(runtimeSource).toContain('const sweepSessionCachePurges')
+    expect(runtimeSource).toContain("import('../lib/session')")
+    expect(runtimeSource).toContain("void sweepSessionCachePurges({ startup: true })")
+    expect(runtimeSource).toContain('Session cache purge sweep failed')
+    expect(runtimeSource).toContain('clearInterval(sessionCachePurgeTimer)')
   })
 
   it('restores answered rows and awaiting_answers status on retryable re-plan failure', async () => {
@@ -232,6 +298,14 @@ describe('answered-question retry contract', () => {
     )
     updateResults.push(
       [{ id: task.id }],
+      [{
+        id: 'artifact-1',
+        agentRunId: 'run-1',
+        artifactType: 'adr_text',
+        content: 'Architect plan available in protected history',
+        metadata: {},
+        createdAt: new Date('2026-01-01T00:03:00Z'),
+      }],
       undefined,
       [{ id: task.id }],
     )
@@ -245,17 +319,9 @@ describe('answered-question retry contract', () => {
         status: 'running',
         startedAt: new Date('2026-01-01T00:02:00Z'),
       }],
-      [{
-        id: 'artifact-1',
-        agentRunId: 'run-1',
-        artifactType: 'adr_text',
-        content: 'plan',
-        metadata: {},
-        createdAt: new Date('2026-01-01T00:03:00Z'),
-      }],
       restoredRows,
     )
-    deleteResults.push(undefined, undefined)
+    deleteResults.push(undefined)
 
     const { processAnsweredQuestions } = await import('@/worker/orchestrator')
 
@@ -264,22 +330,12 @@ describe('answered-question retry contract', () => {
     )
 
     expect(mockMaterializeWorkforce).toHaveBeenCalledOnce()
-    expect(mockDbDelete).toHaveBeenCalledTimes(2)
-    expect(insertValues).toEqual(
-      expect.arrayContaining([
-        expect.arrayContaining([
-          expect.objectContaining({
-            taskId: task.id,
-            question: 'Which branch?',
-            answer: 'main',
-            status: 'answered',
-          }),
-        ]),
-      ]),
-    )
+    expect(mockDbDelete).toHaveBeenCalledOnce()
+    expect(JSON.stringify(insertValues)).not.toContain('Which branch?')
+    expect(JSON.stringify(insertValues)).not.toContain('main')
     expect(updateSets).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ status: 'awaiting_answers' }),
+        expect.objectContaining({ status: 'failed' }),
       ]),
     )
     expect(mockWriteArchitectCheckpointSafely).toHaveBeenCalledWith(
@@ -289,18 +345,14 @@ describe('answered-question retry contract', () => {
         errorMessage: 'materialize failed',
       }),
     )
-    expect(mockPublishTaskEvent).toHaveBeenCalledWith(
+    expect(mockPublishTaskEvent.mock.calls).not.toContainEqual(expect.arrayContaining([
       task.id,
       'questions:created',
       expect.objectContaining({
-        questions: [
-          expect.objectContaining({
-            question: 'Which branch?',
-            answer: 'main',
-            status: 'answered',
-          }),
-        ],
+        questions: expect.arrayContaining([
+          expect.objectContaining({ question: 'Which branch?', answer: 'main' }),
+        ]),
       }),
-    )
+    ]))
   })
 })

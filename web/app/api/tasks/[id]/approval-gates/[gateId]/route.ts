@@ -73,11 +73,11 @@ export async function POST(
 
     try {
       await redis.lpush('forge:approvals', JSON.stringify({ taskId, action: 'approve' }))
-    } catch (err) {
+    } catch {
       // The gate decision above already committed successfully; a failure here
       // only means the worker continuation wasn't queued yet, not that the
       // decision failed, so return an accepted response the operator can retry.
-      console.error('[POST /api/tasks/:id/approval-gates/:gateId] Failed to enqueue worker continuation', err)
+      console.error('[POST /api/tasks/:id/approval-gates/:gateId] Failed to enqueue worker continuation')
       return NextResponse.json(
         {
           error: 'Review gate decision was saved, but the worker continuation could not be queued.',
@@ -88,8 +88,8 @@ export async function POST(
     }
 
     return NextResponse.json({ result })
-  } catch (err) {
-    console.error('[POST /api/tasks/:id/approval-gates/:gateId] Unexpected error', err)
+  } catch {
+    console.error('[POST /api/tasks/:id/approval-gates/:gateId] Unexpected error')
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }

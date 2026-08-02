@@ -16,15 +16,22 @@ For normal local use, `forge` starts both the dashboard and the worker. For
 split deployments, the worker can still run separately.
 
 The most important beta boundary: Forge may write plans, approval records,
-work-package records, handoff/review-gate state, and local repository file
-edits, but not repository commits. Workforce materialization, handoff,
-specialist package execution, and local repository writes are enabled unless
-explicitly disabled. Forge may give a specialist bounded read-only
-host-repository context. Generated files are written into a package sandbox at
-`.forge/task-runs/<task-id>/<work-package-id>/attempt-<attempt-number>/` and,
-after the package execution step, repository-affecting files are applied to the local project.
-Branches, commits, pull requests, merges, live specialist MCP grants,
-autonomous reviewer agents, and parallel specialists are still future work.
+work-package records, and handoff/review-gate state, but specialist execution
+and file materialization are currently unavailable. Workforce materialization
+and handoff are available after approval. `FORGE_WORK_PACKAGE_EXECUTION` is a
+reserved setting and cannot enable execution today. Direct host writes,
+branches, commits, pull
+requests, merges, live specialist MCP grants, autonomous reviewer agents, and
+parallel specialists are still future work.
+
+The protected local-execution protocol designed in Epic #172 is also future work.
+Its first release target is Ubuntu 24.04 with Linux 6.8 or newer because it depends
+on cgroup v2, systemd scopes, separate run users, and kernel-verified Unix-socket
+identity. The current beta installer still supports macOS and Linux as described
+below, but a future #172 activation must refuse unsupported hosts and leave them on
+the clearly labelled legacy/pre-cutover stream; it must not silently disable local
+work or claim the new containment guarantee. Operators may migrate to a supported
+Linux host or wait for a separately reviewed macOS adapter.
 
 ## Install
 
@@ -101,6 +108,44 @@ npm run worker
 Use split runtime only when you intentionally want the web app and worker as
 separate processes. Running `npm run worker` alone does not serve the dashboard.
 
+### Upgrade workers that may have legacy retry entries
+
+This rollout needs a full worker stop between versions. A version 2 (v2) worker
+expects every retry entry to use the newer queue envelope. It cannot understand
+an older, plain-JSON retry entry and may exit when it reaches one. The current
+worker can upgrade a legacy retry entry while promoting it, but Forge does not
+detect worker versions, drain replicas, or run a separate queue migration for
+you.
+
+When upgrading from any version that may have written legacy retry entries:
+
+1. Assume legacy entries are present. Do not dump or log raw Redis queue members
+   to check; they may contain task data.
+2. Stop and drain every v2 worker instance. Wait for each worker to finish its
+   in-flight work and exit cleanly.
+3. Use the deployment's real service manager or container platform to verify
+   that no v2 process or replica remains. The guide cannot give one universal
+   command because Forge supports both local and split deployments.
+4. Only after that verification, start the current workers.
+
+If a deployment accidentally overlaps versions and v2 wins the canonical
+promotion of the same retry entry, the current worker records the fixed, nonfatal
+`mixed_version_retry_promotion` category and continues its loop. That result is
+not a successful promotion by the current worker, and Forge does not fabricate
+a receipt. This containment does not let v2 read legacy plain-JSON entries and
+does not remove the full stop-and-drain requirement.
+
+The compatibility window is the drain period while a v2 worker may still be
+finishing work. It ends when every v2 worker has stopped. There is no
+compatibility key or manual receipt cleanup. The normal opaque disposition
+receipts expire after 15 minutes and remain subject to bounded pruning.
+
+For rollback, first stop and drain the current workers. If legacy retry entries
+may remain, do not restart v2 workers; resume the current version or follow the
+deployment's existing documented restore path. Do not invent a destructive
+queue-cleanup procedure, edit receipts, or assume that rollback is automatically
+safe.
+
 ## First Login And Providers
 
 The first account creates a password and, by default, a passkey. For password
@@ -154,10 +199,10 @@ For the currently wired ACP adapters:
 - The local CLI must already be installed and logged in.
 - The Forge project must have a local folder so Forge can validate and bound
   repository context. Architect planning uses an isolated runtime directory.
-  Executable work-package ACP sessions are enabled after task approval, but the
-  local adapter is not OS-confined by Forge. Set
-  `FORGE_ACP_WORK_PACKAGE_EXECUTION=0` where that local process access is not
-  acceptable.
+  Specialist ACP sessions are currently unavailable. The
+  `FORGE_ACP_WORK_PACKAGE_EXECUTION` setting is reserved and cannot override
+  the missing confined writer; ACP adapters are local processes and are not
+  OS-confined by Forge.
 - Installing the Zed editor is not required; Forge uses Agent Client Protocol
   adapter packages, not the editor itself.
 
@@ -204,24 +249,197 @@ npm run test:providers
 npm run test:providers -- --provider "Provider Name"
 ```
 
-## Executable Workforce Beta
+### PostgreSQL proof commands
 
-Workforce materialization, handoff, package execution, and local repository
-writes are default-on. To keep the older handoff-artifact-only behavior, set
-one of the disable values (`0`, `false`, `off`, `no`, or `disabled`) in the
-worker environment. If `FORGE_EMBED_WORKER` is enabled, that is the web process
-because it hosts the worker loop; in split deployments, do not set it on the
-web-only process.
+For the CI-style database boundary checks, run the general unit suite with the
+S4 PostgreSQL file excluded:
 
 ```bash
-FORGE_WORK_PACKAGE_EXECUTION=0
+cd web
+npm run test:unit:zero-skip
 ```
 
-To run package models but keep generated files sandbox-only, use:
+Run `npm run test:mcp:s4-postgres` only against a freshly migrated, isolated
+database with the S4 administrator, ordinary application, packet issuer, and
+Architect writer/resolver/history-reader URLs configured. CI sets
+`FORGE_S4_REQUIRE_POSTGRES_TEST=1` and fails if the command reports a skipped S4
+test or no passing test. This proves the configured database boundary and test
+fixture; it is not a complete proof of production safety.
+
+For the separate legacy-data maintenance procedure, use the [legacy leakage
+scrub runbook](operators/legacy-leakage-scrub-v1.md). It requires a dedicated
+admin PostgreSQL connection and a private 32-byte HMAC key. The PostgreSQL
+scrub proof, Redis purge proof, and Redis ACL proof are each necessary, but
+none alone proves that the supported production sinks share one safe boundary.
+The mandatory combined cross-sink proof below is a separate release gate.
+
+### Redis task-event cutover
+
+The database-authoritative S4 runtime mode is the only authority that selects
+the legacy or protected task-event path. Environment variables never activate,
+downgrade, or bypass that decision. Credential selection is a separate
+decision. In legacy mode, shared `REDIS_URL` is used only when neither
+dedicated URL is configured. A complete, distinct, authenticated dedicated
+pair takes precedence even in legacy mode. Exactly one dedicated URL is a
+partial pair and fails closed. Protected mode requires the complete dedicated
+pair and never falls back to shared `REDIS_URL`. The scrub command's private
+`REDIS_URL` is a dedicated maintenance/admin connection. It does not authorize
+a protected application to use the shared fallback.
+
+Each protected URL must use `redis://` or `rediss://`, a username, a password,
+and the same endpoint and explicit database. The publisher and subscriber
+must be different ACL users. Do not use a shared principal, an unrestricted
+`+select`, a broad command category, or a real password in a file, command
+argument, shell history, log, or test output.
+
+The closed-world Redis ACL contract proven by PR #290 is:
+
+- Both users are `reset`, `on`, and `sanitize-payload`, have exactly one
+  opaque password hash, and have no selectors.
+- Both use only these key/channel patterns:
+  `~forge:task-events:v2:*:history`,
+  `~forge:task-events:v2:*:seq`, and
+  `&forge:task-events:v2:*:live`.
+- The publisher has only `+select|<db>`, `+ping`, `+info`,
+  `+client|setinfo`, `+eval`, `+incr`, `+zadd`, `+zcard`,
+  `+zremrangebyrank`, and `+publish`.
+- The subscriber has only `+select|<db>`, `+ping`, `+info`,
+  `+client|setinfo`, `+get`, `+zrangebyscore`, `+subscribe`,
+  `+unsubscribe`, `+psubscribe`, and `+punsubscribe`.
+
+Legacy keys, cross-prefix keys, unrelated channels, extra commands, and broad
+ACL categories are outside this contract. Generate or import secrets through
+a protected file, secret manager, or administrator-controlled channel; use
+placeholders in operator documentation.
+
+#### Ordered cutover checklist
+
+1. Keep project ingress, packet issuance, and v2 producers disabled.
+2. Create the Redis ACL principals and store their secrets out of process
+   before the drain. Do not inject
+   `FORGE_TASK_EVENT_PUBLISHER_REDIS_URL` or
+   `FORGE_TASK_EVENT_SUBSCRIBER_REDIS_URL` into any running legacy web,
+   worker, publisher, or subscriber process. A complete pair switches its
+   task-event credentials immediately, even while database mode remains
+   legacy.
+3. Drain and stop every legacy process and old Server-Sent Events client
+   before configuring replacement processes. Wait through the Server-Sent
+   Events recycle window and verify that old Redis clients are absent.
+4. Revoke or disable legacy publish/write authority and terminate remaining
+   clients. Use the scrub runbook's dedicated admin connection for maintenance.
+5. Preview, apply, and resume the existing scrub exactly as documented. Never
+   edit a checkpoint.
+6. Require a complete legacy zero scan and fail-closed v2 validation. After
+   purge, permanently delete or revoke the legacy user and prove that both an
+   old live connection and a fresh connection using old credentials cannot
+   write.
+7. Configure the dedicated URLs only on replacement processes while those
+   processes remain stopped.
+8. Only after those checks pass, permit the separately authorized,
+   database-controlled protected-mode activation. Changing environment values
+   alone cannot flip the mode.
+9. Start the replacement processes with the dedicated URLs only after the
+   separately authorized database activation step permits protected mode.
+   Keep ingress and producers disabled until their separate release gates pass.
+
+Do not treat expiration as erasure. The scrub exhaustively scans the full
+`forge:task-events:v2:*` prefix, validates recognized `:history` and `:seq`
+shapes, and treats unknown or malformed keys and invalid values as violations.
+It never repairs, rewrites, expires, or deletes v2 evidence. It purges only
+exact legacy `forge:task:<uuid>:history` and `forge:task:<uuid>:seq` keys.
+
+#### Separate mandatory proof commands
+
+Run each command against its own freshly migrated or disposable target. These
+commands are destructive within their explicitly named test databases. Every
+required test must pass with zero skips; a skipped proof is a failure.
+
+```bash
+# PostgreSQL: 14/14, zero skipped
+FORGE_S4_REQUIRE_POSTGRES_TEST=1 npm run test:mcp:s4-postgres -- --reporter=default
+# S4_SCRUB_POSTGRES_START
+# S4_SCRUB_POSTGRES_AUTH_CAS_RESUME_OK
+# S4_SCRUB_POSTGRES_ARTIFACT_LINK_RACE_OK
+
+# Redis scrub: 3/3, zero skipped, disposable database 15
+FORGE_S4_REQUIRE_REDIS_TEST=1 FORGE_S4_REDIS_DESTRUCTIVE_TEST=1 \
+  FORGE_S4_REDIS_TEST_URL=redis://localhost:6380/15 \
+  npm run test:mcp:s4-redis
+# S4_SCRUB_REDIS_START
+# S4_SCRUB_REDIS_V2_IMMUTABLE_OK
+# S4_SCRUB_REDIS_PURGE_RETRY_OK
+
+# Redis ACL: 3/3, zero skipped, disposable database 14
+FORGE_S4_REDIS_ACL_TEST_REQUIRED=1 FORGE_S4_REDIS_ACL_DESTRUCTIVE_TEST=1 \
+  FORGE_S4_REDIS_ACL_TEST_ADMIN_URL=redis://localhost:6380/14 \
+  npm run test:mcp:s4-redis-acl
+# S4_REDIS_ACL_ROLE_ISOLATION_OK
+# S4_REDIS_ACL_DENIALS_OK
+# S4_REDIS_ACL_LEGACY_REVOKED_OK
+```
+
+These are separate gates. Passing them does not replace the mandatory combined
+cross-sink proof below.
+
+#### Combined cross-sink production proof
+
+The mandatory combined CI proof is
+`cross-sink-production-sentinel.postgres-redis.test.ts`. It must pass exactly
+1/1 and emit `S4_CROSS_SINK_PRODUCTION_SENTINEL_OK`. It composes the real
+production writers, readers, routes, projections, and scrub adapters against
+disposable PostgreSQL and Redis services, then checks the supported sink set
+collectively:
+
+- canonical `tasks.prompt` authorization;
+- task API projections;
+- logs and export;
+- Server-Sent Events live, snapshot, and replay;
+- Redis history, sequence, and live data;
+- worker diagnostics;
+- the scrubbed database inventory;
+- the signed producers-disabled receipt;
+- zero-scan and reappearance checks; and
+- legacy Redis ACL revocation.
+
+This is exact hosted disposable-service release evidence. It is not a
+production deployment, not proof for arbitrary future producers or sinks, and not proof of correctness. Any new producer or sink must extend the proof
+corpus and inspection before relying on this marker. It does not imply that
+the future specialist, ACP, or three-lease execution lifecycle is implemented
+or enabled.
+
+#### Rollback-safe handling
+
+Before activation, keep the database mode legacy and do not inject the
+dedicated URLs into running legacy processes while investigating. Creating the
+ACL users and storing their secrets out of process does not select application
+credentials. Never re-enable a legacy producer or user after purge or
+revocation merely to roll back. Once the database mode is protected, missing
+or partial dedicated URLs fail closed; changing environment variables cannot
+downgrade it. Preserve the operation identity, checkpoint, and resume
+credentials required by the scrub rather than editing or recreating a
+checkpoint.
+
+## Executable Workforce Beta
+
+Workforce materialization and handoff are available after approval. Package
+execution and file materialization are currently unavailable. Do not set
+`FORGE_WORK_PACKAGE_EXECUTION=1` expecting it to enable execution. If
+`FORGE_EMBED_WORKER` is enabled, that is the web process because it hosts the
+worker loop; in split deployments, do not set it on the web-only process.
+
+The normal path produces handoff artifacts only. You may make the unavailable
+host-write setting explicit:
 
 ```bash
 FORGE_HOST_REPOSITORY_WRITES=0
 ```
+
+Do not set this flag to `1` or `true`. Direct host repository writes and file
+materialization are unavailable, so the request fails closed before provider or
+filesystem work. Path validation is not an operating-system sandbox; a real
+confined writer is required before Forge can apply files automatically.
+The legacy `FORGE_REPOSITORY_EDITS` alias follows the same rule. Review files
+under `.forge/task-runs`, then apply accepted changes manually.
 
 Deployments adopting the Epic #172 retention and signed-release substrate must
 use the [Step 0 retention bridge runbook](operators/epic-172-step0-retention-bridge.md).
@@ -243,13 +461,12 @@ With the default execution path:
 2. Forge releases ready work packages and runs the MCP/capability broker.
 3. Required blocked MCP/tool grants stop the package before execution. Optional
    grants can continue only when the approved fallback is non-blocking.
-4. Forge executes one eligible specialist package at a time.
-5. The specialist receives bounded read-only project context and run-scoped
-   instructions. This is not a live MCP grant or an unbounded filesystem view.
-6. Generated output is written under the project folder at
-   `.forge/task-runs/<task-id>/<work-package-id>/attempt-<attempt-number>/`.
-7. Repository-affecting files are applied to the local project unless
-   `FORGE_HOST_REPOSITORY_WRITES=0` is set.
+4. Forge prepares handoff artifacts for the eligible specialist package.
+5. The package receives reviewable planning context and run-scoped instructions;
+   no specialist provider or ACP process is called.
+6. There is no generated execution sandbox while the confined writer is
+   unavailable.
+7. Review the handoff artifacts and apply any accepted changes manually.
 8. QA, Reviewer, and Security gates appear when required. In this beta, those
    are manual operator decisions, not proof that separate reviewer agents ran.
 
@@ -258,8 +475,8 @@ one of four states you can act on without reading logs (target-state UI; the
 copy/badge contract lands with S5):
 
 - **Planning context** -- the Architect only suggested an MCP; it is recorded as
-  prompt instructions and never blocks handoff. Generated file writes go through
-  the Forge sandbox/host-apply path, not a live MCP write tool.
+  prompt instructions and never blocks handoff. Generated files stay in the
+  Forge sandbox for manual review; they are not written through a live MCP tool.
 - **Needs project context** -- the package needs bounded read-only filesystem
   context (`filesystem.project.read|list|search`). Approve or deny the exact
   grant shown. Approval today holds a never-approved required grant before the
@@ -326,6 +543,7 @@ Set these for both the web process and worker:
 | `DATABASE_URL` | PostgreSQL connection string |
 | `REDIS_URL` | Redis connection string |
 | `SESSION_SECRET` | Secret value used for local session material |
+| `FORGE_SESSION_CREDENTIAL_MODE` | Session rollout mode. Keep `strict` on fresh installs; use `dual` only while old web processes are still draining. |
 | `NEXT_PUBLIC_APP_URL` | Public browser URL for Forge |
 
 Passkey deployments also need:
@@ -348,9 +566,9 @@ Worker and workspace options:
 | `FORGE_PROMPT_UPGRADE_MODE` | `keep` or `overwrite` local workspace prompts during install/upgrade |
 | `FORGE_WORKFORCE_MATERIALIZATION` | Set `0` or `false` to disable default Workforce record materialization |
 | `FORGE_WORK_PACKAGE_HANDOFF` | Set `0` or `false` to disable default work-package handoff claims |
-| `FORGE_WORK_PACKAGE_EXECUTION` | Set `0`, `false`, `off`, `no`, or `disabled` to disable default package execution and create handoff artifacts only |
-| `FORGE_HOST_REPOSITORY_WRITES` | Set `0`, `false`, `off`, `no`, or `disabled` to keep generated files sandbox-only and skip local project edits |
-| `FORGE_ACP_WORK_PACKAGE_EXECUTION` | Set `0`, `false`, `off`, `no`, or `disabled` to block ACP package execution when local adapter process access is not acceptable |
+| `FORGE_WORK_PACKAGE_EXECUTION` | Reserved and currently unavailable; it cannot enable specialist execution or change the handoff-only path |
+| `FORGE_HOST_REPOSITORY_WRITES` | Leave unset or disabled; enable values fail closed because path validation is not an operating-system sandbox |
+| `FORGE_ACP_WORK_PACKAGE_EXECUTION` | Reserved and currently unavailable; it cannot enable ACP package execution |
 | `FORGE_RUNNING_WORK_PACKAGE_STALE_SECONDS` | Defaults to `900`; retry handoff treats older running package rows as interrupted and recovers them before continuing |
 | `FORGE_WORKSPACE_ROOT` | Fixed workspace root override |
 | `FORGE_MCPS_ROOT` | Fixed shared MCP root override |
@@ -441,6 +659,73 @@ npm run db:migrate
 
 If you changed the schema, follow the developer workflow in
 [developer-guide.md](developer-guide.md).
+
+### Legacy tasks with more than 256 work packages
+
+Forge deliberately holds an older task if it has more than 256 work packages.
+Do not split, move, or delete its packages. Use the fixed-principal archive
+commands to preserve the whole source task as history and enable a separately
+reviewed replacement task.
+
+The procedure includes read-only inspection, dry-run, apply, crash-safe resume,
+rollback that detaches the replacement for a fresh attempt, and cancellation that
+permanently marks a bound replacement unused.
+See [Archive a legacy task with more than 256 work packages](operators/local-projection-overlimit-archive-v2.md).
+
+### Session credential upgrade in migration 0027
+
+Migration 0027 adds the new session fields but deliberately leaves old rows
+and old Redis keys unchanged. Old sessions get their expiry from Redis, so a
+database migration cannot safely guess that lifetime.
+
+For a rolling deployment, use this order:
+
+1. Set `FORGE_SESSION_CREDENTIAL_MODE=dual` on the new web processes. New
+   processes then write both the old and new Redis key formats while old web
+   processes finish their requests.
+2. Stop or drain every old web process. Set the mode back to `strict` and
+   restart the new processes. Do this before reconciliation.
+3. Preview the database state. This command changes nothing:
+
+   ```bash
+   cd web
+   npm run session-credentials:reconcile
+   ```
+
+4. Reconcile and purge old keys:
+
+   ```bash
+   npm run session-credentials:reconcile -- --apply
+   ```
+
+   The command reads Redis `PEXPIRETIME`, copies that exact absolute expiry to
+   PostgreSQL, writes the digest-keyed cache, records a pending purge, deletes
+   the old key, and only then replaces the raw-cookie database ID. A malformed,
+   missing, expired, or non-expiring legacy key is revoked instead of receiving
+   a guessed lifetime.
+5. Rerun the same command until it reports zero remaining rows. It is designed
+   to resume after a process or network failure.
+6. Apply the strict cutover only after the drain is complete:
+
+   ```bash
+   npm run session-credentials:reconcile -- --apply --finalize
+   ```
+
+   Finalization performs a zero scan before making the digest and expiry
+   columns required. It refuses to continue if a raw-cookie ID or pending Redis
+   purge remains.
+
+If reconciliation fails, leave the web processes in `strict` mode, fix the
+PostgreSQL or Redis problem, and rerun it. Before any row has been processed,
+you may return the reconciliation state to `expansion` and temporarily restore
+`dual` mode. After an old key has been purged, do not roll back to old web code:
+that code cannot read the new key, and affected users would need to sign in
+again. After `--finalize`, rollback means restoring the new application and
+database together from a pre-cutover backup; do not drop the strict constraints
+or recreate raw-cookie keys by hand.
+
+The command requires PostgreSQL 16 or newer and Redis 7 or newer on both macOS
+and Linux. `--help` is safe to run without either service configured.
 
 ## Runtime Health
 

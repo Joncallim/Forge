@@ -10,6 +10,7 @@ const mocks = vi.hoisted(() => ({
   dbUpdate: vi.fn(),
   convergeRecognizedOperatorHoldTask: vi.fn().mockResolvedValue({ status: 'not_recognized' }),
   publishTaskEvent: vi.fn(),
+  resolveS4ReviewSourceV1: vi.fn(),
   updateTaskStatusIfCurrent: vi.fn(),
 }))
 
@@ -29,6 +30,10 @@ vi.mock('@/lib/mcps/filesystem-grant-reconciliation', () => ({
   convergeRecognizedOperatorHoldTask: mocks.convergeRecognizedOperatorHoldTask,
 }))
 
+vi.mock('@/lib/mcps/review-source-resolver', () => ({
+  resolveS4ReviewSourceV1: mocks.resolveS4ReviewSourceV1,
+}))
+
 vi.mock('@/worker/task-state', () => ({
   updateTaskStatusIfCurrent: mocks.updateTaskStatusIfCurrent,
 }))
@@ -41,6 +46,7 @@ import {
   materializeReviewGatesForWorkPackageCompletion,
   normalizeSecurityReviewPayload,
 } from '@/worker/review-gates'
+import { ClaimLeaseLostError } from '@/worker/claim-lease-fence'
 
 function chain(resolveValue: unknown) {
   const thenable: Record<string, unknown> = {
@@ -750,6 +756,88 @@ describe('review gate contract', () => {
 
     expect(result).toEqual({ status: 'completed' })
     expect(mocks.updateTaskStatusIfCurrent).toHaveBeenCalledWith('task-1', 'running', 'completed')
+  })
+
+  it('propagates the exact claim-loss object before terminal completion', async () => {
+    mocks.dbSelect
+      .mockReturnValueOnce(chain([{ id: 'pkg-1', status: 'completed' }]))
+      .mockReturnValueOnce(chain([]))
+    const loss = new ClaimLeaseLostError()
+    let calls = 0
+
+    await expect(completeTaskIfReviewGatesSatisfied('task-1', {
+      assertOwned: () => {
+        calls += 1
+        if (calls === 3) throw loss
+      },
+    })).rejects.toBe(loss)
+    expect(mocks.updateTaskStatusIfCurrent).not.toHaveBeenCalled()
+    expect(mocks.publishTaskEvent).not.toHaveBeenCalled()
+  })
+
+  it('rolls back review-gate materialization when ownership is lost after the package update', async () => {
+    mocks.dbSelect.mockReturnValueOnce(chain([{
+      id: 'pkg-1', assignedRole: 'backend', status: 'running', taskId: 'task-1', title: 'Backend package',
+    }]))
+    const packageUpdate = updateChain([{ id: 'pkg-1' }])
+    const laterInsert = vi.fn()
+    const loss = new ClaimLeaseLostError()
+    let calls = 0
+    let committed = false
+    mocks.dbTransaction.mockImplementationOnce(async (callback: (tx: unknown) => unknown) => {
+      const result = await callback({
+        update: vi.fn().mockReturnValue(packageUpdate),
+        select: vi.fn().mockReturnValue(chain([])),
+        insert: laterInsert,
+      })
+      committed = true
+      return result
+    })
+
+    await expect(materializeReviewGatesForWorkPackageCompletion({
+      assertOwned: () => {
+        calls += 1
+        if (calls === 4) throw loss
+      },
+      sourceAgentRunId: 'run-1', sourceArtifactId: 'artifact-1', taskId: 'task-1', workPackageId: 'pkg-1',
+    })).rejects.toBe(loss)
+
+    expect(committed).toBe(false)
+    expect(packageUpdate.set).toHaveBeenCalled()
+    expect(laterInsert).not.toHaveBeenCalled()
+    expect(mocks.publishTaskEvent).not.toHaveBeenCalled()
+  })
+
+  it('does not publish review-gate events when ownership is lost after the transaction commits', async () => {
+    mocks.dbSelect.mockReturnValueOnce(chain([{
+      id: 'pkg-1', assignedRole: 'backend', status: 'running', taskId: 'task-1', title: 'Backend package',
+    }]))
+    const packageUpdate = updateChain([{ id: 'pkg-1' }])
+    const qaInsert = insertChain([{ id: 'gate-qa', gateType: 'qa_review', title: 'QA review: Backend package' }])
+    const reviewerInsert = insertChain([{ id: 'gate-reviewer', gateType: 'reviewer_review', title: 'Reviewer review: Backend package' }])
+    const loss = new ClaimLeaseLostError()
+    let calls = 0
+    let committed = false
+    mocks.dbTransaction.mockImplementationOnce(async (callback: (tx: unknown) => unknown) => {
+      const result = await callback({
+        update: vi.fn().mockReturnValue(packageUpdate),
+        select: vi.fn().mockReturnValue(chain([])),
+        insert: vi.fn().mockReturnValueOnce(qaInsert).mockReturnValueOnce(reviewerInsert),
+      })
+      committed = true
+      return result
+    })
+
+    await expect(materializeReviewGatesForWorkPackageCompletion({
+      assertOwned: () => {
+        calls += 1
+        if (calls === 8) throw loss
+      },
+      sourceAgentRunId: 'run-1', sourceArtifactId: 'artifact-1', taskId: 'task-1', workPackageId: 'pkg-1',
+    })).rejects.toBe(loss)
+
+    expect(committed).toBe(true)
+    expect(mocks.publishTaskEvent).not.toHaveBeenCalled()
   })
 
   it('ignores a stale cancelled gate from an earlier rework cycle when the latest attempt is completed', async () => {

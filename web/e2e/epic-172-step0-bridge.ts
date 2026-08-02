@@ -42,7 +42,7 @@ export const EPIC_172_STEP0_E2E_INVENTORY = [
     classification: 'run-disabled-safe',
   },
   {
-    id: 'filesystem-grant-lifecycle-concurrency.spec.ts::mcp-admission.real-approval-route: concurrent reapproval has one CAS winner and immutable history',
+    id: 'filesystem-grant-lifecycle-concurrency.spec.ts::mcp-admission.real-approval-route: authenticated route stays fail-closed and service CAS preserves immutable history',
     classification: 'run-disabled-safe',
   },
   {
@@ -79,6 +79,14 @@ export const EPIC_172_STEP0_E2E_INVENTORY = [
   },
   {
     id: 'filesystem-grant-lifecycle-concurrency.spec.ts::project pointer retains an exact S4 parent, rejects mismatches, and rolls back a stale CAS append',
+    classification: 'run-disabled-safe',
+  },
+  {
+    id: 'filesystem-grant-lifecycle-concurrency.spec.ts::project approval CAS accepts only the exact observed authority pointer',
+    classification: 'run-disabled-safe',
+  },
+  {
+    id: 'filesystem-grant-lifecycle-concurrency.spec.ts::locked health revalidation rejects a mutable filesystem change without durable approval writes',
     classification: 'run-disabled-safe',
   },
   {
@@ -126,7 +134,7 @@ export const EPIC_172_STEP0_E2E_INVENTORY = [
     classification: 'run-disabled-safe',
   },
   {
-    id: 'mcp-handoff-concurrency.spec.ts::post-claim context failure removes only the owned lease from current metadata',
+    id: 'mcp-handoff-concurrency.spec.ts::an execution request remains a handoff when a path-mutating hook cannot activate execution',
     classification: 'run-disabled-safe',
   },
   {
@@ -140,6 +148,10 @@ export const EPIC_172_STEP0_E2E_INVENTORY = [
   {
     id: 'mcp-plan-review-concurrency.spec.ts::rejects an old review after a locked plan replacement commits',
     classification: 'signed-activation-required',
+  },
+  {
+    id: 'mcp-operator-presentation.spec.ts::uses the same bounded runtime vocabulary on desktop and mobile',
+    classification: 'run-disabled-safe',
   },
   {
     id: 'orchestrator-stage.spec.ts::setup, task execution, artifact review, and approval handoff',
@@ -163,11 +175,47 @@ export const EPIC_172_STEP0_E2E_INVENTORY = [
   },
   {
     id: 'task-detail-controls.spec.ts::loads the package pointer and carries D1 into an explicit D2 reapproval',
-    classification: 'signed-activation-required',
+    // Fully route-mocked: it never calls an ingress-gated endpoint, so the
+    // pointer compare-and-set contract is provable while ingress is disabled.
+    classification: 'run-disabled-safe',
   },
   {
     id: 'task-detail-controls.spec.ts::refreshes a stale pointer and waits for a second explicit confirmation',
+    // Fully route-mocked: it never calls an ingress-gated endpoint, so the
+    // pointer compare-and-set contract is provable while ingress is disabled.
+    classification: 'run-disabled-safe',
+  },
+  {
+    id: 'mcp-host-boundary.spec.ts::epic-172.cgroup-descendant-containment',
     classification: 'signed-activation-required',
+  },
+  {
+    id: 'mcp-host-boundary.spec.ts::epic-172.failure-injection-quiescence',
+    classification: 'signed-activation-required',
+  },
+  {
+    id: 'mcp-host-boundary.spec.ts::epic-172.peer-credential-boundary',
+    classification: 'signed-activation-required',
+  },
+  {
+    id: 'mcp-host-boundary.spec.ts::epic-172.protected-fence-service',
+    classification: 'signed-activation-required',
+  },
+  {
+    id: 'mcp-host-boundary.spec.ts::epic-172.supported-host-preflight',
+    classification: 'signed-activation-required',
+  },
+  {
+    id: 'mcp-host-boundary.spec.ts::epic-172.teardown-zero-residue',
+    classification: 'signed-activation-required',
+  },
+  {
+    id: 'mcp-host-boundary.spec.ts::epic-172.uid-credential-isolation',
+    classification: 'signed-activation-required',
+  },
+  {
+    id: 'mcp-operator-recovery.spec.ts::mcp-admission.operator-recovery: presents authenticated filesystem recovery controls',
+    classification: 'run-disabled-safe',
   },
 ] as const satisfies readonly Epic172Step0E2EEntry[]
 

@@ -29,6 +29,18 @@ type EnablementState = Pick<
   | 'stateFingerprint'
 >
 
+type DatabaseEnablementState = Omit<
+  EnablementState,
+  'epoch' | 'startedAt' | 'expiresAt' | 'leaseGeneration' | 'lastHeartbeatAt' | 'leaseExpiresAt'
+> & {
+  epoch: number | string | bigint | null
+  startedAt: Date | string | null
+  expiresAt: Date | string | null
+  leaseGeneration: number | string | bigint | null
+  lastHeartbeatAt: Date | string | null
+  leaseExpiresAt: Date | string | null
+}
+
 export type Epic172ProjectIngressBlockReason =
   | 'missing_state'
   | 'disabled'
@@ -61,6 +73,32 @@ function isDigestBytes(value: unknown): value is Uint8Array {
   return value instanceof Uint8Array && value.byteLength === 32
 }
 
+function databaseSafeInteger(value: number | string | bigint | null): number | null {
+  if (value === null) return null
+  if (typeof value === 'number') return Number.isSafeInteger(value) ? value : Number.NaN
+  const text = typeof value === 'bigint' ? value.toString() : value
+  if (!/^(?:0|[1-9][0-9]*)$/.test(text)) return Number.NaN
+  const parsed = Number(text)
+  return Number.isSafeInteger(parsed) ? parsed : Number.NaN
+}
+
+function databaseTimestamp(value: Date | string | null): Date | null {
+  if (value === null) return null
+  return value instanceof Date ? value : new Date(value)
+}
+
+function normalizeEnablementState(state: DatabaseEnablementState): EnablementState {
+  return {
+    ...state,
+    epoch: databaseSafeInteger(state.epoch),
+    startedAt: databaseTimestamp(state.startedAt),
+    expiresAt: databaseTimestamp(state.expiresAt),
+    leaseGeneration: databaseSafeInteger(state.leaseGeneration),
+    lastHeartbeatAt: databaseTimestamp(state.lastHeartbeatAt),
+    leaseExpiresAt: databaseTimestamp(state.leaseExpiresAt),
+  }
+}
+
 function hasCoreIdentity(state: EnablementState): boolean {
   return isNonEmptyText(state.ownerOperationId)
     && isExactBuildSet(state.exactBuilds)
@@ -76,9 +114,11 @@ function hasCoreIdentity(state: EnablementState): boolean {
 }
 
 export function decideEpic172ProjectManagementIngress(
-  state: EnablementState | null,
-  databaseNow: Date,
+  storedState: DatabaseEnablementState | null,
+  storedDatabaseNow: Date | string,
 ): Epic172ProjectIngressDecision {
+  const state = storedState ? normalizeEnablementState(storedState) : null
+  const databaseNow = databaseTimestamp(storedDatabaseNow)
   if (!state) return { allowed: false, reason: 'missing_state' }
   if (!isDate(databaseNow)) return { allowed: false, reason: 'invalid_timeline' }
   if (state.state === 'disabled') return { allowed: false, reason: 'disabled' }
@@ -135,7 +175,7 @@ export function decideEpic172ProjectManagementIngress(
 
 export async function readEpic172ProjectManagementIngress(): Promise<Epic172ProjectIngressDecision> {
   try {
-    const rows = await db.execute<EnablementState & { databaseNow: Date }>(sql`
+    const rows = await db.execute<DatabaseEnablementState & { databaseNow: Date | string }>(sql`
       select
         state,
         owner_operation_id as "ownerOperationId",

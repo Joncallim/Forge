@@ -20,3 +20,13 @@ export function defaultOnFeatureFlagState(value: string | undefined): DefaultOnF
 export function defaultOnFeatureFlagEnabled(value: string | undefined): boolean {
   return defaultOnFeatureFlagState(value).enabled
 }
+
+/**
+ * Execution can produce local effects, so unlike compatibility-oriented flags
+ * it must be explicitly enabled with a recognized affirmative value.  Missing,
+ * blank, malformed, and negative values all fail closed.
+ */
+export function explicitOptInFeatureFlagEnabled(value: string | undefined): boolean {
+  if (value === undefined) return false
+  return ENABLED_VALUES.has(value.trim().toLowerCase())
+}

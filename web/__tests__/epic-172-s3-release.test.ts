@@ -68,6 +68,12 @@ describe('Epic 172 S3 release seam', () => {
     expect(workflow).toContain("RUN_FORGE_POSTGRES_TESTS: '1'")
     expect(workflow).toContain('e2e/filesystem-grant-lifecycle-concurrency.spec.ts')
     expect(workflow).toContain('--project=chromium-desktop --workers=1 --retries=0')
+    const proofStep = workflow.slice(
+      workflow.indexOf('name: Run mandatory S3 PostgreSQL concurrency proof'),
+      workflow.indexOf('name: Prove Epic 172 Step 0 disabled ingress'),
+    )
+    expect(proofStep).toContain('FORGE_S4_POSTGRES_TEST_DATABASE_URL:')
+    expect(proofStep).toContain('FORGE_PACKET_ISSUER_DATABASE_URL:')
     expect(workflow).toContain("grep -Eq '[1-9][0-9]* skipped'")
     expect(workflow).toContain("if ! grep -Eq '[1-9][0-9]* passed'")
     const concurrencyProof = readFileSync(
@@ -84,6 +90,35 @@ describe('Epic 172 S3 release seam', () => {
     expect(concurrencyProof).toContain("'production claim and grant mutation contention'")
   })
 
+  it('uses a disposable read-only observer for protected runtime audit assertions', () => {
+    const workflow = readFileSync(
+      fileURLToPath(new URL('../../.github/workflows/web-ci.yml', import.meta.url)),
+      'utf8',
+    )
+    const bridgeStep = workflow.slice(
+      workflow.indexOf('name: Run the fail-closed Epic 172 Step 0 E2E bridge suite'),
+    )
+    const handoffConcurrency = readFileSync(
+      fileURLToPath(new URL('../e2e/mcp-handoff-concurrency.spec.ts', import.meta.url)),
+      'utf8',
+    )
+    expect(workflow).toContain('CREATE ROLE forge_e2e_audit_observer')
+    expect(workflow).toContain('REVOKE ALL ON TABLE public.filesystem_mcp_runtime_audits FROM forge_e2e_audit_observer;')
+    expect(workflow).toContain('GRANT SELECT ON TABLE public.filesystem_mcp_runtime_audits TO forge_e2e_audit_observer;')
+    expect(workflow).toContain('The protected-audit observer must not execute Forge routines')
+    expect(workflow).toContain("CI-only observer. PostgreSQL's default PUBLIC CONNECT/TEMPORARY")
+    expect(workflow).toContain('object-level CI boundary, not global database isolation')
+    expect(bridgeStep).toContain('FORGE_E2E_AUDIT_OBSERVER_DATABASE_URL:')
+    expect(workflow).not.toContain('uses: actions/upload-artifact')
+    expect(workflow).not.toContain('web/playwright-report')
+    expect(workflow).not.toContain('web/test-results')
+    expect(handoffConcurrency).toContain('FORGE_E2E_AUDIT_OBSERVER_DATABASE_URL is required')
+    expect(handoffConcurrency).toContain("currentUser: 'forge_e2e_audit_observer'")
+    expect(handoffConcurrency).toContain('from public.filesystem_mcp_runtime_audits')
+    expect(handoffConcurrency).toContain('contextPacketAuditCount(seeded.packageId)')
+    expect(handoffConcurrency).not.toMatch(/from filesystem_mcp_runtime_audits[\s\S]{0,200}where work_package_id = \$\{seeded\.packageId\}/i)
+  })
+
   it('runs the primary unit suite with mandatory release PostgreSQL fixtures and zero lint warnings', () => {
     const workflow = readFileSync(
       fileURLToPath(new URL('../../.github/workflows/web-ci.yml', import.meta.url)),
@@ -91,7 +126,7 @@ describe('Epic 172 S3 release seam', () => {
     )
     expect(workflow).toContain('npm run lint -- --max-warnings=0')
     expect(workflow).toContain('name: Run the complete zero-skip unit suite')
-    expect(workflow).toContain('run: npm test')
+    expect(workflow).toContain('run: npm run test:unit:zero-skip')
     expect(workflow).toContain("FORGE_EPIC_172_REQUIRE_POSTGRES_TEST: '1'")
     expect(workflow).toContain('FORGE_EPIC_172_TEST_APP_DATABASE_URL:')
     expect(workflow).toContain('FORGE_EPIC_172_TEST_WRITER_DATABASE_URL:')

@@ -1,6 +1,10 @@
 import fs from 'node:fs/promises'
 import { constants, type Dirent } from 'node:fs'
 import path from 'node:path'
+import {
+  PACKET_REDACTION_CATEGORIES,
+  type PacketRedactionSummary,
+} from '../lib/mcps/packet-issuance-v2'
 
 const CONTEXT_SCHEMA_VERSION = 1
 const MAX_CONTEXT_FILES = 50
@@ -303,6 +307,21 @@ function emptyPacket(root: string): ExecutionContextPacket {
 
 export function buildEmptyExecutionContextPacket(projectRoot: string): ExecutionContextPacket {
   return emptyPacket(path.resolve(projectRoot))
+}
+
+export function executionContextPacketRedactionSummary(
+  packet: ExecutionContextPacket,
+): PacketRedactionSummary {
+  const counts: PacketRedactionSummary = {}
+  const allowed = new Set<string>(PACKET_REDACTION_CATEGORIES)
+  for (const file of packet.files) {
+    for (const category of file.redactions) {
+      if (!allowed.has(category)) continue
+      const key = category as keyof PacketRedactionSummary
+      counts[key] = (counts[key] ?? 0) + 1
+    }
+  }
+  return counts
 }
 
 function recordOmission(

@@ -2,14 +2,20 @@ import { db } from '../db'
 import { taskLogs } from '../db/schema'
 import { publishTaskEvent } from './events'
 import { sanitizeWorkerMessage } from './redaction'
-import { sanitizeLogFrontMatter, sanitizeLogRecordForOutput, sanitizeLogStructuredValue } from '@/lib/task-log-sanitization'
+import {
+  LEGACY_TASK_LOG_UNAVAILABLE,
+  sanitizeLogFrontMatter,
+  sanitizeLogRecordForOutput,
+  sanitizeLogStructuredValue,
+  sanitizePromptSnapshot,
+} from '@/lib/task-log-sanitization'
+import { taskLogsUnavailableMessage } from '@/lib/task-log-db-errors'
 
 export type TaskLogLevel = 'info' | 'success' | 'warning' | 'error'
 
 export type TaskLogFrontMatter = {
   connector?: string | null
   model?: string | null
-  prompt?: string | null
   timestamp?: string
 }
 
@@ -40,9 +46,9 @@ function frontMatterWithTimestamp(frontMatter: Record<string, unknown>, createdA
   })
 }
 
-function errorField(value: unknown): string | undefined {
+function errorField(value: unknown): ReturnType<typeof sanitizePromptSnapshot> | undefined {
   return typeof value === 'string' && value.trim() !== ''
-    ? sanitizeWorkerMessage(value).slice(0, 2000)
+    ? sanitizePromptSnapshot(value)
     : undefined
 }
 
@@ -75,8 +81,7 @@ function taskLogErrorDiagnostic(err: unknown): Record<string, unknown> {
     depth += 1
   }
 
-  const serialized = JSON.stringify(diagnostic)
-  if (/relation "task_logs" does not exist/i.test(serialized)) {
+  if (taskLogsUnavailableMessage(err)) {
     diagnostic.remediation = 'Run `npm run db:migrate` from the web directory so the task_logs table exists.'
   }
 
@@ -91,13 +96,13 @@ export async function recordTaskLog(input: RecordTaskLogInput): Promise<typeof t
       agentRunId: input.agentRunId ?? null,
       approvalGateId: input.approvalGateId ?? null,
       artifactId: input.artifactId ?? null,
-      eventType: input.eventType,
+      eventType: cleanText(input.eventType, 500),
       frontMatter: frontMatterWithTimestamp(input.frontMatter ?? {}, createdAt),
       level: input.level ?? 'info',
-      message: cleanText(input.message),
+      message: LEGACY_TASK_LOG_UNAVAILABLE,
       metadata: sanitizeLogStructuredValue(input.metadata ?? {}, { stringByteLimit: 16 * 1024 }) as Record<string, unknown>,
       occurredAt: createdAt,
-      source: input.source ?? 'system',
+      source: cleanText(input.source ?? 'system', 100),
       taskAttemptId: input.taskAttemptId ?? null,
       taskId: input.taskId,
       title: cleanText(input.title, 500),
@@ -129,7 +134,7 @@ export async function recordTaskLogBestEffort(input: RecordTaskLogInput): Promis
   } catch (err) {
     console.warn('[task-logs] Failed to record task log', {
       ...taskLogErrorDiagnostic(err),
-      eventType: input.eventType,
+      eventType: cleanText(input.eventType, 500),
       taskId: input.taskId,
     })
   }

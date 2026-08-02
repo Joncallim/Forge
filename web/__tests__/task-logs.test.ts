@@ -1,3 +1,6 @@
+import fs from 'node:fs'
+import path from 'node:path'
+import ts from 'typescript'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
@@ -31,7 +34,7 @@ describe('task log writer', () => {
     vi.clearAllMocks()
   })
 
-  it('sanitizes prompt front matter before insert and publishes the created log', async () => {
+  it('removes prompt front matter before insert and publishes the created log', async () => {
     const row = {
       id: 'log-1',
       taskId: 'task-1',
@@ -68,17 +71,10 @@ describe('task log writer', () => {
     })
 
     expect(chain.values).toHaveBeenCalledWith(expect.objectContaining({
-      frontMatter: expect.objectContaining({
-        prompt: expect.objectContaining({
-          byteLength: expect.any(Number),
-          sha256: expect.any(String),
-          truncated: false,
-        }),
-      }),
+      frontMatter: expect.not.objectContaining({ prompt: expect.anything() }),
+      message: 'legacy_task_log_unavailable',
       metadata: expect.objectContaining({
-        nested: expect.objectContaining({
-          token: '[REDACTED_TOKEN]',
-        }),
+        nested: expect.not.objectContaining({ token: expect.anything() }),
       }),
     }))
     expect(mocks.publishTaskEvent).toHaveBeenCalledWith('task-1', 'task:log', expect.objectContaining({
@@ -90,7 +86,7 @@ describe('task log writer', () => {
     }))
   })
 
-  it('hashes nested prompt-shaped objects instead of preserving their text', () => {
+  it('recursively removes prompt aliases and keeps count metadata for other output', () => {
     const sanitized = sanitizeLogStructuredValue({
       mcpExecutionDesign: {
         promptOverlays: {
@@ -101,6 +97,8 @@ describe('task log writer', () => {
         prompt: {
           messages: [{ content: 'Bearer ghp_secret12345' }],
         },
+        system_prompt: 'RAW-SYSTEM-PROMPT-SENTINEL',
+        apiKey: 'RAW-API-KEY-SENTINEL',
       },
       feedback: {
         text: 'Retry with the original user prompt copied here',
@@ -114,26 +112,153 @@ describe('task log writer', () => {
           stdout: 'stdout copied Bearer ghp_secret12345',
         },
       ],
-    }) as {
-      mcpExecutionDesign: { promptOverlays: { byteLength: number; sha256: string } }
-      nested: { prompt: { byteLength: number; sha256: string } }
-      feedback: { byteLength: number; sha256: string }
-      partialOutput: { byteLength: number; sha256: string }
+    }) as unknown as {
+      mcpExecutionDesign: Record<string, unknown>
+      nested: Record<string, unknown>
+      feedback: { kind: string; byteCount: number }
       commandResults: Array<{
-        stderr: { byteLength: number; sha256: string }
-        stdout: { byteLength: number; sha256: string }
+        stderr: { kind: string; byteCount: number }
+        stdout: { kind: string; byteCount: number }
       }>
     }
 
-    expect(sanitized.mcpExecutionDesign.promptOverlays.sha256).toHaveLength(64)
-    expect(sanitized.nested.prompt.sha256).toHaveLength(64)
-    expect(sanitized.feedback.sha256).toHaveLength(64)
-    expect(sanitized.partialOutput.sha256).toHaveLength(64)
-    expect(sanitized.commandResults[0].stderr.sha256).toHaveLength(64)
-    expect(sanitized.commandResults[0].stdout.sha256).toHaveLength(64)
+    expect(sanitized.mcpExecutionDesign).not.toHaveProperty('promptOverlays')
+    expect(sanitized.nested).not.toHaveProperty('prompt')
+    expect(sanitized.nested).not.toHaveProperty('system_prompt')
+    expect(sanitized.nested).not.toHaveProperty('apiKey')
+    expect(sanitized.feedback).toEqual({ kind: 'unknown_legacy_digest', byteCount: expect.any(Number) })
+    expect(sanitized.commandResults[0].stderr).toEqual({ kind: 'unknown_legacy_digest', byteCount: expect.any(Number) })
+    expect(sanitized.commandResults[0].stdout).toEqual({ kind: 'unknown_legacy_digest', byteCount: expect.any(Number) })
+    expect(JSON.stringify(sanitized)).not.toContain('sha256')
     expect(JSON.stringify(sanitized)).not.toContain('sk-live-secret')
     expect(JSON.stringify(sanitized)).not.toContain('ghp_secret12345')
     expect(JSON.stringify(sanitized)).not.toContain('original user prompt')
     expect(JSON.stringify(sanitized)).not.toContain('failing test printed')
+    expect(JSON.stringify(sanitized)).not.toContain('RAW-SYSTEM-PROMPT-SENTINEL')
+    expect(JSON.stringify(sanitized)).not.toContain('RAW-API-KEY-SENTINEL')
+  })
+
+  it('keeps prompt aliases out of every checked-in task-log front-matter producer', () => {
+    const roots = [path.resolve(process.cwd(), 'worker'), path.resolve(process.cwd(), 'app/api')]
+    const files: string[] = []
+    const visitDirectory = (directory: string) => {
+      for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+        const target = path.join(directory, entry.name)
+        if (entry.isDirectory()) visitDirectory(target)
+        else if (entry.isFile() && target.endsWith('.ts') && !target.endsWith('/worker/task-logs.ts')) files.push(target)
+      }
+    }
+    roots.forEach(visitDirectory)
+
+    const violations: string[] = []
+    const propertyName = (name: ts.PropertyName): string | null => {
+      if (ts.isIdentifier(name) || ts.isStringLiteral(name) || ts.isNumericLiteral(name)) return name.text
+      return null
+    }
+    for (const file of files) {
+      const source = ts.createSourceFile(file, fs.readFileSync(file, 'utf8'), ts.ScriptTarget.Latest, true)
+      const inspectFrontMatter = (node: ts.Node) => {
+        if (ts.isPropertyAssignment(node) && propertyName(node.name) === 'frontMatter') {
+          if (!ts.isObjectLiteralExpression(node.initializer)) {
+            violations.push(`${path.relative(process.cwd(), file)}:${source.getLineAndCharacterOfPosition(node.getStart()).line + 1}:dynamic-front-matter`)
+          } else {
+            const inspectKey = (candidate: ts.Node) => {
+              if (ts.isSpreadAssignment(candidate)) {
+                violations.push(`${path.relative(process.cwd(), file)}:${source.getLineAndCharacterOfPosition(candidate.getStart()).line + 1}:spread-front-matter`)
+              }
+              if (ts.isPropertyAssignment(candidate) || ts.isShorthandPropertyAssignment(candidate)) {
+                const key = propertyName(candidate.name)
+                if (key && (/prompt/i.test(key) || key === 'messages')) {
+                  violations.push(`${path.relative(process.cwd(), file)}:${source.getLineAndCharacterOfPosition(candidate.getStart()).line + 1}:${key}`)
+                }
+              }
+              ts.forEachChild(candidate, inspectKey)
+            }
+            inspectKey(node.initializer)
+          }
+        }
+        ts.forEachChild(node, inspectFrontMatter)
+      }
+      inspectFrontMatter(source)
+    }
+
+    expect(violations).toEqual([])
+  })
+
+  it('keeps task producers on the canonical task-log/event writers and out of the legacy Redis namespace', () => {
+    const roots = [path.resolve(process.cwd(), 'worker'), path.resolve(process.cwd(), 'app/api/tasks')]
+    const files: string[] = []
+    const visitDirectory = (directory: string) => {
+      for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+        const target = path.join(directory, entry.name)
+        if (entry.isDirectory()) visitDirectory(target)
+        else if (entry.isFile() && target.endsWith('.ts')) files.push(target)
+      }
+    }
+    roots.forEach(visitDirectory)
+
+    const directRedisWriter = path.resolve(process.cwd(), 'worker/events.ts')
+    const directTaskLogWriter = path.resolve(process.cwd(), 'worker/task-logs.ts')
+    const violations: string[] = []
+    for (const file of files) {
+      const source = fs.readFileSync(file, 'utf8')
+      const relative = path.relative(process.cwd(), file)
+      if (source.includes('forge:task:')) violations.push(`${relative}:legacy-task-namespace`)
+      if (file !== directRedisWriter && /\.(?:eval|publish)\s*\(/.test(source)) {
+        violations.push(`${relative}:direct-redis-publish`)
+      }
+      if (file !== directTaskLogWriter && /\.insert\s*\(\s*taskLogs\s*\)/.test(source)) {
+        violations.push(`${relative}:direct-task-log-insert`)
+      }
+    }
+
+    expect(violations).toEqual([])
+  })
+
+  it('keeps compatibility readers on the closed projection and task diagnostics free of caught-error payloads', () => {
+    const taskApiRoot = path.resolve(process.cwd(), 'app/api/tasks')
+    const compatibilityReader = fs.readFileSync(path.join(taskApiRoot, '[id]', 'route.ts'), 'utf8')
+    const streamReader = fs.readFileSync(path.join(taskApiRoot, '[id]', 'runs', 'route.ts'), 'utf8')
+    const taskApiFiles: string[] = []
+    const visitDirectory = (directory: string) => {
+      for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+        const target = path.join(directory, entry.name)
+        if (entry.isDirectory()) visitDirectory(target)
+        else if (entry.isFile() && target.endsWith('.ts')) taskApiFiles.push(target)
+      }
+    }
+    visitDirectory(taskApiRoot)
+
+    expect(compatibilityReader).toContain('projectTaskCompatibilityTask(task)')
+    expect(compatibilityReader).toContain('projectTaskCompatibilityRun')
+    expect(compatibilityReader).toContain('projectTaskCompatibilityAttempt')
+    expect(compatibilityReader).toContain('projectTaskCompatibilityArtifact')
+    expect(streamReader).toContain('projectTaskCompatibilityArtifact')
+    expect(streamReader).toContain('taskCompatibilityError(run.errorMessage)')
+    expect(taskApiFiles.flatMap((file) => {
+      const source = fs.readFileSync(file, 'utf8')
+      return /console\.(?:error|warn)\([^\n]*,\s*(?:err|error)\)/.test(source)
+        ? [path.relative(process.cwd(), file)]
+        : []
+    })).toEqual([])
+
+    const rejectRoute = fs.readFileSync(path.join(taskApiRoot, '[id]', 'reject', 'route.ts'), 'utf8')
+    const source = ts.createSourceFile('reject-route.ts', rejectRoute, ts.ScriptTarget.Latest, true)
+    const consoleViolations: string[] = []
+    const inspect = (node: ts.Node) => {
+      if (ts.isCallExpression(node)
+        && ts.isPropertyAccessExpression(node.expression)
+        && ts.isIdentifier(node.expression.expression)
+        && node.expression.expression.text === 'console') {
+        for (const argument of node.arguments) {
+          if (/\breason\b/.test(argument.getText(source))) {
+            consoleViolations.push(`${node.expression.name.text}:raw-rejection-reason`)
+          }
+        }
+      }
+      ts.forEachChild(node, inspect)
+    }
+    inspect(source)
+    expect(consoleViolations).toEqual([])
   })
 })

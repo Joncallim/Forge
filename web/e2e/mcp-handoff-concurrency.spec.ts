@@ -13,6 +13,7 @@ import {
   mutateTaskFilesystemGrants,
 } from '../lib/mcps/filesystem-grant-reconciliation'
 import { applyEpic172Step0E2EBridge } from './epic-172-step0-bridge'
+import { computeCredentialDigest } from '../lib/session-credential-digest'
 
 const databaseUrl = process.env.DATABASE_URL
 if (!databaseUrl) throw new Error('DATABASE_URL is required for MCP handoff concurrency tests.')
@@ -55,32 +56,6 @@ const unknownMcpRequirement = [{
   assignment: { type: 'agent', targetId: null },
   fallback: { action: 'block', message: 'Revise the invalid MCP policy.' },
 }]
-
-function explicitFilesystemGrant(grantApprovalId = crypto.randomUUID()) {
-  return {
-    schemaVersion: 1,
-    phase: 'effective',
-    source: 'explicit-grant-approval',
-    grantApprovalId,
-    grantMode: 'allow_once',
-    scope: 'work_package',
-    mcpId: 'filesystem',
-    approvedAt: new Date().toISOString(),
-    approvedBy: crypto.randomUUID(),
-    grants: [{
-      mcpId: 'filesystem',
-      status: 'approved',
-      capabilities: ['filesystem.project.read'],
-      grantApprovalId,
-      grantMode: 'allow_once',
-      reason: 'Concurrency integration fixture.',
-    }],
-    reason: 'Concurrency integration fixture.',
-    runtimeIssued: false,
-    runtimeEnforcement: 'bounded_context_packet',
-    status: 'approved',
-  }
-}
 
 async function seedPackage(sql: Sql, input: {
   metadata: JsonObject
@@ -215,6 +190,8 @@ test.describe('MCP handoff optimistic concurrency', () => {
   test.describe.configure({ mode: 'serial' })
   let sql: Sql
   let writer: Sql
+  let auditObserver: Sql | undefined
+  let auditObserverIdentityVerified = false
   let workspaceRoot: string
   let previousExecutionFlag: string | undefined
   let previousWorkspaceRoot: string | undefined
@@ -223,6 +200,31 @@ test.describe('MCP handoff optimistic concurrency', () => {
   const usersToDelete: string[] = []
   const projectsToDelete: string[] = []
   const sessionsToDelete: string[] = []
+
+  async function contextPacketAuditCount(workPackageId: string): Promise<number> {
+    const auditObserverDatabaseUrl = process.env.FORGE_E2E_AUDIT_OBSERVER_DATABASE_URL?.trim()
+    if (!auditObserverDatabaseUrl) {
+      throw new Error('FORGE_E2E_AUDIT_OBSERVER_DATABASE_URL is required to inspect protected runtime audit evidence.')
+    }
+    auditObserver ??= postgres(auditObserverDatabaseUrl, { max: 1 })
+    if (!auditObserverIdentityVerified) {
+      const [identity] = await auditObserver<{ currentUser: string; sessionUser: string }[]>`
+        select current_user as "currentUser", session_user as "sessionUser"
+      `
+      expect(identity).toEqual({
+        currentUser: 'forge_e2e_audit_observer',
+        sessionUser: 'forge_e2e_audit_observer',
+      })
+      auditObserverIdentityVerified = true
+    }
+    const [{ count }] = await auditObserver<{ count: number }[]>`
+      select count(*)::int as count
+      from public.filesystem_mcp_runtime_audits
+      where work_package_id = ${workPackageId}
+        and operation = 'context_packet'
+    `
+    return count
+  }
 
   test.beforeEach(async ({}, testInfo) => {
     applyEpic172Step0E2EBridge(testInfo, 'mcp-handoff-concurrency.spec.ts')
@@ -265,7 +267,9 @@ test.describe('MCP handoff optimistic concurrency', () => {
 
   test.afterEach(async () => {
     if (!sql || !writer) return
-    await Promise.all(sessionsToDelete.splice(0).map((sessionId) => redis.del(`session:${sessionId}`)))
+    await Promise.all(sessionsToDelete.splice(0).map((sessionId) => (
+      redis.del(`session:v2:${computeCredentialDigest(sessionId).digest.toString('hex')}`)
+    )))
     // Grant decisions and runtime audits are retained evidence. The fixtures
     // use random identities, so archive their projects instead of requiring the
     // ordinary application role to truncate protected history.
@@ -285,7 +289,13 @@ test.describe('MCP handoff optimistic concurrency', () => {
         on conflict (key) do update set value = excluded.value, updated_at = now()
       `
     }
-    await Promise.all([sql.end(), writer.end()])
+    const clientsToClose = [sql.end(), writer.end()]
+    if (auditObserver) {
+      clientsToClose.push(auditObserver.end())
+      auditObserver = undefined
+      auditObserverIdentityVerified = false
+    }
+    await Promise.all(clientsToClose)
     await rm(workspaceRoot, { recursive: true, force: true })
     if (previousExecutionFlag === undefined) delete process.env.FORGE_WORK_PACKAGE_EXECUTION
     else process.env.FORGE_WORK_PACKAGE_EXECUTION = previousExecutionFlag
@@ -385,12 +395,7 @@ test.describe('MCP handoff optimistic concurrency', () => {
     })
     const [{ count }] = await sql`select count(*)::int as count from agent_runs where work_package_id = ${seeded.packageId}`
     expect(count).toBe(0)
-    const [{ count: contextPacketAudits }] = await sql`
-      select count(*)::int as count
-      from filesystem_mcp_runtime_audits
-      where work_package_id = ${seeded.packageId}
-        and operation = 'context_packet'
-    `
+    const contextPacketAudits = await contextPacketAuditCount(seeded.packageId)
     expect(contextPacketAudits).toBe(0)
   })
 
@@ -447,12 +452,7 @@ test.describe('MCP handoff optimistic concurrency', () => {
       select count(*)::int as count from agent_runs where work_package_id = ${seeded.packageId}
     `
     expect(runs).toBe(0)
-    const [{ count: contextPacketAudits }] = await sql`
-      select count(*)::int as count
-      from filesystem_mcp_runtime_audits
-      where work_package_id = ${seeded.packageId}
-        and operation = 'context_packet'
-    `
+    const contextPacketAudits = await contextPacketAuditCount(seeded.packageId)
     expect(contextPacketAudits).toBe(0)
   })
 
@@ -750,7 +750,7 @@ test.describe('MCP handoff optimistic concurrency', () => {
     expect(conflictRuns).toBe(0)
   })
 
-  test('post-claim context failure removes only the owned lease from current metadata', async () => {
+  test('an execution request remains a handoff when a path-mutating hook cannot activate execution', async () => {
     process.env.FORGE_WORK_PACKAGE_EXECUTION = '1'
     const seeded = await seedPackage(sql, {
       metadata: { ownerNote: 'before-claim' },
@@ -759,44 +759,44 @@ test.describe('MCP handoff optimistic concurrency', () => {
     })
     usersToDelete.push(seeded.userId)
     projectsToDelete.push(seeded.projectId)
-    const effective = explicitFilesystemGrant()
 
-    await expect(handoffApprovedWorkPackages(seeded.taskId, {
+    let pathMutatingHookCalled = false
+    const result = await handoffApprovedWorkPackages(seeded.taskId, {
       afterWorkPackageClaimed: async ({ attempt, packageId }) => {
+        pathMutatingHookCalled = true
         expect(attempt).toBe(1)
         expect(packageId).toBe(seeded.packageId)
-        // This is a separate connection committing after the claim transaction.
-        // Nulling localPath makes the subsequent real context load fail before
-        // executor/context-packet issuance, exercising lease-owned cleanup.
         await writer`
           update work_packages
           set metadata = jsonb_set(
-            jsonb_set(metadata, '{mcpGrantPhases}', ${writer.json({ effective })}, true),
+            jsonb_set(metadata, '{mcpGrantPhases}', ${writer.json({ ignored: true })}, true),
             '{postClaimWriter}', ${writer.json('survives-failure')}, true
           ), updated_at = now()
           where id = ${seeded.packageId}
         `
         await writer`update projects set local_path = null, updated_at = now() where id = ${seeded.projectId}`
       },
-    })).rejects.toThrow('Project localPath is required')
+    })
 
+    expect(result).toMatchObject({ status: 'handed_off', claimedPackageId: seeded.packageId })
+    expect(pathMutatingHookCalled).toBe(false)
     const [pkg] = await sql`select status, metadata from work_packages where id = ${seeded.packageId}`
-    expect(pkg.status).toBe('failed')
+    expect(pkg.status).toBe('awaiting_review')
     expect(pkg.metadata.ownerNote).toBe('before-claim')
-    expect(pkg.metadata.postClaimWriter).toBe('survives-failure')
-    expect(pkg.metadata.mcpGrantPhases.effective.grantApprovalId).toBe(effective.grantApprovalId)
-    expect(pkg.metadata.executionLease).toBeUndefined()
+    expect(pkg.metadata.postClaimWriter).toBeUndefined()
+    expect(pkg.metadata.mcpGrantPhases).toBeUndefined()
     const [run] = await sql`
-      select id, status, error_message
+      select id, status, error_message, agent_type, stage
       from agent_runs
       where work_package_id = ${seeded.packageId}
     `
-    expect(run.status).toBe('failed')
-    expect(run.error_message).toContain('Project localPath is required')
+    expect(run).toMatchObject({ agent_type: 'handoff', stage: 'handoff', status: 'completed' })
+    expect(run.error_message).toBeNull()
     const [{ count: contextArtifacts }] = await sql`
       select count(*)::int as count
       from artifacts
       where agent_run_id = ${run.id}
+        and metadata->>'source' = 'execution-context-packet'
     `
     expect(contextArtifacts).toBe(0)
   })
