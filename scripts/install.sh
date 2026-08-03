@@ -1138,14 +1138,30 @@ grant_forge_privileges() {
   [ "${MANAGE_LOCAL_DB:-0}" = "1" ] || return 0
 
   if [ "$DRY_RUN" = "1" ]; then
-    info "[dry-run] Grant forge role privileges on all forge database tables"
+    info "[dry-run] Grant forge role app privileges while excluding protected release tables"
     return 0
   fi
 
-  if run_quiet "Grant forge role database privileges" psql_admin -d forge -c "GRANT USAGE, CREATE ON SCHEMA public TO forge; GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO forge; GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO forge; ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO forge; ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO forge;"; then
-    info "Ensured the forge role can read and write all forge tables."
+  if run_quiet "Grant forge role database privileges" psql_admin -d forge --set ON_ERROR_STOP=1 -c "BEGIN;
+GRANT USAGE, CREATE ON SCHEMA public TO forge;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO forge;
+GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO forge;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO forge;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO forge;
+REVOKE ALL ON TABLE
+  public.forge_epic_172_enablement_state,
+  public.forge_epic_172_enablement_transition_audits,
+  public.forge_epic_172_release_evidence,
+  public.forge_epic_172_release_evidence_consumptions,
+  public.forge_epic_172_transition_authorizations,
+  public.forge_release_signer_key_lifecycle_audits,
+  public.forge_release_signer_keys,
+  public.forge_epic_172_s3_release_state
+FROM forge;
+COMMIT;"; then
+    info "Ensured the forge role can read and write ordinary forge tables without access to protected release tables."
   else
-    warn "Could not re-grant table privileges to the forge role (non-fatal). If task-detail logs report a 'not readable' audit table, run as a DB admin: psql -d forge -c 'GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO forge;'"
+    warn "Could not transactionally refresh forge app privileges (non-fatal). Re-run 'forge repair' after checking PostgreSQL administrator access."
   fi
   return 0
 }

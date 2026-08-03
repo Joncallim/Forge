@@ -89,6 +89,14 @@ const protectedReleaseTables = [
   'forge_epic_172_transition_authorizations', 'forge_release_signer_key_lifecycle_audits',
   'forge_release_signer_keys',
 ] as const
+const protectedInstallerGrantTables = [
+  ...protectedReleaseTables,
+  'forge_epic_172_s3_release_state',
+] as const
+const protectedInstallerGrantTableSql = protectedInstallerGrantTables
+  .map((table) => `public.${table}`)
+  .join(', ')
+const forgeContaminationPrivileges = ['DELETE', 'INSERT', 'SELECT', 'UPDATE'] as const
 const releaseRoutineNames = [
   'activate_epic_172_release_signer_v1', 'assert_epic_172_transition_authorization_live_v1',
   'constant_time_equal_32_v1', 'consume_epic_172_release_evidence_v1',
@@ -148,7 +156,19 @@ const releaseTriggerRoutineFingerprintsNoPublic = [
   releaseTriggerRoutineFingerprintsPublic[0],
   'public.forge_epic_172_reject_mutation_v1()|6c37302b654f96cecd43f1716ffbdd51|forge_release_routines_owner|false|search_path=pg_catalog, public|forge_release_routines_owner:EXECUTE:false:forge_release_routines_owner',
 ] as const
-const s3ReleaseStateAcl = 'PUBLIC:SELECT:false:forge_release_routines_owner,forge_release_evidence_writer:INSERT:false:forge_release_routines_owner,forge_release_evidence_writer:SELECT:false:forge_release_routines_owner,forge_release_evidence_writer:UPDATE:false:forge_release_routines_owner,forge_release_routines_owner:DELETE:false:forge_release_routines_owner,forge_release_routines_owner:INSERT:false:forge_release_routines_owner,forge_release_routines_owner:REFERENCES:false:forge_release_routines_owner,forge_release_routines_owner:SELECT:false:forge_release_routines_owner,forge_release_routines_owner:TRIGGER:false:forge_release_routines_owner,forge_release_routines_owner:TRUNCATE:false:forge_release_routines_owner,forge_release_routines_owner:UPDATE:false:forge_release_routines_owner'
+const s3ReleaseStateAclEntries = [
+  'PUBLIC:SELECT:false:forge_release_routines_owner',
+  'forge_release_evidence_writer:INSERT:false:forge_release_routines_owner',
+  'forge_release_evidence_writer:SELECT:false:forge_release_routines_owner',
+  'forge_release_evidence_writer:UPDATE:false:forge_release_routines_owner',
+  'forge_release_routines_owner:DELETE:false:forge_release_routines_owner',
+  'forge_release_routines_owner:INSERT:false:forge_release_routines_owner',
+  'forge_release_routines_owner:REFERENCES:false:forge_release_routines_owner',
+  'forge_release_routines_owner:SELECT:false:forge_release_routines_owner',
+  'forge_release_routines_owner:TRIGGER:false:forge_release_routines_owner',
+  'forge_release_routines_owner:TRUNCATE:false:forge_release_routines_owner',
+  'forge_release_routines_owner:UPDATE:false:forge_release_routines_owner',
+] as const
 const s3ReleaseStateConstraints = [
   'forge_epic_172_s3_release_state_authorization_id_forge_epic_172|f|false|false|true|9cfbaed876d6e720d9e863f7f05c5fc4',
   'forge_epic_172_s3_release_state_evidence_receipt_id_forge_epic_|f|false|false|true|e66d0dc8f69da2fb17c60af5a5891e03',
@@ -177,6 +197,16 @@ function triggerRoutineStateFor0026(s4BoundaryState: S4BoundaryState): ReleaseTr
   return s4BoundaryState === 'failed-bootstrap-local'
     ? 'failed-bootstrap-no-public'
     : 'pre-s4-public'
+}
+
+function expectedS3ReleaseStateAcl(expectForgeContamination: boolean): string {
+  const expected: string[] = [...s3ReleaseStateAclEntries]
+  if (expectForgeContamination) {
+    for (const privilege of forgeContaminationPrivileges) {
+      expected.push(`forge:${privilege}:false:forge_release_routines_owner`)
+    }
+  }
+  return expected.sort().join(',')
 }
 
 function expectedRoutineAcl(
@@ -568,7 +598,10 @@ async function exactReleaseCatalog(
     )
 }
 
-async function exactS3CompletionBoundary(sql: postgres.Sql | postgres.TransactionSql): Promise<boolean> {
+async function exactS3CompletionBoundary(
+  sql: postgres.Sql | postgres.TransactionSql,
+  expectForgeContamination = false,
+): Promise<boolean> {
   const [table] = await sql<readonly { owner: string; kind: string; acl: string | null }[]>`
     SELECT owner_role.rolname AS owner, relation.relkind AS kind,
       (SELECT pg_catalog.string_agg(
@@ -586,7 +619,8 @@ async function exactS3CompletionBoundary(sql: postgres.Sql | postgres.Transactio
     JOIN pg_catalog.pg_roles owner_role ON owner_role.oid = relation.relowner
     WHERE relation.oid = pg_catalog.to_regclass('public.forge_epic_172_s3_release_state')
   `
-  if (table?.owner !== 'forge_release_routines_owner' || table.kind !== 'r' || table.acl !== s3ReleaseStateAcl) return false
+  if (table?.owner !== 'forge_release_routines_owner' || table.kind !== 'r'
+    || table.acl !== expectedS3ReleaseStateAcl(expectForgeContamination)) return false
 
   const constraints = await sql<readonly { fingerprint: string }[]>`
     SELECT constraint_row.conname || '|' || constraint_row.contype::text || '|'
@@ -751,7 +785,11 @@ async function exactCurrentMigrationLoginBoundary(
   return boundary.migrationLogin
 }
 
-async function exactProtectedTableAcls(sql: postgres.Sql | postgres.TransactionSql, repaired: boolean): Promise<boolean> {
+async function exactProtectedTableAcls(
+  sql: postgres.Sql | postgres.TransactionSql,
+  repaired: boolean,
+  expectForgeContamination = false,
+): Promise<boolean> {
   const grants = await sql<readonly { entry: string }[]>`
     SELECT relation.relname || '|' || COALESCE(grantee.rolname, 'PUBLIC') || '|'
       || privilege.privilege_type || '|' || privilege.is_grantable || '|' || grantor.rolname AS entry
@@ -785,6 +823,11 @@ async function exactProtectedTableAcls(sql: postgres.Sql | postgres.TransactionS
     if (writerSelect.has(table)) expected.push(`${table}|forge_release_evidence_writer|SELECT|false|forge_release_routines_owner`)
     if (transitionSelect.has(table)) expected.push(`${table}|forge_release_transition|SELECT|false|forge_release_routines_owner`)
     if (!repaired && consumerSelect.has(table)) expected.push(`${table}|forge_release_evidence_consumer|SELECT|false|forge_release_routines_owner`)
+    if (expectForgeContamination) {
+      for (const privilege of forgeContaminationPrivileges) {
+        expected.push(`${table}|forge|${privilege}|false|forge_release_routines_owner`)
+      }
+    }
   }
   const actual = grants.map((row) => row.entry).sort()
   expected.sort()
@@ -1003,20 +1046,29 @@ async function current0026Fingerprint(sql: postgres.Sql | postgres.TransactionSq
   if (!migrationLogin) return false
   const s4BoundaryState = await exactCurrentRoleBoundaryState(sql, migrationLogin)
   if (!s4BoundaryState) return false
+  // Current 0025 has shipped both exact trigger ACL variants: older installs
+  // retain PUBLIC execute while current migration SQL revokes it. This is a
+  // no-mutation compatibility check only; legacy and durable fingerprints
+  // keep their S4-coupled ACL requirements.
+  const exactCurrentCatalog = await exactReleaseCatalog(sql, true, 'pre-s4-public')
+    || await exactReleaseCatalog(sql, true, 'failed-bootstrap-no-public')
   return await exactEmptyReleaseState(sql)
-    && await exactReleaseCatalog(sql, true, triggerRoutineStateFor0026(s4BoundaryState))
+    && exactCurrentCatalog
     && await exactS3CompletionBoundary(sql)
     && await exactProtectedTableAcls(sql, true)
     && await exactRoutines(sql, repairedRoutineDigests, false, false, migrationLogin)
 }
 
-async function durableRepairedFingerprint(sql: postgres.Sql | postgres.TransactionSql): Promise<boolean> {
+async function durableRepairedFingerprint(
+  sql: postgres.Sql | postgres.TransactionSql,
+  expectForgeContamination = false,
+): Promise<boolean> {
   // Later migrations legitimately add S4/S5 objects and may populate release
   // state.  The stable repair receipt is therefore the complete protected S3
   // catalog, ACL and routine surface plus the inert legacy consumer principal.
   return await exactReleaseCatalog(sql, true, 'durable-s4-no-public')
-    && await exactS3CompletionBoundary(sql)
-    && await exactProtectedTableAcls(sql, true)
+    && await exactS3CompletionBoundary(sql, expectForgeContamination)
+    && await exactProtectedTableAcls(sql, true, expectForgeContamination)
     && await exactLegacyConsumerLocalAuthority(sql, true)
     && await exactRoutines(sql, repairedRoutineDigests, false, true, null)
     && await exactReleaseRoleBoundary(sql, true)
@@ -1076,10 +1128,34 @@ async function main(): Promise<void> {
       }
 
       if (position !== '0026') {
-        if (!await durableRepairedFingerprint(sql)) {
+        if (await durableRepairedFingerprint(sql)) return 'later-repaired' as const
+
+        // The old installer granted its ordinary app role access to every
+        // public table after migrations. Lock the exact protected set before
+        // classifying that one known ACL shape so no concurrent grant can be
+        // accepted or normalized between the fingerprint and the revoke.
+        await sql.unsafe(`LOCK TABLE ${protectedInstallerGrantTableSql} IN ACCESS EXCLUSIVE MODE`)
+        if (await durableRepairedFingerprint(sql)) return 'later-repaired' as const
+        if (!await durableRepairedFingerprint(sql, true)) {
           throw new Error('Refusing legacy release repair: a later legacy-hash ledger lacks the durable repaired catalog fingerprint.')
         }
-        return 'later-repaired' as const
+        await sql.unsafe(`REVOKE ALL ON TABLE ${protectedInstallerGrantTableSql} FROM forge`)
+        const ledgerAfterNormalization = await sql<readonly { hash: string; created_at: number }[]>`
+          SELECT hash, created_at
+          FROM drizzle.__drizzle_migrations
+          ORDER BY created_at
+        `
+        if (ledgerAfterNormalization.length !== lockedLedger.length
+          || ledgerAfterNormalization.some((row, index) => (
+            row.hash !== lockedLedger[index]?.hash
+            || Number(row.created_at) !== Number(lockedLedger[index]?.created_at)
+          ))) {
+          throw new Error('Legacy release protected-grant normalization unexpectedly altered the immutable migration ledger.')
+        }
+        if (!await durableRepairedFingerprint(sql)) {
+          throw new Error('Legacy release protected-grant normalization did not restore the exact durable catalog fingerprint.')
+        }
+        return 'later-normalized' as const
       }
 
       if (await repairedFingerprint(sql)) {
@@ -1114,6 +1190,8 @@ async function main(): Promise<void> {
       console.log('✓ Epic 172 legacy release catalog is already repaired at 0026; migration ledger was left unchanged.')
     } else if (outcome === 'later-repaired') {
       console.log('✓ Durable Epic 172 legacy release repair is present at the later migration position; migration ledger was left unchanged.')
+    } else if (outcome === 'later-normalized') {
+      console.log('✓ Removed the exact known installer app grants from protected release tables without altering the migration ledger.')
     } else {
       console.log('✓ Epic 172 legacy release repair is not needed.')
     }

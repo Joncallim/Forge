@@ -122,6 +122,9 @@ SQL
 apply_legacy_fixture() {
   admin_psql --file "$FIXTURE"
   strip_current_migration_grants
+  # The legacy catalog predates migration 0025's PUBLIC execute revocation.
+  # Restore that exact old ACL after reconstructing the disposable fixture.
+  admin_psql --command 'GRANT EXECUTE ON FUNCTION public.forge_epic_172_reject_mutation_v1() TO PUBLIC;'
 }
 
 prepare_legacy_fixture() {
@@ -193,6 +196,120 @@ run_repair() {
   )
 }
 
+ensure_forge_app_role() {
+  admin_server_psql <<'SQL'
+DO $role$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'forge') THEN
+    CREATE ROLE forge
+      LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_roles
+    WHERE rolname = 'forge' AND rolcanlogin AND NOT rolinherit AND NOT rolsuper
+      AND NOT rolcreatedb AND NOT rolcreaterole AND NOT rolreplication AND NOT rolbypassrls
+  ) THEN
+    RAISE EXCEPTION 'Literal forge role does not have the exact app-role attributes';
+  END IF;
+END;
+$role$;
+SQL
+}
+
+grant_exact_forge_contamination() {
+  admin_psql <<'SQL'
+SET ROLE forge_release_routines_owner;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE
+  public.forge_epic_172_enablement_state,
+  public.forge_epic_172_enablement_transition_audits,
+  public.forge_epic_172_release_evidence,
+  public.forge_epic_172_release_evidence_consumptions,
+  public.forge_epic_172_transition_authorizations,
+  public.forge_release_signer_key_lifecycle_audits,
+  public.forge_release_signer_keys,
+  public.forge_epic_172_s3_release_state
+TO forge;
+RESET ROLE;
+SQL
+}
+
+revoke_forge_contamination() {
+  admin_psql <<'SQL'
+SET ROLE forge_release_routines_owner;
+REVOKE ALL ON TABLE
+  public.forge_epic_172_enablement_state,
+  public.forge_epic_172_enablement_transition_audits,
+  public.forge_epic_172_release_evidence,
+  public.forge_epic_172_release_evidence_consumptions,
+  public.forge_epic_172_transition_authorizations,
+  public.forge_release_signer_key_lifecycle_audits,
+  public.forge_release_signer_keys,
+  public.forge_epic_172_s3_release_state
+FROM forge;
+RESET ROLE;
+SQL
+}
+
+assert_protected_forge_acl_count() {
+  local expected_count="$1"
+  local actual_count exact_live_count
+  actual_count="$(admin_psql --no-align --tuples-only --quiet --command "
+  SELECT count(*)
+  FROM pg_catalog.pg_class table_row
+  JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = table_row.relnamespace
+  CROSS JOIN LATERAL pg_catalog.aclexplode(
+    COALESCE(table_row.relacl, pg_catalog.acldefault('r', table_row.relowner))
+  ) privilege
+  JOIN pg_catalog.pg_roles grantee ON grantee.oid = privilege.grantee
+  WHERE namespace_row.nspname = 'public'
+    AND table_row.relname IN (
+      'forge_epic_172_enablement_state',
+      'forge_epic_172_enablement_transition_audits',
+      'forge_epic_172_release_evidence',
+      'forge_epic_172_release_evidence_consumptions',
+      'forge_epic_172_transition_authorizations',
+      'forge_release_signer_key_lifecycle_audits',
+      'forge_release_signer_keys',
+      'forge_epic_172_s3_release_state'
+    )
+    AND grantee.rolname = 'forge';")"
+  [ "$actual_count" = "$expected_count" ] || {
+    echo "Expected $expected_count protected forge ACL rows, found $actual_count." >&2
+    exit 1
+  }
+  if [ "$expected_count" = 32 ]; then
+    exact_live_count="$(admin_psql --no-align --tuples-only --quiet --command "
+    SELECT count(*)
+    FROM pg_catalog.pg_class table_row
+    JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = table_row.relnamespace
+    CROSS JOIN LATERAL pg_catalog.aclexplode(
+      COALESCE(table_row.relacl, pg_catalog.acldefault('r', table_row.relowner))
+    ) privilege
+    JOIN pg_catalog.pg_roles grantee ON grantee.oid = privilege.grantee
+    JOIN pg_catalog.pg_roles grantor ON grantor.oid = privilege.grantor
+    WHERE namespace_row.nspname = 'public'
+      AND table_row.relname IN (
+        'forge_epic_172_enablement_state',
+        'forge_epic_172_enablement_transition_audits',
+        'forge_epic_172_release_evidence',
+        'forge_epic_172_release_evidence_consumptions',
+        'forge_epic_172_transition_authorizations',
+        'forge_release_signer_key_lifecycle_audits',
+        'forge_release_signer_keys',
+        'forge_epic_172_s3_release_state'
+      )
+      AND grantee.rolname = 'forge'
+      AND privilege.privilege_type IN ('DELETE', 'INSERT', 'SELECT', 'UPDATE')
+      AND NOT privilege.is_grantable
+      AND grantor.rolname = 'forge_release_routines_owner';")"
+    [ "$exact_live_count" = 32 ] || {
+      echo "Exact installer contamination expected 32 owner-granted ACL rows, found $exact_live_count." >&2
+      exit 1
+    }
+  fi
+}
+
 expect_refusal() {
   local case_name="$1"
   if run_repair; then
@@ -210,11 +327,20 @@ snapshot current-managed-0026-after
 assert_unchanged current-managed-0026-before current-managed-0026-after 'Current managed 0026 no-op'
 
 prepare_0026_baseline
-admin_psql --command 'REVOKE EXECUTE ON FUNCTION public.forge_epic_172_reject_mutation_v1() FROM PUBLIC;'
-snapshot current-no-public-without-s4-before
-expect_refusal 'Current 0026 no-PUBLIC ACL without local S4 state'
-snapshot current-no-public-without-s4-after
-assert_unchanged current-no-public-without-s4-before current-no-public-without-s4-after 'Current 0026 no-PUBLIC ACL without local S4 state'
+admin_psql --command 'GRANT EXECUTE ON FUNCTION public.forge_epic_172_reject_mutation_v1() TO PUBLIC;'
+snapshot current-public-without-s4-before
+run_repair
+snapshot current-public-without-s4-after
+assert_unchanged current-public-without-s4-before current-public-without-s4-after 'Current 0026 PUBLIC ACL no-op'
+
+prepare_0026_baseline
+admin_psql --set migration_role="$FORGE_LEGACY_REPAIR_MIGRATION_USER" <<'SQL'
+GRANT EXECUTE ON FUNCTION public.forge_epic_172_reject_mutation_v1() TO :"migration_role";
+SQL
+snapshot current-third-trigger-acl-before
+expect_refusal 'Current 0026 third trigger-routine ACL shape'
+snapshot current-third-trigger-acl-after
+assert_unchanged current-third-trigger-acl-before current-third-trigger-acl-after 'Current 0026 third trigger-routine ACL shape'
 
 prepare_cross_database_consumer
 prepare_0026_baseline
@@ -244,6 +370,7 @@ assert_unchanged current-extra-schema-grant-before current-extra-schema-grant-af
 
 prepare_0026_baseline
 strip_current_migration_grants
+admin_psql --command 'GRANT EXECUTE ON FUNCTION public.forge_epic_172_reject_mutation_v1() TO PUBLIC;'
 snapshot current-0026-normalized
 
 prepare_legacy_fixture
@@ -561,6 +688,45 @@ BEGIN
 END;
 $proof$;
 SQL
+
+echo 'Proving exact installer-grant normalization and near-miss refusal at the 29-row ledger.'
+ensure_forge_app_role
+grant_exact_forge_contamination
+assert_protected_forge_acl_count 32
+snapshot exact-installer-contamination-before
+run_repair
+snapshot exact-installer-contamination-after
+cmp -s "$TEMP_ROOT/exact-installer-contamination-before.ledger" "$TEMP_ROOT/exact-installer-contamination-after.ledger" || {
+  echo 'Installer-grant normalization changed the immutable migration ledger.' >&2
+  exit 1
+}
+assert_protected_forge_acl_count 0
+run_repair
+snapshot exact-installer-contamination-rerun
+assert_unchanged exact-installer-contamination-after exact-installer-contamination-rerun 'Normalized installer-grant rerun'
+
+admin_psql <<'SQL'
+SET ROLE forge_release_routines_owner;
+GRANT SELECT ON TABLE public.forge_epic_172_enablement_state TO forge;
+RESET ROLE;
+SQL
+snapshot partial-installer-contamination-before
+expect_refusal 'Partial installer-grant contamination'
+snapshot partial-installer-contamination-after
+assert_unchanged partial-installer-contamination-before partial-installer-contamination-after 'Partial installer-grant contamination refusal'
+revoke_forge_contamination
+
+grant_exact_forge_contamination
+admin_psql <<'SQL'
+SET ROLE forge_release_routines_owner;
+GRANT TRUNCATE ON TABLE public.forge_epic_172_enablement_state TO forge;
+RESET ROLE;
+SQL
+snapshot extra-installer-contamination-before
+expect_refusal 'Extra installer-grant contamination'
+snapshot extra-installer-contamination-after
+assert_unchanged extra-installer-contamination-before extra-installer-contamination-after 'Extra installer-grant contamination refusal'
+revoke_forge_contamination
 
 # S4 principals are cluster-global. Keep this deliberately unsafe membership
 # case last so it cannot alter an earlier successful repair proof.

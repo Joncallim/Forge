@@ -14,11 +14,11 @@ fail() {
 }
 
 assert_contains() {
-  grep -Fq "$1" "$2" || fail "expected '$1' in $2"
+  grep -Fq -- "$1" "$2" || fail "expected '$1' in $2"
 }
 
 assert_not_contains() {
-  ! grep -Fq "$1" "$2" || fail "did not expect '$1' in $2"
+  ! grep -Fq -- "$1" "$2" || fail "did not expect '$1' in $2"
 }
 
 assert_stages() {
@@ -29,6 +29,29 @@ assert_stages() {
   actual="$(sed -n '2,$p' "$file")"
   [ "$actual" = "$expected" ] || fail "unexpected stages in $file: $actual"
 }
+
+grant_function="$TEST_ROOT/grant-forge-privileges"
+sed -n '/^grant_forge_privileges() {/,/^}/p' "$INSTALLER" > "$grant_function"
+assert_contains '--set ON_ERROR_STOP=1' "$grant_function"
+assert_contains 'ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO forge;' "$grant_function"
+assert_contains 'ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO forge;' "$grant_function"
+grant_function_sql="$(tr '\n' ' ' < "$grant_function")"
+case "$grant_function_sql" in
+  *'BEGIN;'*'GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO forge;'*'REVOKE ALL ON TABLE'*'FROM forge;'*'COMMIT;'*) ;;
+  *) fail 'forge app grants and protected-table revoke must share one ordered transaction' ;;
+esac
+for protected_table in \
+  forge_epic_172_enablement_state \
+  forge_epic_172_enablement_transition_audits \
+  forge_epic_172_release_evidence \
+  forge_epic_172_release_evidence_consumptions \
+  forge_epic_172_transition_authorizations \
+  forge_release_signer_key_lifecycle_audits \
+  forge_release_signer_keys \
+  forge_epic_172_s3_release_state
+do
+  assert_contains "public.$protected_table" "$grant_function"
+done
 
 run_managed_case() {
   local name="$1" admin_mode="$2" dry_run="${3:-0}" fail_stage="${4:-}"
