@@ -841,6 +841,103 @@ async function exactProtectedTableAcls(
   return ownership?.objects === 0
 }
 
+async function exactProtectedInstallerColumnAcls(
+  sql: postgres.Sql | postgres.TransactionSql,
+): Promise<boolean> {
+  const columnGrants = await sql<readonly { entry: string }[]>`
+    SELECT relation.relname || '|' || attribute.attname || '|'
+      || COALESCE(grantee.rolname, 'PUBLIC') || '|' || privilege.privilege_type || '|'
+      || privilege.is_grantable || '|' || grantor.rolname AS entry
+    FROM pg_catalog.pg_class relation
+    JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = relation.relnamespace
+    JOIN pg_catalog.pg_attribute attribute ON attribute.attrelid = relation.oid
+      AND attribute.attnum > 0 AND NOT attribute.attisdropped
+    CROSS JOIN LATERAL pg_catalog.aclexplode(attribute.attacl) privilege
+    LEFT JOIN pg_catalog.pg_roles grantee ON grantee.oid = privilege.grantee
+    JOIN pg_catalog.pg_roles grantor ON grantor.oid = privilege.grantor
+    WHERE namespace_row.nspname = 'public'
+      AND relation.relname = ANY(${sql.array([...protectedInstallerGrantTables])}::text[])
+    ORDER BY 1
+  `
+  return columnGrants.length === 0
+}
+
+async function exactOptionalForgeAppRoleBoundary(
+  sql: postgres.Sql | postgres.TransactionSql,
+): Promise<boolean> {
+  const [boundary] = await sql<readonly {
+    roles: number
+    exactRoles: number
+    membershipEdges: number
+  }[]>`
+    SELECT
+      (SELECT pg_catalog.count(*)::integer FROM pg_catalog.pg_roles
+       WHERE rolname = 'forge') AS roles,
+      (SELECT pg_catalog.count(*)::integer FROM pg_catalog.pg_roles
+       WHERE rolname = 'forge' AND rolcanlogin AND NOT rolinherit AND NOT rolsuper
+         AND NOT rolcreatedb AND NOT rolcreaterole AND NOT rolreplication AND NOT rolbypassrls) AS "exactRoles",
+      (SELECT pg_catalog.count(*)::integer
+       FROM pg_catalog.pg_auth_members membership
+       WHERE membership.roleid = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = 'forge')
+          OR membership.member = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = 'forge')) AS "membershipEdges"
+  `
+  return boundary?.roles === 0
+    || (boundary?.roles === 1 && boundary.exactRoles === 1 && boundary.membershipEdges === 0)
+}
+
+async function lockProtectedInstallerAclCatalog(
+  sql: postgres.TransactionSql,
+): Promise<void> {
+  const lockedRelations = await sql<readonly { oid: number; name: string }[]>`
+    SELECT relation.oid::integer AS oid, relation.relname AS name
+    FROM pg_catalog.pg_class relation
+    JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = relation.relnamespace
+    WHERE namespace_row.nspname = 'public'
+      AND relation.relkind IN ('r', 'p')
+      AND relation.relname = ANY(${sql.array([...protectedInstallerGrantTables])}::text[])
+    ORDER BY relation.oid
+    FOR UPDATE OF relation
+  `
+  const expectedNames = [...protectedInstallerGrantTables].sort()
+  const lockedNames = lockedRelations.map((relation) => relation.name).sort()
+  if (lockedRelations.length !== expectedNames.length
+    || lockedNames.some((name, index) => name !== expectedNames[index])) {
+    throw new Error('Refusing legacy release repair: protected relation catalog lock set is incomplete.')
+  }
+
+  const lockedColumns = await sql<readonly { relationOid: number; relationName: string; attnum: number }[]>`
+    SELECT attribute.attrelid::integer AS "relationOid", relation.relname AS "relationName",
+      attribute.attnum::integer AS attnum
+    FROM pg_catalog.pg_attribute attribute
+    JOIN pg_catalog.pg_class relation ON relation.oid = attribute.attrelid
+    JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = relation.relnamespace
+    WHERE namespace_row.nspname = 'public'
+      AND relation.relkind IN ('r', 'p')
+      AND relation.relname = ANY(${sql.array([...protectedInstallerGrantTables])}::text[])
+      AND attribute.attnum > 0
+      AND NOT attribute.attisdropped
+    ORDER BY attribute.attrelid, attribute.attnum
+    FOR UPDATE OF attribute
+  `
+  const [columnBoundary] = await sql<readonly { columns: number; relations: number }[]>`
+    SELECT pg_catalog.count(*)::integer AS columns,
+      pg_catalog.count(DISTINCT attribute.attrelid)::integer AS relations
+    FROM pg_catalog.pg_attribute attribute
+    JOIN pg_catalog.pg_class relation ON relation.oid = attribute.attrelid
+    JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = relation.relnamespace
+    WHERE namespace_row.nspname = 'public'
+      AND relation.relkind IN ('r', 'p')
+      AND relation.relname = ANY(${sql.array([...protectedInstallerGrantTables])}::text[])
+      AND attribute.attnum > 0
+      AND NOT attribute.attisdropped
+  `
+  if (lockedColumns.length === 0 || lockedColumns.length !== columnBoundary?.columns
+    || columnBoundary.relations !== expectedNames.length
+    || lockedColumns.some((column) => !expectedNames.includes(column.relationName as typeof expectedNames[number]))) {
+    throw new Error('Refusing legacy release repair: protected column catalog lock set is incomplete.')
+  }
+}
+
 async function exactLegacyConsumerLocalAuthority(
   sql: postgres.Sql | postgres.TransactionSql,
   repaired: boolean,
@@ -1003,6 +1100,7 @@ async function legacyFingerprint(sql: postgres.Sql | postgres.TransactionSql): P
     || !await exactReleaseCatalog(sql, false, triggerRoutineStateFor0026(s4BoundaryState))
     || !await exactS3CompletionBoundary(sql)
     || !await exactMigrationLoginBoundary(sql) || !await exactProtectedTableAcls(sql, false)
+    || !await exactProtectedInstallerColumnAcls(sql)
     || !await exactLegacyConsumerLocalAuthority(sql, false)
     || !await exactRoutines(sql, legacyRoutineDigests, false, false, null)) return false
   // A prior S4 bootstrap can leave an exact inert local role boundary.  That
@@ -1036,6 +1134,7 @@ async function repairedFingerprint(sql: postgres.Sql | postgres.TransactionSql):
     || !await exactReleaseCatalog(sql, true, triggerRoutineStateFor0026(s4BoundaryState))
     || !await exactS3CompletionBoundary(sql)
     || !await exactMigrationLoginBoundary(sql) || !await exactProtectedTableAcls(sql, true)
+    || !await exactProtectedInstallerColumnAcls(sql)
     || !await exactLegacyConsumerLocalAuthority(sql, true)
     || !await exactRoutines(sql, repairedRoutineDigests, false, false, null)) return false
   return true
@@ -1056,6 +1155,7 @@ async function current0026Fingerprint(sql: postgres.Sql | postgres.TransactionSq
     && exactCurrentCatalog
     && await exactS3CompletionBoundary(sql)
     && await exactProtectedTableAcls(sql, true)
+    && await exactProtectedInstallerColumnAcls(sql)
     && await exactRoutines(sql, repairedRoutineDigests, false, false, migrationLogin)
 }
 
@@ -1069,6 +1169,7 @@ async function durableRepairedFingerprint(
   return await exactReleaseCatalog(sql, true, 'durable-s4-no-public')
     && await exactS3CompletionBoundary(sql, expectForgeContamination)
     && await exactProtectedTableAcls(sql, true, expectForgeContamination)
+    && await exactProtectedInstallerColumnAcls(sql)
     && await exactLegacyConsumerLocalAuthority(sql, true)
     && await exactRoutines(sql, repairedRoutineDigests, false, true, null)
     && await exactReleaseRoleBoundary(sql, true)
@@ -1119,6 +1220,9 @@ async function main(): Promise<void> {
       if (!exactLedger || !position) {
         throw new Error('Refusing legacy release repair: locked migration ledger is not an exact supported 0026, 0027, or 0028 position.')
       }
+      if (!await exactOptionalForgeAppRoleBoundary(sql)) {
+        throw new Error('Refusing legacy release repair: literal forge role is outside the exact safe app-role boundary.')
+      }
 
       if (pair === 'current') {
         if (position === '0026' && !await current0026Fingerprint(sql)) {
@@ -1128,14 +1232,16 @@ async function main(): Promise<void> {
       }
 
       if (position !== '0026') {
+        await lockProtectedInstallerAclCatalog(sql)
         if (await durableRepairedFingerprint(sql)) return 'later-repaired' as const
+        if (position !== '0028') {
+          throw new Error('Refusing legacy release repair: protected installer grants are normalizable only at the exact 0028 ledger position.')
+        }
 
         // The old installer granted its ordinary app role access to every
-        // public table after migrations. Lock the exact protected set before
-        // classifying that one known ACL shape so no concurrent grant can be
-        // accepted or normalized between the fingerprint and the revoke.
-        await sql.unsafe(`LOCK TABLE ${protectedInstallerGrantTableSql} IN ACCESS EXCLUSIVE MODE`)
-        if (await durableRepairedFingerprint(sql)) return 'later-repaired' as const
+        // public table after migrations. The exact protected relation and
+        // column catalog tuples are already locked, so concurrent table- or
+        // column-level GRANT/REVOKE changes serialize before classification.
         if (!await durableRepairedFingerprint(sql, true)) {
           throw new Error('Refusing legacy release repair: a later legacy-hash ledger lacks the durable repaired catalog fingerprint.')
         }

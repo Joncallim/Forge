@@ -1099,18 +1099,23 @@ provision_database() {
     return 0
   fi
 
-  local db_password_escaped role_exists db_exists
+  local db_password_escaped role_exists role_membership_edges role_boundary_ok db_exists
   db_password_escaped="$(sql_escape_literal "$DB_PASSWORD")"
 
   role_exists="$(psql_admin -tAc "SELECT 1 FROM pg_roles WHERE rolname='forge'" | tr -d '[:space:]' || true)"
   if [ "$role_exists" = "1" ]; then
-    run_quiet_redacted_stdin "Sync forge role password" "ALTER ROLE forge PASSWORD '$db_password_escaped';" psql_admin
-    info "Role forge exists; password synced."
+    role_membership_edges="$(psql_admin -tAc "SELECT count(*) FROM pg_catalog.pg_auth_members WHERE roleid = 'forge'::pg_catalog.regrole OR member = 'forge'::pg_catalog.regrole" | tr -d '[:space:]' || true)"
+    [ "$role_membership_edges" = "0" ] || die "Role forge has membership edges. Remove every grant to or from forge before retrying the installer."
+    run_quiet_redacted_stdin "Harden forge role and sync password" "ALTER ROLE forge LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD '$db_password_escaped';" psql_admin
+    info "Role forge exists; safe attributes and password synced."
   else
-    run_quiet_redacted_stdin "Create forge role" "CREATE ROLE forge LOGIN PASSWORD '$db_password_escaped';" psql_admin
+    run_quiet_redacted_stdin "Create forge role" "CREATE ROLE forge LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD '$db_password_escaped';" psql_admin
     record_manifest "postgres_role" "forge"
     info "Created role forge."
   fi
+
+  role_boundary_ok="$(psql_admin -tAc "SELECT 1 FROM pg_catalog.pg_roles role_row WHERE role_row.rolname = 'forge' AND role_row.rolcanlogin AND NOT role_row.rolinherit AND NOT role_row.rolsuper AND NOT role_row.rolcreatedb AND NOT role_row.rolcreaterole AND NOT role_row.rolreplication AND NOT role_row.rolbypassrls AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_auth_members membership WHERE membership.roleid = role_row.oid OR membership.member = role_row.oid)" | tr -d '[:space:]' || true)"
+  [ "$role_boundary_ok" = "1" ] || die "Role forge did not reach the exact safe native app-role boundary."
 
   db_exists="$(psql_admin -tAc "SELECT 1 FROM pg_database WHERE datname='forge'" | tr -d '[:space:]' || true)"
   if [ "$db_exists" = "1" ]; then
@@ -1142,23 +1147,163 @@ grant_forge_privileges() {
     return 0
   fi
 
-  if run_quiet "Grant forge role database privileges" psql_admin -d forge --set ON_ERROR_STOP=1 -c "BEGIN;
+  # This step is deliberately best-effort. The installer enables inherited ERR
+  # traps globally, so isolate this command from that trap and handle its status
+  # with the surrounding conditional instead.
+  if (
+    trap - ERR
+    run_quiet "Grant forge role database privileges" psql_admin -d forge --set ON_ERROR_STOP=1 -c "BEGIN;
+DO \$boundary\$
+DECLARE
+  protected_count integer;
+BEGIN
+  IF (SELECT count(*) FROM pg_catalog.pg_roles
+      WHERE rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner')) <> 2 THEN
+    RAISE EXCEPTION 'protected owner roles are missing';
+  END IF;
+  SELECT count(*) INTO protected_count
+  FROM pg_catalog.pg_class relation
+  JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = relation.relnamespace
+  JOIN pg_catalog.pg_roles owner_role ON owner_role.oid = relation.relowner
+  WHERE namespace_row.nspname = 'public'
+    AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
+    AND owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner');
+  IF protected_count < 2 THEN
+    RAISE EXCEPTION 'protected ownership boundary is incomplete';
+  END IF;
+END;
+\$boundary\$;
+SELECT relation.oid, relation.relname
+FROM pg_catalog.pg_class relation
+JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = relation.relnamespace
+JOIN pg_catalog.pg_roles owner_role ON owner_role.oid = relation.relowner
+WHERE namespace_row.nspname = 'public'
+  AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
+  AND owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner')
+ORDER BY relation.oid
+FOR UPDATE OF relation;
+SELECT attribute.attrelid, attribute.attnum, attribute.attname
+FROM pg_catalog.pg_attribute attribute
+JOIN pg_catalog.pg_class relation ON relation.oid = attribute.attrelid
+JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = relation.relnamespace
+JOIN pg_catalog.pg_roles owner_role ON owner_role.oid = relation.relowner
+WHERE namespace_row.nspname = 'public'
+  AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
+  AND owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner')
+  AND attribute.attnum > 0
+  AND NOT attribute.attisdropped
+ORDER BY attribute.attrelid, attribute.attnum
+FOR UPDATE OF attribute;
 GRANT USAGE, CREATE ON SCHEMA public TO forge;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO forge;
 GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO forge;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO forge;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO forge;
-REVOKE ALL ON TABLE
-  public.forge_epic_172_enablement_state,
-  public.forge_epic_172_enablement_transition_audits,
-  public.forge_epic_172_release_evidence,
-  public.forge_epic_172_release_evidence_consumptions,
-  public.forge_epic_172_transition_authorizations,
-  public.forge_release_signer_key_lifecycle_audits,
-  public.forge_release_signer_keys,
-  public.forge_epic_172_s3_release_state
-FROM forge;
-COMMIT;"; then
+DO \$reconcile\$
+DECLARE
+  protected_relation record;
+  protected_columns text;
+BEGIN
+  FOR protected_relation IN
+    SELECT namespace_row.nspname AS schema_name, relation.relname AS relation_name, relation.oid
+    FROM pg_catalog.pg_class relation
+    JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = relation.relnamespace
+    JOIN pg_catalog.pg_roles owner_role ON owner_role.oid = relation.relowner
+    WHERE namespace_row.nspname = 'public'
+      AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
+      AND owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner')
+    ORDER BY relation.oid
+  LOOP
+    EXECUTE pg_catalog.format(
+      'REVOKE ALL PRIVILEGES ON TABLE %I.%I FROM forge',
+      protected_relation.schema_name,
+      protected_relation.relation_name
+    );
+    SELECT pg_catalog.string_agg(pg_catalog.format('%I', attribute.attname), ', ' ORDER BY attribute.attnum)
+    INTO protected_columns
+    FROM pg_catalog.pg_attribute attribute
+    WHERE attribute.attrelid = protected_relation.oid
+      AND attribute.attnum > 0
+      AND NOT attribute.attisdropped;
+    IF protected_columns IS NOT NULL THEN
+      EXECUTE pg_catalog.format(
+        'REVOKE ALL PRIVILEGES (%s) ON TABLE %I.%I FROM forge',
+        protected_columns,
+        protected_relation.schema_name,
+        protected_relation.relation_name
+      );
+    END IF;
+  END LOOP;
+END;
+\$reconcile\$;
+GRANT SELECT ON TABLE
+  public.work_package_local_projection_sources,
+  public.work_package_local_projection_heads
+TO forge;
+DO \$verify\$
+DECLARE
+  projection_name text;
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_class relation
+    JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = relation.relnamespace
+    JOIN pg_catalog.pg_roles owner_role ON owner_role.oid = relation.relowner
+    CROSS JOIN LATERAL pg_catalog.aclexplode(
+      COALESCE(relation.relacl, pg_catalog.acldefault('r', relation.relowner))
+    ) privilege
+    WHERE namespace_row.nspname = 'public'
+      AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
+      AND owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner')
+      AND privilege.grantee = 'forge'::pg_catalog.regrole
+      AND (
+        relation.relname NOT IN ('work_package_local_projection_sources', 'work_package_local_projection_heads')
+        OR privilege.privilege_type <> 'SELECT'
+        OR privilege.is_grantable
+        OR privilege.grantor <> relation.relowner
+      )
+  ) OR EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_attribute attribute
+    JOIN pg_catalog.pg_class relation ON relation.oid = attribute.attrelid
+    JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = relation.relnamespace
+    JOIN pg_catalog.pg_roles owner_role ON owner_role.oid = relation.relowner
+    CROSS JOIN LATERAL pg_catalog.aclexplode(attribute.attacl) privilege
+    WHERE namespace_row.nspname = 'public'
+      AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
+      AND owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner')
+      AND attribute.attnum > 0
+      AND NOT attribute.attisdropped
+      AND privilege.grantee = 'forge'::pg_catalog.regrole
+  ) THEN
+    RAISE EXCEPTION 'forge retained unexpected protected table or column authority';
+  END IF;
+  FOREACH projection_name IN ARRAY ARRAY[
+    'work_package_local_projection_sources',
+    'work_package_local_projection_heads'
+  ]
+  LOOP
+    IF (
+      SELECT count(*)
+      FROM pg_catalog.pg_class relation
+      JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = relation.relnamespace
+      CROSS JOIN LATERAL pg_catalog.aclexplode(
+        COALESCE(relation.relacl, pg_catalog.acldefault('r', relation.relowner))
+      ) privilege
+      WHERE namespace_row.nspname = 'public'
+        AND relation.relname = projection_name
+        AND privilege.grantee = 'forge'::pg_catalog.regrole
+        AND privilege.privilege_type = 'SELECT'
+        AND NOT privilege.is_grantable
+        AND privilege.grantor = relation.relowner
+    ) <> 1 THEN
+      RAISE EXCEPTION 'projection exception % does not have exact forge SELECT authority', projection_name;
+    END IF;
+  END LOOP;
+END;
+\$verify\$;
+COMMIT;"
+  ); then
     info "Ensured the forge role can read and write ordinary forge tables without access to protected release tables."
   else
     warn "Could not transactionally refresh forge app privileges (non-fatal). Re-run 'forge repair' after checking PostgreSQL administrator access."
