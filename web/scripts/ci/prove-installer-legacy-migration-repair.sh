@@ -389,6 +389,8 @@ run_repair_grant_privileges() {
     PGDATABASE="$FORGE_LEGACY_REPAIR_ADMIN_DATABASE" \
     FORGE_REPAIR_TEST_HOOK=reconcile-forge-privileges \
     FORGE_REPAIR_TEST_DATABASE_NAME="$FORGE_LEGACY_REPAIR_ADMIN_DATABASE" \
+    FORGE_REPAIR_TEST_PSQL_SOCKET="${FORGE_LEGACY_REPAIR_ADMIN_SOCKET:-/tmp}" \
+    FORGE_REPAIR_TEST_PSQL_PORT="${PGPORT:-5432}" \
     bash "$REPO_ROOT/scripts/repair.sh" > "$TEMP_ROOT/$label.log" 2>&1
 }
 
@@ -1437,8 +1439,29 @@ admin_psql <<'SQL'
 REVOKE ALL ON ALL TABLES IN SCHEMA public FROM forge;
 REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM forge;
 REVOKE USAGE, CREATE ON SCHEMA public FROM forge;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE SELECT, INSERT, UPDATE, DELETE ON TABLES FROM forge;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE USAGE, SELECT, UPDATE ON SEQUENCES FROM forge;
+DO $cleanup$
+DECLARE
+  default_owner record;
+BEGIN
+  FOR default_owner IN
+    SELECT DISTINCT owner_role.rolname
+    FROM pg_catalog.pg_default_acl default_acl
+    JOIN pg_catalog.pg_roles owner_role ON owner_role.oid = default_acl.defaclrole
+    CROSS JOIN LATERAL pg_catalog.aclexplode(default_acl.defaclacl) privilege
+    WHERE default_acl.defaclnamespace = 'public'::pg_catalog.regnamespace
+      AND privilege.grantee = 'forge'::pg_catalog.regrole
+  LOOP
+    EXECUTE pg_catalog.format(
+      'ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public REVOKE ALL ON TABLES FROM forge',
+      default_owner.rolname
+    );
+    EXECUTE pg_catalog.format(
+      'ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public REVOKE ALL ON SEQUENCES FROM forge',
+      default_owner.rolname
+    );
+  END LOOP;
+END;
+$cleanup$;
 CREATE FUNCTION public.forge_fail_privilege_reconciliation_proof()
 RETURNS event_trigger
 LANGUAGE plpgsql

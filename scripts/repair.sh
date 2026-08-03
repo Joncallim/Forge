@@ -17,6 +17,8 @@ DRY_RUN=0
 SKIP_INSTALL=0
 SKIP_DOCTOR=0
 SKIP_MIGRATE=0
+REPAIR_PSQL_ADMIN_RESOLUTION=unresolved
+REPAIR_PSQL_ADMIN=()
 
 usage() {
   cat <<'EOF'
@@ -226,6 +228,126 @@ load_database_url_from_local_fallbacks() {
   done
 }
 
+last_install_manifest_value() {
+  local key="$1" manifest="$WORKSPACE_ROOT/runtime/install/install-manifest"
+  local line value=''
+  [ -f "$manifest" ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      "$key"=*) value="${line#*=}" ;;
+    esac
+  done < "$manifest"
+  [ -n "$value" ] || return 1
+  printf '%s' "$value"
+}
+
+installed_service_mode_is_native() {
+  local service_mode
+  service_mode="$(last_install_manifest_value service_mode 2>/dev/null || true)"
+  [ "$service_mode" = native ]
+}
+
+probe_repair_psql_admin() {
+  local is_superuser
+  is_superuser="$("${REPAIR_PSQL_ADMIN[@]}" -d postgres -tAc \
+    "SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = CURRENT_USER AND rolsuper" \
+    2>/dev/null || true)"
+  [ "$is_superuser" = 1 ]
+}
+
+resolve_repair_psql_admin() {
+  local os_name socket_dir port psql_bin sudo_bin runuser_bin
+  if [ "$REPAIR_PSQL_ADMIN_RESOLUTION" = resolved ]; then
+    [ "${#REPAIR_PSQL_ADMIN[@]}" -gt 0 ]
+    return
+  fi
+  REPAIR_PSQL_ADMIN_RESOLUTION=resolved
+  REPAIR_PSQL_ADMIN=()
+
+  if [ "${FORGE_REPAIR_TEST_HOOK:-}" = reconcile-forge-privileges ]; then
+    socket_dir="${FORGE_REPAIR_TEST_PSQL_SOCKET:-}"
+    port="${FORGE_REPAIR_TEST_PSQL_PORT:-}"
+  else
+    os_name="$(uname -s 2>/dev/null || true)"
+    case "$os_name" in
+      Darwin) socket_dir=/tmp ;;
+      Linux) socket_dir=/var/run/postgresql ;;
+      *) return 1 ;;
+    esac
+    port=5432
+  fi
+  case "$socket_dir" in
+    /*) ;;
+    *) return 1 ;;
+  esac
+  case "$port" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || return 1
+  [ -d "$socket_dir" ] || return 1
+  psql_bin="$(command -v psql 2>/dev/null || true)"
+  case "$psql_bin" in
+    /*) [ -x "$psql_bin" ] || return 1 ;;
+    *) return 1 ;;
+  esac
+
+  REPAIR_PSQL_ADMIN=(
+    /usr/bin/env
+    -u PGHOST -u PGHOSTADDR -u PGPORT -u PGDATABASE -u PGUSER
+    -u PGPASSWORD -u PGPASSFILE -u PGSERVICE -u PGSERVICEFILE -u PGOPTIONS
+    -u PGSSLMODE -u PGREQUIRESSL -u PGSSLCOMPRESSION -u PGSSLCERT -u PGSSLKEY
+    -u PGSSLROOTCERT -u PGSSLCRL -u PGSSLCRLDIR -u PGSSLSNI -u PGREQUIREPEER
+    -u PGCHANNELBINDING -u PGTARGETSESSIONATTRS -u PGLOADBALANCEHOSTS
+    -u PGCONNECT_TIMEOUT -u PGAPPNAME -u PGCLIENTENCODING -u PGKRBSRVNAME
+    -u PGGSSLIB -u PGGSSENCMODE
+    "$psql_bin" -X -h "$socket_dir" -p "$port"
+  )
+  if probe_repair_psql_admin; then
+    return 0
+  fi
+
+  if id postgres >/dev/null 2>&1; then
+    sudo_bin="$(command -v sudo 2>/dev/null || true)"
+    if [ -n "$sudo_bin" ]; then
+      REPAIR_PSQL_ADMIN=(
+        /usr/bin/env
+        -u PGHOST -u PGHOSTADDR -u PGPORT -u PGDATABASE -u PGUSER
+        -u PGPASSWORD -u PGPASSFILE -u PGSERVICE -u PGSERVICEFILE -u PGOPTIONS
+        -u PGSSLMODE -u PGREQUIRESSL -u PGSSLCOMPRESSION -u PGSSLCERT -u PGSSLKEY
+        -u PGSSLROOTCERT -u PGSSLCRL -u PGSSLCRLDIR -u PGSSLSNI -u PGREQUIREPEER
+        -u PGCHANNELBINDING -u PGTARGETSESSIONATTRS -u PGLOADBALANCEHOSTS
+        -u PGCONNECT_TIMEOUT -u PGAPPNAME -u PGCLIENTENCODING -u PGKRBSRVNAME
+        -u PGGSSLIB -u PGGSSENCMODE
+        "$sudo_bin" -n -u postgres "$psql_bin" -X -h "$socket_dir" -p "$port"
+      )
+      if probe_repair_psql_admin; then
+        return 0
+      fi
+    fi
+
+    runuser_bin="$(command -v runuser 2>/dev/null || true)"
+    if [ -n "$runuser_bin" ]; then
+      REPAIR_PSQL_ADMIN=(
+        /usr/bin/env
+        -u PGHOST -u PGHOSTADDR -u PGPORT -u PGDATABASE -u PGUSER
+        -u PGPASSWORD -u PGPASSFILE -u PGSERVICE -u PGSERVICEFILE -u PGOPTIONS
+        -u PGSSLMODE -u PGREQUIRESSL -u PGSSLCOMPRESSION -u PGSSLCERT -u PGSSLKEY
+        -u PGSSLROOTCERT -u PGSSLCRL -u PGSSLCRLDIR -u PGSSLSNI -u PGREQUIREPEER
+        -u PGCHANNELBINDING -u PGTARGETSESSIONATTRS -u PGLOADBALANCEHOSTS
+        -u PGCONNECT_TIMEOUT -u PGAPPNAME -u PGCLIENTENCODING -u PGKRBSRVNAME
+        -u PGGSSLIB -u PGGSSENCMODE
+        "$runuser_bin" -u postgres -- "$psql_bin" -X -h "$socket_dir" -p "$port"
+      )
+      if probe_repair_psql_admin; then
+        return 0
+      fi
+    fi
+  fi
+
+  REPAIR_PSQL_ADMIN=()
+  return 1
+}
+
 reconcile_forge_privileges() {
   local database_name="${1:-}"
   case "$database_name" in
@@ -237,9 +359,11 @@ reconcile_forge_privileges() {
     return 0
   fi
 
-  command -v psql >/dev/null 2>&1 || return 0
-  psql -d postgres -tAc 'SELECT 1' >/dev/null 2>&1 || return 0
-  if psql -d postgres -d "$database_name" --set ON_ERROR_STOP=1 \
+  if ! resolve_repair_psql_admin; then
+    warn "Could not establish controlled native PostgreSQL administrator access; skipping app privilege reconciliation."
+    return 0
+  fi
+  if "${REPAIR_PSQL_ADMIN[@]}" -d "$database_name" --set ON_ERROR_STOP=1 \
     --file "$FORGE_PRIVILEGE_SQL" >/dev/null 2>&1; then
     info "Ensured the forge role can read ordinary forge tables without protected-table DML access."
   else
@@ -248,15 +372,57 @@ reconcile_forge_privileges() {
   return 0
 }
 
-should_reconcile_local_forge_privileges() {
-  case "${DATABASE_URL:-}" in
-    postgresql://forge:*@localhost:5432/forge|postgres://forge:*@localhost:5432/forge)
-      return 0
-      ;;
-    *)
-      return 1
-      ;;
+uri_safe_database_password() {
+  local password="${1:-}" index=0 length character hex_pair
+  length="${#password}"
+  [ "$length" -gt 0 ] || return 1
+
+  while [ "$index" -lt "$length" ]; do
+    character="${password:$index:1}"
+    case "$character" in
+      [A-Za-z0-9._~]|'!'|'$'|'&'|"'"|'('|')'|'*'|'+'|','|';'|'='|':'|'-')
+        index=$((index + 1))
+        ;;
+      '%')
+        [ $((index + 2)) -lt "$length" ] || return 1
+        hex_pair="${password:$((index + 1)):2}"
+        case "$hex_pair" in
+          [0-9A-Fa-f][0-9A-Fa-f]) ;;
+          *) return 1 ;;
+        esac
+        index=$((index + 3))
+        ;;
+      *)
+        return 1
+        ;;
+    esac
+  done
+}
+
+native_forge_database_password() {
+  local database_url="${1:-}" remainder password
+  local target='@localhost:5432/forge'
+
+  case "$database_url" in
+    postgresql://forge:*) remainder="${database_url#postgresql://forge:}" ;;
+    postgres://forge:*) remainder="${database_url#postgres://forge:}" ;;
+    *) return 1 ;;
   esac
+  case "$remainder" in
+    *"$target") password="${remainder%"$target"}" ;;
+    *) return 1 ;;
+  esac
+  uri_safe_database_password "$password" || return 1
+  printf '%s' "$password"
+}
+
+is_native_forge_database_url() {
+  native_forge_database_password "${1:-}" >/dev/null
+}
+
+should_reconcile_local_forge_privileges() {
+  is_native_forge_database_url "${DATABASE_URL:-}"
+  installed_service_mode_is_native
 }
 
 while [ "$#" -gt 0 ]; do
@@ -347,12 +513,16 @@ fi
 # direct DML access to protected owner tables. Best-effort: no administrator
 # connection leaves the database untouched.
 if [ "$SKIP_MIGRATE" != "1" ]; then
-  if should_reconcile_local_forge_privileges; then
+  if ! is_native_forge_database_url "${DATABASE_URL:-}"; then
+    if [ -n "${DATABASE_URL:-}" ]; then
+      info "Skipping local forge privilege reconciliation for a custom DATABASE_URL."
+    else
+      info "Skipping local forge privilege reconciliation because DATABASE_URL is not set."
+    fi
+  elif ! installed_service_mode_is_native; then
+    info "Skipping local forge privilege reconciliation because the install manifest does not end in service_mode=native."
+  elif should_reconcile_local_forge_privileges; then
     reconcile_forge_privileges forge
-  elif [ -n "${DATABASE_URL:-}" ]; then
-    info "Skipping local forge privilege reconciliation for a custom DATABASE_URL."
-  else
-    info "Skipping local forge privilege reconciliation because DATABASE_URL is not set."
   fi
 fi
 

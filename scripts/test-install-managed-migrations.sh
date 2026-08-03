@@ -43,7 +43,14 @@ assert_not_contains "Re-run 'forge repair'" "$grant_function"
 assert_contains '--file "$FORGE_PRIVILEGE_SQL"' "$REPAIR"
 assert_contains "Re-run 'forge repair'" "$REPAIR"
 assert_contains 'Would reconcile local forge app privileges in database' "$REPAIR"
-assert_contains 'postgresql://forge:*@localhost:5432/forge|postgres://forge:*@localhost:5432/forge' "$REPAIR"
+assert_contains 'native_forge_database_password()' "$INSTALLER"
+assert_contains 'native_forge_database_password()' "$REPAIR"
+assert_contains 'installed_service_mode_is_native()' "$REPAIR"
+assert_contains 'REPAIR_PSQL_ADMIN_RESOLUTION=unresolved' "$REPAIR"
+assert_contains '-u PGHOST -u PGHOSTADDR -u PGPORT -u PGDATABASE -u PGUSER' "$REPAIR"
+assert_contains 'WHERE rolname = CURRENT_USER AND rolsuper' "$REPAIR"
+assert_not_contains 'postgresql://forge:*@localhost:5432/forge|postgres://forge:*@localhost:5432/forge' "$INSTALLER"
+assert_not_contains 'postgresql://forge:*@localhost:5432/forge|postgres://forge:*@localhost:5432/forge' "$REPAIR"
 assert_contains 'FORGE_REPAIR_TEST_DATABASE_NAME is required for the privilege reconciliation test hook.' "$REPAIR"
 assert_contains 'GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO forge;' "$PRIVILEGE_SQL"
 assert_contains 'GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO forge;' "$PRIVILEGE_SQL"
@@ -174,8 +181,8 @@ assert_contains 'Installer failed near line' "$global_err_case/stderr"
 assert_not_contains 'unexpected continuation' "$global_err_case/stdout"
 
 run_repair_process_case() {
-  local name="$1" database_url="$2"
-  shift 2
+  local name="$1" database_url="$2" manifest_fixture="$3"
+  shift 3
   local case_dir="$TEST_ROOT/repair-process-$name"
   local repo_dir="$case_dir/repo"
   mkdir -p \
@@ -183,7 +190,7 @@ run_repair_process_case() {
     "$repo_dir/web/node_modules/next/dist/client" \
     "$case_dir/bin" \
     "$case_dir/home" \
-    "$case_dir/workspace"
+    "$case_dir/workspace/runtime/install"
   cp "$REPAIR" "$repo_dir/scripts/repair.sh"
   cp "$PRIVILEGE_SQL" "$repo_dir/scripts/reconcile-forge-app-privileges.sql"
   printf '{}\n' > "$repo_dir/web/package.json"
@@ -201,14 +208,45 @@ run_repair_process_case() {
   else
     printf 'DATABASE_URL=%s\n' "$database_url" > "$case_dir/forge.env"
   fi
+  case "$manifest_fixture" in
+    native)
+      printf 'service_mode=native\n' > "$case_dir/workspace/runtime/install/install-manifest"
+      ;;
+    docker)
+      printf 'service_mode=docker\n' > "$case_dir/workspace/runtime/install/install-manifest"
+      ;;
+    missing)
+      ;;
+    malformed)
+      printf 'service_mode\n' > "$case_dir/workspace/runtime/install/install-manifest"
+      ;;
+    native-then-docker)
+      printf 'service_mode=native\nservice_mode=docker\n' > "$case_dir/workspace/runtime/install/install-manifest"
+      ;;
+    docker-then-native)
+      printf 'service_mode=docker\nservice_mode=native\n' > "$case_dir/workspace/runtime/install/install-manifest"
+      ;;
+    *)
+      fail "unknown repair manifest fixture: $manifest_fixture"
+      ;;
+  esac
   printf 'untouched\n' > "$case_dir/sentinel"
   : > "$case_dir/psql-calls"
   : > "$case_dir/reconciler-calls"
   : > "$case_dir/npm-calls"
-  cat > "$case_dir/bin/psql" <<'EOF'
+cat > "$case_dir/bin/psql" <<'EOF'
 #!/usr/bin/env bash
+for variable in PGHOST PGHOSTADDR PGPORT PGDATABASE PGUSER PGPASSWORD PGPASSFILE PGSERVICE PGSERVICEFILE PGOPTIONS; do
+  if [ -n "${!variable+x}" ]; then
+    printf 'ambient-%s-leaked\n' "$variable" >> "$FORGE_REPAIR_TEST_PSQL_CALLS"
+    exit 97
+  fi
+done
 printf '%s\n' "$*" >> "$FORGE_REPAIR_TEST_PSQL_CALLS"
 printf 'touched\n' > "$FORGE_REPAIR_TEST_SENTINEL"
+[ "$1" = '-X' ] && [ "$2" = '-h' ] && [ "$3" = "$FORGE_REPAIR_TEST_EXPECTED_SOCKET" ] \
+  && [ "$4" = '-p' ] && [ "$5" = '5432' ] && [ "$6" = '-d' ] || exit 96
+database_name="$7"
 previous=''
 for argument in "$@"; do
   if [ "$previous" = '--file' ]; then
@@ -220,6 +258,12 @@ for argument in "$@"; do
   fi
   previous="$argument"
 done
+if [ "$database_name" = postgres ]; then
+  case "$*" in
+    *'WHERE rolname = CURRENT_USER AND rolsuper'*) printf '1\n' ;;
+    *) exit 95 ;;
+  esac
+fi
 exit 0
 EOF
   cat > "$case_dir/bin/npm" <<'EOF'
@@ -244,6 +288,17 @@ EOF
     FORGE_REPAIR_TEST_RECONCILER_CALLS="$case_dir/reconciler-calls" \
     FORGE_REPAIR_TEST_NPM_CALLS="$case_dir/npm-calls" \
     FORGE_REPAIR_TEST_SENTINEL="$case_dir/sentinel" \
+    FORGE_REPAIR_TEST_EXPECTED_SOCKET="$REPAIR_EXPECTED_SOCKET" \
+    PGHOST=remote.invalid \
+    PGHOSTADDR=203.0.113.7 \
+    PGPORT=6543 \
+    PGUSER=ambient_user \
+    PGDATABASE=ambient_database \
+    PGPASSWORD=ambient_password \
+    PGPASSFILE="$case_dir/ambient.pgpass" \
+    PGSERVICE=ambient_service \
+    PGSERVICEFILE="$case_dir/ambient-service.conf" \
+    PGOPTIONS='-c search_path=ambient' \
     /bin/bash "$repo_dir/scripts/repair.sh" --skip-install --skip-doctor "$@" \
     > "$case_dir/stdout" 2> "$case_dir/stderr"
   CASE_STATUS=$?
@@ -252,33 +307,73 @@ EOF
 }
 
 managed_repair_url="postgresql://forge:${TEST_SECRET}@localhost:5432/forge"
+case "$(uname -s)" in
+  Darwin) REPAIR_EXPECTED_SOCKET=/tmp ;;
+  Linux) REPAIR_EXPECTED_SOCKET=/var/run/postgresql ;;
+  *) fail 'unsupported repair process-test operating system' ;;
+esac
 
-run_repair_process_case dry-run "$managed_repair_url" --dry-run
+run_repair_process_case dry-run "$managed_repair_url" native --dry-run
 [ "$CASE_STATUS" -eq 0 ] || fail 'full-process repair dry-run should succeed'
 assert_contains 'Would reconcile local forge app privileges in database forge.' "$CASE_DIR/stdout"
 [ ! -s "$CASE_DIR/psql-calls" ] || fail 'repair dry-run must not invoke psql'
 [ "$(<"$CASE_DIR/sentinel")" = untouched ] || fail 'repair dry-run touched the database sentinel'
 
-run_repair_process_case remote "postgresql://forge:${TEST_SECRET}@remote.invalid:5432/forge"
-[ "$CASE_STATUS" -eq 0 ] || fail 'full-process remote repair should succeed with fake migration runner'
-assert_contains 'Skipping local forge privilege reconciliation for a custom DATABASE_URL.' "$CASE_DIR/stdout"
-[ ! -s "$CASE_DIR/psql-calls" ] || fail 'remote DATABASE_URL must not invoke local psql'
-[ "$(<"$CASE_DIR/sentinel")" = untouched ] || fail 'remote DATABASE_URL touched the local database sentinel'
+invalid_routing_urls=(
+  "postgresql://forge:pw@remote.invalid:5432/custom?application_name=@localhost:5432/forge"
+  "postgresql://forge:${TEST_SECRET}@localhost.evil:5432/forge"
+  "postgresql://forge:${TEST_SECRET}@remote.invalid:5432/forge"
+  "postgresql://forge:${TEST_SECRET}@localhost:5432/custom"
+  "postgresql://forge:${TEST_SECRET}@localhost:5432/forge?sslmode=disable"
+  "postgresql://forge:${TEST_SECRET}@localhost:5432/forge#fragment"
+  "postgresql://other:${TEST_SECRET}@localhost:5432/forge"
+  "postgresql://forge:${TEST_SECRET}@localhost:6543/forge"
+  "postgresql://forge:bad%2@localhost:5432/forge"
+  "postgresql://forge:@localhost:5432/forge"
+  'not-a-database-url'
+)
+for invalid_index in "${!invalid_routing_urls[@]}"; do
+  run_repair_process_case "nonlocal-$invalid_index" "${invalid_routing_urls[$invalid_index]}" native
+  [ "$CASE_STATUS" -eq 0 ] || fail "full-process nonlocal repair case $invalid_index should succeed"
+  assert_contains 'Skipping local forge privilege reconciliation for a custom DATABASE_URL.' "$CASE_DIR/stdout"
+  [ ! -s "$CASE_DIR/psql-calls" ] || fail "nonlocal DATABASE_URL case $invalid_index invoked local psql"
+  [ "$(<"$CASE_DIR/sentinel")" = untouched ] || fail "nonlocal DATABASE_URL case $invalid_index touched the local database sentinel"
+done
 
-run_repair_process_case no-database-url __UNSET__
+run_repair_process_case no-database-url __UNSET__ native
 [ "$CASE_STATUS" -eq 0 ] || fail 'full-process repair without DATABASE_URL should succeed'
 assert_contains 'Skipping local forge privilege reconciliation because DATABASE_URL is not set.' "$CASE_DIR/stdout"
 [ ! -s "$CASE_DIR/psql-calls" ] || fail 'absent DATABASE_URL must not invoke local psql'
 [ "$(<"$CASE_DIR/sentinel")" = untouched ] || fail 'absent DATABASE_URL touched the local database sentinel'
 
-run_repair_process_case managed "$managed_repair_url"
+run_repair_process_case managed "$managed_repair_url" native
 [ "$CASE_STATUS" -eq 0 ] || fail 'full-process managed local repair should succeed'
 [ "$(wc -l < "$CASE_DIR/reconciler-calls" | tr -d '[:space:]')" = 1 ] \
   || fail 'managed local repair must invoke the shared reconciler exactly once'
-assert_contains '-d postgres -d forge --set ON_ERROR_STOP=1 --file' "$CASE_DIR/psql-calls"
 assert_not_contains 'must_not_leak_into_normal_routing' "$CASE_DIR/psql-calls"
+assert_contains "-X -h $REPAIR_EXPECTED_SOCKET -p 5432 -d postgres" "$CASE_DIR/psql-calls"
+assert_contains "-X -h $REPAIR_EXPECTED_SOCKET -p 5432 -d forge" "$CASE_DIR/psql-calls"
+assert_not_contains 'ambient-' "$CASE_DIR/psql-calls"
 
-run_repair_process_case skip-migrate "$managed_repair_url" --skip-migrate
+run_repair_process_case managed-postgres 'postgres://forge:p%40ss%3Aword!@localhost:5432/forge' native
+[ "$CASE_STATUS" -eq 0 ] || fail 'full-process postgres native repair should succeed'
+[ "$(wc -l < "$CASE_DIR/reconciler-calls" | tr -d '[:space:]')" = 1 ] \
+  || fail 'postgres native repair must invoke the shared reconciler exactly once'
+
+for manifest_fixture in docker missing malformed native-then-docker; do
+  run_repair_process_case "manifest-$manifest_fixture" "$managed_repair_url" "$manifest_fixture"
+  [ "$CASE_STATUS" -eq 0 ] || fail "repair manifest case $manifest_fixture should succeed"
+  assert_contains 'install manifest does not end in service_mode=native' "$CASE_DIR/stdout"
+  [ ! -s "$CASE_DIR/psql-calls" ] || fail "repair manifest case $manifest_fixture invoked psql"
+  [ "$(<"$CASE_DIR/sentinel")" = untouched ] || fail "repair manifest case $manifest_fixture touched the database sentinel"
+done
+
+run_repair_process_case manifest-last-native "$managed_repair_url" docker-then-native
+[ "$CASE_STATUS" -eq 0 ] || fail 'last native manifest entry should enable local reconciliation'
+[ "$(wc -l < "$CASE_DIR/reconciler-calls" | tr -d '[:space:]')" = 1 ] \
+  || fail 'last native manifest entry must invoke the shared reconciler exactly once'
+
+run_repair_process_case skip-migrate "$managed_repair_url" native --skip-migrate
 [ "$CASE_STATUS" -eq 0 ] || fail 'full-process --skip-migrate repair should succeed'
 [ ! -s "$CASE_DIR/psql-calls" ] || fail '--skip-migrate must not invoke psql reconciliation'
 [ "$(<"$CASE_DIR/sentinel")" = untouched ] || fail '--skip-migrate touched the database sentinel'
@@ -381,10 +476,82 @@ run_enabled_case() {
   CASE_DIR="$case_dir"
 }
 
-run_enabled_case custom native "postgresql://custom:${TEST_SECRET}@example.invalid/forge"
-assert_contains 'managed-local-migrations-bypassed' "$CASE_DIR/stdout"
+for invalid_index in "${!invalid_routing_urls[@]}"; do
+  run_enabled_case "installer-nonlocal-$invalid_index" native "${invalid_routing_urls[$invalid_index]}"
+  assert_contains 'managed-local-migrations-bypassed' "$CASE_DIR/stdout"
+done
+run_enabled_case installer-valid-postgresql native "$managed_repair_url"
+assert_contains 'managed-local-migrations-enabled' "$CASE_DIR/stdout"
+run_enabled_case installer-valid-postgres native 'postgres://forge:p%40ss%3Aword!@localhost:5432/forge'
+assert_contains 'managed-local-migrations-enabled' "$CASE_DIR/stdout"
 run_enabled_case docker docker "postgresql://forge:${TEST_SECRET}@localhost:5432/forge"
 assert_contains 'managed-local-migrations-bypassed' "$CASE_DIR/stdout"
+
+run_installer_privilege_routing_case() {
+  local name="$1" database_url="$2"
+  local case_dir="$TEST_ROOT/installer-routing-$name"
+  mkdir -p "$case_dir/bin" "$case_dir/state" "$case_dir/workspace"
+  printf 'DATABASE_URL=%s\n' "$database_url" > "$case_dir/forge.env"
+  printf 'untouched\n' > "$case_dir/sentinel"
+  : > "$case_dir/psql-calls"
+  : > "$case_dir/reconciler-calls"
+  cat > "$case_dir/bin/psql" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FORGE_INSTALL_ROUTING_PSQL_CALLS"
+printf 'touched\n' > "$FORGE_INSTALL_ROUTING_SENTINEL"
+previous=''
+for argument in "$@"; do
+  if [ "$previous" = '--file' ]; then
+    case "$argument" in
+      */reconcile-forge-app-privileges.sql)
+        printf 'reconcile\n' >> "$FORGE_INSTALL_ROUTING_RECONCILER_CALLS"
+        ;;
+    esac
+  fi
+  previous="$argument"
+done
+case "$*" in
+  *'-tAc SELECT 1'*) printf '1\n' ;;
+esac
+exit 0
+EOF
+  chmod +x "$case_dir/bin/psql"
+  set +e
+  PATH="$case_dir/bin:$PATH" \
+    FORGE_INSTALL_LIBRARY=1 \
+    FORGE_ENV_FILE="$case_dir/forge.env" \
+    FORGE_INSTALL_STATE_DIR="$case_dir/state" \
+    FORGE_WORKSPACE_ROOT="$case_dir/workspace" \
+    FORGE_INSTALL_ROUTING_PSQL_CALLS="$case_dir/psql-calls" \
+    FORGE_INSTALL_ROUTING_RECONCILER_CALLS="$case_dir/reconciler-calls" \
+    FORGE_INSTALL_ROUTING_SENTINEL="$case_dir/sentinel" \
+    /bin/bash -c '
+      source "$1"
+      SERVICE_MODE=native
+      DRY_RUN=0
+      should_manage_local_db
+      grant_forge_privileges
+    ' _ "$INSTALLER" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  CASE_STATUS=$?
+  set -e
+  CASE_DIR="$case_dir"
+}
+
+for invalid_index in "${!invalid_routing_urls[@]}"; do
+  run_installer_privilege_routing_case "nonlocal-$invalid_index" "${invalid_routing_urls[$invalid_index]}"
+  [ "$CASE_STATUS" -eq 0 ] || fail "installer nonlocal routing case $invalid_index should succeed"
+  [ ! -s "$CASE_DIR/psql-calls" ] || fail "installer nonlocal routing case $invalid_index invoked psql"
+  [ "$(<"$CASE_DIR/sentinel")" = untouched ] || fail "installer nonlocal routing case $invalid_index touched the psql sentinel"
+done
+
+run_installer_privilege_routing_case valid-postgresql "$managed_repair_url"
+[ "$CASE_STATUS" -eq 0 ] || fail 'installer postgresql native routing should succeed'
+[ "$(wc -l < "$CASE_DIR/reconciler-calls" | tr -d '[:space:]')" = 1 ] \
+  || fail 'installer postgresql native routing must invoke the shared reconciler once'
+run_installer_privilege_routing_case valid-postgres 'postgres://forge:p%40ss%3Aword!@localhost:5432/forge'
+[ "$CASE_STATUS" -eq 0 ] || fail 'installer postgres native routing should succeed'
+[ "$(wc -l < "$CASE_DIR/reconciler-calls" | tr -d '[:space:]')" = 1 ] \
+  || fail 'installer postgres native routing must invoke the shared reconciler once'
 
 run_runuser_environment_case() {
   local case_dir="$TEST_ROOT/runuser-environment"

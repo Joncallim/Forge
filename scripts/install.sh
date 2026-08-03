@@ -1070,6 +1070,54 @@ psql_admin() {
   die "Could not connect to PostgreSQL as an admin user."
 }
 
+uri_safe_database_password() {
+  local password="${1:-}" index=0 length character hex_pair
+  length="${#password}"
+  [ "$length" -gt 0 ] || return 1
+
+  while [ "$index" -lt "$length" ]; do
+    character="${password:$index:1}"
+    case "$character" in
+      [A-Za-z0-9._~]|'!'|'$'|'&'|"'"|'('|')'|'*'|'+'|','|';'|'='|':'|'-')
+        index=$((index + 1))
+        ;;
+      '%')
+        [ $((index + 2)) -lt "$length" ] || return 1
+        hex_pair="${password:$((index + 1)):2}"
+        case "$hex_pair" in
+          [0-9A-Fa-f][0-9A-Fa-f]) ;;
+          *) return 1 ;;
+        esac
+        index=$((index + 3))
+        ;;
+      *)
+        return 1
+        ;;
+    esac
+  done
+}
+
+native_forge_database_password() {
+  local database_url="${1:-}" remainder password
+  local target='@localhost:5432/forge'
+
+  case "$database_url" in
+    postgresql://forge:*) remainder="${database_url#postgresql://forge:}" ;;
+    postgres://forge:*) remainder="${database_url#postgres://forge:}" ;;
+    *) return 1 ;;
+  esac
+  case "$remainder" in
+    *"$target") password="${remainder%"$target"}" ;;
+    *) return 1 ;;
+  esac
+  uri_safe_database_password "$password" || return 1
+  printf '%s' "$password"
+}
+
+is_native_forge_database_url() {
+  native_forge_database_password "${1:-}" >/dev/null
+}
+
 should_manage_local_db() {
   local existing_database_url
   existing_database_url="$(env_value DATABASE_URL)"
@@ -1078,15 +1126,12 @@ should_manage_local_db() {
     return 0
   fi
 
-  case "$existing_database_url" in
-    postgresql://forge:*@localhost:5432/forge|postgres://forge:*@localhost:5432/forge)
-      MANAGE_LOCAL_DB=1
-      ;;
-    *)
-      MANAGE_LOCAL_DB=0
-      warn "Existing DATABASE_URL is custom. The installer will not create or alter a local forge database."
-      ;;
-  esac
+  if is_native_forge_database_url "$existing_database_url"; then
+    MANAGE_LOCAL_DB=1
+  else
+    MANAGE_LOCAL_DB=0
+    warn "Existing DATABASE_URL is custom. The installer will not create or alter a local forge database."
+  fi
 }
 
 provision_database() {
@@ -1996,7 +2041,7 @@ fi
 
 install_base_dependencies
 
-DB_PASSWORD="$(initial_env_value DATABASE_URL | sed -n 's#^postgres\(ql\)\?://forge:\(.*\)@localhost:5432/forge.*#\2#p' | head -1)"
+DB_PASSWORD="$(native_forge_database_password "$(initial_env_value DATABASE_URL)" || true)"
 DB_PASSWORD="${DB_PASSWORD:-$(initial_env_value POSTGRES_PASSWORD)}"
 if placeholder_value "$DB_PASSWORD"; then
   DB_PASSWORD=""
