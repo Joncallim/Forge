@@ -50,7 +50,7 @@ run_managed_case() {
   CASE_DIR="$case_dir"
 }
 
-expected_stages=(release migrate-0025 s3 migrate-0026 s4 migrate-0027 s5 latest)
+expected_stages=(release migrate-0025 s3 migrate-0026 legacy-repair s4 migrate-0027 s5 latest)
 
 for admin_mode in current sudo runuser; do
   run_managed_case "$admin_mode" "$admin_mode"
@@ -79,6 +79,11 @@ run_managed_case s5-failure current 0 s5
 assert_contains 's5-cleanup-attempted' "$CASE_DIR/stages"
 assert_not_contains 'latest' "$CASE_DIR/stages"
 assert_contains 'its cleanup wrapper preserves the original migration failure' "$CASE_DIR/stderr"
+
+run_managed_case legacy-repair-failure current 0 legacy-repair
+[ "$CASE_STATUS" -ne 0 ] || fail 'legacy repair failure must fail the orchestration'
+assert_not_contains s4 "$CASE_DIR/stages"
+assert_contains 'repairing the exact known legacy release catalog drift' "$CASE_DIR/stderr"
 
 run_enabled_case() {
   local name="$1" service_mode="$2" database_url="$3"
