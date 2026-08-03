@@ -931,8 +931,27 @@ start_native_services() {
   step "Starting PostgreSQL and Redis"
 
   if [ "$PACKAGE_MANAGER" = "brew" ]; then
-    run_quiet "Start PostgreSQL" brew services start "$PG_FORMULA"
-    run_quiet "Start Redis" brew services start redis
+    # Keep dry runs deterministic: show both commands without consulting the
+    # local services. In a real run, avoid Homebrew's service dispatcher when
+    # the dependency already accepts its normal local protocol.
+    if [ "$DRY_RUN" = "1" ]; then
+      info "[dry-run] brew services start $PG_FORMULA"
+      run_quiet "Start PostgreSQL" brew services start "$PG_FORMULA"
+      info "[dry-run] brew services start redis"
+      run_quiet "Start Redis" brew services start redis
+    else
+      if postgres_is_ready; then
+        info "PostgreSQL is already ready on localhost:5432; skipping Homebrew service start."
+      elif ! run_quiet "Start PostgreSQL" brew services start "$PG_FORMULA"; then
+        die "Could not start PostgreSQL with Homebrew. Check the install log: $INSTALL_LOG"
+      fi
+
+      if redis_is_ready; then
+        info "Redis is already ready on localhost:6379; skipping Homebrew service start."
+      elif ! run_quiet "Start Redis" brew services start redis; then
+        die "Could not start Redis with Homebrew. Check the install log: $INSTALL_LOG"
+      fi
+    fi
   else
     initialize_linux_postgres_if_needed
     start_service_candidates "PostgreSQL" postgresql postgresql-16 postgresql@16-main ||
@@ -943,6 +962,16 @@ start_native_services() {
 
   wait_for_postgres
   wait_for_redis
+}
+
+postgres_is_ready() {
+  command -v pg_isready >/dev/null 2>&1 &&
+    pg_isready -q -h localhost -p 5432 >/dev/null 2>&1
+}
+
+redis_is_ready() {
+  command -v redis-cli >/dev/null 2>&1 &&
+    redis-cli -h localhost -p 6379 ping 2>/dev/null | grep -qx 'PONG'
 }
 
 compose_command() {
@@ -981,7 +1010,7 @@ wait_for_postgres() {
   info "Waiting for PostgreSQL on localhost:5432..."
   local attempt
   for attempt in $(seq 1 60); do
-    if pg_isready -q -h localhost -p 5432 >/dev/null 2>&1; then
+    if postgres_is_ready; then
       info "PostgreSQL is ready."
       return 0
     fi
@@ -1001,7 +1030,7 @@ wait_for_redis() {
   info "Waiting for Redis on localhost:6379..."
   local attempt
   for attempt in $(seq 1 60); do
-    if redis-cli -h localhost -p 6379 ping 2>/dev/null | grep -q PONG; then
+    if redis_is_ready; then
       info "Redis is ready."
       return 0
     fi
@@ -1653,6 +1682,15 @@ acquire_install_lock() {
 
   die "Another Forge install appears to be running. Remove $LOCK_DIR only if you are sure it is stale."
 }
+
+# Internal seam for the focused installer regression test. It intentionally
+# bypasses all setup work and invokes only the native-service function.
+if [ "${FORGE_INSTALL_TEST_HOOK:-}" = "start-native-services" ]; then
+  PACKAGE_MANAGER="${FORGE_INSTALL_TEST_PACKAGE_MANAGER:-brew}"
+  PG_FORMULA="${FORGE_INSTALL_TEST_PG_FORMULA:-postgresql@16}"
+  start_native_services
+  exit 0
+fi
 
 bold "Forge installer"
 info "Repo: $REPO_ROOT"
