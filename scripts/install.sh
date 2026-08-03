@@ -1483,6 +1483,7 @@ run_managed_local_migration_stage() {
         migrate-0025) npx tsx scripts/ci/migrate-through-0025.ts ;;
         s3) npm run protocol:bootstrap-epic-172-s3-release-owner ;;
         migrate-0026) npx tsx scripts/ci/migrate-through-0026.ts ;;
+        legacy-repair) npm run protocol:repair-epic-172-legacy-release ;;
         s4) npm run protocol:bootstrap-epic-172-s4-roles ;;
         migrate-0027) npx tsx scripts/ci/migrate-through-0027.ts ;;
         s5) bash scripts/ci/apply-epic-172-s5-recovery-migration.sh ;;
@@ -1581,6 +1582,7 @@ run_managed_local_migration_as_runuser() {
       migrate-0025) npx tsx scripts/ci/migrate-through-0025.ts ;;
       s3) npm run protocol:bootstrap-epic-172-s3-release-owner ;;
       migrate-0026) npx tsx scripts/ci/migrate-through-0026.ts ;;
+      legacy-repair) npm run protocol:repair-epic-172-legacy-release ;;
       s4) npm run protocol:bootstrap-epic-172-s4-roles ;;
       migrate-0027) npx tsx scripts/ci/migrate-through-0027.ts ;;
       s5) bash scripts/ci/apply-epic-172-s5-recovery-migration.sh ;;
@@ -1603,6 +1605,7 @@ run_managed_local_migration_as_sudo() {
       migrate-0025) npx tsx scripts/ci/migrate-through-0025.ts ;;
       s3) npm run protocol:bootstrap-epic-172-s3-release-owner ;;
       migrate-0026) npx tsx scripts/ci/migrate-through-0026.ts ;;
+      legacy-repair) npm run protocol:repair-epic-172-legacy-release ;;
       s4) npm run protocol:bootstrap-epic-172-s4-roles ;;
       migrate-0027) npx tsx scripts/ci/migrate-through-0027.ts ;;
       s5) bash scripts/ci/apply-epic-172-s5-recovery-migration.sh ;;
@@ -1615,7 +1618,7 @@ run_managed_local_migration_as_sudo() {
 run_managed_local_migrations() {
   step "Applying managed local database migrations"
   if [ "$DRY_RUN" = "1" ]; then
-    info "[dry-run] Bootstrap release roles, migrate through 0025, bootstrap S3, migrate through 0026, bootstrap S4, migrate through 0027, apply S5 with cleanup, then run the latest migrator."
+    info "[dry-run] Bootstrap release roles, migrate through 0025, bootstrap S3, migrate through 0026, repair an exact known legacy release catalog if needed, bootstrap S4, migrate through 0027, apply S5 with cleanup, then run the latest migrator."
     return 0
   fi
 
@@ -1640,6 +1643,7 @@ run_managed_local_migration_sequence() {
   run_managed_local_migration_stage "Migrate managed local database through 0025" migrate-0025 || die "Managed local migration failed while applying migrations through 0025."
   run_managed_local_migration_stage "Bootstrap S3 owner handoff for managed local migration" s3 || die "Managed local migration failed while bootstrapping the S3 owner handoff."
   run_managed_local_migration_stage "Migrate managed local database through 0026" migrate-0026 || die "Managed local migration failed while applying migrations through 0026."
+  run_managed_local_migration_stage "Repair exact known legacy release catalog drift" legacy-repair || die "Managed local migration failed while repairing the exact known legacy release catalog drift."
   run_managed_local_migration_stage "Bootstrap S4 owner handoff for managed local migration" s4 || die "Managed local migration failed while bootstrapping the S4 owner handoff."
   run_managed_local_migration_stage "Migrate managed local database through 0027" migrate-0027 || die "Managed local migration failed while applying migrations through 0027."
   run_managed_local_migration_stage "Apply S5 managed local migration with mandatory cleanup" s5 || die "Managed local migration failed while applying S5; its cleanup wrapper preserves the original migration failure."

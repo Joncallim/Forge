@@ -25,6 +25,8 @@
     "db:seed-agents": "npx tsx db/seed-agents.ts",
     "db:seed-providers": "npx tsx db/seed-providers.ts",
     "protocol:bootstrap-epic-172-s4-roles": "tsx scripts/bootstrap-epic-172-s4-roles.ts",
+    "protocol:repair-epic-172-legacy-release": "tsx scripts/repair-epic-172-legacy-release.ts",
+    "test:installer-legacy-migration-repair": "bash scripts/ci/prove-installer-legacy-migration-repair.sh",
     "protocol:scrub-legacy-leakage": "tsx scripts/scrub-legacy-leakage.ts",
     "protocol:inspect-local-projection-overlimit": "tsx scripts/inspect-local-projection-overlimit.ts",
     "protocol:archive-local-projection-overlimit": "tsx scripts/archive-local-projection-overlimit.ts",
