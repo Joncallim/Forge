@@ -34,17 +34,28 @@ assert_stages() {
 
 grant_function="$TEST_ROOT/grant-forge-privileges"
 sed -n '/^grant_forge_privileges() {/,/^}/p' "$INSTALLER" > "$grant_function"
+psql_admin_function="$TEST_ROOT/psql-admin"
+sed -n '/^psql_admin() {/,/^}/p' "$INSTALLER" > "$psql_admin_function"
 assert_contains "trap 'on_error" "$INSTALLER"
 assert_contains '--set ON_ERROR_STOP=1' "$grant_function"
 assert_contains 'trap - ERR' "$grant_function"
 assert_contains '--file "$FORGE_PRIVILEGE_SQL"' "$grant_function"
 assert_contains "Re-run 'forge upgrade'" "$grant_function"
 assert_not_contains "Re-run 'forge repair'" "$grant_function"
+assert_contains 'resolve_managed_local_admin' "$psql_admin_function"
+assert_contains '"${MANAGED_LOCAL_PSQL_ADMIN[@]}" "$@"' "$psql_admin_function"
+assert_not_contains 'psql -d postgres' "$psql_admin_function"
+assert_not_contains 'sudo -u postgres psql' "$psql_admin_function"
 assert_contains '--file "$FORGE_PRIVILEGE_SQL"' "$REPAIR"
 assert_contains "Re-run 'forge repair'" "$REPAIR"
 assert_contains 'Would reconcile local forge app privileges in database' "$REPAIR"
 assert_contains 'native_forge_database_password()' "$INSTALLER"
 assert_contains 'native_forge_database_password()' "$REPAIR"
+assert_contains 'MANAGED_LOCAL_ADMIN_RESOLUTION=unresolved' "$INSTALLER"
+assert_contains 'MANAGED_LOCAL_PSQL_ADMIN=(' "$INSTALLER"
+assert_contains '"$psql_bin" -X -h "$socket_dir" -p "$port" -U "$current_user" -d postgres' "$INSTALLER"
+assert_contains 'clear_postgres_routing_environment' "$INSTALLER"
+assert_contains 'PGHOST|PGPORT|PGUSER' "$INSTALLER"
 assert_contains 'installed_service_mode_is_native()' "$REPAIR"
 assert_contains 'REPAIR_PSQL_ADMIN_RESOLUTION=unresolved' "$REPAIR"
 assert_contains '-u PGHOST -u PGHOSTADDR -u PGPORT -u PGDATABASE -u PGUSER' "$REPAIR"
@@ -114,7 +125,7 @@ cat > "$psql_status_case/bin/psql" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$FORGE_TEST_PSQL_CALLS"
 case "$*" in
-  *'-tAc SELECT 1'*) exit 0 ;;
+  *'WHERE rolname = CURRENT_USER AND rolsuper'*) printf '1\n'; exit 0 ;;
   *) exit 73 ;;
 esac
 EOF
@@ -123,6 +134,9 @@ chmod +x "$psql_status_case/bin/psql"
 set +e
 PATH="$psql_status_case/bin:$PATH" \
   FORGE_TEST_PSQL_CALLS="$psql_status_case/calls" \
+  FORGE_INSTALL_TEST_ADMIN_MODE=current \
+  FORGE_INSTALL_TEST_PSQL_SOCKET="$psql_status_case" \
+  FORGE_INSTALL_TEST_PSQL_PORT=5432 \
   FORGE_INSTALL_STATE_DIR="$psql_status_case/grant-state" \
   FORGE_WORKSPACE_ROOT="$psql_status_case/grant-workspace" \
   FORGE_ENV_FILE="$psql_status_case/grant.env" \
@@ -154,6 +168,9 @@ assert_not_contains 'unexpected psql_admin success' "$psql_status_case/grant-std
 set +e
 PATH="$psql_status_case/bin:$PATH" \
   FORGE_TEST_PSQL_CALLS="$psql_status_case/calls" \
+  FORGE_INSTALL_TEST_ADMIN_MODE=current \
+  FORGE_INSTALL_TEST_PSQL_SOCKET="$psql_status_case" \
+  FORGE_INSTALL_TEST_PSQL_PORT=5432 \
   FORGE_INSTALL_STATE_DIR="$psql_status_case/fatal-state" \
   FORGE_WORKSPACE_ROOT="$psql_status_case/fatal-workspace" \
   FORGE_ENV_FILE="$psql_status_case/fatal.env" \
@@ -233,6 +250,7 @@ run_repair_process_case() {
   printf 'untouched\n' > "$case_dir/sentinel"
   : > "$case_dir/psql-calls"
   : > "$case_dir/reconciler-calls"
+  : > "$case_dir/migration-stages"
   : > "$case_dir/npm-calls"
 cat > "$case_dir/bin/psql" <<'EOF'
 #!/usr/bin/env bash
@@ -488,16 +506,26 @@ run_enabled_case docker docker "postgresql://forge:${TEST_SECRET}@localhost:5432
 assert_contains 'managed-local-migrations-bypassed' "$CASE_DIR/stdout"
 
 run_installer_privilege_routing_case() {
-  local name="$1" database_url="$2"
+  local name="$1" database_url="$2" service_mode="${3:-native}"
   local case_dir="$TEST_ROOT/installer-routing-$name"
-  mkdir -p "$case_dir/bin" "$case_dir/state" "$case_dir/workspace"
+  mkdir -p "$case_dir/bin" "$case_dir/socket" "$case_dir/state" "$case_dir/workspace"
   printf 'DATABASE_URL=%s\n' "$database_url" > "$case_dir/forge.env"
   printf 'untouched\n' > "$case_dir/sentinel"
   : > "$case_dir/psql-calls"
   : > "$case_dir/reconciler-calls"
-  cat > "$case_dir/bin/psql" <<'EOF'
+cat > "$case_dir/bin/psql" <<'EOF'
 #!/usr/bin/env bash
+for variable in PGHOST PGHOSTADDR PGPORT PGDATABASE PGUSER PGPASSWORD PGPASSFILE PGSERVICE PGSERVICEFILE PGOPTIONS; do
+  if [ -n "${!variable+x}" ]; then
+    printf 'ambient-%s-leaked\n' "$variable" >> "$FORGE_INSTALL_ROUTING_PSQL_CALLS"
+    exit 97
+  fi
+done
 printf '%s\n' "$*" >> "$FORGE_INSTALL_ROUTING_PSQL_CALLS"
+[ "$1" = '-X' ] && [ "$2" = '-h' ] && [ "$3" = "$FORGE_INSTALL_ROUTING_EXPECTED_SOCKET" ] \
+  && [ "$4" = '-p' ] && [ "$5" = '5432' ] && [ "$6" = '-U' ] \
+  && [ "$7" = "$FORGE_INSTALL_ROUTING_EXPECTED_USER" ] \
+  && [ "$8" = '-d' ] && [ "$9" = postgres ] || exit 96
 printf 'touched\n' > "$FORGE_INSTALL_ROUTING_SENTINEL"
 previous=''
 for argument in "$@"; do
@@ -511,7 +539,11 @@ for argument in "$@"; do
   previous="$argument"
 done
 case "$*" in
-  *'-tAc SELECT 1'*) printf '1\n' ;;
+  *'WHERE rolname = CURRENT_USER AND rolsuper'*) printf '1\n' ;;
+  *"FROM pg_roles WHERE rolname='forge'"*) printf '1\n' ;;
+  *'SELECT count(*) FROM pg_catalog.pg_auth_members'*) printf '0\n' ;;
+  *"role_row.rolname = 'forge'"*) printf '1\n' ;;
+  *"FROM pg_database WHERE datname='forge'"*) printf '1\n' ;;
 esac
 exit 0
 EOF
@@ -524,12 +556,47 @@ EOF
     FORGE_WORKSPACE_ROOT="$case_dir/workspace" \
     FORGE_INSTALL_ROUTING_PSQL_CALLS="$case_dir/psql-calls" \
     FORGE_INSTALL_ROUTING_RECONCILER_CALLS="$case_dir/reconciler-calls" \
+    FORGE_INSTALL_ROUTING_STAGE_LOG="$case_dir/migration-stages" \
     FORGE_INSTALL_ROUTING_SENTINEL="$case_dir/sentinel" \
+    FORGE_INSTALL_ROUTING_EXPECTED_SOCKET="$case_dir/socket" \
+    FORGE_INSTALL_ROUTING_EXPECTED_USER="$(/usr/bin/id -un)" \
+    FORGE_INSTALL_TEST_ADMIN_MODE=current \
+    FORGE_INSTALL_TEST_PSQL_SOCKET="$case_dir/socket" \
+    FORGE_INSTALL_TEST_PSQL_PORT=5432 \
+    FORGE_INSTALL_ROUTING_SERVICE_MODE="$service_mode" \
+    PGHOST=remote.invalid \
+    PGHOSTADDR=203.0.113.7 \
+    PGPORT=6543 \
+    PGUSER=ambient_user \
+    PGDATABASE=ambient_database \
+    PGPASSWORD=ambient_password \
+    PGPASSFILE="$case_dir/ambient.pgpass" \
+    PGSERVICE=ambient_service \
+    PGSERVICEFILE="$case_dir/ambient-service.conf" \
+    PGOPTIONS='-c search_path=ambient' \
     /bin/bash -c '
       source "$1"
-      SERVICE_MODE=native
+      SERVICE_MODE="$FORGE_INSTALL_ROUTING_SERVICE_MODE"
       DRY_RUN=0
-      should_manage_local_db
+      DB_PASSWORD="routing-test-password"
+      provision_database
+      if [ "$SERVICE_MODE" = native ] && [ "$MANAGE_LOCAL_DB" = 1 ]; then
+        calls_before="$(wc -l < "$FORGE_INSTALL_ROUTING_PSQL_CALLS" | tr -d "[:space:]")"
+        prefix_before="${MANAGED_LOCAL_PSQL_ADMIN[*]}"
+        resolve_managed_local_admin
+        calls_after_first="$(wc -l < "$FORGE_INSTALL_ROUTING_PSQL_CALLS" | tr -d "[:space:]")"
+        [ "$calls_after_first" = "$calls_before" ]
+        [ "${MANAGED_LOCAL_PSQL_ADMIN[*]}" = "$prefix_before" ]
+        resolve_managed_local_admin
+        calls_after_second="$(wc -l < "$FORGE_INSTALL_ROUTING_PSQL_CALLS" | tr -d "[:space:]")"
+        [ "$calls_after_second" = "$calls_after_first" ]
+        [ "${MANAGED_LOCAL_PSQL_ADMIN[*]}" = "$prefix_before" ]
+        FORGE_INSTALL_TEST_HOOK=managed-local-migrations
+        FORGE_INSTALL_TEST_STAGE_LOG="$FORGE_INSTALL_ROUTING_STAGE_LOG"
+        printf "admin:cached\n" >> "$FORGE_INSTALL_TEST_STAGE_LOG"
+        run_managed_local_migrations
+        FORGE_INSTALL_TEST_HOOK=""
+      fi
       grant_forge_privileges
     ' _ "$INSTALLER" > "$case_dir/stdout" 2> "$case_dir/stderr"
   CASE_STATUS=$?
@@ -545,13 +612,26 @@ for invalid_index in "${!invalid_routing_urls[@]}"; do
 done
 
 run_installer_privilege_routing_case valid-postgresql "$managed_repair_url"
+[ "$CASE_STATUS" -eq 0 ] || sed -n '1,120p' "$CASE_DIR/stderr" >&2
 [ "$CASE_STATUS" -eq 0 ] || fail 'installer postgresql native routing should succeed'
 [ "$(wc -l < "$CASE_DIR/reconciler-calls" | tr -d '[:space:]')" = 1 ] \
+  || { sed -n '1,120p' "$CASE_DIR/stderr" >&2; sed -n '1,120p' "$CASE_DIR/psql-calls" >&2; }
+[ "$(wc -l < "$CASE_DIR/reconciler-calls" | tr -d '[:space:]')" = 1 ] \
   || fail 'installer postgresql native routing must invoke the shared reconciler once'
+assert_contains "-X -h $CASE_DIR/socket -p 5432 -U $(/usr/bin/id -un) -d postgres" "$CASE_DIR/psql-calls"
+assert_contains '-d forge --set ON_ERROR_STOP=1 --file' "$CASE_DIR/psql-calls"
+assert_not_contains 'ambient-' "$CASE_DIR/psql-calls"
+assert_not_contains "$TEST_SECRET" "$CASE_DIR/psql-calls"
+assert_stages "$CASE_DIR/migration-stages" "${expected_stages[@]}"
 run_installer_privilege_routing_case valid-postgres 'postgres://forge:p%40ss%3Aword!@localhost:5432/forge'
 [ "$CASE_STATUS" -eq 0 ] || fail 'installer postgres native routing should succeed'
 [ "$(wc -l < "$CASE_DIR/reconciler-calls" | tr -d '[:space:]')" = 1 ] \
   || fail 'installer postgres native routing must invoke the shared reconciler once'
+
+run_installer_privilege_routing_case docker-native-url "$managed_repair_url" docker
+[ "$CASE_STATUS" -eq 0 ] || fail 'installer docker routing case should succeed'
+[ ! -s "$CASE_DIR/psql-calls" ] || fail 'docker service mode invoked native psql administration'
+[ "$(<"$CASE_DIR/sentinel")" = untouched ] || fail 'docker service mode touched the native psql sentinel'
 
 run_runuser_environment_case() {
   local case_dir="$TEST_ROOT/runuser-environment"

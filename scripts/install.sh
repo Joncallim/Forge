@@ -64,6 +64,21 @@ APT_UPDATED=0
 MANAGE_LOCAL_DB=1
 PG_FORMULA="postgresql@16"
 PG_BIN=""
+MANAGED_LOCAL_ADMIN_RESOLUTION=unresolved
+MANAGED_LOCAL_ADMIN_MODE=""
+MANAGED_LOCAL_ADMIN_SOCKET=""
+MANAGED_LOCAL_ADMIN_PORT=""
+MANAGED_LOCAL_ADMIN_USER=""
+MANAGED_LOCAL_PSQL_ADMIN=()
+POSTGRES_ENV_UNSET_ARGS=(
+  -u PGHOST -u PGHOSTADDR -u PGPORT -u PGDATABASE -u PGUSER
+  -u PGPASSWORD -u PGPASSFILE -u PGSERVICE -u PGSERVICEFILE -u PGOPTIONS
+  -u PGSSLMODE -u PGREQUIRESSL -u PGSSLCOMPRESSION -u PGSSLCERT -u PGSSLKEY
+  -u PGSSLROOTCERT -u PGSSLCRL -u PGSSLCRLDIR -u PGSSLSNI -u PGREQUIREPEER
+  -u PGCHANNELBINDING -u PGTARGETSESSIONATTRS -u PGLOADBALANCEHOSTS
+  -u PGCONNECT_TIMEOUT -u PGAPPNAME -u PGCLIENTENCODING -u PGKRBSRVNAME
+  -u PGGSSLIB -u PGGSSENCMODE
+)
 LOCK_DIR="$INSTALL_STATE_DIR/install.lock"
 TEMP_FILES=""
 
@@ -1051,23 +1066,10 @@ psql_admin() {
     return 0
   fi
 
-  if psql -d postgres -tAc 'SELECT 1' >/dev/null 2>&1; then
-    psql -d postgres "$@" || psql_status="$?"
-    return "$psql_status"
-  fi
-
-  if id postgres >/dev/null 2>&1; then
-    if command -v sudo >/dev/null 2>&1; then
-      sudo -u postgres psql -d postgres "$@" || psql_status="$?"
-      return "$psql_status"
-    fi
-    if command -v runuser >/dev/null 2>&1; then
-      runuser -u postgres -- psql -d postgres "$@" || psql_status="$?"
-      return "$psql_status"
-    fi
-  fi
-
-  die "Could not connect to PostgreSQL as an admin user."
+  resolve_managed_local_admin \
+    || die "Could not establish controlled local PostgreSQL administrator access."
+  "${MANAGED_LOCAL_PSQL_ADMIN[@]}" "$@" || psql_status="$?"
+  return "$psql_status"
 }
 
 uri_safe_database_password() {
@@ -1146,6 +1148,9 @@ provision_database() {
     info "[dry-run] Create local PostgreSQL database forge if missing"
     return 0
   fi
+
+  resolve_managed_local_admin \
+    || die "Could not establish controlled local PostgreSQL administrator access."
 
   local db_password_escaped role_exists role_membership_edges role_normalizable role_boundary_ok db_exists
   db_password_escaped="$(sql_escape_literal "$DB_PASSWORD")"
@@ -1486,43 +1491,140 @@ managed_local_migrations_enabled() {
 }
 
 resolve_managed_local_admin() {
-  local psql_bin sudo_bin runuser_bin
+  local socket_dir port psql_bin current_user sudo_bin runuser_bin test_mode=""
+  if [ "$MANAGED_LOCAL_ADMIN_RESOLUTION" = resolved ]; then
+    [ -n "$MANAGED_LOCAL_ADMIN_MODE" ]
+    return
+  fi
+  MANAGED_LOCAL_ADMIN_RESOLUTION=resolved
   MANAGED_LOCAL_ADMIN_MODE=""
   MANAGED_LOCAL_ADMIN_SOCKET=""
+  MANAGED_LOCAL_ADMIN_PORT=""
   MANAGED_LOCAL_ADMIN_USER=""
+  MANAGED_LOCAL_PSQL_ADMIN=()
 
   if [ -n "${FORGE_INSTALL_TEST_ADMIN_MODE:-}" ]; then
     case "$FORGE_INSTALL_TEST_ADMIN_MODE" in
-      current|sudo|runuser) MANAGED_LOCAL_ADMIN_MODE="$FORGE_INSTALL_TEST_ADMIN_MODE" ;;
+      current|sudo|runuser) test_mode="$FORGE_INSTALL_TEST_ADMIN_MODE" ;;
       unavailable) return 1 ;;
       *) die "Unknown installer test admin mode." ;;
     esac
-    MANAGED_LOCAL_ADMIN_SOCKET="/tmp"
-    MANAGED_LOCAL_ADMIN_USER="postgres"
-    return 0
-  fi
-
-  if psql -d postgres -tAc 'SELECT current_user' >/dev/null 2>&1; then
-    MANAGED_LOCAL_ADMIN_MODE="current"
-    MANAGED_LOCAL_ADMIN_USER="$(psql -d postgres -tAc 'SELECT current_user' | tr -d '[:space:]')"
-    MANAGED_LOCAL_ADMIN_SOCKET="$(psql -d postgres -tAc 'SHOW unix_socket_directories' | tr -d '[:space:]' | cut -d, -f1)"
-  elif [ "$OS_NAME" = "Linux" ] && id postgres >/dev/null 2>&1 \
-    && sudo_bin="$(trusted_linux_tool sudo)" && psql_bin="$(trusted_linux_tool psql)" \
-    && "$sudo_bin" -n -u postgres "$psql_bin" -d postgres -tAc 'SELECT 1' >/dev/null 2>&1; then
-    MANAGED_LOCAL_ADMIN_MODE="sudo"
-    MANAGED_LOCAL_ADMIN_USER="postgres"
-    MANAGED_LOCAL_ADMIN_SOCKET="$("$sudo_bin" -n -u postgres "$psql_bin" -d postgres -tAc 'SHOW unix_socket_directories' | tr -d '[:space:]' | cut -d, -f1)"
-  elif [ "$OS_NAME" = "Linux" ] && id postgres >/dev/null 2>&1 \
-    && runuser_bin="$(trusted_linux_tool runuser)" && psql_bin="$(trusted_linux_tool psql)" \
-    && "$runuser_bin" -u postgres -- "$psql_bin" -d postgres -tAc 'SELECT 1' >/dev/null 2>&1; then
-    MANAGED_LOCAL_ADMIN_MODE="runuser"
-    MANAGED_LOCAL_ADMIN_USER="postgres"
-    MANAGED_LOCAL_ADMIN_SOCKET="$("$runuser_bin" -u postgres -- "$psql_bin" -d postgres -tAc 'SHOW unix_socket_directories' | tr -d '[:space:]' | cut -d, -f1)"
+    socket_dir="${FORGE_INSTALL_TEST_PSQL_SOCKET:-/tmp}"
+    port="${FORGE_INSTALL_TEST_PSQL_PORT:-5432}"
+    if [ -z "${FORGE_INSTALL_TEST_PSQL_SOCKET:-}" ]; then
+      MANAGED_LOCAL_ADMIN_MODE="$test_mode"
+      MANAGED_LOCAL_ADMIN_SOCKET="$socket_dir"
+      MANAGED_LOCAL_ADMIN_PORT="$port"
+      case "$test_mode" in
+        current) MANAGED_LOCAL_ADMIN_USER="$(/usr/bin/id -un)" ;;
+        *) MANAGED_LOCAL_ADMIN_USER=postgres ;;
+      esac
+      return 0
+    fi
   else
-    return 1
+    case "$OS_NAME" in
+      Darwin) socket_dir=/tmp ;;
+      Linux) socket_dir=/var/run/postgresql ;;
+      *) return 1 ;;
+    esac
+    port=5432
+  fi
+  case "$socket_dir" in
+    /*) ;;
+    *) return 1 ;;
+  esac
+  case "$port" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || return 1
+  [ -d "$socket_dir" ] || return 1
+
+  if [ -n "$test_mode" ] || [ "$OS_NAME" = Darwin ]; then
+    psql_bin="$(command -v psql 2>/dev/null || true)"
+  else
+    psql_bin="$(trusted_linux_tool psql 2>/dev/null || true)"
+  fi
+  case "$psql_bin" in
+    /*) [ -x "$psql_bin" ] || return 1 ;;
+    *) return 1 ;;
+  esac
+
+  current_user="$(/usr/bin/id -un 2>/dev/null || true)"
+  if [ -n "$current_user" ] && { [ -z "$test_mode" ] || [ "$test_mode" = current ]; }; then
+    MANAGED_LOCAL_ADMIN_MODE=current
+    MANAGED_LOCAL_ADMIN_SOCKET="$socket_dir"
+    MANAGED_LOCAL_ADMIN_PORT="$port"
+    MANAGED_LOCAL_ADMIN_USER="$current_user"
+    MANAGED_LOCAL_PSQL_ADMIN=(
+      /usr/bin/env "${POSTGRES_ENV_UNSET_ARGS[@]}"
+      "$psql_bin" -X -h "$socket_dir" -p "$port" -U "$current_user" -d postgres
+    )
+    if probe_managed_local_admin; then
+      return 0
+    fi
   fi
 
-  [ -n "$MANAGED_LOCAL_ADMIN_USER" ] && [ -n "$MANAGED_LOCAL_ADMIN_SOCKET" ]
+  if [ "$OS_NAME" = Linux ] && /usr/bin/id postgres >/dev/null 2>&1 \
+    && { [ -z "$test_mode" ] || [ "$test_mode" = sudo ]; }; then
+    sudo_bin="$(trusted_linux_tool sudo 2>/dev/null || true)"
+    if [ -n "$sudo_bin" ]; then
+      MANAGED_LOCAL_ADMIN_MODE=sudo
+      MANAGED_LOCAL_ADMIN_SOCKET="$socket_dir"
+      MANAGED_LOCAL_ADMIN_PORT="$port"
+      MANAGED_LOCAL_ADMIN_USER=postgres
+      MANAGED_LOCAL_PSQL_ADMIN=(
+        /usr/bin/env "${POSTGRES_ENV_UNSET_ARGS[@]}"
+        "$sudo_bin" -n -u postgres "$psql_bin"
+        -X -h "$socket_dir" -p "$port" -U postgres -d postgres
+      )
+      if probe_managed_local_admin; then
+        return 0
+      fi
+    fi
+  fi
+
+  if [ "$OS_NAME" = Linux ] && /usr/bin/id postgres >/dev/null 2>&1 \
+    && { [ -z "$test_mode" ] || [ "$test_mode" = runuser ]; }; then
+    runuser_bin="$(trusted_linux_tool runuser 2>/dev/null || true)"
+    if [ -n "$runuser_bin" ]; then
+      MANAGED_LOCAL_ADMIN_MODE=runuser
+      MANAGED_LOCAL_ADMIN_SOCKET="$socket_dir"
+      MANAGED_LOCAL_ADMIN_PORT="$port"
+      MANAGED_LOCAL_ADMIN_USER=postgres
+      MANAGED_LOCAL_PSQL_ADMIN=(
+        /usr/bin/env "${POSTGRES_ENV_UNSET_ARGS[@]}"
+        "$runuser_bin" -u postgres -- "$psql_bin"
+        -X -h "$socket_dir" -p "$port" -U postgres -d postgres
+      )
+      if probe_managed_local_admin; then
+        return 0
+      fi
+    fi
+  fi
+
+  MANAGED_LOCAL_ADMIN_MODE=""
+  MANAGED_LOCAL_ADMIN_SOCKET=""
+  MANAGED_LOCAL_ADMIN_PORT=""
+  MANAGED_LOCAL_ADMIN_USER=""
+  MANAGED_LOCAL_PSQL_ADMIN=()
+  return 1
+}
+
+probe_managed_local_admin() {
+  local is_superuser
+  is_superuser="$("${MANAGED_LOCAL_PSQL_ADMIN[@]}" -tAc \
+    "SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = CURRENT_USER AND rolsuper" \
+    2>/dev/null || true)"
+  [ "$is_superuser" = 1 ]
+}
+
+clear_postgres_routing_environment() {
+  unset PGHOST PGHOSTADDR PGPORT PGDATABASE PGUSER PGPASSWORD PGPASSFILE
+  unset PGSERVICE PGSERVICEFILE PGOPTIONS PGSSLMODE PGREQUIRESSL
+  unset PGSSLCOMPRESSION PGSSLCERT PGSSLKEY PGSSLROOTCERT PGSSLCRL PGSSLCRLDIR
+  unset PGSSLSNI PGREQUIREPEER PGCHANNELBINDING PGTARGETSESSIONATTRS
+  unset PGLOADBALANCEHOSTS PGCONNECT_TIMEOUT PGAPPNAME PGCLIENTENCODING
+  unset PGKRBSRVNAME PGGSSLIB PGGSSENCMODE
 }
 
 run_managed_local_migration_stage() {
@@ -1633,7 +1735,7 @@ run_managed_local_migration_as_runuser() {
     local name
     for name in $(compgen -e); do
       case "$name" in
-        DATABASE_URL|FORGE_DATABASE_ADMIN_URL|PGHOST|PGUSER|FORGE_WORKSPACE_ROOT|FORGE_ENV_FILE|FORGE_SUPPRESS_MIGRATION_NOTICES|PATH) ;;
+        DATABASE_URL|FORGE_DATABASE_ADMIN_URL|PGHOST|PGPORT|PGUSER|FORGE_WORKSPACE_ROOT|FORGE_ENV_FILE|FORGE_SUPPRESS_MIGRATION_NOTICES|PATH) ;;
         *) unset "$name" ;;
       esac
     done
@@ -1662,7 +1764,7 @@ run_managed_local_migration_as_sudo() {
   (
     PATH="$MANAGED_LOCAL_PATH"
     export PATH
-    "$sudo_bin" -n -u postgres --preserve-env=DATABASE_URL,FORGE_DATABASE_ADMIN_URL,PGHOST,PGUSER,FORGE_WORKSPACE_ROOT,FORGE_ENV_FILE,FORGE_SUPPRESS_MIGRATION_NOTICES,PATH "$MANAGED_LOCAL_BASH" -c 'cd "$1"; case "$2" in
+    "$sudo_bin" -n -u postgres --preserve-env=DATABASE_URL,FORGE_DATABASE_ADMIN_URL,PGHOST,PGPORT,PGUSER,FORGE_WORKSPACE_ROOT,FORGE_ENV_FILE,FORGE_SUPPRESS_MIGRATION_NOTICES,PATH "$MANAGED_LOCAL_BASH" -c 'cd "$1"; case "$2" in
       release) npm run protocol:bootstrap-epic-172-release-roles ;;
       migrate-0025) npx tsx scripts/ci/migrate-through-0025.ts ;;
       s3) npm run protocol:bootstrap-epic-172-s3-release-owner ;;
@@ -1686,16 +1788,18 @@ run_managed_local_migrations() {
 
   resolve_managed_local_admin || die "Could not establish passwordless local PostgreSQL administrator access for managed migrations. Use a native local PostgreSQL peer login, or run the documented operator migration procedure for a custom database."
 
-  local DATABASE_URL FORGE_DATABASE_ADMIN_URL PGHOST PGUSER FORGE_WORKSPACE_ROOT FORGE_ENV_FILE FORGE_SUPPRESS_MIGRATION_NOTICES
+  local DATABASE_URL FORGE_DATABASE_ADMIN_URL PGHOST PGPORT PGUSER FORGE_WORKSPACE_ROOT FORGE_ENV_FILE FORGE_SUPPRESS_MIGRATION_NOTICES
+  clear_postgres_routing_environment
   DATABASE_URL="$(env_value DATABASE_URL)"
   [ -n "$DATABASE_URL" ] || die "Managed local migrations require DATABASE_URL in the local Forge environment file."
   FORGE_DATABASE_ADMIN_URL="postgresql:///forge"
   PGHOST="$MANAGED_LOCAL_ADMIN_SOCKET"
+  PGPORT="$MANAGED_LOCAL_ADMIN_PORT"
   PGUSER="$MANAGED_LOCAL_ADMIN_USER"
   FORGE_WORKSPACE_ROOT="$WORKSPACE_ROOT"
   FORGE_ENV_FILE="$ENV_FILE"
   FORGE_SUPPRESS_MIGRATION_NOTICES=1
-  export DATABASE_URL FORGE_DATABASE_ADMIN_URL PGHOST PGUSER FORGE_WORKSPACE_ROOT FORGE_ENV_FILE FORGE_SUPPRESS_MIGRATION_NOTICES
+  export DATABASE_URL FORGE_DATABASE_ADMIN_URL PGHOST PGPORT PGUSER FORGE_WORKSPACE_ROOT FORGE_ENV_FILE FORGE_SUPPRESS_MIGRATION_NOTICES
 
   run_managed_local_migration_sequence
 }

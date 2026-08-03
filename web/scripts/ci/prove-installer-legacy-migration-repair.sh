@@ -25,6 +25,10 @@ trap 'rm -rf "$TEMP_ROOT"' EXIT
 case "$FORGE_LEGACY_REPAIR_ADMIN_DATABASE" in
   ''|*[!A-Za-z0-9_]* ) echo 'Unsafe disposable database name.' >&2; exit 64 ;;
 esac
+[ "$FORGE_LEGACY_REPAIR_ADMIN_DATABASE" = forge ] || {
+  echo 'The real native-installer proof requires the disposable database name forge.' >&2
+  exit 64
+}
 case "$FORGE_LEGACY_REPAIR_MIGRATION_USER" in
   ''|*[!A-Za-z0-9_]* ) echo 'Unsafe disposable migration role name.' >&2; exit 64 ;;
 esac
@@ -355,28 +359,13 @@ run_installer_grant_privileges() {
     export FORGE_INSTALL_STATE_DIR="$TEMP_ROOT/$label-state"
     export FORGE_WORKSPACE_ROOT="$TEMP_ROOT/$label-workspace"
     export FORGE_ENV_FILE="$TEMP_ROOT/$label.env"
+    export FORGE_INSTALL_TEST_ADMIN_MODE=current
+    export FORGE_INSTALL_TEST_PSQL_SOCKET="${FORGE_LEGACY_REPAIR_ADMIN_SOCKET:-/tmp}"
+    export FORGE_INSTALL_TEST_PSQL_PORT="${PGPORT:-5432}"
     source "$REPO_ROOT/scripts/install.sh"
     SERVICE_MODE=native
     MANAGE_LOCAL_DB=1
     DRY_RUN=0
-    psql_admin() {
-      local forwarded=()
-      while [ "$#" -gt 0 ]; do
-        if [ "$1" = '-d' ]; then
-          shift
-          [ "$#" -gt 0 ] || return 64
-          shift
-        else
-          forwarded+=("$1")
-          shift
-        fi
-      done
-      PGPASSWORD="$FORGE_LEGACY_REPAIR_ADMIN_PASSWORD" \
-        PGHOST="$FORGE_LEGACY_REPAIR_ADMIN_HOST" \
-        PGUSER="$FORGE_LEGACY_REPAIR_ADMIN_USER" \
-        PGDATABASE="$FORGE_LEGACY_REPAIR_ADMIN_DATABASE" \
-        command psql "${forwarded[@]}"
-    }
     grant_forge_privileges
   )
 }
