@@ -1441,14 +1441,14 @@ resolve_managed_local_admin() {
     MANAGED_LOCAL_ADMIN_MODE="current"
     MANAGED_LOCAL_ADMIN_USER="$(psql -d postgres -tAc 'SELECT current_user' | tr -d '[:space:]')"
     MANAGED_LOCAL_ADMIN_SOCKET="$(psql -d postgres -tAc 'SHOW unix_socket_directories' | tr -d '[:space:]' | cut -d, -f1)"
-  elif [ "$OS_NAME" = "Linux" ] && id postgres >/dev/null 2>&1 && command -v sudo >/dev/null 2>&1 && sudo -n -u postgres psql -d postgres -tAc 'SELECT 1' >/dev/null 2>&1; then
+  elif [ "$OS_NAME" = "Linux" ] && id postgres >/dev/null 2>&1 && trusted_linux_tool sudo >/dev/null 2>&1 && "$(trusted_linux_tool sudo)" -n -u postgres psql -d postgres -tAc 'SELECT 1' >/dev/null 2>&1; then
     MANAGED_LOCAL_ADMIN_MODE="sudo"
     MANAGED_LOCAL_ADMIN_USER="postgres"
-    MANAGED_LOCAL_ADMIN_SOCKET="$(sudo -n -u postgres psql -d postgres -tAc 'SHOW unix_socket_directories' | tr -d '[:space:]' | cut -d, -f1)"
-  elif [ "$OS_NAME" = "Linux" ] && id postgres >/dev/null 2>&1 && command -v runuser >/dev/null 2>&1 && runuser -u postgres -- psql -d postgres -tAc 'SELECT 1' >/dev/null 2>&1; then
+    MANAGED_LOCAL_ADMIN_SOCKET="$("$(trusted_linux_tool sudo)" -n -u postgres psql -d postgres -tAc 'SHOW unix_socket_directories' | tr -d '[:space:]' | cut -d, -f1)"
+  elif [ "$OS_NAME" = "Linux" ] && id postgres >/dev/null 2>&1 && trusted_linux_tool runuser >/dev/null 2>&1 && "$(trusted_linux_tool runuser)" -u postgres -- psql -d postgres -tAc 'SELECT 1' >/dev/null 2>&1; then
     MANAGED_LOCAL_ADMIN_MODE="runuser"
     MANAGED_LOCAL_ADMIN_USER="postgres"
-    MANAGED_LOCAL_ADMIN_SOCKET="$(runuser -u postgres -- psql -d postgres -tAc 'SHOW unix_socket_directories' | tr -d '[:space:]' | cut -d, -f1)"
+    MANAGED_LOCAL_ADMIN_SOCKET="$("$(trusted_linux_tool runuser)" -u postgres -- psql -d postgres -tAc 'SHOW unix_socket_directories' | tr -d '[:space:]' | cut -d, -f1)"
   else
     return 1
   fi
@@ -1484,17 +1484,7 @@ run_managed_local_migration_stage() {
       esac' _ "$REPO_ROOT/web" "$stage"
       ;;
     sudo)
-      run "$description" sudo -n -u postgres --preserve-env=DATABASE_URL,FORGE_DATABASE_ADMIN_URL,PGHOST,PGUSER,FORGE_WORKSPACE_ROOT,FORGE_ENV_FILE,FORGE_SUPPRESS_MIGRATION_NOTICES,PATH bash -c 'cd "$1"; case "$2" in
-        release) npm run protocol:bootstrap-epic-172-release-roles ;;
-        migrate-0025) npx tsx scripts/ci/migrate-through-0025.ts ;;
-        s3) npm run protocol:bootstrap-epic-172-s3-release-owner ;;
-        migrate-0026) npx tsx scripts/ci/migrate-through-0026.ts ;;
-        s4) npm run protocol:bootstrap-epic-172-s4-roles ;;
-        migrate-0027) npx tsx scripts/ci/migrate-through-0027.ts ;;
-        s5) bash scripts/ci/apply-epic-172-s5-recovery-migration.sh ;;
-        latest) npm run db:migrate ;;
-        *) exit 64 ;;
-      esac' _ "$REPO_ROOT/web" "$stage"
+      run_managed_local_migration_as_sudo "$description" "$stage"
       ;;
     runuser)
       run_managed_local_migration_as_runuser "$description" "$stage"
@@ -1503,22 +1493,42 @@ run_managed_local_migration_stage() {
   esac
 }
 
-managed_local_executable_path() {
-  local tool path result=""
-  for tool in node npm npx bash; do
-    path="$(command -v "$tool")" || die "Managed local migrations require $tool on PATH."
-    case ":$result:" in
-      *":$(dirname "$path"):"*) ;;
-      *) result="${result:+$result:}$(dirname "$path")" ;;
-    esac
+trusted_linux_tool() {
+  local tool="$1" candidate resolved owner mode
+  for candidate in "/usr/local/sbin/$tool" "/usr/local/bin/$tool" "/usr/sbin/$tool" "/usr/bin/$tool" "/sbin/$tool" "/bin/$tool"; do
+    [ -x "$candidate" ] || continue
+    resolved="$(/usr/bin/readlink -f "$candidate" 2>/dev/null || true)"
+    [ -n "$resolved" ] && [ -f "$resolved" ] || continue
+    owner="$(/usr/bin/stat -c '%U' "$resolved" 2>/dev/null || true)"
+    mode="$(/usr/bin/stat -c '%a' "$resolved" 2>/dev/null || true)"
+    [ "$owner" = root ] && [ -n "$mode" ] || continue
+    [ $((8#$mode & 022)) -eq 0 ] || continue
+    while [ "$resolved" != / ]; do
+      resolved="$(/usr/bin/dirname "$resolved")"
+      owner="$(/usr/bin/stat -c '%U' "$resolved" 2>/dev/null || true)"
+      mode="$(/usr/bin/stat -c '%a' "$resolved" 2>/dev/null || true)"
+      [ "$owner" = root ] && [ -n "$mode" ] && [ $((8#$mode & 022)) -eq 0 ] || break 2
+    done
+    printf '%s\n' "$(/usr/bin/readlink -f "$candidate")"
+    return 0
   done
-  printf '%s:/usr/local/bin:/usr/bin:/bin\n' "$result"
+  return 1
+}
+
+prepare_trusted_linux_migration_toolchain() {
+  [ "$OS_NAME" = Linux ] || die "Elevated managed local migrations are only supported on Linux."
+  MANAGED_LOCAL_BASH="$(trusted_linux_tool bash)" || die "Could not find a root-owned non-writable bash for elevated managed migrations."
+  MANAGED_LOCAL_NODE="$(trusted_linux_tool node)" || die "Could not find a root-owned non-writable node for elevated managed migrations."
+  MANAGED_LOCAL_NPM="$(trusted_linux_tool npm)" || die "Could not find a root-owned non-writable npm for elevated managed migrations."
+  MANAGED_LOCAL_NPX="$(trusted_linux_tool npx)" || die "Could not find a root-owned non-writable npx for elevated managed migrations."
+  MANAGED_LOCAL_PATH="$(dirname "$MANAGED_LOCAL_NODE"):$(dirname "$MANAGED_LOCAL_NPM"):$(dirname "$MANAGED_LOCAL_NPX"):$(dirname "$MANAGED_LOCAL_BASH"):/usr/local/bin:/usr/bin:/bin"
 }
 
 run_managed_local_migration_as_runuser() {
   local description="$1" stage="$2"
   local controlled_path
-  controlled_path="$(managed_local_executable_path)"
+  prepare_trusted_linux_migration_toolchain
+  controlled_path="$MANAGED_LOCAL_PATH"
 
   # `runuser --preserve-environment` is needed so the child receives the
   # process-only socket/admin context without serialising a credential into an
@@ -1534,7 +1544,29 @@ run_managed_local_migration_as_runuser() {
     done
     PATH="$controlled_path"
     export PATH
-    run "$description" runuser -u postgres --preserve-environment -- bash -c 'cd "$1"; case "$2" in
+    run "$description" "$(trusted_linux_tool runuser)" -u postgres --preserve-environment -- "$MANAGED_LOCAL_BASH" -c 'cd "$1"; case "$2" in
+      release) npm run protocol:bootstrap-epic-172-release-roles ;;
+      migrate-0025) npx tsx scripts/ci/migrate-through-0025.ts ;;
+      s3) npm run protocol:bootstrap-epic-172-s3-release-owner ;;
+      migrate-0026) npx tsx scripts/ci/migrate-through-0026.ts ;;
+      s4) npm run protocol:bootstrap-epic-172-s4-roles ;;
+      migrate-0027) npx tsx scripts/ci/migrate-through-0027.ts ;;
+      s5) bash scripts/ci/apply-epic-172-s5-recovery-migration.sh ;;
+      latest) npm run db:migrate ;;
+      *) exit 64 ;;
+    esac' _ "$REPO_ROOT/web" "$stage"
+  )
+}
+
+run_managed_local_migration_as_sudo() {
+  local description="$1" stage="$2"
+  local sudo_bin
+  prepare_trusted_linux_migration_toolchain
+  sudo_bin="$(trusted_linux_tool sudo)" || die "Could not find a root-owned non-writable sudo for elevated managed migrations."
+  (
+    PATH="$MANAGED_LOCAL_PATH"
+    export PATH
+    "$sudo_bin" -n -u postgres --preserve-env=DATABASE_URL,FORGE_DATABASE_ADMIN_URL,PGHOST,PGUSER,FORGE_WORKSPACE_ROOT,FORGE_ENV_FILE,FORGE_SUPPRESS_MIGRATION_NOTICES,PATH "$MANAGED_LOCAL_BASH" -c 'cd "$1"; case "$2" in
       release) npm run protocol:bootstrap-epic-172-release-roles ;;
       migrate-0025) npx tsx scripts/ci/migrate-through-0025.ts ;;
       s3) npm run protocol:bootstrap-epic-172-s3-release-owner ;;
@@ -1560,11 +1592,7 @@ run_managed_local_migrations() {
   local DATABASE_URL FORGE_DATABASE_ADMIN_URL PGHOST PGUSER FORGE_WORKSPACE_ROOT FORGE_ENV_FILE FORGE_SUPPRESS_MIGRATION_NOTICES
   DATABASE_URL="$(env_value DATABASE_URL)"
   [ -n "$DATABASE_URL" ] || die "Managed local migrations require DATABASE_URL in the local Forge environment file."
-  if [ "${FORGE_INSTALL_TEST_HOOK:-}" = "managed-local-migrations-real" ] && [ -n "${FORGE_INSTALL_TEST_ADMIN_URL:-}" ]; then
-    FORGE_DATABASE_ADMIN_URL="$FORGE_INSTALL_TEST_ADMIN_URL"
-  else
-    FORGE_DATABASE_ADMIN_URL="postgresql:///forge"
-  fi
+  FORGE_DATABASE_ADMIN_URL="postgresql:///forge"
   PGHOST="$MANAGED_LOCAL_ADMIN_SOCKET"
   PGUSER="$MANAGED_LOCAL_ADMIN_USER"
   FORGE_WORKSPACE_ROOT="$WORKSPACE_ROOT"
@@ -1572,6 +1600,10 @@ run_managed_local_migrations() {
   FORGE_SUPPRESS_MIGRATION_NOTICES=1
   export DATABASE_URL FORGE_DATABASE_ADMIN_URL PGHOST PGUSER FORGE_WORKSPACE_ROOT FORGE_ENV_FILE FORGE_SUPPRESS_MIGRATION_NOTICES
 
+  run_managed_local_migration_sequence
+}
+
+run_managed_local_migration_sequence() {
   run_managed_local_migration_stage "Bootstrap release roles for managed local migration" release || die "Managed local migration failed while bootstrapping release roles."
   run_managed_local_migration_stage "Migrate managed local database through 0025" migrate-0025 || die "Managed local migration failed while applying migrations through 0025."
   run_managed_local_migration_stage "Bootstrap S3 owner handoff for managed local migration" s3 || die "Managed local migration failed while bootstrapping the S3 owner handoff."
@@ -1854,6 +1886,10 @@ acquire_install_lock() {
   die "Another Forge install appears to be running. Remove $LOCK_DIR only if you are sure it is stale."
 }
 
+if [ "${FORGE_INSTALL_LIBRARY:-0}" = "1" ] && [ "${BASH_SOURCE[0]}" != "$0" ]; then
+  return 0
+fi
+
 # Internal seam for the focused installer regression test. It intentionally
 # bypasses all setup work and invokes only the native-service function.
 if [ "${FORGE_INSTALL_TEST_HOOK:-}" = "start-native-services" ]; then
@@ -1866,18 +1902,6 @@ fi
 if [ "${FORGE_INSTALL_TEST_HOOK:-}" = "managed-local-migrations" ]; then
   SERVICE_MODE="${FORGE_INSTALL_TEST_SERVICE_MODE:-native}"
   printf 'admin:%s\n' "${FORGE_INSTALL_TEST_ADMIN_MODE:-unset}" >> "${FORGE_INSTALL_TEST_STAGE_LOG:?}"
-  run_managed_local_migrations
-  exit 0
-fi
-
-if [ "${FORGE_INSTALL_TEST_HOOK:-}" = "managed-local-migrations-runuser-environment" ]; then
-  SERVICE_MODE="native"
-  run_managed_local_migrations
-  exit 0
-fi
-
-if [ "${FORGE_INSTALL_TEST_HOOK:-}" = "managed-local-migrations-real" ]; then
-  SERVICE_MODE="native"
   run_managed_local_migrations
   exit 0
 fi

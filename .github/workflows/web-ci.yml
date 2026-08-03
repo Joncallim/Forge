@@ -129,6 +129,11 @@ jobs:
           FORGE_INSTALLER_MANAGED_FAILURE_DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_installer_managed_s5_failure_test
           FORGE_INSTALLER_MANAGED_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_installer_managed_migration_test
           FORGE_INSTALLER_MANAGED_FAILURE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_installer_managed_s5_failure_test
+          FORGE_INSTALLER_MANAGED_ADMIN_HOST: localhost
+          FORGE_INSTALLER_MANAGED_ADMIN_USER: forge_e2e
+          FORGE_INSTALLER_MANAGED_ADMIN_PASSWORD: forge
+          FORGE_INSTALLER_MANAGED_ADMIN_DATABASE: forge_installer_managed_migration_test
+          FORGE_INSTALLER_MANAGED_FAILURE_ADMIN_DATABASE: forge_installer_managed_s5_failure_test
       - name: Prove populated migration 0026 to latest recovery upgrade and strict cutover
         run: npm run test:migration-0027-upgrade
         env:

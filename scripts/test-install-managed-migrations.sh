@@ -123,13 +123,32 @@ EOF
     printf '#!/usr/bin/env bash\nexit 0\n' > "$case_dir/bin/$command"
   done
   chmod +x "$case_dir/bin/runuser" "$case_dir/bin/bash" "$case_dir/bin/node" "$case_dir/bin/npm" "$case_dir/bin/npx"
-  PATH="$case_dir/bin:$PATH" \
+  cat > "$case_dir/driver.sh" <<'EOF'
+#!/bin/bash
+FORGE_INSTALL_LIBRARY=1 source "$INSTALLER"
+test_toolchain_dir="$FORGE_TEST_TOOLCHAIN_DIR"
+trusted_linux_tool() { printf '%s/%s\n' "$test_toolchain_dir" "$1"; }
+OS_NAME=Linux
+SERVICE_MODE=native
+DRY_RUN=0
+run_managed_local_migrations
+EOF
+  chmod +x "$case_dir/driver.sh"
+  set +e
+  INSTALLER="$INSTALLER" \
+    FORGE_TEST_TOOLCHAIN_DIR="$case_dir/bin" \
+    PATH="$case_dir/bin:$PATH" \
     UNRELATED_SECRET_SENTINEL='unrelated-value-must-not-reach-postgres' \
-    FORGE_INSTALL_TEST_HOOK=managed-local-migrations-runuser-environment \
     FORGE_INSTALL_TEST_ADMIN_MODE=runuser \
     FORGE_ENV_FILE="$case_dir/forge.env" \
     FORGE_INSTALL_STATE_DIR="$case_dir/state" \
-    /bin/bash "$INSTALLER" > "$case_dir/stdout" 2> "$case_dir/stderr"
+    /bin/bash "$case_dir/driver.sh" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  local driver_status=$?
+  set -e
+  if [ "$driver_status" -ne 0 ]; then
+    sed -n '1,80p' "$case_dir/stderr" >&2
+    fail 'runuser environment driver failed'
+  fi
   CASE_DIR="$case_dir"
 }
 
@@ -141,6 +160,21 @@ assert_contains 'FORGE_DATABASE_ADMIN_URL' "$CASE_DIR/runuser-environment-names"
 assert_contains 'PGHOST' "$CASE_DIR/runuser-environment-names"
 assert_contains 'PGUSER' "$CASE_DIR/runuser-environment-names"
 assert_not_contains "$TEST_SECRET" "$CASE_DIR/runuser-environment-names"
+
+run_shadow_refusal_case() {
+  local case_dir="$TEST_ROOT/shadow-refusal"
+  mkdir -p "$case_dir/bin"
+  printf '#!/bin/bash\nprintf shadow-used > "$FORGE_SHADOW_MARKER"\nexit 0\n' > "$case_dir/bin/sudo"
+  chmod +x "$case_dir/bin/sudo"
+  INSTALLER="$INSTALLER" FORGE_SHADOW_MARKER="$case_dir/marker" PATH="$case_dir/bin:$PATH" /bin/bash -c '
+    FORGE_INSTALL_LIBRARY=1 source "$INSTALLER"
+    resolved="$(trusted_linux_tool sudo 2>/dev/null || true)"
+    [ "$resolved" != "$PWD/bin/sudo" ]
+  ' > "$case_dir/stdout" 2> "$case_dir/stderr"
+  [ ! -e "$case_dir/marker" ] || fail 'caller PATH shadow reached the privileged sudo resolver'
+}
+
+run_shadow_refusal_case
 
 if rg -F "$TEST_SECRET" "$TEST_ROOT" --glob '!forge.env' >/dev/null; then
   fail 'test sentinel leaked outside the local environment fixture'
