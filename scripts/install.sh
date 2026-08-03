@@ -80,6 +80,7 @@ POSTGRES_ENV_UNSET_ARGS=(
   -u PGGSSLIB -u PGGSSENCMODE
 )
 LOCK_DIR="$INSTALL_STATE_DIR/install.lock"
+INSTALL_LOCK_HELD=0
 TEMP_FILES=""
 
 export FORGE_ZERO_CONFIG_MODEL="$ZERO_CONFIG_MODEL"
@@ -171,8 +172,9 @@ cleanup() {
     [ -n "$file" ] && rm -f "$file" 2>/dev/null || true
   done
 
-  if [ "$DRY_RUN" != "1" ] && [ -d "$LOCK_DIR" ]; then
+  if [ "$DRY_RUN" != "1" ] && [ "$INSTALL_LOCK_HELD" = 1 ] && [ -d "$LOCK_DIR" ]; then
     rmdir "$LOCK_DIR" 2>/dev/null || true
+    INSTALL_LOCK_HELD=0
   fi
 }
 trap cleanup EXIT
@@ -1118,8 +1120,37 @@ uri_safe_database_password() {
   done
 }
 
+percent_decode_database_password() {
+  local encoded="${1:-}" decoded='' index=0 length character hex_pair byte_value decoded_character
+  length="${#encoded}"
+  [ "$length" -gt 0 ] || return 1
+
+  while [ "$index" -lt "$length" ]; do
+    character="${encoded:$index:1}"
+    if [ "$character" != '%' ]; then
+      decoded+="$character"
+      index=$((index + 1))
+      continue
+    fi
+    [ $((index + 2)) -lt "$length" ] || return 1
+    hex_pair="${encoded:$((index + 1)):2}"
+    case "$hex_pair" in
+      [0-9A-Fa-f][0-9A-Fa-f]) ;;
+      *) return 1 ;;
+    esac
+    byte_value=$((16#$hex_pair))
+    # Bash strings cannot preserve NUL. Other ASCII control bytes are rejected
+    # as ambiguous credential/config delimiters before SQL is constructed.
+    [ "$byte_value" -gt 31 ] && [ "$byte_value" -ne 127 ] || return 1
+    printf -v decoded_character '%b' "\\x$hex_pair"
+    decoded+="$decoded_character"
+    index=$((index + 3))
+  done
+  printf '%s' "$decoded"
+}
+
 native_forge_database_password() {
-  local database_url="${1:-}" remainder password
+  local database_url="${1:-}" remainder encoded_password
   local target='@localhost:5432/forge'
 
   case "$database_url" in
@@ -1128,11 +1159,11 @@ native_forge_database_password() {
     *) return 1 ;;
   esac
   case "$remainder" in
-    *"$target") password="${remainder%"$target"}" ;;
+    *"$target") encoded_password="${remainder%"$target"}" ;;
     *) return 1 ;;
   esac
-  uri_safe_database_password "$password" || return 1
-  printf '%s' "$password"
+  uri_safe_database_password "$encoded_password" || return 1
+  percent_decode_database_password "$encoded_password"
 }
 
 is_native_forge_database_url() {
@@ -1580,6 +1611,10 @@ managed_local_migrations_enabled() {
   [ "$MANAGE_LOCAL_DB" = "1" ]
 }
 
+managed_local_postgres_user_exists() {
+  /usr/bin/id postgres >/dev/null 2>&1
+}
+
 resolve_managed_local_admin() {
   local socket_dir port psql_bin current_user sudo_bin runuser_bin test_mode=""
   if [ "$MANAGED_LOCAL_ADMIN_RESOLUTION" = resolved ]; then
@@ -1595,22 +1630,12 @@ resolve_managed_local_admin() {
 
   if [ -n "${FORGE_INSTALL_TEST_ADMIN_MODE:-}" ]; then
     case "$FORGE_INSTALL_TEST_ADMIN_MODE" in
-      current|sudo|runuser) test_mode="$FORGE_INSTALL_TEST_ADMIN_MODE" ;;
+      current) test_mode=current ;;
       unavailable) return 1 ;;
       *) die "Unknown installer test admin mode." ;;
     esac
     socket_dir="${FORGE_INSTALL_TEST_PSQL_SOCKET:-/tmp}"
     port="${FORGE_INSTALL_TEST_PSQL_PORT:-5432}"
-    if [ -z "${FORGE_INSTALL_TEST_PSQL_SOCKET:-}" ]; then
-      MANAGED_LOCAL_ADMIN_MODE="$test_mode"
-      MANAGED_LOCAL_ADMIN_SOCKET="$socket_dir"
-      MANAGED_LOCAL_ADMIN_PORT="$port"
-      case "$test_mode" in
-        current) MANAGED_LOCAL_ADMIN_USER="$(/usr/bin/id -un)" ;;
-        *) MANAGED_LOCAL_ADMIN_USER=postgres ;;
-      esac
-      return 0
-    fi
   else
     case "$OS_NAME" in
       Darwin) socket_dir=/tmp ;;
@@ -1640,7 +1665,7 @@ resolve_managed_local_admin() {
   esac
 
   current_user="$(/usr/bin/id -un 2>/dev/null || true)"
-  if [ -n "$current_user" ] && { [ -z "$test_mode" ] || [ "$test_mode" = current ]; }; then
+  if [ -n "$current_user" ]; then
     MANAGED_LOCAL_ADMIN_MODE=current
     MANAGED_LOCAL_ADMIN_SOCKET="$socket_dir"
     MANAGED_LOCAL_ADMIN_PORT="$port"
@@ -1654,8 +1679,18 @@ resolve_managed_local_admin() {
     fi
   fi
 
-  if [ "$OS_NAME" = Linux ] && /usr/bin/id postgres >/dev/null 2>&1 \
-    && { [ -z "$test_mode" ] || [ "$test_mode" = sudo ]; }; then
+  # A test-selected psql is caller-controlled. It may prove current-user
+  # access, but it is never carried across a sudo/runuser boundary.
+  if [ -n "$test_mode" ]; then
+    MANAGED_LOCAL_ADMIN_MODE=""
+    MANAGED_LOCAL_ADMIN_SOCKET=""
+    MANAGED_LOCAL_ADMIN_PORT=""
+    MANAGED_LOCAL_ADMIN_USER=""
+    MANAGED_LOCAL_PSQL_ADMIN=()
+    return 1
+  fi
+
+  if [ "$OS_NAME" = Linux ] && managed_local_postgres_user_exists; then
     sudo_bin="$(trusted_linux_tool sudo 2>/dev/null || true)"
     if [ -n "$sudo_bin" ]; then
       MANAGED_LOCAL_ADMIN_MODE=sudo
@@ -1673,8 +1708,7 @@ resolve_managed_local_admin() {
     fi
   fi
 
-  if [ "$OS_NAME" = Linux ] && /usr/bin/id postgres >/dev/null 2>&1 \
-    && { [ -z "$test_mode" ] || [ "$test_mode" = runuser ]; }; then
+  if [ "$OS_NAME" = Linux ] && managed_local_postgres_user_exists; then
     runuser_bin="$(trusted_linux_tool runuser 2>/dev/null || true)"
     if [ -n "$runuser_bin" ]; then
       MANAGED_LOCAL_ADMIN_MODE=runuser
@@ -1786,7 +1820,16 @@ trusted_linux_candidate() {
 }
 
 trusted_linux_tool() {
-  local tool="$1" candidate
+  local tool="$1" candidate version
+  # Ubuntu's /usr/bin/psql is a pg_wrapper symlink. Executing its canonical
+  # target loses argv[0]=psql, so prefer the versioned PostgreSQL 16+ binary.
+  if [ "$tool" = psql ]; then
+    for version in 18 17 16; do
+      for candidate in "/usr/lib/postgresql/$version/bin/psql" "/usr/pgsql-$version/bin/psql"; do
+        trusted_linux_candidate "$candidate" && return 0
+      done
+    done
+  fi
   for candidate in "/usr/local/sbin/$tool" "/usr/local/bin/$tool" "/usr/sbin/$tool" "/usr/bin/$tool" "/sbin/$tool" "/bin/$tool"; do
     trusted_linux_candidate "$candidate" && return 0
   done
@@ -2004,6 +2047,15 @@ resolve_service_mode() {
   if [ "$SERVICE_MODE" = "auto" ]; then
     SERVICE_MODE="native"
   fi
+}
+
+commit_service_mode() {
+  [ "$DRY_RUN" = 1 ] && return 0
+  [ "$INSTALL_LOCK_HELD" = 1 ] \
+    || die "Refusing to record service mode without the Forge install lock."
+  # This is the installed-state commit point: the selected PostgreSQL/Redis
+  # service transition has completed successfully, while later dependency,
+  # migration, seed, or doctor failures cannot make that running mode untrue.
   record_current_manifest_value "service_mode" "$SERVICE_MODE"
 }
 
@@ -2172,6 +2224,7 @@ acquire_install_lock() {
   [ "$DRY_RUN" = "1" ] && return 0
   ensure_install_state
   if mkdir "$LOCK_DIR" 2>/dev/null; then
+    INSTALL_LOCK_HELD=1
     return 0
   fi
 
@@ -2193,7 +2246,19 @@ fi
 
 if [ "${FORGE_INSTALL_TEST_HOOK:-}" = "managed-local-migrations" ]; then
   SERVICE_MODE="${FORGE_INSTALL_TEST_SERVICE_MODE:-native}"
-  printf 'admin:%s\n' "${FORGE_INSTALL_TEST_ADMIN_MODE:-unset}" >> "${FORGE_INSTALL_TEST_STAGE_LOG:?}"
+  case "${FORGE_INSTALL_TEST_ADMIN_MODE:-current}" in
+    current)
+      MANAGED_LOCAL_ADMIN_RESOLUTION=resolved
+      MANAGED_LOCAL_ADMIN_MODE=current
+      MANAGED_LOCAL_ADMIN_USER="$(/usr/bin/id -un)"
+      ;;
+    unavailable)
+      MANAGED_LOCAL_ADMIN_RESOLUTION=resolved
+      MANAGED_LOCAL_ADMIN_MODE=""
+      ;;
+    *) die "Installer migration test hook supports only current-user administration." ;;
+  esac
+  printf 'admin:%s\n' "${FORGE_INSTALL_TEST_ADMIN_MODE:-current}" >> "${FORGE_INSTALL_TEST_STAGE_LOG:?}"
   run_managed_local_migrations
   exit 0
 fi
@@ -2252,9 +2317,11 @@ install_cli_entrypoint
 
 if [ "$SERVICE_MODE" = "docker" ]; then
   start_docker_services
+  commit_service_mode
 else
   install_native_services
   start_native_services
+  commit_service_mode
   provision_database
 fi
 

@@ -374,8 +374,9 @@ run_installer_grant_privileges() {
 
 run_installer_provision_database() {
   local label="$1"
+  local encoded_password="${2:-installer-race-proof}"
   local proof_env="$TEMP_ROOT/$label.env"
-  printf 'DATABASE_URL=postgresql://forge:installer-race-proof@localhost:5432/forge\n' > "$proof_env"
+  printf 'DATABASE_URL=postgresql://forge:%s@localhost:5432/forge\n' "$encoded_password" > "$proof_env"
   (
     export FORGE_INSTALL_LIBRARY=1
     export FORGE_INSTALL_STATE_DIR="$TEMP_ROOT/$label-state"
@@ -390,8 +391,50 @@ run_installer_provision_database() {
     SERVICE_MODE=native
     MANAGE_LOCAL_DB=1
     DRY_RUN=0
-    DB_PASSWORD=installer-race-proof
+    DB_PASSWORD="$(native_forge_database_password "$(initial_env_value DATABASE_URL)")"
     provision_database
+  )
+}
+
+prove_encoded_installer_password() {
+  local encoded_password='p%40ss%3Aword!'
+  local endpoint="${FORGE_LEGACY_REPAIR_DATABASE_URL#*@}"
+  local login_url="postgresql://forge:${encoded_password}@${endpoint}"
+  run_installer_provision_database encoded-password-first "$encoded_password"
+  run_installer_provision_database encoded-password-rerun "$encoded_password"
+  (
+    cd "$WEB_ROOT"
+    FORGE_ENCODED_LOGIN_URL="$login_url" \
+      FORGE_ENCODED_ADMIN_URL="$FORGE_LEGACY_REPAIR_ADMIN_URL" node <<'NODE'
+const crypto = require('node:crypto')
+const postgres = require('postgres')
+const client = postgres(process.env.FORGE_ENCODED_LOGIN_URL, { max: 1 })
+const admin = postgres(process.env.FORGE_ENCODED_ADMIN_URL, { max: 1 })
+Promise.all([
+  client`SELECT current_user AS user_name`,
+  admin`SELECT rolpassword FROM pg_catalog.pg_authid WHERE rolname = 'forge'`,
+])
+  .then(([rows, passwordRows]) => {
+    if (rows.length !== 1 || rows[0].user_name !== 'forge') {
+      throw new Error('encoded installer credential did not authenticate the forge role')
+    }
+    const verifier = passwordRows[0]?.rolpassword ?? ''
+    const match = /^SCRAM-SHA-256\$(\d+):([^$]+)\$([^:]+):(.+)$/.exec(verifier)
+    if (!match) throw new Error('forge role did not retain a SCRAM password verifier')
+    const salted = crypto.pbkdf2Sync('p@ss:word!', Buffer.from(match[2], 'base64'), Number(match[1]), 32, 'sha256')
+    const clientKey = crypto.createHmac('sha256', salted).update('Client Key').digest()
+    const storedKey = crypto.createHash('sha256').update(clientKey).digest()
+    if (!crypto.timingSafeEqual(storedKey, Buffer.from(match[3], 'base64'))) {
+      throw new Error('installer did not store the once-decoded native URL password')
+    }
+  })
+  .then(() => Promise.all([client.end(), admin.end()]))
+  .catch(async (error) => {
+    await Promise.all([client.end().catch(() => {}), admin.end().catch(() => {})])
+    console.error(error)
+    process.exit(1)
+  })
+NODE
   )
 }
 
@@ -1441,6 +1484,9 @@ prove_role_boundary_race_refusal shared membership
 echo 'Proving installer provisioning role races block, then refuse the committed unsafe boundary.'
 prove_role_boundary_race_refusal installer attribute
 prove_role_boundary_race_refusal installer membership
+
+echo 'Proving percent-encoded native installer credentials survive provisioning and rerun.'
+prove_encoded_installer_password
 
 admin_psql --command 'GRANT INSERT ON TABLE public.architect_plan_versions TO PUBLIC;'
 snapshot shared-public-table-authority-before

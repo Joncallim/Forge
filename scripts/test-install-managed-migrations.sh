@@ -68,6 +68,14 @@ assert_contains 'repair_trusted_darwin_psql' "$REPAIR"
 assert_not_contains 'postgresql://forge:*@localhost:5432/forge|postgres://forge:*@localhost:5432/forge' "$INSTALLER"
 assert_not_contains 'postgresql://forge:*@localhost:5432/forge|postgres://forge:*@localhost:5432/forge' "$REPAIR"
 assert_contains 'FORGE_REPAIR_TEST_DATABASE_NAME is required for the privilege reconciliation test hook.' "$REPAIR"
+installer_main="$TEST_ROOT/installer-main"
+sed -n '/^bold "Forge installer"/,$p' "$INSTALLER" > "$installer_main"
+installer_main_text="$(tr '\n' ' ' < "$installer_main")"
+case "$installer_main_text" in
+  *'resolve_service_mode'*'print_preflight_summary'*'if [ "$CHECK_ONLY" = "1" ]'*'acquire_install_lock'*'start_docker_services'*'commit_service_mode'*'start_native_services'*'commit_service_mode'*'provision_database'*) ;;
+  *) fail 'service mode must resolve before check and commit only after the locked successful service transition' ;;
+esac
+assert_not_contains 'record_current_manifest_value' "$installer_main"
 assert_contains 'GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO forge;' "$PRIVILEGE_SQL"
 assert_contains 'GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO forge;' "$PRIVILEGE_SQL"
 assert_contains "owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner')" "$PRIVILEGE_SQL"
@@ -115,21 +123,120 @@ manifest_case="$TEST_ROOT/current-service-mode-manifest"
 mkdir -p "$manifest_case/state"
 printf 'unrelated=preserved\nservice_mode=stale\nanother=value\nservice_mode=older\n' \
   > "$manifest_case/state/install-manifest"
+cp "$manifest_case/state/install-manifest" "$manifest_case/check-before"
+set +e
+FORGE_CHECK_ONLY=1 \
+  FORGE_SERVICE_MODE=native \
+  FORGE_OS_OVERRIDE=Darwin \
+  FORGE_PACKAGE_MANAGER_OVERRIDE=brew \
+  FORGE_INSTALL_STATE_DIR="$manifest_case/state" \
+  FORGE_WORKSPACE_ROOT="$manifest_case/workspace" \
+  FORGE_ENV_FILE="$manifest_case/forge.env" \
+  /bin/bash "$INSTALLER" --check > "$manifest_case/check-stdout" 2> "$manifest_case/check-stderr"
+set -e
+cmp -s "$manifest_case/check-before" "$manifest_case/state/install-manifest" \
+  || fail '--check changed the install manifest'
+
+cp "$manifest_case/state/install-manifest" "$manifest_case/failure-before"
+set +e
 FORGE_INSTALL_LIBRARY=1 \
+  FORGE_SERVICE_MODE=docker \
   FORGE_INSTALL_STATE_DIR="$manifest_case/state" \
   FORGE_WORKSPACE_ROOT="$manifest_case/workspace" \
   FORGE_ENV_FILE="$manifest_case/forge.env" \
   /bin/bash -c '
     source "$1"
-    for SERVICE_MODE in native docker native; do
+    resolve_service_mode
+    acquire_install_lock
+    die "Induced failure before the service transition completed."
+  ' _ "$INSTALLER" > "$manifest_case/failure-stdout" 2> "$manifest_case/failure-stderr"
+transition_failure_status=$?
+set -e
+[ "$transition_failure_status" -ne 0 ] || fail 'induced pre-transition failure unexpectedly succeeded'
+cmp -s "$manifest_case/failure-before" "$manifest_case/state/install-manifest" \
+  || fail 'pre-transition failure changed the prior installed service mode'
+
+run_service_mode_transition() {
+  FORGE_INSTALL_LIBRARY=1 \
+    FORGE_SERVICE_MODE="$1" \
+    FORGE_INSTALL_STATE_DIR="$manifest_case/state" \
+    FORGE_WORKSPACE_ROOT="$manifest_case/workspace" \
+    FORGE_ENV_FILE="$manifest_case/forge.env" \
+    /bin/bash -c '
+      source "$1"
       resolve_service_mode
-    done
-  ' _ "$INSTALLER"
+      acquire_install_lock
+      commit_service_mode
+    ' _ "$INSTALLER" > "$manifest_case/$1-stdout" 2> "$manifest_case/$1-stderr"
+}
+run_service_mode_transition native
+
+ready_file="$manifest_case/lock-ready"
+gate_file="$manifest_case/lock-gate"
+FORGE_INSTALL_LIBRARY=1 \
+  FORGE_INSTALL_TEST_LOCK_READY="$ready_file" \
+  FORGE_INSTALL_TEST_LOCK_GATE="$gate_file" \
+  FORGE_SERVICE_MODE=docker \
+  FORGE_INSTALL_STATE_DIR="$manifest_case/state" \
+  FORGE_WORKSPACE_ROOT="$manifest_case/workspace" \
+  FORGE_ENV_FILE="$manifest_case/forge.env" \
+  /bin/bash -c '
+    source "$1"
+    resolve_service_mode
+    acquire_install_lock
+    : > "$FORGE_INSTALL_TEST_LOCK_READY"
+    while [ ! -e "$FORGE_INSTALL_TEST_LOCK_GATE" ]; do sleep 0.05; done
+    commit_service_mode
+  ' _ "$INSTALLER" > "$manifest_case/concurrent-first-stdout" 2> "$manifest_case/concurrent-first-stderr" &
+first_transition_pid=$!
+for attempt in $(seq 1 100); do
+  [ -e "$ready_file" ] && break
+  [ "$attempt" -lt 100 ] || fail 'first service-mode transition did not acquire its lock'
+  sleep 0.05
+done
+set +e
+FORGE_INSTALL_LIBRARY=1 \
+  FORGE_SERVICE_MODE=native \
+  FORGE_INSTALL_STATE_DIR="$manifest_case/state" \
+  FORGE_WORKSPACE_ROOT="$manifest_case/workspace" \
+  FORGE_ENV_FILE="$manifest_case/forge.env" \
+  /bin/bash -c '
+    source "$1"
+    resolve_service_mode
+    acquire_install_lock
+    commit_service_mode
+  ' _ "$INSTALLER" > "$manifest_case/concurrent-second-stdout" 2> "$manifest_case/concurrent-second-stderr"
+second_transition_status=$?
+set -e
+[ "$second_transition_status" -ne 0 ] || fail 'concurrent service-mode transition bypassed the install lock'
+assert_contains 'service_mode=native' "$manifest_case/state/install-manifest"
+: > "$gate_file"
+wait "$first_transition_pid"
+assert_contains 'service_mode=docker' "$manifest_case/state/install-manifest"
+run_service_mode_transition native
 [ "$(grep -c '^service_mode=' "$manifest_case/state/install-manifest")" = 1 ] \
   || fail 'service mode writer must keep exactly one current manifest value'
 assert_contains 'service_mode=native' "$manifest_case/state/install-manifest"
 assert_contains 'unrelated=preserved' "$manifest_case/state/install-manifest"
 assert_contains 'another=value' "$manifest_case/state/install-manifest"
+
+credential_case="$TEST_ROOT/native-url-credential"
+mkdir -p "$credential_case/state"
+FORGE_INSTALL_LIBRARY=1 \
+  FORGE_INSTALL_STATE_DIR="$credential_case/state" \
+  FORGE_WORKSPACE_ROOT="$credential_case/workspace" \
+  FORGE_ENV_FILE="$credential_case/forge.env" \
+  /bin/bash -c '
+    source "$1"
+    [ "$(native_forge_database_password "postgresql://forge:p%40ss%3Aword!@localhost:5432/forge")" = "p@ss:word!" ]
+    [ "$(native_forge_database_password "postgres://forge:p%2540literal@localhost:5432/forge")" = "p%40literal" ]
+    [ "$(native_forge_database_password "postgresql://forge:plain:literal!@localhost:5432/forge")" = "plain:literal!" ]
+    ! native_forge_database_password "postgresql://forge:bad%2@localhost:5432/forge" >/dev/null
+    ! native_forge_database_password "postgresql://forge:bad%00value@localhost:5432/forge" >/dev/null
+    ! native_forge_database_password "postgresql://forge:raw@ambiguous@localhost:5432/forge" >/dev/null
+    ! native_forge_database_password "postgresql://forge:p%40ss@remote.invalid:5432/forge" >/dev/null
+    ! native_forge_database_password "postgresql://forge:p%40ss@localhost:5432/forge?sslmode=disable" >/dev/null
+  ' _ "$INSTALLER"
 
 hostile_path_case="$TEST_ROOT/repair-hostile-linux-path"
 mkdir -p "$hostile_path_case/shadow" "$hostile_path_case/trusted" "$hostile_path_case/socket"
@@ -144,10 +251,7 @@ cat > "$hostile_path_case/trusted/psql" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$FORGE_HOSTILE_TRUSTED_CALLS"
 printf '1\n'
-if [ "${FORGE_HOSTILE_ELEVATED:-0}" = 1 ]; then
-  exit 0
-fi
-exit 74
+exit 0
 EOF
 cat > "$hostile_path_case/trusted/id" <<'EOF'
 #!/usr/bin/env bash
@@ -186,14 +290,120 @@ PATH="$hostile_path_case/shadow:/usr/bin:/bin" \
     }
     resolve_repair_psql_admin
     case "${REPAIR_PSQL_ADMIN[*]}" in
-      *"$FORGE_HOSTILE_TRUSTED_DIR/sudo"*"$FORGE_HOSTILE_TRUSTED_DIR/psql"*) ;;
+      *"$FORGE_HOSTILE_TRUSTED_DIR/psql"*) ;;
       *) exit 95 ;;
+    esac
+    case "${REPAIR_PSQL_ADMIN[*]}" in
+      *"$FORGE_HOSTILE_TRUSTED_DIR/sudo"*|*"$FORGE_HOSTILE_TRUSTED_DIR/runuser"*) exit 94 ;;
     esac
   ' _ "$REPAIR"
 [ ! -s "$hostile_path_case/shadow-marker" ] \
   || fail 'repair Linux fallback executed a hostile PATH shadow'
-[ "$(wc -l < "$hostile_path_case/trusted-calls" | tr -d '[:space:]')" = 2 ] \
-  || fail 'repair Linux fallback must reject print-1/nonzero current probe then accept trusted sudo probe'
+[ "$(wc -l < "$hostile_path_case/trusted-calls" | tr -d '[:space:]')" = 1 ] \
+  || fail 'repair Linux trusted psql should run once as the current user'
+
+test_hook_boundary_case="$TEST_ROOT/test-hook-privilege-boundary"
+mkdir -p "$test_hook_boundary_case/installer-writable" "$test_hook_boundary_case/repair-writable" \
+  "$test_hook_boundary_case/elevators" "$test_hook_boundary_case/socket"
+cat > "$test_hook_boundary_case/installer-writable/psql" <<'EOF'
+#!/usr/bin/env bash
+printf 'direct\n' >> "$FORGE_HOOK_DIRECT_CALLS"
+/bin/mv "$FORGE_HOOK_REPLACEMENT" "$0"
+printf '1\n'
+exit 74
+EOF
+cat > "$test_hook_boundary_case/repair-writable/psql" <<'EOF'
+#!/usr/bin/env bash
+printf 'direct\n' >> "$FORGE_HOOK_DIRECT_CALLS"
+/bin/mv "$FORGE_HOOK_REPLACEMENT" "$0"
+printf '1\n'
+exit 74
+EOF
+for replacement in installer repair; do
+  cat > "$test_hook_boundary_case/$replacement-replacement" <<'EOF'
+#!/usr/bin/env bash
+printf 'replacement-executed\n' >> "$FORGE_HOOK_ELEVATED_MARKER"
+printf '1\n'
+exit 74
+EOF
+done
+cat > "$test_hook_boundary_case/elevators/sudo" <<'EOF'
+#!/usr/bin/env bash
+printf 'sudo-invoked\n' >> "$FORGE_HOOK_ELEVATOR_MARKER"
+exit 97
+EOF
+cat > "$test_hook_boundary_case/elevators/runuser" <<'EOF'
+#!/usr/bin/env bash
+printf 'runuser-invoked\n' >> "$FORGE_HOOK_ELEVATOR_MARKER"
+exit 98
+EOF
+cat > "$test_hook_boundary_case/elevators/id" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod 555 "$test_hook_boundary_case/installer-writable/psql" \
+  "$test_hook_boundary_case/repair-writable/psql" \
+  "$test_hook_boundary_case/installer-replacement" \
+  "$test_hook_boundary_case/repair-replacement" \
+  "$test_hook_boundary_case/elevators/"*
+
+for surface in installer repair; do
+  : > "$test_hook_boundary_case/$surface-direct"
+  : > "$test_hook_boundary_case/$surface-elevators"
+  : > "$test_hook_boundary_case/$surface-elevated"
+  if [ "$surface" = installer ]; then
+    PATH="$test_hook_boundary_case/installer-writable:/usr/bin:/bin" \
+      FORGE_INSTALL_LIBRARY=1 \
+      FORGE_INSTALL_TEST_ADMIN_MODE=current \
+      FORGE_INSTALL_TEST_PSQL_SOCKET="$test_hook_boundary_case/socket" \
+      FORGE_INSTALL_TEST_PSQL_PORT=5432 \
+      FORGE_INSTALL_STATE_DIR="$test_hook_boundary_case/installer-state" \
+      FORGE_WORKSPACE_ROOT="$test_hook_boundary_case/installer-workspace" \
+      FORGE_ENV_FILE="$test_hook_boundary_case/installer.env" \
+      FORGE_HOOK_DIRECT_CALLS="$test_hook_boundary_case/installer-direct" \
+      FORGE_HOOK_REPLACEMENT="$test_hook_boundary_case/installer-replacement" \
+      FORGE_HOOK_ELEVATOR_MARKER="$test_hook_boundary_case/installer-elevators" \
+      FORGE_HOOK_ELEVATED_MARKER="$test_hook_boundary_case/installer-elevated" \
+      FORGE_HOOK_ELEVATOR_DIR="$test_hook_boundary_case/elevators" \
+      /bin/bash -c '
+        source "$1"
+        trap - ERR
+        OS_NAME=Linux
+        managed_local_postgres_user_exists() { return 0; }
+        trusted_linux_tool() {
+          printf "%s\n" "$1" >> "$FORGE_HOOK_ELEVATOR_MARKER"
+          printf "%s/%s\n" "$FORGE_HOOK_ELEVATOR_DIR" "$1"
+        }
+        ! resolve_managed_local_admin
+      ' _ "$INSTALLER"
+  else
+    FORGE_REPAIR_LIBRARY=1 \
+      FORGE_REPAIR_TEST_HOOK=full-process \
+      FORGE_REPAIR_TEST_OS_NAME=Linux \
+      FORGE_REPAIR_TEST_PSQL_BIN="$test_hook_boundary_case/repair-writable/psql" \
+      FORGE_REPAIR_TEST_PSQL_SOCKET="$test_hook_boundary_case/socket" \
+      FORGE_REPAIR_TEST_PSQL_PORT=5432 \
+      FORGE_HOOK_DIRECT_CALLS="$test_hook_boundary_case/repair-direct" \
+      FORGE_HOOK_REPLACEMENT="$test_hook_boundary_case/repair-replacement" \
+      FORGE_HOOK_ELEVATOR_MARKER="$test_hook_boundary_case/repair-elevators" \
+      FORGE_HOOK_ELEVATED_MARKER="$test_hook_boundary_case/repair-elevated" \
+      FORGE_HOOK_ELEVATOR_DIR="$test_hook_boundary_case/elevators" \
+      /bin/bash -c '
+        source "$1"
+        repair_trusted_linux_tool() {
+          printf "%s\n" "$1" >> "$FORGE_HOOK_ELEVATOR_MARKER"
+          printf "%s/%s\n" "$FORGE_HOOK_ELEVATOR_DIR" "$1"
+        }
+        ! resolve_repair_psql_admin
+      ' _ "$REPAIR"
+  fi
+  [ "$(wc -l < "$test_hook_boundary_case/$surface-direct" | tr -d '[:space:]')" = 1 ] \
+    || fail "$surface test psql did not run exactly once as the current user"
+  [ ! -s "$test_hook_boundary_case/$surface-elevators" ] \
+    || fail "$surface test psql failure reached sudo, runuser, id, or trusted-tool resolution"
+  [ ! -s "$test_hook_boundary_case/$surface-elevated" ] \
+    || fail "$surface writable-parent replacement executed after the current-user probe"
+done
 
 provision_function="$TEST_ROOT/provision-database"
 sed -n '/^provision_database() {/,/^}/p' "$INSTALLER" > "$provision_function"
@@ -586,11 +796,15 @@ run_managed_case() {
 
 expected_stages=(release migrate-0025 s3 migrate-0026 legacy-repair s4 migrate-0027 s5 latest)
 
-for admin_mode in current sudo runuser; do
-  run_managed_case "$admin_mode" "$admin_mode"
-  [ "$CASE_STATUS" -eq 0 ] || fail "$admin_mode managed migration should succeed"
-  assert_contains "admin:$admin_mode" "$CASE_DIR/stages"
-  assert_stages "$CASE_DIR/stages" "${expected_stages[@]}"
+run_managed_case current current
+[ "$CASE_STATUS" -eq 0 ] || fail 'current-user managed migration should succeed'
+assert_contains 'admin:current' "$CASE_DIR/stages"
+assert_stages "$CASE_DIR/stages" "${expected_stages[@]}"
+
+for forbidden_test_mode in sudo runuser; do
+  run_managed_case "forbidden-$forbidden_test_mode" "$forbidden_test_mode"
+  [ "$CASE_STATUS" -ne 0 ] || fail "$forbidden_test_mode test administration mode was not rejected"
+  assert_contains 'supports only current-user administration' "$CASE_DIR/stderr"
 done
 
 run_managed_case idempotent-first current
@@ -815,6 +1029,9 @@ trusted_linux_tool() { printf '%s/%s\n' "$test_toolchain_dir" "$1"; }
 OS_NAME=Linux
 SERVICE_MODE=native
 DRY_RUN=0
+MANAGED_LOCAL_ADMIN_RESOLUTION=resolved
+MANAGED_LOCAL_ADMIN_MODE=runuser
+MANAGED_LOCAL_ADMIN_USER=postgres
 run_managed_local_migrations
 EOF
   chmod +x "$case_dir/driver.sh"
@@ -823,7 +1040,6 @@ EOF
     FORGE_TEST_TOOLCHAIN_DIR="$case_dir/bin" \
     PATH="$case_dir/bin:$PATH" \
     UNRELATED_SECRET_SENTINEL='unrelated-value-must-not-reach-postgres' \
-    FORGE_INSTALL_TEST_ADMIN_MODE=runuser \
     FORGE_ENV_FILE="$case_dir/forge.env" \
     FORGE_INSTALL_STATE_DIR="$case_dir/state" \
     /bin/bash "$case_dir/driver.sh" > "$case_dir/stdout" 2> "$case_dir/stderr"

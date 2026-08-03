@@ -341,7 +341,7 @@ probe_repair_psql_admin() {
 }
 
 resolve_repair_psql_admin() {
-  local os_name socket_dir port psql_bin id_bin sudo_bin runuser_bin
+  local os_name socket_dir port psql_bin id_bin sudo_bin runuser_bin test_psql=0
   if [ "$REPAIR_PSQL_ADMIN_RESOLUTION" = resolved ]; then
     [ "${#REPAIR_PSQL_ADMIN[@]}" -gt 0 ]
     return
@@ -374,6 +374,7 @@ resolve_repair_psql_admin() {
   [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || return 1
   [ -d "$socket_dir" ] || return 1
   if [ -n "${FORGE_REPAIR_TEST_PSQL_BIN:-}" ]; then
+    test_psql=1
     psql_bin="$(repair_test_psql 2>/dev/null || true)"
   elif [ "$os_name" = Darwin ]; then
     psql_bin="$(repair_trusted_darwin_psql 2>/dev/null || true)"
@@ -398,6 +399,13 @@ resolve_repair_psql_admin() {
   )
   if probe_repair_psql_admin; then
     return 0
+  fi
+
+  # Test-provided executables are permitted only for a current-user probe.
+  # Never carry a replaceable test path across a privilege boundary.
+  if [ "$test_psql" = 1 ]; then
+    REPAIR_PSQL_ADMIN=()
+    return 1
   fi
 
   if [ "$os_name" = Linux ]; then
