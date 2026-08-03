@@ -151,6 +151,30 @@ snapshot() {
     WHERE granted.rolname LIKE $q$forge_release_%$q$ OR granted.rolname LIKE $q$forge_s4_%$q$
        OR member.rolname LIKE $q$forge_release_%$q$ OR member.rolname LIKE $q$forge_s4_%$q$
     ORDER BY 1;' > "$TEMP_ROOT/$label.roles"
+  admin_psql --no-align --tuples-only --quiet --command '
+    SELECT namespace_row.nspname || chr(46) || routine.proname || chr(40)
+      || pg_catalog.pg_get_function_identity_arguments(routine.oid) || chr(41) || chr(58)
+      || pg_catalog.md5(pg_catalog.pg_get_functiondef(routine.oid)) || chr(58)
+      || owner_role.rolname || chr(58) || routine.prosecdef || chr(58)
+      || COALESCE(pg_catalog.array_to_string(routine.proconfig, chr(44)), $q$<null>$q$) || chr(58)
+      || COALESCE((SELECT pg_catalog.string_agg(
+        COALESCE(grantee.rolname, $q$PUBLIC$q$) || chr(58) || privilege.privilege_type || chr(58)
+          || privilege.is_grantable || chr(58) || grantor.rolname,
+        chr(44) ORDER BY COALESCE(grantee.rolname, $q$PUBLIC$q$), privilege.privilege_type,
+          privilege.is_grantable, grantor.rolname)
+        FROM pg_catalog.aclexplode(
+          COALESCE(routine.proacl, pg_catalog.acldefault($q$f$q$, routine.proowner))
+        ) privilege
+        LEFT JOIN pg_catalog.pg_roles grantee ON grantee.oid = privilege.grantee
+        JOIN pg_catalog.pg_roles grantor ON grantor.oid = privilege.grantor), $q$<null>$q$)
+    FROM pg_catalog.pg_proc routine
+    JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = routine.pronamespace
+    JOIN pg_catalog.pg_roles owner_role ON owner_role.oid = routine.proowner
+    WHERE routine.oid IN (
+      pg_catalog.to_regprocedure($q$public.forge_epic_172_reject_mutation_v1()$q$),
+      pg_catalog.to_regprocedure($q$forge.guard_epic_172_s3_evidence_insert_v1()$q$)
+    )
+    ORDER BY 1;' > "$TEMP_ROOT/$label.trigger-routines"
 }
 
 assert_unchanged() {
@@ -158,6 +182,7 @@ assert_unchanged() {
   cmp -s "$TEMP_ROOT/$before.ledger" "$TEMP_ROOT/$after.ledger" || { echo "$case_name changed the migration ledger." >&2; exit 1; }
   cmp -s "$TEMP_ROOT/$before.schema" "$TEMP_ROOT/$after.schema" || { echo "$case_name changed the database catalog." >&2; exit 1; }
   cmp -s "$TEMP_ROOT/$before.roles" "$TEMP_ROOT/$after.roles" || { echo "$case_name changed the role boundary." >&2; exit 1; }
+  cmp -s "$TEMP_ROOT/$before.trigger-routines" "$TEMP_ROOT/$after.trigger-routines" || { echo "$case_name changed the trigger-routine boundary." >&2; exit 1; }
 }
 
 run_repair() {
@@ -264,6 +289,43 @@ snapshot extra-trigger-near-miss-before
 expect_refusal 'Protected-table extra-trigger near-miss'
 snapshot extra-trigger-near-miss-after
 assert_unchanged extra-trigger-near-miss-before extra-trigger-near-miss-after 'Protected-table extra-trigger near-miss'
+
+prepare_legacy_fixture
+admin_psql <<'SQL'
+CREATE OR REPLACE FUNCTION public.forge_epic_172_reject_mutation_v1()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, public
+AS $function$
+BEGIN
+  RETURN OLD;
+END;
+$function$;
+SQL
+snapshot trigger-routine-body-near-miss-before
+expect_refusal 'Trigger-routine body near-miss'
+snapshot trigger-routine-body-near-miss-after
+assert_unchanged trigger-routine-body-near-miss-before trigger-routine-body-near-miss-after 'Trigger-routine body near-miss'
+
+prepare_legacy_fixture
+admin_psql --set migration_role="$FORGE_LEGACY_REPAIR_MIGRATION_USER" <<'SQL'
+ALTER FUNCTION forge.guard_epic_172_s3_evidence_insert_v1() OWNER TO :"migration_role";
+SQL
+snapshot trigger-routine-owner-near-miss-before
+expect_refusal 'Trigger-routine owner near-miss'
+snapshot trigger-routine-owner-near-miss-after
+assert_unchanged trigger-routine-owner-near-miss-before trigger-routine-owner-near-miss-after 'Trigger-routine owner near-miss'
+
+prepare_legacy_fixture
+admin_psql <<'SQL'
+SET ROLE forge_release_routines_owner;
+GRANT EXECUTE ON FUNCTION forge.guard_epic_172_s3_evidence_insert_v1() TO forge_release_transition;
+RESET ROLE;
+SQL
+snapshot trigger-routine-acl-near-miss-before
+expect_refusal 'Trigger-routine ACL near-miss'
+snapshot trigger-routine-acl-near-miss-after
+assert_unchanged trigger-routine-acl-near-miss-before trigger-routine-acl-near-miss-after 'Trigger-routine ACL near-miss'
 
 prepare_legacy_fixture
 admin_psql --command 'REVOKE SELECT ON TABLE public.forge_release_signer_keys FROM forge_release_evidence_consumer;'

@@ -140,6 +140,14 @@ const releaseTriggerFingerprints = [
   'forge_release_signer_keys_no_delete|forge_release_signer_keys|forge_epic_172_reject_mutation_v1()|O|13c0c6f1e332701344f8131ac2693e2d',
   'forge_release_signer_lifecycle_append_only|forge_release_signer_key_lifecycle_audits|forge_epic_172_reject_mutation_v1()|O|09159d710dac8a28733eedc0296b022d',
 ] as const
+const releaseTriggerRoutineFingerprintsPreS4 = [
+  'forge.guard_epic_172_s3_evidence_insert_v1()|4d09e72e463d8264bfc80d560bc74560|forge_release_routines_owner|false|search_path=pg_catalog, public|forge_release_routines_owner:EXECUTE:false:forge_release_routines_owner',
+  'public.forge_epic_172_reject_mutation_v1()|6c37302b654f96cecd43f1716ffbdd51|forge_release_routines_owner|false|search_path=pg_catalog, public|PUBLIC:EXECUTE:false:forge_release_routines_owner,forge_release_routines_owner:EXECUTE:false:forge_release_routines_owner',
+] as const
+const releaseTriggerRoutineFingerprintsS4 = [
+  releaseTriggerRoutineFingerprintsPreS4[0],
+  'public.forge_epic_172_reject_mutation_v1()|6c37302b654f96cecd43f1716ffbdd51|forge_release_routines_owner|false|search_path=pg_catalog, public|forge_release_routines_owner:EXECUTE:false:forge_release_routines_owner',
+] as const
 
 function expectedRoutineAcl(
   identity: string,
@@ -401,7 +409,11 @@ async function exactCurrentRoleBoundary(
   return exactReleaseBoundary && await exactS4Boundary(sql, migrationLogin)
 }
 
-async function exactReleaseCatalog(sql: postgres.Sql | postgres.TransactionSql, repaired: boolean): Promise<boolean> {
+async function exactReleaseCatalog(
+  sql: postgres.Sql | postgres.TransactionSql,
+  repaired: boolean,
+  expectS4TriggerAcl = false,
+): Promise<boolean> {
   const [shape] = await sql<readonly { owners: number; forgeOwner: boolean; requiredEvidence: number; tokenType: string | null; signerDefault: string | null }[]>`
     SELECT
       (SELECT pg_catalog.count(*)::integer FROM pg_catalog.pg_class relation
@@ -471,8 +483,57 @@ async function exactReleaseCatalog(sql: postgres.Sql | postgres.TransactionSql, 
       AND table_row.relname = ANY(${sql.array([...protectedReleaseTables])}::text[])
     ORDER BY 1
   `
-  return triggers.length === releaseTriggerFingerprints.length
-    && triggers.every((trigger, index) => trigger.fingerprint === releaseTriggerFingerprints[index])
+  if (triggers.length !== releaseTriggerFingerprints.length
+    || !triggers.every((trigger, index) => trigger.fingerprint === releaseTriggerFingerprints[index])) return false
+  const triggerRoutines = await sql<readonly {
+    identity: string
+    definitionDigest: string
+    owner: string
+    securityDefiner: boolean
+    config: readonly string[] | null
+    acl: string | null
+  }[]>`
+    SELECT namespace_row.nspname || '.' || routine.proname || '('
+        || pg_catalog.pg_get_function_identity_arguments(routine.oid) || ')' AS identity,
+      pg_catalog.md5(pg_catalog.pg_get_functiondef(routine.oid)) AS "definitionDigest",
+      owner_role.rolname AS owner,
+      routine.prosecdef AS "securityDefiner",
+      routine.proconfig AS config,
+      (SELECT pg_catalog.string_agg(
+        COALESCE(grantee.rolname, 'PUBLIC') || ':' || privilege.privilege_type || ':'
+          || privilege.is_grantable || ':' || grantor.rolname,
+        ',' ORDER BY COALESCE(grantee.rolname, 'PUBLIC'), privilege.privilege_type,
+          privilege.is_grantable, grantor.rolname
+      )
+      FROM pg_catalog.aclexplode(
+        COALESCE(routine.proacl, pg_catalog.acldefault('f', routine.proowner))
+      ) privilege
+      LEFT JOIN pg_catalog.pg_roles grantee ON grantee.oid = privilege.grantee
+      JOIN pg_catalog.pg_roles grantor ON grantor.oid = privilege.grantor) AS acl
+    FROM pg_catalog.pg_proc routine
+    JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = routine.pronamespace
+    JOIN pg_catalog.pg_roles owner_role ON owner_role.oid = routine.proowner
+    WHERE routine.oid IN (
+      pg_catalog.to_regprocedure('public.forge_epic_172_reject_mutation_v1()'),
+      pg_catalog.to_regprocedure('forge.guard_epic_172_s3_evidence_insert_v1()')
+    )
+    ORDER BY 1
+  `
+  const triggerRoutineFingerprints = triggerRoutines.map((routine) => [
+    routine.identity,
+    routine.definitionDigest,
+    routine.owner,
+    String(routine.securityDefiner),
+    routine.config?.join(',') ?? '<null>',
+    routine.acl ?? '<null>',
+  ].join('|'))
+  const expectedTriggerRoutines = expectS4TriggerAcl
+    ? releaseTriggerRoutineFingerprintsS4
+    : releaseTriggerRoutineFingerprintsPreS4
+  return triggerRoutineFingerprints.length === expectedTriggerRoutines.length
+    && triggerRoutineFingerprints.every(
+      (fingerprint, index) => fingerprint === expectedTriggerRoutines[index],
+    )
 }
 
 async function exactMigrationLoginBoundary(sql: postgres.Sql | postgres.TransactionSql): Promise<boolean> {
@@ -809,7 +870,7 @@ async function durableRepairedFingerprint(sql: postgres.Sql | postgres.Transacti
   // Later migrations legitimately add S4/S5 objects and may populate release
   // state.  The stable repair receipt is therefore the complete protected S3
   // catalog, ACL and routine surface plus the inert legacy consumer principal.
-  return await exactReleaseCatalog(sql, true)
+  return await exactReleaseCatalog(sql, true, true)
     && await exactProtectedTableAcls(sql, true)
     && await exactLegacyConsumerLocalAuthority(sql, true)
     && await exactRoutines(sql, repairedRoutineDigests, false, true, null)
