@@ -1,5 +1,11 @@
 BEGIN;
 
+-- Keep role classification and mutation in one critical section. PostgreSQL's
+-- ALTER ROLE and GRANT/REVOKE ROLE paths take conflicting table locks.
+SET LOCAL application_name = 'forge-shared-app-privilege-reconciliation';
+LOCK TABLE pg_catalog.pg_authid IN SHARE ROW EXCLUSIVE MODE;
+LOCK TABLE pg_catalog.pg_auth_members IN SHARE ROW EXCLUSIVE MODE;
+
 CREATE TEMPORARY TABLE forge_expected_protected_owner_inventory (
   relation_name name PRIMARY KEY,
   owner_name name NOT NULL

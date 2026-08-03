@@ -247,16 +247,101 @@ installed_service_mode_is_native() {
   [ "$service_mode" = native ]
 }
 
+repair_trusted_linux_path_chain() {
+  local path="$1" owner mode
+  while :; do
+    [ -e "$path" ] || [ -L "$path" ] || return 1
+    owner="$(/usr/bin/stat -c '%U' "$path" 2>/dev/null || true)"
+    [ "$owner" = root ] || return 1
+    if [ ! -L "$path" ]; then
+      mode="$(/usr/bin/stat -c '%a' "$path" 2>/dev/null || true)"
+      [ -n "$mode" ] && [ $((8#$mode & 022)) -eq 0 ] || return 1
+    fi
+    [ "$path" = / ] && return 0
+    path="${path%/*}"
+    [ -n "$path" ] || path=/
+  done
+}
+
+repair_trusted_linux_candidate() {
+  local candidate="$1" canonical
+  [ -x "$candidate" ] || return 1
+  repair_trusted_linux_path_chain "$candidate" || return 1
+  canonical="$(/usr/bin/readlink -f "$candidate" 2>/dev/null || true)"
+  [ -n "$canonical" ] && [ -f "$canonical" ] || return 1
+  repair_trusted_linux_path_chain "$canonical" || return 1
+  printf '%s\n' "$canonical"
+}
+
+repair_trusted_linux_tool() {
+  local tool="$1" candidate version
+  if [ "$tool" = psql ]; then
+    for version in 18 17 16; do
+      for candidate in "/usr/lib/postgresql/$version/bin/psql" "/usr/pgsql-$version/bin/psql"; do
+        repair_trusted_linux_candidate "$candidate" && return 0
+      done
+    done
+  fi
+  for candidate in "/usr/local/sbin/$tool" "/usr/local/bin/$tool" "/usr/sbin/$tool" "/usr/bin/$tool" "/sbin/$tool" "/bin/$tool"; do
+    repair_trusted_linux_candidate "$candidate" && return 0
+  done
+  return 1
+}
+
+repair_canonical_darwin_candidate() {
+  local candidate="$1" target directory links=0
+  while [ -L "$candidate" ]; do
+    links=$((links + 1))
+    [ "$links" -le 32 ] || return 1
+    target="$(/usr/bin/readlink "$candidate" 2>/dev/null || true)"
+    [ -n "$target" ] || return 1
+    case "$target" in
+      /*) candidate="$target" ;;
+      *) candidate="${candidate%/*}/$target" ;;
+    esac
+  done
+  directory="$(cd -P "$(/usr/bin/dirname "$candidate")" 2>/dev/null && pwd)" || return 1
+  candidate="$directory/$(/usr/bin/basename "$candidate")"
+  [ -f "$candidate" ] && [ -x "$candidate" ] && [ ! -w "$candidate" ] || return 1
+  printf '%s\n' "$candidate"
+}
+
+repair_trusted_darwin_psql() {
+  local candidate
+  for candidate in \
+    /opt/homebrew/opt/postgresql@16/bin/psql \
+    /opt/homebrew/bin/psql \
+    /usr/local/opt/postgresql@16/bin/psql \
+    /usr/local/bin/psql \
+    /Applications/Postgres.app/Contents/Versions/16/bin/psql
+  do
+    repair_canonical_darwin_candidate "$candidate" && return 0
+  done
+  return 1
+}
+
+repair_test_psql() {
+  local candidate="${FORGE_REPAIR_TEST_PSQL_BIN:-}"
+  [ "${FORGE_REPAIR_TEST_HOOK:-}" = full-process ] \
+    || [ "${FORGE_REPAIR_TEST_HOOK:-}" = reconcile-forge-privileges ] \
+    || return 1
+  case "$candidate" in
+    /*) [ -f "$candidate" ] && [ -x "$candidate" ] && [ ! -w "$candidate" ] || return 1 ;;
+    *) return 1 ;;
+  esac
+  printf '%s\n' "$candidate"
+}
+
 probe_repair_psql_admin() {
-  local is_superuser
+  local is_superuser psql_status=0
   is_superuser="$("${REPAIR_PSQL_ADMIN[@]}" -d postgres -tAc \
     "SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = CURRENT_USER AND rolsuper" \
-    2>/dev/null || true)"
-  [ "$is_superuser" = 1 ]
+    2>/dev/null)" || psql_status="$?"
+  [ "$psql_status" -eq 0 ] && [ "$is_superuser" = 1 ]
 }
 
 resolve_repair_psql_admin() {
-  local os_name socket_dir port psql_bin sudo_bin runuser_bin
+  local os_name socket_dir port psql_bin id_bin sudo_bin runuser_bin
   if [ "$REPAIR_PSQL_ADMIN_RESOLUTION" = resolved ]; then
     [ "${#REPAIR_PSQL_ADMIN[@]}" -gt 0 ]
     return
@@ -264,11 +349,14 @@ resolve_repair_psql_admin() {
   REPAIR_PSQL_ADMIN_RESOLUTION=resolved
   REPAIR_PSQL_ADMIN=()
 
-  if [ "${FORGE_REPAIR_TEST_HOOK:-}" = reconcile-forge-privileges ]; then
+  if { [ "${FORGE_REPAIR_TEST_HOOK:-}" = reconcile-forge-privileges ] \
+    || [ "${FORGE_REPAIR_TEST_HOOK:-}" = full-process ]; } \
+    && [ "${FORGE_REPAIR_PRODUCTION_NATIVE_ROUTE:-0}" != 1 ]; then
     socket_dir="${FORGE_REPAIR_TEST_PSQL_SOCKET:-}"
     port="${FORGE_REPAIR_TEST_PSQL_PORT:-}"
+    os_name="${FORGE_REPAIR_TEST_OS_NAME:-$(/usr/bin/uname -s 2>/dev/null || true)}"
   else
-    os_name="$(uname -s 2>/dev/null || true)"
+    os_name="$(/usr/bin/uname -s 2>/dev/null || true)"
     case "$os_name" in
       Darwin) socket_dir=/tmp ;;
       Linux) socket_dir=/var/run/postgresql ;;
@@ -285,7 +373,13 @@ resolve_repair_psql_admin() {
   esac
   [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || return 1
   [ -d "$socket_dir" ] || return 1
-  psql_bin="$(command -v psql 2>/dev/null || true)"
+  if [ -n "${FORGE_REPAIR_TEST_PSQL_BIN:-}" ]; then
+    psql_bin="$(repair_test_psql 2>/dev/null || true)"
+  elif [ "$os_name" = Darwin ]; then
+    psql_bin="$(repair_trusted_darwin_psql 2>/dev/null || true)"
+  else
+    psql_bin="$(repair_trusted_linux_tool psql 2>/dev/null || true)"
+  fi
   case "$psql_bin" in
     /*) [ -x "$psql_bin" ] || return 1 ;;
     *) return 1 ;;
@@ -306,8 +400,17 @@ resolve_repair_psql_admin() {
     return 0
   fi
 
-  if id postgres >/dev/null 2>&1; then
-    sudo_bin="$(command -v sudo 2>/dev/null || true)"
+  if [ "$os_name" = Linux ]; then
+    id_bin="$(repair_trusted_linux_tool id 2>/dev/null || true)"
+  else
+    id_bin=/usr/bin/id
+  fi
+  if [ -n "$id_bin" ] && "$id_bin" postgres >/dev/null 2>&1; then
+    if [ "$os_name" = Linux ]; then
+      sudo_bin="$(repair_trusted_linux_tool sudo 2>/dev/null || true)"
+    else
+      sudo_bin=""
+    fi
     if [ -n "$sudo_bin" ]; then
       REPAIR_PSQL_ADMIN=(
         /usr/bin/env
@@ -325,7 +428,11 @@ resolve_repair_psql_admin() {
       fi
     fi
 
-    runuser_bin="$(command -v runuser 2>/dev/null || true)"
+    if [ "$os_name" = Linux ]; then
+      runuser_bin="$(repair_trusted_linux_tool runuser 2>/dev/null || true)"
+    else
+      runuser_bin=""
+    fi
     if [ -n "$runuser_bin" ]; then
       REPAIR_PSQL_ADMIN=(
         /usr/bin/env
@@ -425,6 +532,10 @@ should_reconcile_local_forge_privileges() {
   installed_service_mode_is_native
 }
 
+if [ "${FORGE_REPAIR_LIBRARY:-0}" = 1 ]; then
+  return 0 2>/dev/null || exit 0
+fi
+
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --dry-run) DRY_RUN=1 ;;
@@ -445,6 +556,7 @@ done
 
 if [ -n "${FORGE_REPAIR_TEST_HOOK:-}" ]; then
   case "$FORGE_REPAIR_TEST_HOOK" in
+    full-process) ;;
     reconcile-forge-privileges)
       [ -n "${FORGE_REPAIR_TEST_DATABASE_NAME:-}" ] \
         || die "FORGE_REPAIR_TEST_DATABASE_NAME is required for the privilege reconciliation test hook."

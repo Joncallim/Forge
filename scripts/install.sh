@@ -401,6 +401,25 @@ record_manifest() {
   fi
 }
 
+record_current_manifest_value() {
+  local key="$1"
+  local value="$2"
+  local replacement
+  [ "$DRY_RUN" = "1" ] && return 0
+  ensure_install_state
+  replacement="$(mktemp "${INSTALL_MANIFEST}.tmp.XXXXXX")"
+  TEMP_FILES="${TEMP_FILES} ${replacement}"
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      "$key"=*) continue ;;
+    esac
+    printf '%s\n' "$line"
+  done < "$INSTALL_MANIFEST" > "$replacement"
+  printf '%s=%s\n' "$key" "$value" >> "$replacement"
+  chmod 600 "$replacement" 2>/dev/null || true
+  mv "$replacement" "$INSTALL_MANIFEST"
+}
+
 make_temp_file() {
   local file
   file="$(mktemp)"
@@ -1152,25 +1171,96 @@ provision_database() {
   resolve_managed_local_admin \
     || die "Could not establish controlled local PostgreSQL administrator access."
 
-  local db_password_escaped role_exists role_membership_edges role_normalizable role_boundary_ok db_exists
+  local db_password_escaped role_action role_provision_sql db_exists
   db_password_escaped="$(sql_escape_literal "$DB_PASSWORD")"
-
-  role_exists="$(psql_admin -tAc "SELECT 1 FROM pg_roles WHERE rolname='forge'" | tr -d '[:space:]' || true)"
-  if [ "$role_exists" = "1" ]; then
-    role_membership_edges="$(psql_admin -tAc "SELECT count(*) FROM pg_catalog.pg_auth_members WHERE roleid = 'forge'::pg_catalog.regrole OR member = 'forge'::pg_catalog.regrole" | tr -d '[:space:]' || true)"
-    [ "$role_membership_edges" = "0" ] || die "Role forge has membership edges. Remove every grant to or from forge before retrying the installer."
-    role_normalizable="$(psql_admin -tAc "SELECT 1 FROM pg_catalog.pg_roles role_row WHERE role_row.rolname = 'forge' AND role_row.rolcanlogin AND NOT role_row.rolsuper AND NOT role_row.rolcreatedb AND NOT role_row.rolcreaterole AND NOT role_row.rolreplication AND NOT role_row.rolbypassrls" | tr -d '[:space:]' || true)"
-    [ "$role_normalizable" = "1" ] || die "Role forge is outside the safe or known legacy app-role boundary; refusing to alter it."
-    run_quiet_redacted_stdin "Harden forge role and sync password" "ALTER ROLE forge LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD '$db_password_escaped';" psql_admin
-    info "Role forge exists; safe attributes and password synced."
-  else
-    run_quiet_redacted_stdin "Create forge role" "CREATE ROLE forge LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD '$db_password_escaped';" psql_admin
-    record_manifest "postgres_role" "forge"
-    info "Created role forge."
+  role_provision_sql="$(cat <<SQL
+BEGIN;
+SET LOCAL application_name = 'forge-installer-role-provision';
+LOCK TABLE pg_catalog.pg_authid IN SHARE ROW EXCLUSIVE MODE;
+LOCK TABLE pg_catalog.pg_auth_members IN SHARE ROW EXCLUSIVE MODE;
+CREATE TEMPORARY TABLE forge_role_provision_input (
+  password text NOT NULL,
+  action text
+) ON COMMIT DROP;
+INSERT INTO forge_role_provision_input (password) VALUES ('$db_password_escaped');
+DO \$provision\$
+DECLARE
+  role_password text;
+BEGIN
+  SELECT password INTO STRICT role_password FROM forge_role_provision_input;
+  IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'forge') THEN
+    IF EXISTS (
+      SELECT 1 FROM pg_catalog.pg_auth_members membership
+      WHERE membership.roleid = 'forge'::pg_catalog.regrole
+         OR membership.member = 'forge'::pg_catalog.regrole
+    ) THEN
+      RAISE EXCEPTION 'Role forge has membership edges. Remove every grant to or from forge before retrying the installer.';
+    END IF;
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_catalog.pg_roles role_row
+      WHERE role_row.rolname = 'forge'
+        AND role_row.rolcanlogin
+        AND NOT role_row.rolsuper
+        AND NOT role_row.rolcreatedb
+        AND NOT role_row.rolcreaterole
+        AND NOT role_row.rolreplication
+        AND NOT role_row.rolbypassrls
+    ) THEN
+      RAISE EXCEPTION 'Role forge is outside the safe or known legacy app-role boundary; refusing to alter it.';
+    END IF;
+    EXECUTE format(
+      'ALTER ROLE forge LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD %L',
+      role_password
+    );
+    UPDATE forge_role_provision_input SET action = 'existing';
+  ELSE
+    EXECUTE format(
+      'CREATE ROLE forge LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD %L',
+      role_password
+    );
+    UPDATE forge_role_provision_input SET action = 'created';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_catalog.pg_roles role_row
+    WHERE role_row.rolname = 'forge'
+      AND role_row.rolcanlogin
+      AND NOT role_row.rolinherit
+      AND NOT role_row.rolsuper
+      AND NOT role_row.rolcreatedb
+      AND NOT role_row.rolcreaterole
+      AND NOT role_row.rolreplication
+      AND NOT role_row.rolbypassrls
+      AND NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_auth_members membership
+        WHERE membership.roleid = role_row.oid OR membership.member = role_row.oid
+      )
+  ) THEN
+    RAISE EXCEPTION 'Role forge did not reach the exact safe native app-role boundary.';
+  END IF;
+END;
+\$provision\$;
+SELECT action FROM forge_role_provision_input;
+COMMIT;
+SQL
+)"
+  ensure_install_state
+  {
+    printf '\n[%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "Transactionally provision forge role"
+    printf 'Command: [redacted: stdin contains generated secret]\n'
+  } >> "$INSTALL_LOG" 2>&1
+  chmod 600 "$INSTALL_LOG" 2>/dev/null || true
+  if ! role_action="$(printf '%s\n' "$role_provision_sql" | psql_admin -Atq --set ON_ERROR_STOP=1 2>> "$INSTALL_LOG")"; then
+    die "Could not transactionally provision the exact safe forge role. Check the install log for the refused boundary."
   fi
-
-  role_boundary_ok="$(psql_admin -tAc "SELECT 1 FROM pg_catalog.pg_roles role_row WHERE role_row.rolname = 'forge' AND role_row.rolcanlogin AND NOT role_row.rolinherit AND NOT role_row.rolsuper AND NOT role_row.rolcreatedb AND NOT role_row.rolcreaterole AND NOT role_row.rolreplication AND NOT role_row.rolbypassrls AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_auth_members membership WHERE membership.roleid = role_row.oid OR membership.member = role_row.oid)" | tr -d '[:space:]' || true)"
-  [ "$role_boundary_ok" = "1" ] || die "Role forge did not reach the exact safe native app-role boundary."
+  role_action="$(printf '%s' "$role_action" | tr -d '[:space:]')"
+  case "$role_action" in
+    created)
+      record_manifest "postgres_role" "forge"
+      info "Created role forge."
+      ;;
+    existing) info "Role forge exists; safe attributes and password synced." ;;
+    *) die "Forge role provisioning returned an unexpected result." ;;
+  esac
 
   db_exists="$(psql_admin -tAc "SELECT 1 FROM pg_database WHERE datname='forge'" | tr -d '[:space:]' || true)"
   if [ "$db_exists" = "1" ]; then
@@ -1611,11 +1701,11 @@ resolve_managed_local_admin() {
 }
 
 probe_managed_local_admin() {
-  local is_superuser
+  local is_superuser psql_status=0
   is_superuser="$("${MANAGED_LOCAL_PSQL_ADMIN[@]}" -tAc \
     "SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = CURRENT_USER AND rolsuper" \
-    2>/dev/null || true)"
-  [ "$is_superuser" = 1 ]
+    2>/dev/null)" || psql_status="$?"
+  [ "$psql_status" -eq 0 ] && [ "$is_superuser" = 1 ]
 }
 
 clear_postgres_routing_environment() {
@@ -1914,7 +2004,7 @@ resolve_service_mode() {
   if [ "$SERVICE_MODE" = "auto" ]; then
     SERVICE_MODE="native"
   fi
-  record_manifest "service_mode" "$SERVICE_MODE"
+  record_current_manifest_value "service_mode" "$SERVICE_MODE"
 }
 
 print_preflight_summary() {

@@ -60,6 +60,11 @@ assert_contains 'installed_service_mode_is_native()' "$REPAIR"
 assert_contains 'REPAIR_PSQL_ADMIN_RESOLUTION=unresolved' "$REPAIR"
 assert_contains '-u PGHOST -u PGHOSTADDR -u PGPORT -u PGDATABASE -u PGUSER' "$REPAIR"
 assert_contains 'WHERE rolname = CURRENT_USER AND rolsuper' "$REPAIR"
+assert_not_contains 'command -v psql' "$REPAIR"
+assert_not_contains 'command -v sudo' "$REPAIR"
+assert_not_contains 'command -v runuser' "$REPAIR"
+assert_contains 'repair_trusted_linux_path_chain' "$REPAIR"
+assert_contains 'repair_trusted_darwin_psql' "$REPAIR"
 assert_not_contains 'postgresql://forge:*@localhost:5432/forge|postgres://forge:*@localhost:5432/forge' "$INSTALLER"
 assert_not_contains 'postgresql://forge:*@localhost:5432/forge|postgres://forge:*@localhost:5432/forge' "$REPAIR"
 assert_contains 'FORGE_REPAIR_TEST_DATABASE_NAME is required for the privilege reconciliation test hook.' "$REPAIR"
@@ -88,7 +93,7 @@ broad_grant_sources="$(grep -lF 'GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TAB
   || fail 'the shared reconciliation SQL must be the only broad table-GRANT source'
 privilege_sql="$(tr '\n' ' ' < "$PRIVILEGE_SQL")"
 case "$privilege_sql" in
-  *'BEGIN;'*'fixed protected owner inventory is incomplete or has ownership drift'*'ALTER ROLE forge NOINHERIT;'*'FOR UPDATE OF relation;'*'FOR UPDATE OF attribute;'*'GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO forge;'*'REVOKE ALL PRIVILEGES ON TABLE'*'GRANT SELECT ON TABLE'*'COMMIT;'*) ;;
+  *'BEGIN;'*'LOCK TABLE pg_catalog.pg_authid IN SHARE ROW EXCLUSIVE MODE;'*'LOCK TABLE pg_catalog.pg_auth_members IN SHARE ROW EXCLUSIVE MODE;'*'fixed protected owner inventory is incomplete or has ownership drift'*'ALTER ROLE forge NOINHERIT;'*'FOR UPDATE OF relation;'*'FOR UPDATE OF attribute;'*'GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO forge;'*'REVOKE ALL PRIVILEGES ON TABLE'*'GRANT SELECT ON TABLE'*'COMMIT;'*) ;;
   *) fail 'forge app grants and owner-driven protected reconciliation must share one ordered transaction' ;;
 esac
 
@@ -106,16 +111,102 @@ sed -n '/canonical-protected-owner-map-begin/,/canonical-protected-owner-map-end
 cmp -s "$sql_owner_map" "$ts_owner_map" \
   || fail 'shared SQL and legacy normalizer protected owner maps drifted'
 
+manifest_case="$TEST_ROOT/current-service-mode-manifest"
+mkdir -p "$manifest_case/state"
+printf 'unrelated=preserved\nservice_mode=stale\nanother=value\nservice_mode=older\n' \
+  > "$manifest_case/state/install-manifest"
+FORGE_INSTALL_LIBRARY=1 \
+  FORGE_INSTALL_STATE_DIR="$manifest_case/state" \
+  FORGE_WORKSPACE_ROOT="$manifest_case/workspace" \
+  FORGE_ENV_FILE="$manifest_case/forge.env" \
+  /bin/bash -c '
+    source "$1"
+    for SERVICE_MODE in native docker native; do
+      resolve_service_mode
+    done
+  ' _ "$INSTALLER"
+[ "$(grep -c '^service_mode=' "$manifest_case/state/install-manifest")" = 1 ] \
+  || fail 'service mode writer must keep exactly one current manifest value'
+assert_contains 'service_mode=native' "$manifest_case/state/install-manifest"
+assert_contains 'unrelated=preserved' "$manifest_case/state/install-manifest"
+assert_contains 'another=value' "$manifest_case/state/install-manifest"
+
+hostile_path_case="$TEST_ROOT/repair-hostile-linux-path"
+mkdir -p "$hostile_path_case/shadow" "$hostile_path_case/trusted" "$hostile_path_case/socket"
+for tool in psql sudo runuser id; do
+  cat > "$hostile_path_case/shadow/$tool" <<'EOF'
+#!/usr/bin/env bash
+printf 'shadow-executed:%s\n' "${0##*/}" >> "$FORGE_HOSTILE_PATH_MARKER"
+exit 99
+EOF
+done
+cat > "$hostile_path_case/trusted/psql" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FORGE_HOSTILE_TRUSTED_CALLS"
+printf '1\n'
+if [ "${FORGE_HOSTILE_ELEVATED:-0}" = 1 ]; then
+  exit 0
+fi
+exit 74
+EOF
+cat > "$hostile_path_case/trusted/id" <<'EOF'
+#!/usr/bin/env bash
+[ "${1:-}" = postgres ]
+EOF
+cat > "$hostile_path_case/trusted/sudo" <<'EOF'
+#!/usr/bin/env bash
+[ "${1:-}" = -n ] && [ "${2:-}" = -u ] && [ "${3:-}" = postgres ] || exit 96
+shift 3
+export FORGE_HOSTILE_ELEVATED=1
+exec "$@"
+EOF
+cat > "$hostile_path_case/trusted/runuser" <<'EOF'
+#!/usr/bin/env bash
+exit 98
+EOF
+chmod 555 "$hostile_path_case/shadow/"* "$hostile_path_case/trusted/"*
+: > "$hostile_path_case/shadow-marker"
+: > "$hostile_path_case/trusted-calls"
+PATH="$hostile_path_case/shadow:/usr/bin:/bin" \
+  FORGE_REPAIR_LIBRARY=1 \
+  FORGE_REPAIR_TEST_HOOK=full-process \
+  FORGE_REPAIR_TEST_OS_NAME=Linux \
+  FORGE_REPAIR_TEST_PSQL_SOCKET="$hostile_path_case/socket" \
+  FORGE_REPAIR_TEST_PSQL_PORT=5432 \
+  FORGE_HOSTILE_PATH_MARKER="$hostile_path_case/shadow-marker" \
+  FORGE_HOSTILE_TRUSTED_CALLS="$hostile_path_case/trusted-calls" \
+  FORGE_HOSTILE_TRUSTED_DIR="$hostile_path_case/trusted" \
+  /bin/bash -c '
+    source "$1"
+    repair_trusted_linux_tool() {
+      case "$1" in
+        psql|sudo|runuser|id) printf "%s/%s\n" "$FORGE_HOSTILE_TRUSTED_DIR" "$1" ;;
+        *) return 1 ;;
+      esac
+    }
+    resolve_repair_psql_admin
+    case "${REPAIR_PSQL_ADMIN[*]}" in
+      *"$FORGE_HOSTILE_TRUSTED_DIR/sudo"*"$FORGE_HOSTILE_TRUSTED_DIR/psql"*) ;;
+      *) exit 95 ;;
+    esac
+  ' _ "$REPAIR"
+[ ! -s "$hostile_path_case/shadow-marker" ] \
+  || fail 'repair Linux fallback executed a hostile PATH shadow'
+[ "$(wc -l < "$hostile_path_case/trusted-calls" | tr -d '[:space:]')" = 2 ] \
+  || fail 'repair Linux fallback must reject print-1/nonzero current probe then accept trusted sudo probe'
+
 provision_function="$TEST_ROOT/provision-database"
 sed -n '/^provision_database() {/,/^}/p' "$INSTALLER" > "$provision_function"
 assert_contains 'CREATE ROLE forge LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD' "$provision_function"
 assert_contains 'ALTER ROLE forge LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD' "$provision_function"
-assert_contains "FROM pg_catalog.pg_auth_members WHERE roleid = 'forge'::pg_catalog.regrole OR member = 'forge'::pg_catalog.regrole" "$provision_function"
+assert_contains 'LOCK TABLE pg_catalog.pg_authid IN SHARE ROW EXCLUSIVE MODE;' "$provision_function"
+assert_contains 'LOCK TABLE pg_catalog.pg_auth_members IN SHARE ROW EXCLUSIVE MODE;' "$provision_function"
+assert_contains "membership.roleid = 'forge'::pg_catalog.regrole" "$provision_function"
 assert_contains 'Role forge has membership edges.' "$provision_function"
 assert_contains 'Role forge is outside the safe or known legacy app-role boundary' "$provision_function"
 provision_function_sql="$(tr '\n' ' ' < "$provision_function")"
 case "$provision_function_sql" in
-  *'pg_catalog.pg_auth_members'*'role_normalizable='*'ALTER ROLE forge LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD'*) ;;
+  *'LOCK TABLE pg_catalog.pg_authid IN SHARE ROW EXCLUSIVE MODE;'*'LOCK TABLE pg_catalog.pg_auth_members IN SHARE ROW EXCLUSIVE MODE;'*'IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles'*'pg_catalog.pg_auth_members'*'ALTER ROLE forge LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD'*'Role forge did not reach the exact safe native app-role boundary.'*'COMMIT;'*) ;;
   *) fail 'existing forge membership and role-shape refusal must precede role hardening' ;;
 esac
 
@@ -125,7 +216,7 @@ cat > "$psql_status_case/bin/psql" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$FORGE_TEST_PSQL_CALLS"
 case "$*" in
-  *'WHERE rolname = CURRENT_USER AND rolsuper'*) printf '1\n'; exit 0 ;;
+  *'WHERE rolname = CURRENT_USER AND rolsuper'*) printf '1\n'; exit "${FORGE_TEST_PROBE_EXIT:-0}" ;;
   *) exit 73 ;;
 esac
 EOF
@@ -164,6 +255,32 @@ assert_contains 'Could not transactionally refresh forge app privileges (non-fat
 assert_contains "Re-run 'forge upgrade'" "$psql_status_case/grant-stdout"
 assert_not_contains 'Ensured the forge role can read and write ordinary forge tables' "$psql_status_case/grant-stdout"
 assert_not_contains 'unexpected psql_admin success' "$psql_status_case/grant-stdout"
+
+: > "$psql_status_case/nonzero-probe-calls"
+set +e
+PATH="$psql_status_case/bin:$PATH" \
+  FORGE_TEST_PSQL_CALLS="$psql_status_case/nonzero-probe-calls" \
+  FORGE_TEST_PROBE_EXIT=74 \
+  FORGE_INSTALL_TEST_ADMIN_MODE=current \
+  FORGE_INSTALL_TEST_PSQL_SOCKET="$psql_status_case" \
+  FORGE_INSTALL_TEST_PSQL_PORT=5432 \
+  FORGE_INSTALL_STATE_DIR="$psql_status_case/nonzero-state" \
+  FORGE_WORKSPACE_ROOT="$psql_status_case/nonzero-workspace" \
+  FORGE_ENV_FILE="$psql_status_case/nonzero.env" \
+  bash -c '
+    export FORGE_INSTALL_LIBRARY=1
+    source "$1"
+    if resolve_managed_local_admin; then
+      printf "unexpected admin acceptance\n"
+      exit 65
+    fi
+  ' _ "$INSTALLER" > "$psql_status_case/nonzero-stdout" 2> "$psql_status_case/nonzero-stderr"
+nonzero_probe_status=$?
+set -e
+[ "$nonzero_probe_status" -eq 0 ] || fail 'installer must reject print-1/nonzero administrator probe cleanly'
+[ "$(wc -l < "$psql_status_case/nonzero-probe-calls" | tr -d '[:space:]')" = 1 ] \
+  || fail 'installer print-1/nonzero probe must stop before mutation'
+assert_not_contains 'unexpected admin acceptance' "$psql_status_case/nonzero-stdout"
 
 set +e
 PATH="$psql_status_case/bin:$PATH" \
@@ -278,7 +395,7 @@ for argument in "$@"; do
 done
 if [ "$database_name" = postgres ]; then
   case "$*" in
-    *'WHERE rolname = CURRENT_USER AND rolsuper'*) printf '1\n' ;;
+    *'WHERE rolname = CURRENT_USER AND rolsuper'*) printf '1\n'; exit "${FORGE_REPAIR_TEST_PROBE_EXIT:-0}" ;;
     *) exit 95 ;;
   esac
 fi
@@ -293,7 +410,8 @@ EOF
 #!/usr/bin/env bash
 exit 1
 EOF
-  chmod +x "$case_dir/bin/psql" "$case_dir/bin/npm" "$case_dir/bin/pgrep"
+  chmod 555 "$case_dir/bin/psql"
+  chmod +x "$case_dir/bin/npm" "$case_dir/bin/pgrep"
 
   set +e
   env -u DATABASE_URL \
@@ -307,6 +425,11 @@ EOF
     FORGE_REPAIR_TEST_NPM_CALLS="$case_dir/npm-calls" \
     FORGE_REPAIR_TEST_SENTINEL="$case_dir/sentinel" \
     FORGE_REPAIR_TEST_EXPECTED_SOCKET="$REPAIR_EXPECTED_SOCKET" \
+    FORGE_REPAIR_TEST_PROBE_EXIT="${REPAIR_CASE_PROBE_EXIT:-0}" \
+    FORGE_REPAIR_TEST_HOOK=full-process \
+    FORGE_REPAIR_TEST_PSQL_BIN="$case_dir/bin/psql" \
+    FORGE_REPAIR_TEST_PSQL_SOCKET="$REPAIR_EXPECTED_SOCKET" \
+    FORGE_REPAIR_TEST_PSQL_PORT=5432 \
     PGHOST=remote.invalid \
     PGHOSTADDR=203.0.113.7 \
     PGPORT=6543 \
@@ -373,6 +496,14 @@ assert_contains "-X -h $REPAIR_EXPECTED_SOCKET -p 5432 -d postgres" "$CASE_DIR/p
 assert_contains "-X -h $REPAIR_EXPECTED_SOCKET -p 5432 -d forge" "$CASE_DIR/psql-calls"
 assert_not_contains 'ambient-' "$CASE_DIR/psql-calls"
 
+REPAIR_CASE_PROBE_EXIT=74
+run_repair_process_case probe-print-one-nonzero "$managed_repair_url" native
+unset REPAIR_CASE_PROBE_EXIT
+[ "$CASE_STATUS" -eq 0 ] || fail 'repair print-1/nonzero administrator probe should remain non-fatal'
+[ ! -s "$CASE_DIR/reconciler-calls" ] \
+  || fail 'repair print-1/nonzero administrator probe must reject before mutation'
+assert_contains 'Could not establish controlled native PostgreSQL administrator access' "$CASE_DIR/stderr"
+
 run_repair_process_case managed-postgres 'postgres://forge:p%40ss%3Aword!@localhost:5432/forge' native
 [ "$CASE_STATUS" -eq 0 ] || fail 'full-process postgres native repair should succeed'
 [ "$(wc -l < "$CASE_DIR/reconciler-calls" | tr -d '[:space:]')" = 1 ] \
@@ -399,12 +530,16 @@ run_repair_process_case skip-migrate "$managed_repair_url" native --skip-migrate
 repair_hook_case="$TEST_ROOT/repair-hook"
 mkdir -p "$repair_hook_case/bin"
 cp "$TEST_ROOT/repair-process-managed/bin/psql" "$repair_hook_case/bin/psql"
+chmod 555 "$repair_hook_case/bin/psql"
 : > "$repair_hook_case/psql-calls"
 : > "$repair_hook_case/reconciler-calls"
 printf 'untouched\n' > "$repair_hook_case/sentinel"
 set +e
 PATH="$repair_hook_case/bin:$PATH" \
   FORGE_REPAIR_TEST_HOOK=reconcile-forge-privileges \
+  FORGE_REPAIR_TEST_PSQL_BIN="$repair_hook_case/bin/psql" \
+  FORGE_REPAIR_TEST_PSQL_SOCKET="$REPAIR_EXPECTED_SOCKET" \
+  FORGE_REPAIR_TEST_PSQL_PORT=5432 \
   FORGE_REPAIR_TEST_PSQL_CALLS="$repair_hook_case/psql-calls" \
   FORGE_REPAIR_TEST_RECONCILER_CALLS="$repair_hook_case/reconciler-calls" \
   FORGE_REPAIR_TEST_SENTINEL="$repair_hook_case/sentinel" \
@@ -417,6 +552,9 @@ assert_contains 'FORGE_REPAIR_TEST_DATABASE_NAME is required' "$repair_hook_case
 
 PATH="$repair_hook_case/bin:$PATH" \
   FORGE_REPAIR_TEST_HOOK=reconcile-forge-privileges \
+  FORGE_REPAIR_TEST_PSQL_BIN="$repair_hook_case/bin/psql" \
+  FORGE_REPAIR_TEST_PSQL_SOCKET="$REPAIR_EXPECTED_SOCKET" \
+  FORGE_REPAIR_TEST_PSQL_PORT=5432 \
   FORGE_REPAIR_TEST_DATABASE_NAME=explicit_disposable_target \
   FORGE_REPAIR_TEST_PSQL_CALLS="$repair_hook_case/psql-calls" \
   FORGE_REPAIR_TEST_RECONCILER_CALLS="$repair_hook_case/reconciler-calls" \
@@ -527,6 +665,17 @@ printf '%s\n' "$*" >> "$FORGE_INSTALL_ROUTING_PSQL_CALLS"
   && [ "$7" = "$FORGE_INSTALL_ROUTING_EXPECTED_USER" ] \
   && [ "$8" = '-d' ] && [ "$9" = postgres ] || exit 96
 printf 'touched\n' > "$FORGE_INSTALL_ROUTING_SENTINEL"
+case "$*" in
+  *'-Atq --set ON_ERROR_STOP=1'*)
+    provision_sql="$(cat)"
+    case "$provision_sql" in
+      *'LOCK TABLE pg_catalog.pg_authid IN SHARE ROW EXCLUSIVE MODE;'*'LOCK TABLE pg_catalog.pg_auth_members IN SHARE ROW EXCLUSIVE MODE;'*'COMMIT;'*) ;;
+      *) exit 94 ;;
+    esac
+    printf 'existing\n'
+    exit 0
+    ;;
+esac
 previous=''
 for argument in "$@"; do
   if [ "$previous" = '--file' ]; then

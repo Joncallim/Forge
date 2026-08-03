@@ -1367,6 +1367,8 @@ async function main(): Promise<void> {
   const client = postgres(process.env.FORGE_DATABASE_ADMIN_URL ?? getRequiredEnv('DATABASE_URL'), { max: 1, onnotice: () => {} })
   try {
     const outcome = await client.begin(async (sql) => {
+      await sql.unsafe('LOCK TABLE pg_catalog.pg_authid IN SHARE ROW EXCLUSIVE MODE')
+      await sql.unsafe('LOCK TABLE pg_catalog.pg_auth_members IN SHARE ROW EXCLUSIVE MODE')
       // Classification belongs to the same critical section as repair.  This
       // prevents an installer from accepting a journal shape that changed
       // between an optimistic read and the migration-ledger lock.

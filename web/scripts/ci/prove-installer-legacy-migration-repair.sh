@@ -359,14 +359,39 @@ run_installer_grant_privileges() {
     export FORGE_INSTALL_STATE_DIR="$TEMP_ROOT/$label-state"
     export FORGE_WORKSPACE_ROOT="$TEMP_ROOT/$label-workspace"
     export FORGE_ENV_FILE="$TEMP_ROOT/$label.env"
-    export FORGE_INSTALL_TEST_ADMIN_MODE=current
-    export FORGE_INSTALL_TEST_PSQL_SOCKET="${FORGE_LEGACY_REPAIR_ADMIN_SOCKET:-/tmp}"
-    export FORGE_INSTALL_TEST_PSQL_PORT="${PGPORT:-5432}"
+    if [ "${FORGE_LEGACY_REPAIR_PRODUCTION_NATIVE_ROUTE:-0}" != 1 ]; then
+      export FORGE_INSTALL_TEST_ADMIN_MODE=current
+      export FORGE_INSTALL_TEST_PSQL_SOCKET="${FORGE_LEGACY_REPAIR_ADMIN_SOCKET:-/tmp}"
+      export FORGE_INSTALL_TEST_PSQL_PORT="${PGPORT:-5432}"
+    fi
     source "$REPO_ROOT/scripts/install.sh"
     SERVICE_MODE=native
     MANAGE_LOCAL_DB=1
     DRY_RUN=0
     grant_forge_privileges
+  )
+}
+
+run_installer_provision_database() {
+  local label="$1"
+  local proof_env="$TEMP_ROOT/$label.env"
+  printf 'DATABASE_URL=postgresql://forge:installer-race-proof@localhost:5432/forge\n' > "$proof_env"
+  (
+    export FORGE_INSTALL_LIBRARY=1
+    export FORGE_INSTALL_STATE_DIR="$TEMP_ROOT/$label-state"
+    export FORGE_WORKSPACE_ROOT="$TEMP_ROOT/$label-workspace"
+    export FORGE_ENV_FILE="$proof_env"
+    if [ "${FORGE_LEGACY_REPAIR_PRODUCTION_NATIVE_ROUTE:-0}" != 1 ]; then
+      export FORGE_INSTALL_TEST_ADMIN_MODE=current
+      export FORGE_INSTALL_TEST_PSQL_SOCKET="${FORGE_LEGACY_REPAIR_ADMIN_SOCKET:-/tmp}"
+      export FORGE_INSTALL_TEST_PSQL_PORT="${PGPORT:-5432}"
+    fi
+    source "$REPO_ROOT/scripts/install.sh"
+    SERVICE_MODE=native
+    MANAGE_LOCAL_DB=1
+    DRY_RUN=0
+    DB_PASSWORD=installer-race-proof
+    provision_database
   )
 }
 
@@ -380,6 +405,7 @@ run_repair_grant_privileges() {
     FORGE_REPAIR_TEST_DATABASE_NAME="$FORGE_LEGACY_REPAIR_ADMIN_DATABASE" \
     FORGE_REPAIR_TEST_PSQL_SOCKET="${FORGE_LEGACY_REPAIR_ADMIN_SOCKET:-/tmp}" \
     FORGE_REPAIR_TEST_PSQL_PORT="${PGPORT:-5432}" \
+    FORGE_REPAIR_PRODUCTION_NATIVE_ROUTE="${FORGE_LEGACY_REPAIR_PRODUCTION_NATIVE_ROUTE:-0}" \
     bash "$REPO_ROOT/scripts/repair.sh" > "$TEMP_ROOT/$label.log" 2>&1
 }
 
@@ -509,8 +535,7 @@ wait_for_activity_condition() {
     count="$(admin_psql --no-align --tuples-only --quiet --command "
       SELECT count(*)
       FROM pg_catalog.pg_stat_activity
-      WHERE datname = pg_catalog.current_database()
-        AND application_name = '$application_name'
+      WHERE application_name = '$application_name'
         AND $condition;")"
     [ "$count" -ge 1 ] && return 0
     sleep 0.1
@@ -579,6 +604,129 @@ prove_acl_grant_race_refusal() {
     echo "$label concurrent ACL change was unexpectedly accepted or normalized." >&2
     exit 1
   fi
+}
+
+assert_only_external_role_changed() {
+  local before="$1" after="$2" case_name="$3"
+  cmp -s "$TEMP_ROOT/$before.ledger" "$TEMP_ROOT/$after.ledger" \
+    || { echo "$case_name changed the migration ledger." >&2; exit 1; }
+  cmp -s "$TEMP_ROOT/$before.schema" "$TEMP_ROOT/$after.schema" \
+    || { echo "$case_name changed the database catalog." >&2; exit 1; }
+  cmp -s "$TEMP_ROOT/$before.trigger-routines" "$TEMP_ROOT/$after.trigger-routines" \
+    || { echo "$case_name changed the trigger-routine boundary." >&2; exit 1; }
+}
+
+prove_role_boundary_race_refusal() {
+  local surface="$1" mutation="$2"
+  local label="role-race-$surface-$mutation"
+  local fixture_application="forge_role_fixture_${surface}_${mutation}"
+  local surface_application fixture_sql cleanup_sql race_admin_url separator
+  local race_fifo="$TEMP_ROOT/$label.fifo"
+  local fixture_log="$TEMP_ROOT/$label-fixture.log"
+  local surface_log="$TEMP_ROOT/$label-surface.log"
+  local fixture_pid surface_pid surface_status retained
+
+  case "$mutation" in
+    attribute)
+      fixture_sql='ALTER ROLE forge CREATEROLE;'
+      cleanup_sql='ALTER ROLE forge NOCREATEROLE;'
+      ;;
+    membership)
+      fixture_sql='GRANT forge_release_transition TO forge;'
+      cleanup_sql='REVOKE forge_release_transition FROM forge;'
+      ;;
+    *) echo "Unknown role-race mutation: $mutation" >&2; exit 64 ;;
+  esac
+  case "$surface" in
+    legacy) surface_application="forge_role_surface_$mutation" ;;
+    shared) surface_application=forge-shared-app-privilege-reconciliation ;;
+    installer) surface_application=forge-installer-role-provision ;;
+    *) echo "Unknown role-race surface: $surface" >&2; exit 64 ;;
+  esac
+
+  snapshot "$label-before"
+  mkfifo "$race_fifo"
+  exec 9<>"$race_fifo"
+  PGAPPNAME="$fixture_application" \
+    PGPASSWORD="$FORGE_LEGACY_REPAIR_ADMIN_PASSWORD" \
+    PGHOST="$FORGE_LEGACY_REPAIR_ADMIN_HOST" \
+    PGUSER="$FORGE_LEGACY_REPAIR_ADMIN_USER" \
+    PGDATABASE="$FORGE_LEGACY_REPAIR_ADMIN_DATABASE" \
+    psql --set ON_ERROR_STOP=1 < "$race_fifo" > "$fixture_log" 2>&1 &
+  fixture_pid=$!
+  printf 'BEGIN;\n%s\n' "$fixture_sql" >&9
+  if ! wait_for_activity_condition "$fixture_application" "state = 'idle in transaction'"; then
+    printf 'ROLLBACK;\n\\q\n' >&9
+    exec 9>&-
+    wait "$fixture_pid" || true
+    echo "$label fixture did not reach idle-in-transaction state." >&2
+    exit 1
+  fi
+
+  case "$surface" in
+    legacy)
+      case "$FORGE_LEGACY_REPAIR_ADMIN_URL" in
+        *\?*) separator='&' ;;
+        *) separator='?' ;;
+      esac
+      race_admin_url="${FORGE_LEGACY_REPAIR_ADMIN_URL}${separator}application_name=${surface_application}"
+      (
+        cd "$WEB_ROOT"
+        DATABASE_URL="$FORGE_LEGACY_REPAIR_DATABASE_URL" FORGE_DATABASE_ADMIN_URL="$race_admin_url" \
+          npm run protocol:repair-epic-172-legacy-release
+      ) > "$surface_log" 2>&1 &
+      ;;
+    shared)
+      (run_repair_grant_privileges "$label") > "$surface_log" 2>&1 &
+      ;;
+    installer)
+      (run_installer_provision_database "$label") > "$surface_log" 2>&1 &
+      ;;
+  esac
+  surface_pid=$!
+  if ! wait_for_activity_condition "$surface_application" "wait_event_type = 'Lock'"; then
+    printf 'ROLLBACK;\n\\q\n' >&9
+    exec 9>&-
+    wait "$fixture_pid" || true
+    kill "$surface_pid" 2>/dev/null || true
+    wait "$surface_pid" 2>/dev/null || true
+    sed -n '1,160p' "$surface_log" >&2
+    echo "$label did not expose the required pre-commit lock wait." >&2
+    exit 1
+  fi
+
+  printf 'COMMIT;\n\\q\n' >&9
+  exec 9>&-
+  wait "$fixture_pid"
+  set +e
+  wait "$surface_pid"
+  surface_status=$?
+  set -e
+  case "$surface" in
+    shared)
+      [ "$surface_status" -eq 0 ] \
+        && grep -Fq 'Could not transactionally refresh forge app privileges (non-fatal).' "$TEMP_ROOT/$label.log" \
+        || { sed -n '1,160p' "$surface_log" >&2; echo "$label did not refuse after the racing commit." >&2; exit 1; }
+      ;;
+    *)
+      [ "$surface_status" -ne 0 ] \
+        || { sed -n '1,160p' "$surface_log" >&2; echo "$label unexpectedly accepted the unsafe committed role boundary." >&2; exit 1; }
+      ;;
+  esac
+
+  case "$mutation" in
+    attribute)
+      retained="$(admin_server_psql --no-align --tuples-only --quiet --command "SELECT rolcreaterole FROM pg_catalog.pg_roles WHERE rolname = 'forge';")"
+      [ "$retained" = t ] || { echo "$label normalized or lost the external attribute change." >&2; exit 1; }
+      ;;
+    membership)
+      retained="$(admin_server_psql --no-align --tuples-only --quiet --command "SELECT count(*) FROM pg_catalog.pg_auth_members WHERE roleid = 'forge_release_transition'::pg_catalog.regrole AND member = 'forge'::pg_catalog.regrole;")"
+      [ "$retained" = 1 ] || { echo "$label normalized or lost the external membership change." >&2; exit 1; }
+      ;;
+  esac
+  snapshot "$label-after"
+  assert_only_external_role_changed "$label-before" "$label-after" "$label"
+  admin_server_psql --command "$cleanup_sql"
 }
 
 expect_refusal() {
@@ -985,6 +1133,9 @@ CREATE TABLE public.forge_legacy_ordinary_acl_probe (
 SQL
 grant_exact_forge_contamination
 assert_protected_forge_acl_count 148
+echo 'Proving legacy normalizer role races block, then refuse the committed unsafe boundary.'
+prove_role_boundary_race_refusal legacy attribute
+prove_role_boundary_race_refusal legacy membership
 snapshot exact-installer-contamination-before
 run_repair
 snapshot exact-installer-contamination-after
@@ -1282,6 +1433,14 @@ grep -Fq 'Ensured the forge role can read ordinary forge tables without protecte
 }
 assert_protected_forge_acl_count 2
 assert_owner_driven_forge_boundary
+
+echo 'Proving shared reconciliation role races block, then refuse the committed unsafe boundary.'
+prove_role_boundary_race_refusal shared attribute
+prove_role_boundary_race_refusal shared membership
+
+echo 'Proving installer provisioning role races block, then refuse the committed unsafe boundary.'
+prove_role_boundary_race_refusal installer attribute
+prove_role_boundary_race_refusal installer membership
 
 admin_psql --command 'GRANT INSERT ON TABLE public.architect_plan_versions TO PUBLIC;'
 snapshot shared-public-table-authority-before
