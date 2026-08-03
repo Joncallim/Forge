@@ -251,6 +251,75 @@ BEGIN
   ) THEN
     RAISE EXCEPTION 'forge retained unexpected protected table or column authority';
   END IF;
+  IF EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_class relation
+    JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = relation.relnamespace
+    JOIN pg_catalog.pg_roles owner_role ON owner_role.oid = relation.relowner
+    CROSS JOIN LATERAL pg_catalog.aclexplode(
+      COALESCE(relation.relacl, pg_catalog.acldefault('r', relation.relowner))
+    ) privilege
+    WHERE namespace_row.nspname = 'public'
+      AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
+      AND owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner')
+      AND privilege.grantee = 0
+      AND (
+        relation.relname <> 'forge_epic_172_s3_release_state'
+        OR privilege.privilege_type <> 'SELECT'
+        OR privilege.is_grantable
+        OR privilege.grantor <> relation.relowner
+      )
+  ) OR EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_attribute attribute
+    JOIN pg_catalog.pg_class relation ON relation.oid = attribute.attrelid
+    JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = relation.relnamespace
+    JOIN pg_catalog.pg_roles owner_role ON owner_role.oid = relation.relowner
+    CROSS JOIN LATERAL pg_catalog.aclexplode(attribute.attacl) privilege
+    WHERE namespace_row.nspname = 'public'
+      AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
+      AND owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner')
+      AND attribute.attnum > 0
+      AND NOT attribute.attisdropped
+      AND privilege.grantee = 0
+  ) THEN
+    RAISE EXCEPTION 'protected owner tables retained unexpected PUBLIC authority';
+  END IF;
+  IF EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_class relation
+    JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = relation.relnamespace
+    JOIN pg_catalog.pg_roles owner_role ON owner_role.oid = relation.relowner
+    CROSS JOIN pg_catalog.pg_roles forge_role
+    WHERE namespace_row.nspname = 'public'
+      AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
+      AND owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner')
+      AND forge_role.rolname = 'forge'
+      AND (
+        pg_catalog.has_table_privilege(forge_role.oid, relation.oid, 'INSERT')
+        OR pg_catalog.has_table_privilege(forge_role.oid, relation.oid, 'UPDATE')
+        OR pg_catalog.has_table_privilege(forge_role.oid, relation.oid, 'DELETE')
+        OR pg_catalog.has_table_privilege(forge_role.oid, relation.oid, 'TRUNCATE')
+        OR pg_catalog.has_table_privilege(forge_role.oid, relation.oid, 'REFERENCES')
+        OR pg_catalog.has_table_privilege(forge_role.oid, relation.oid, 'TRIGGER')
+        OR pg_catalog.has_any_column_privilege(forge_role.oid, relation.oid, 'INSERT')
+        OR pg_catalog.has_any_column_privilege(forge_role.oid, relation.oid, 'UPDATE')
+        OR pg_catalog.has_any_column_privilege(forge_role.oid, relation.oid, 'REFERENCES')
+        OR (
+          relation.relname NOT IN (
+            'forge_epic_172_s3_release_state',
+            'work_package_local_projection_sources',
+            'work_package_local_projection_heads'
+          )
+          AND (
+            pg_catalog.has_table_privilege(forge_role.oid, relation.oid, 'SELECT')
+            OR pg_catalog.has_any_column_privilege(forge_role.oid, relation.oid, 'SELECT')
+          )
+        )
+      )
+  ) THEN
+    RAISE EXCEPTION 'forge retained effective protected table or column authority';
+  END IF;
   FOREACH projection_name IN ARRAY ARRAY[
     'work_package_local_projection_sources',
     'work_package_local_projection_heads'

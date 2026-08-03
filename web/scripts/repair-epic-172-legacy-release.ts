@@ -136,6 +136,9 @@ const preS4ProtectedInstallerTables = protectedInstallerRelations
 const protectedProjectionTables = new Set<string>(protectedInstallerRelations
   .filter((relation) => relation.scope === 'projection')
   .map((relation) => relation.name))
+const protectedEffectiveSelectTables = protectedInstallerRelations
+  .filter((relation) => relation.scope === 's3' || relation.scope === 'projection')
+  .map((relation) => relation.name)
 const protectedInstallerGrantTableSql = protectedInstallerGrantTables
   .map((table) => `public.${table}`)
   .join(', ')
@@ -906,6 +909,74 @@ async function exactProtectedInstallerColumnAcls(
   return columnGrants.length === 0
 }
 
+async function exactEffectiveForgeProtectedInstallerPrivileges(
+  sql: postgres.Sql | postgres.TransactionSql,
+): Promise<boolean> {
+  const [boundary] = await sql<readonly {
+    roles: number; relations: number; violations: number; publicViolations: number
+  }[]>`
+    WITH forge_role AS (
+      SELECT oid FROM pg_catalog.pg_roles WHERE rolname = 'forge'
+    ), protected_relations AS (
+      SELECT relation.oid, relation.relname, relation.relowner, relation.relacl
+      FROM pg_catalog.pg_class relation
+      JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = relation.relnamespace
+      WHERE namespace_row.nspname = 'public'
+        AND relation.relkind IN ('r', 'p')
+        AND relation.relname = ANY(${sql.array([...protectedInstallerGrantTables])}::text[])
+    )
+    SELECT
+      (SELECT pg_catalog.count(*)::integer FROM forge_role) AS roles,
+      pg_catalog.count(*)::integer AS relations,
+      pg_catalog.count(*) FILTER (WHERE
+        pg_catalog.has_table_privilege(forge_role.oid, relation.oid, 'INSERT')
+        OR pg_catalog.has_table_privilege(forge_role.oid, relation.oid, 'UPDATE')
+        OR pg_catalog.has_table_privilege(forge_role.oid, relation.oid, 'DELETE')
+        OR pg_catalog.has_table_privilege(forge_role.oid, relation.oid, 'TRUNCATE')
+        OR pg_catalog.has_table_privilege(forge_role.oid, relation.oid, 'REFERENCES')
+        OR pg_catalog.has_table_privilege(forge_role.oid, relation.oid, 'TRIGGER')
+        OR pg_catalog.has_any_column_privilege(forge_role.oid, relation.oid, 'INSERT')
+        OR pg_catalog.has_any_column_privilege(forge_role.oid, relation.oid, 'UPDATE')
+        OR pg_catalog.has_any_column_privilege(forge_role.oid, relation.oid, 'REFERENCES')
+        OR (
+          relation.relname <> ALL(${sql.array([...protectedEffectiveSelectTables])}::text[])
+          AND (
+            pg_catalog.has_table_privilege(forge_role.oid, relation.oid, 'SELECT')
+            OR pg_catalog.has_any_column_privilege(forge_role.oid, relation.oid, 'SELECT')
+          )
+        )
+      )::integer AS violations,
+      (
+        SELECT pg_catalog.count(*)::integer
+        FROM protected_relations public_relation
+        CROSS JOIN LATERAL pg_catalog.aclexplode(
+          COALESCE(public_relation.relacl, pg_catalog.acldefault('r', public_relation.relowner))
+        ) privilege
+        WHERE privilege.grantee = 0
+          AND (
+            public_relation.relname <> 'forge_epic_172_s3_release_state'
+            OR privilege.privilege_type <> 'SELECT'
+            OR privilege.is_grantable
+            OR privilege.grantor <> public_relation.relowner
+          )
+      ) + (
+        SELECT pg_catalog.count(*)::integer
+        FROM protected_relations public_relation
+        JOIN pg_catalog.pg_attribute attribute ON attribute.attrelid = public_relation.oid
+          AND attribute.attnum > 0 AND NOT attribute.attisdropped
+        CROSS JOIN LATERAL pg_catalog.aclexplode(attribute.attacl) privilege
+        WHERE privilege.grantee = 0
+      ) AS "publicViolations"
+    FROM protected_relations relation
+    CROSS JOIN forge_role
+  `
+  return boundary?.publicViolations === 0
+    && (boundary.roles === 0
+      || (boundary.roles === 1
+        && boundary.relations === protectedInstallerRelations.length
+        && boundary.violations === 0))
+}
+
 type ProtectedInstallerAclMode = 'pre-0028-clean' | 'canonical' | 'legacy-dirty'
 
 async function exactProtectedInstallerBoundary(
@@ -960,8 +1031,10 @@ async function exactProtectedInstallerBoundary(
   }
   const actual = grants.map((row) => row.entry).sort()
   expected.sort()
-  return actual.length === expected.length
-    && actual.every((entry, index) => entry === expected[index])
+  if (actual.length !== expected.length
+    || !actual.every((entry, index) => entry === expected[index])) return false
+  return mode === 'legacy-dirty'
+    || await exactEffectiveForgeProtectedInstallerPrivileges(sql)
 }
 
 async function exactOptionalForgeAppRoleBoundary(

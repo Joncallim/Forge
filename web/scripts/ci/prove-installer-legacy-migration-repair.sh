@@ -1073,6 +1073,42 @@ RESET ROLE;
 SQL
 restore_canonical_forge_boundary
 
+grant_exact_forge_contamination
+admin_psql --command 'GRANT INSERT ON TABLE public.architect_plan_versions TO PUBLIC;'
+snapshot dirty-public-table-authority-before
+expect_refusal 'Exact installer contamination with effective PUBLIC table authority'
+snapshot dirty-public-table-authority-after
+assert_unchanged dirty-public-table-authority-before dirty-public-table-authority-after 'Dirty PUBLIC table-authority refusal rollback'
+admin_psql --command 'REVOKE INSERT ON TABLE public.architect_plan_versions FROM PUBLIC;'
+restore_canonical_forge_boundary
+
+grant_exact_forge_contamination
+admin_psql --command 'GRANT SELECT (task_id), UPDATE (task_id) ON TABLE public.architect_plan_versions TO PUBLIC;'
+snapshot dirty-public-column-authority-before
+expect_refusal 'Exact installer contamination with effective PUBLIC column authority'
+snapshot dirty-public-column-authority-after
+assert_unchanged dirty-public-column-authority-before dirty-public-column-authority-after 'Dirty PUBLIC column-authority refusal rollback'
+admin_psql --command 'REVOKE SELECT (task_id), UPDATE (task_id) ON TABLE public.architect_plan_versions FROM PUBLIC;'
+restore_canonical_forge_boundary
+
+grant_exact_forge_contamination
+admin_psql --command 'GRANT SELECT ON TABLE public.work_package_local_projection_sources TO PUBLIC;'
+snapshot dirty-public-projection-authority-before
+expect_refusal 'Exact installer contamination with PUBLIC projection SELECT'
+snapshot dirty-public-projection-authority-after
+assert_unchanged dirty-public-projection-authority-before dirty-public-projection-authority-after 'Dirty PUBLIC projection-authority refusal rollback'
+admin_psql --command 'REVOKE SELECT ON TABLE public.work_package_local_projection_sources FROM PUBLIC;'
+restore_canonical_forge_boundary
+
+grant_exact_forge_contamination
+admin_psql --command 'GRANT SELECT (task_id) ON TABLE public.architect_plan_versions TO forge_architect_plan_history_reader;'
+snapshot dirty-unrelated-column-acl-before
+expect_refusal 'Exact installer contamination with unrelated-principal column ACL'
+snapshot dirty-unrelated-column-acl-after
+assert_unchanged dirty-unrelated-column-acl-before dirty-unrelated-column-acl-after 'Strict legacy unrelated-principal column-ACL refusal'
+admin_psql --command 'REVOKE SELECT (task_id) ON TABLE public.architect_plan_versions FROM forge_architect_plan_history_reader;'
+restore_canonical_forge_boundary
+
 admin_psql <<'SQL'
 SET ROLE forge_release_routines_owner;
 GRANT SELECT ON TABLE public.forge_epic_172_enablement_state TO forge;
@@ -1255,6 +1291,57 @@ grep -Fq 'Ensured the forge role can read ordinary forge tables without protecte
 }
 assert_protected_forge_acl_count 2
 assert_owner_driven_forge_boundary
+
+admin_psql --command 'GRANT INSERT ON TABLE public.architect_plan_versions TO PUBLIC;'
+snapshot shared-public-table-authority-before
+run_repair_grant_privileges repair-public-table-authority
+snapshot shared-public-table-authority-after
+assert_unchanged shared-public-table-authority-before shared-public-table-authority-after 'Shared SQL PUBLIC table-authority rollback'
+grep -Fq 'Could not transactionally refresh forge app privileges (non-fatal).' \
+  "$TEMP_ROOT/repair-public-table-authority.log" || {
+  echo 'Repair did not report the shared SQL PUBLIC table-authority refusal.' >&2
+  exit 1
+}
+admin_psql --command 'REVOKE INSERT ON TABLE public.architect_plan_versions FROM PUBLIC;'
+
+admin_psql --command 'GRANT SELECT (task_id), UPDATE (task_id) ON TABLE public.architect_plan_versions TO PUBLIC;'
+snapshot shared-public-column-authority-before
+run_repair_grant_privileges repair-public-column-authority
+snapshot shared-public-column-authority-after
+assert_unchanged shared-public-column-authority-before shared-public-column-authority-after 'Shared SQL PUBLIC column-authority rollback'
+grep -Fq 'Could not transactionally refresh forge app privileges (non-fatal).' \
+  "$TEMP_ROOT/repair-public-column-authority.log" || {
+  echo 'Repair did not report the shared SQL PUBLIC column-authority refusal.' >&2
+  exit 1
+}
+admin_psql --command 'REVOKE SELECT (task_id), UPDATE (task_id) ON TABLE public.architect_plan_versions FROM PUBLIC;'
+assert_protected_forge_acl_count 2
+
+admin_psql --command 'GRANT SELECT ON TABLE public.work_package_local_projection_sources TO PUBLIC;'
+snapshot shared-public-projection-authority-before
+run_repair_grant_privileges repair-public-projection-authority
+snapshot shared-public-projection-authority-after
+assert_unchanged shared-public-projection-authority-before shared-public-projection-authority-after 'Shared SQL PUBLIC projection-authority rollback'
+grep -Fq 'Could not transactionally refresh forge app privileges (non-fatal).' \
+  "$TEMP_ROOT/repair-public-projection-authority.log" || {
+  echo 'Repair did not report the shared SQL PUBLIC projection-authority refusal.' >&2
+  exit 1
+}
+admin_psql --command 'REVOKE SELECT ON TABLE public.work_package_local_projection_sources FROM PUBLIC;'
+assert_protected_forge_acl_count 2
+
+admin_psql --command 'GRANT SELECT (task_id) ON TABLE public.architect_plan_versions TO forge_architect_plan_history_reader;'
+snapshot shared-unrelated-column-acl-before
+run_repair_grant_privileges repair-unrelated-column-acl
+snapshot shared-unrelated-column-acl-after
+assert_unchanged shared-unrelated-column-acl-before shared-unrelated-column-acl-after 'Shared SQL unrelated-principal column-ACL preservation'
+grep -Fq 'Ensured the forge role can read ordinary forge tables without protected-table DML access.' \
+  "$TEMP_ROOT/repair-unrelated-column-acl.log" || {
+  echo 'Repair did not accept the unrelated-principal column ACL.' >&2
+  exit 1
+}
+admin_psql --command 'REVOKE SELECT (task_id) ON TABLE public.architect_plan_versions FROM forge_architect_plan_history_reader;'
+assert_protected_forge_acl_count 2
 
 admin_server_psql --command 'ALTER ROLE forge INHERIT;'
 run_repair_grant_privileges repair-legacy-inherit

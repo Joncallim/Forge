@@ -227,10 +227,15 @@ load_database_url_from_local_fallbacks() {
 }
 
 reconcile_forge_privileges() {
-  local database_name="${1:-forge}"
+  local database_name="${1:-}"
   case "$database_name" in
     ''|*[!A-Za-z0-9_]*) die "unsafe local database name for privilege reconciliation" ;;
   esac
+
+  if [ "$DRY_RUN" = "1" ]; then
+    info "Would reconcile local forge app privileges in database $database_name."
+    return 0
+  fi
 
   command -v psql >/dev/null 2>&1 || return 0
   psql -d postgres -tAc 'SELECT 1' >/dev/null 2>&1 || return 0
@@ -241,6 +246,17 @@ reconcile_forge_privileges() {
     warn "Could not transactionally refresh forge app privileges (non-fatal). Re-run 'forge repair' after checking PostgreSQL administrator access."
   fi
   return 0
+}
+
+should_reconcile_local_forge_privileges() {
+  case "${DATABASE_URL:-}" in
+    postgresql://forge:*@localhost:5432/forge|postgres://forge:*@localhost:5432/forge)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 }
 
 while [ "$#" -gt 0 ]; do
@@ -261,9 +277,18 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 
-if [ "${FORGE_REPAIR_TEST_HOOK:-}" = "reconcile-forge-privileges" ]; then
-  reconcile_forge_privileges "${FORGE_REPAIR_TEST_DATABASE_NAME:-forge}"
-  exit 0
+if [ -n "${FORGE_REPAIR_TEST_HOOK:-}" ]; then
+  case "$FORGE_REPAIR_TEST_HOOK" in
+    reconcile-forge-privileges)
+      [ -n "${FORGE_REPAIR_TEST_DATABASE_NAME:-}" ] \
+        || die "FORGE_REPAIR_TEST_DATABASE_NAME is required for the privilege reconciliation test hook."
+      reconcile_forge_privileges "$FORGE_REPAIR_TEST_DATABASE_NAME"
+      exit 0
+      ;;
+    *)
+      die "unknown repair test hook: $FORGE_REPAIR_TEST_HOOK"
+      ;;
+  esac
 fi
 
 [ -f "$WEB_DIR/package.json" ] || die "could not find web/package.json under $REPO_ROOT"
@@ -322,7 +347,13 @@ fi
 # direct DML access to protected owner tables. Best-effort: no administrator
 # connection leaves the database untouched.
 if [ "$SKIP_MIGRATE" != "1" ]; then
-  reconcile_forge_privileges forge
+  if should_reconcile_local_forge_privileges; then
+    reconcile_forge_privileges forge
+  elif [ -n "${DATABASE_URL:-}" ]; then
+    info "Skipping local forge privilege reconciliation for a custom DATABASE_URL."
+  else
+    info "Skipping local forge privilege reconciliation because DATABASE_URL is not set."
+  fi
 fi
 
 if [ "$SKIP_DOCTOR" = "1" ]; then

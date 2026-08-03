@@ -42,6 +42,9 @@ assert_contains "Re-run 'forge upgrade'" "$grant_function"
 assert_not_contains "Re-run 'forge repair'" "$grant_function"
 assert_contains '--file "$FORGE_PRIVILEGE_SQL"' "$REPAIR"
 assert_contains "Re-run 'forge repair'" "$REPAIR"
+assert_contains 'Would reconcile local forge app privileges in database' "$REPAIR"
+assert_contains 'postgresql://forge:*@localhost:5432/forge|postgres://forge:*@localhost:5432/forge' "$REPAIR"
+assert_contains 'FORGE_REPAIR_TEST_DATABASE_NAME is required for the privilege reconciliation test hook.' "$REPAIR"
 assert_contains 'GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO forge;' "$PRIVILEGE_SQL"
 assert_contains 'GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO forge;' "$PRIVILEGE_SQL"
 assert_contains "owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner')" "$PRIVILEGE_SQL"
@@ -52,6 +55,10 @@ assert_contains "'REVOKE ALL PRIVILEGES (%s) ON TABLE %I.%I FROM forge'" "$PRIVI
 assert_contains 'public.work_package_local_projection_sources,' "$PRIVILEGE_SQL"
 assert_contains 'public.work_package_local_projection_heads' "$PRIVILEGE_SQL"
 assert_contains "RAISE EXCEPTION 'forge retained unexpected protected table or column authority'" "$PRIVILEGE_SQL"
+assert_contains "RAISE EXCEPTION 'forge retained effective protected table or column authority'" "$PRIVILEGE_SQL"
+assert_contains "RAISE EXCEPTION 'protected owner tables retained unexpected PUBLIC authority'" "$PRIVILEGE_SQL"
+assert_contains 'pg_catalog.has_table_privilege(forge_role.oid, relation.oid' "$PRIVILEGE_SQL"
+assert_contains 'pg_catalog.has_any_column_privilege(forge_role.oid, relation.oid' "$PRIVILEGE_SQL"
 assert_contains "RAISE EXCEPTION 'fixed protected owner inventory is incomplete or has ownership drift'" "$PRIVILEGE_SQL"
 assert_contains "RAISE EXCEPTION 'forge app role is not a safe or known legacy login'" "$PRIVILEGE_SQL"
 assert_contains 'ALTER ROLE forge NOINHERIT;' "$PRIVILEGE_SQL"
@@ -165,6 +172,146 @@ set -e
 [ "$global_err_status" -ne 0 ] || fail 'ordinary sourced-installer errors must remain fatal'
 assert_contains 'Installer failed near line' "$global_err_case/stderr"
 assert_not_contains 'unexpected continuation' "$global_err_case/stdout"
+
+run_repair_process_case() {
+  local name="$1" database_url="$2"
+  shift 2
+  local case_dir="$TEST_ROOT/repair-process-$name"
+  local repo_dir="$case_dir/repo"
+  mkdir -p \
+    "$repo_dir/scripts" \
+    "$repo_dir/web/node_modules/next/dist/client" \
+    "$case_dir/bin" \
+    "$case_dir/home" \
+    "$case_dir/workspace"
+  cp "$REPAIR" "$repo_dir/scripts/repair.sh"
+  cp "$PRIVILEGE_SQL" "$repo_dir/scripts/reconcile-forge-app-privileges.sql"
+  printf '{}\n' > "$repo_dir/web/package.json"
+  for required_file in \
+    flight-data-helpers.js \
+    use-merged-ref.js \
+    normalize-trailing-slash.js \
+    app-next-turbopack.js \
+    navigation-build-id.js
+  do
+    : > "$repo_dir/web/node_modules/next/dist/client/$required_file"
+  done
+  if [ "$database_url" = '__UNSET__' ]; then
+    : > "$case_dir/forge.env"
+  else
+    printf 'DATABASE_URL=%s\n' "$database_url" > "$case_dir/forge.env"
+  fi
+  printf 'untouched\n' > "$case_dir/sentinel"
+  : > "$case_dir/psql-calls"
+  : > "$case_dir/reconciler-calls"
+  : > "$case_dir/npm-calls"
+  cat > "$case_dir/bin/psql" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FORGE_REPAIR_TEST_PSQL_CALLS"
+printf 'touched\n' > "$FORGE_REPAIR_TEST_SENTINEL"
+previous=''
+for argument in "$@"; do
+  if [ "$previous" = '--file' ]; then
+    case "$argument" in
+      */reconcile-forge-app-privileges.sql)
+        printf 'reconcile\n' >> "$FORGE_REPAIR_TEST_RECONCILER_CALLS"
+        ;;
+    esac
+  fi
+  previous="$argument"
+done
+exit 0
+EOF
+  cat > "$case_dir/bin/npm" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FORGE_REPAIR_TEST_NPM_CALLS"
+exit 0
+EOF
+  cat > "$case_dir/bin/pgrep" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+  chmod +x "$case_dir/bin/psql" "$case_dir/bin/npm" "$case_dir/bin/pgrep"
+
+  set +e
+  env -u DATABASE_URL \
+    PATH="$case_dir/bin:$PATH" \
+    HOME="$case_dir/home" \
+    FORGE_WORKSPACE_ROOT="$case_dir/workspace" \
+    FORGE_ENV_FILE="$case_dir/forge.env" \
+    FORGE_REPAIR_TEST_DATABASE_NAME='must_not_leak_into_normal_routing' \
+    FORGE_REPAIR_TEST_PSQL_CALLS="$case_dir/psql-calls" \
+    FORGE_REPAIR_TEST_RECONCILER_CALLS="$case_dir/reconciler-calls" \
+    FORGE_REPAIR_TEST_NPM_CALLS="$case_dir/npm-calls" \
+    FORGE_REPAIR_TEST_SENTINEL="$case_dir/sentinel" \
+    /bin/bash "$repo_dir/scripts/repair.sh" --skip-install --skip-doctor "$@" \
+    > "$case_dir/stdout" 2> "$case_dir/stderr"
+  CASE_STATUS=$?
+  set -e
+  CASE_DIR="$case_dir"
+}
+
+managed_repair_url="postgresql://forge:${TEST_SECRET}@localhost:5432/forge"
+
+run_repair_process_case dry-run "$managed_repair_url" --dry-run
+[ "$CASE_STATUS" -eq 0 ] || fail 'full-process repair dry-run should succeed'
+assert_contains 'Would reconcile local forge app privileges in database forge.' "$CASE_DIR/stdout"
+[ ! -s "$CASE_DIR/psql-calls" ] || fail 'repair dry-run must not invoke psql'
+[ "$(<"$CASE_DIR/sentinel")" = untouched ] || fail 'repair dry-run touched the database sentinel'
+
+run_repair_process_case remote "postgresql://forge:${TEST_SECRET}@remote.invalid:5432/forge"
+[ "$CASE_STATUS" -eq 0 ] || fail 'full-process remote repair should succeed with fake migration runner'
+assert_contains 'Skipping local forge privilege reconciliation for a custom DATABASE_URL.' "$CASE_DIR/stdout"
+[ ! -s "$CASE_DIR/psql-calls" ] || fail 'remote DATABASE_URL must not invoke local psql'
+[ "$(<"$CASE_DIR/sentinel")" = untouched ] || fail 'remote DATABASE_URL touched the local database sentinel'
+
+run_repair_process_case no-database-url __UNSET__
+[ "$CASE_STATUS" -eq 0 ] || fail 'full-process repair without DATABASE_URL should succeed'
+assert_contains 'Skipping local forge privilege reconciliation because DATABASE_URL is not set.' "$CASE_DIR/stdout"
+[ ! -s "$CASE_DIR/psql-calls" ] || fail 'absent DATABASE_URL must not invoke local psql'
+[ "$(<"$CASE_DIR/sentinel")" = untouched ] || fail 'absent DATABASE_URL touched the local database sentinel'
+
+run_repair_process_case managed "$managed_repair_url"
+[ "$CASE_STATUS" -eq 0 ] || fail 'full-process managed local repair should succeed'
+[ "$(wc -l < "$CASE_DIR/reconciler-calls" | tr -d '[:space:]')" = 1 ] \
+  || fail 'managed local repair must invoke the shared reconciler exactly once'
+assert_contains '-d postgres -d forge --set ON_ERROR_STOP=1 --file' "$CASE_DIR/psql-calls"
+assert_not_contains 'must_not_leak_into_normal_routing' "$CASE_DIR/psql-calls"
+
+run_repair_process_case skip-migrate "$managed_repair_url" --skip-migrate
+[ "$CASE_STATUS" -eq 0 ] || fail 'full-process --skip-migrate repair should succeed'
+[ ! -s "$CASE_DIR/psql-calls" ] || fail '--skip-migrate must not invoke psql reconciliation'
+[ "$(<"$CASE_DIR/sentinel")" = untouched ] || fail '--skip-migrate touched the database sentinel'
+
+repair_hook_case="$TEST_ROOT/repair-hook"
+mkdir -p "$repair_hook_case/bin"
+cp "$TEST_ROOT/repair-process-managed/bin/psql" "$repair_hook_case/bin/psql"
+: > "$repair_hook_case/psql-calls"
+: > "$repair_hook_case/reconciler-calls"
+printf 'untouched\n' > "$repair_hook_case/sentinel"
+set +e
+PATH="$repair_hook_case/bin:$PATH" \
+  FORGE_REPAIR_TEST_HOOK=reconcile-forge-privileges \
+  FORGE_REPAIR_TEST_PSQL_CALLS="$repair_hook_case/psql-calls" \
+  FORGE_REPAIR_TEST_RECONCILER_CALLS="$repair_hook_case/reconciler-calls" \
+  FORGE_REPAIR_TEST_SENTINEL="$repair_hook_case/sentinel" \
+  /bin/bash "$REPAIR" --dry-run > "$repair_hook_case/missing-target-stdout" 2> "$repair_hook_case/missing-target-stderr"
+missing_hook_target_status=$?
+set -e
+[ "$missing_hook_target_status" -ne 0 ] || fail 'repair test hook must require an explicit target'
+assert_contains 'FORGE_REPAIR_TEST_DATABASE_NAME is required' "$repair_hook_case/missing-target-stderr"
+[ ! -s "$repair_hook_case/psql-calls" ] || fail 'targetless repair test hook must not invoke psql'
+
+PATH="$repair_hook_case/bin:$PATH" \
+  FORGE_REPAIR_TEST_HOOK=reconcile-forge-privileges \
+  FORGE_REPAIR_TEST_DATABASE_NAME=explicit_disposable_target \
+  FORGE_REPAIR_TEST_PSQL_CALLS="$repair_hook_case/psql-calls" \
+  FORGE_REPAIR_TEST_RECONCILER_CALLS="$repair_hook_case/reconciler-calls" \
+  FORGE_REPAIR_TEST_SENTINEL="$repair_hook_case/sentinel" \
+  /bin/bash "$REPAIR" --dry-run > "$repair_hook_case/dry-run-stdout" 2> "$repair_hook_case/dry-run-stderr"
+assert_contains 'Would reconcile local forge app privileges in database explicit_disposable_target.' "$repair_hook_case/dry-run-stdout"
+[ ! -s "$repair_hook_case/psql-calls" ] || fail 'dry-run repair test hook must not invoke psql'
+[ "$(<"$repair_hook_case/sentinel")" = untouched ] || fail 'dry-run repair test hook touched the database sentinel'
 
 run_managed_case() {
   local name="$1" admin_mode="$2" dry_run="${3:-0}" fail_stage="${4:-}"
