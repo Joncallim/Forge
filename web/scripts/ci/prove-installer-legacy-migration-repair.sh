@@ -141,11 +141,32 @@ expect_refusal() {
 echo 'Proving exact legacy repair refusal cases against isolated disposable databases.'
 
 prepare_0026_baseline
-strip_current_migration_grants
-snapshot current-0026-before
+snapshot current-managed-0026-before
 run_repair
-snapshot current-0026-after
-assert_unchanged current-0026-before current-0026-after 'Current 0026 no-op'
+snapshot current-managed-0026-after
+assert_unchanged current-managed-0026-before current-managed-0026-after 'Current managed 0026 no-op'
+
+prepare_0026_baseline
+admin_psql --set migration_role="$FORGE_LEGACY_REPAIR_MIGRATION_USER" <<'SQL'
+REVOKE EXECUTE ON FUNCTION forge.read_epic_172_enablement_state_v1() FROM :"migration_role";
+SQL
+snapshot current-missing-read-grant-before
+expect_refusal 'Current 0026 missing read grant'
+snapshot current-missing-read-grant-after
+assert_unchanged current-missing-read-grant-before current-missing-read-grant-after 'Current 0026 missing read grant'
+
+prepare_0026_baseline
+admin_psql --set migration_role="$FORGE_LEGACY_REPAIR_MIGRATION_USER" <<'SQL'
+GRANT CREATE ON SCHEMA forge TO :"migration_role";
+SQL
+snapshot current-extra-schema-grant-before
+expect_refusal 'Current 0026 extra schema grant'
+snapshot current-extra-schema-grant-after
+assert_unchanged current-extra-schema-grant-before current-extra-schema-grant-after 'Current 0026 extra schema grant'
+
+prepare_0026_baseline
+strip_current_migration_grants
+snapshot current-0026-normalized
 
 prepare_legacy_fixture
 admin_psql --command "UPDATE drizzle.__drizzle_migrations SET hash = '0000000000000000000000000000000000000000000000000000000000000000' WHERE created_at = 1784258966103;"
@@ -239,7 +260,7 @@ cmp -s "$TEMP_ROOT/legacy-before-repair.ledger" "$TEMP_ROOT/repaired-once.ledger
 # than a fresh 0026 column. Raw dumps remain above for no-mutation checks; this
 # comparison removes only that declaration. The repair fingerprint separately
 # requires its exact jsonb type, NOT NULL shape, and check constraint.
-sed '/^    "required_evidence" "jsonb" NOT NULL,$/d' "$TEMP_ROOT/current-0026-before.schema" \
+sed '/^    "required_evidence" "jsonb" NOT NULL,$/d' "$TEMP_ROOT/current-0026-normalized.schema" \
   > "$TEMP_ROOT/current-0026-canonical.schema"
 sed '/^    "required_evidence" "jsonb" NOT NULL,$/d' "$TEMP_ROOT/repaired-once.schema" \
   > "$TEMP_ROOT/repaired-canonical.schema"

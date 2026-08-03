@@ -109,13 +109,20 @@ const releaseTriggerFingerprints = [
   'forge_release_signer_lifecycle_append_only|forge_release_signer_key_lifecycle_audits|forge_epic_172_reject_mutation_v1()|O|09159d710dac8a28733eedc0296b022d',
 ] as const
 
-function expectedRoutineAcl(identity: string, expectS4ReadExecute: boolean): string {
+function expectedRoutineAcl(
+  identity: string,
+  expectS4ReadExecute: boolean,
+  migrationLogin: string | null,
+): string {
   const name = identity.slice('forge.'.length, identity.indexOf('('))
   const grants = ['forge_release_routines_owner:EXECUTE:false:forge_release_routines_owner']
   if (writerRoutineNames.has(name)) grants.push('forge_release_evidence_writer:EXECUTE:false:forge_release_routines_owner')
   if (transitionRoutineNames.has(name)) grants.push('forge_release_transition:EXECUTE:false:forge_release_routines_owner')
   if (expectS4ReadExecute && name === 'read_epic_172_enablement_state_v1') {
     grants.push('forge_s4_routines_owner:EXECUTE:false:forge_release_routines_owner')
+  }
+  if (migrationLogin && name === 'read_epic_172_enablement_state_v1') {
+    grants.push(`${migrationLogin}:EXECUTE:false:forge_release_routines_owner`)
   }
   return grants.sort().join(',')
 }
@@ -125,6 +132,7 @@ async function exactRoutines(
   expected: readonly string[],
   expectPublicExecute: boolean,
   expectS4ReadExecute: boolean,
+  migrationLogin: string | null,
 ): Promise<boolean> {
   const rows = await sql<readonly {
     identity: string
@@ -167,7 +175,7 @@ async function exactRoutines(
     && row.config?.length === 1
     && row.config[0] === 'search_path=pg_catalog, public'
     && row.publicExecute === expectPublicExecute
-    && row.acl === expectedRoutineAcl(row.identity, expectS4ReadExecute)
+    && row.acl === expectedRoutineAcl(row.identity, expectS4ReadExecute, migrationLogin)
   ))
 }
 
@@ -213,7 +221,11 @@ async function exactReleaseRoleBoundary(
   return edges?.count === 0
 }
 
-async function exactS4RoleBoundary(sql: postgres.Sql | postgres.TransactionSql, allowInertS4: boolean): Promise<boolean> {
+async function exactS4RoleBoundary(
+  sql: postgres.Sql | postgres.TransactionSql,
+  allowInertS4: boolean,
+  migrationLogin: string | null,
+): Promise<boolean> {
   const roles = await sql<readonly {
     name: string; login: boolean; inherit: boolean; superuser: boolean; createdb: boolean; createrole: boolean; replication: boolean; bypassrls: boolean
   }[]>`
@@ -272,7 +284,7 @@ async function exactS4RoleBoundary(sql: postgres.Sql | postgres.TransactionSql, 
        OR member.rolname = ANY(${sql.array([...s4Roles])}::text[])
   `
   if (edges?.count !== 0) return false
-  if (!await exactForgeSchemaAcl(sql, allowInertS4)) return false
+  if (!await exactForgeSchemaAcl(sql, allowInertS4, migrationLogin)) return false
   if (!allowInertS4) return schemaGrants.length === 0
   const inertUsageRoles = [
     'forge_architect_plan_history_reader', 'forge_architect_plan_resolver',
@@ -286,7 +298,10 @@ async function exactS4RoleBoundary(sql: postgres.Sql | postgres.TransactionSql, 
   ))
 }
 
-async function exactZeroAuthorityS4Roles(sql: postgres.Sql | postgres.TransactionSql): Promise<boolean> {
+async function exactZeroAuthorityS4Roles(
+  sql: postgres.Sql | postgres.TransactionSql,
+  migrationLogin: string | null,
+): Promise<boolean> {
   const roles = await sql<readonly { name: string; login: boolean; inherit: boolean; superuser: boolean; createdb: boolean; createrole: boolean; replication: boolean; bypassrls: boolean }[]>`
     SELECT rolname AS name, rolcanlogin AS login, rolinherit AS inherit, rolsuper AS superuser,
       rolcreatedb AS createdb, rolcreaterole AS createrole, rolreplication AS replication, rolbypassrls AS bypassrls
@@ -323,17 +338,18 @@ async function exactZeroAuthorityS4Roles(sql: postgres.Sql | postgres.Transactio
   `
   return authority?.memberships === 0 && authority.owned === 0 && authority.tableGrants === 0
     && authority.routineGrants === 0 && authority.schemaGrants === 0 && authority.databaseGrants === 0
-    && await exactForgeSchemaAcl(sql, false)
+    && await exactForgeSchemaAcl(sql, false, migrationLogin)
 }
 
 async function exactRoleBoundary(
   sql: postgres.Sql | postgres.TransactionSql,
   expectLegacyConsumer: boolean,
+  migrationLogin: string | null,
 ): Promise<boolean> {
   if (!await exactReleaseRoleBoundary(sql, expectLegacyConsumer)) return false
-  return (await exactS4RoleBoundary(sql, false))
-    || (await exactZeroAuthorityS4Roles(sql))
-    || (await exactS4RoleBoundary(sql, true))
+  return (await exactS4RoleBoundary(sql, false, migrationLogin))
+    || (await exactZeroAuthorityS4Roles(sql, migrationLogin))
+    || (await exactS4RoleBoundary(sql, true, migrationLogin))
 }
 
 async function exactReleaseCatalog(sql: postgres.Sql | postgres.TransactionSql, repaired: boolean): Promise<boolean> {
@@ -433,6 +449,67 @@ async function exactMigrationLoginBoundary(sql: postgres.Sql | postgres.Transact
     && boundary.schemaGrants === 0 && boundary.routineGrants === 0
 }
 
+async function exactCurrentMigrationLoginBoundary(
+  sql: postgres.Sql | postgres.TransactionSql,
+): Promise<string | null> {
+  const [boundary] = await sql<readonly {
+    migrationLogin: string | null
+    schemaGrants: number
+    exactSchemaGrants: number
+    routineGrants: number
+    exactRoutineGrants: number
+  }[]>`
+    WITH migration_login AS (
+      SELECT namespace_row.nspowner AS oid, owner_role.rolname AS name
+      FROM pg_catalog.pg_namespace namespace_row
+      JOIN pg_catalog.pg_roles owner_role ON owner_role.oid = namespace_row.nspowner
+      WHERE namespace_row.nspname = 'drizzle'
+    ) SELECT
+      (SELECT name FROM migration_login) AS "migrationLogin",
+      (SELECT pg_catalog.count(*)::integer
+       FROM pg_catalog.pg_namespace namespace_row
+       CROSS JOIN LATERAL pg_catalog.aclexplode(
+         COALESCE(namespace_row.nspacl, pg_catalog.acldefault('n', namespace_row.nspowner))
+       ) privilege
+       WHERE namespace_row.nspname = 'forge'
+         AND privilege.grantee = (SELECT oid FROM migration_login)) AS "schemaGrants",
+      (SELECT pg_catalog.count(*)::integer
+       FROM pg_catalog.pg_namespace namespace_row
+       CROSS JOIN LATERAL pg_catalog.aclexplode(
+         COALESCE(namespace_row.nspacl, pg_catalog.acldefault('n', namespace_row.nspowner))
+       ) privilege
+       WHERE namespace_row.nspname = 'forge'
+         AND privilege.grantee = (SELECT oid FROM migration_login)
+         AND privilege.privilege_type = 'USAGE'
+         AND NOT privilege.is_grantable
+         AND privilege.grantor = 'forge_release_routines_owner'::pg_catalog.regrole) AS "exactSchemaGrants",
+      (SELECT pg_catalog.count(*)::integer
+       FROM pg_catalog.pg_proc routine
+       JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = routine.pronamespace
+       CROSS JOIN LATERAL pg_catalog.aclexplode(
+         COALESCE(routine.proacl, pg_catalog.acldefault('f', routine.proowner))
+       ) privilege
+       WHERE namespace_row.nspname = 'forge'
+         AND privilege.grantee = (SELECT oid FROM migration_login)) AS "routineGrants",
+      (SELECT pg_catalog.count(*)::integer
+       FROM pg_catalog.pg_proc routine
+       CROSS JOIN LATERAL pg_catalog.aclexplode(
+         COALESCE(routine.proacl, pg_catalog.acldefault('f', routine.proowner))
+       ) privilege
+       WHERE routine.oid = pg_catalog.to_regprocedure('forge.read_epic_172_enablement_state_v1()')
+         AND privilege.grantee = (SELECT oid FROM migration_login)
+         AND privilege.privilege_type = 'EXECUTE'
+         AND NOT privilege.is_grantable
+         AND privilege.grantor = 'forge_release_routines_owner'::pg_catalog.regrole) AS "exactRoutineGrants"
+  `
+  if (!boundary?.migrationLogin
+    || [...s4Roles, 'forge_release_evidence_writer', 'forge_release_transition',
+      'forge_release_routines_owner', 'forge_release_evidence_consumer'].includes(boundary.migrationLogin)
+    || boundary.schemaGrants !== 1 || boundary.exactSchemaGrants !== 1
+    || boundary.routineGrants !== 1 || boundary.exactRoutineGrants !== 1) return null
+  return boundary.migrationLogin
+}
+
 async function exactProtectedTableAcls(sql: postgres.Sql | postgres.TransactionSql, repaired: boolean): Promise<boolean> {
   const grants = await sql<readonly { entry: string }[]>`
     SELECT relation.relname || '|' || COALESCE(grantee.rolname, 'PUBLIC') || '|'
@@ -517,7 +594,11 @@ async function exactLegacyConsumerLocalAuthority(
     && authority.databaseGrants === 0
 }
 
-async function exactForgeSchemaAcl(sql: postgres.Sql | postgres.TransactionSql, inertS4: boolean): Promise<boolean> {
+async function exactForgeSchemaAcl(
+  sql: postgres.Sql | postgres.TransactionSql,
+  inertS4: boolean,
+  migrationLogin: string | null,
+): Promise<boolean> {
   const rows = await sql<readonly { grant: string }[]>`
     SELECT COALESCE(grantee.rolname, 'PUBLIC') || ':' || privilege.privilege_type || ':'
       || privilege.is_grantable || ':' || grantor.rolname AS grant
@@ -530,6 +611,7 @@ async function exactForgeSchemaAcl(sql: postgres.Sql | postgres.TransactionSql, 
   `
   const expectedRoles = [
     'forge_release_evidence_writer', 'forge_release_transition',
+    ...(migrationLogin ? [migrationLogin] : []),
     ...(inertS4 ? [
       'forge_architect_plan_history_reader', 'forge_architect_plan_resolver', 'forge_architect_plan_writer',
       'forge_local_projection_archiver', 'forge_packet_issuer', 'forge_project_root_reconciler',
@@ -632,11 +714,12 @@ async function legacyFingerprint(sql: postgres.Sql | postgres.TransactionSql): P
   `
   if (result?.ok !== true || !await exactEmptyReleaseState(sql) || !await exactReleaseCatalog(sql, false)
     || !await exactMigrationLoginBoundary(sql) || !await exactProtectedTableAcls(sql, false)
-    || !await exactLegacyConsumerLocalAuthority(sql, false) || !await exactRoutines(sql, legacyRoutineDigests, false, false)) return false
+    || !await exactLegacyConsumerLocalAuthority(sql, false)
+    || !await exactRoutines(sql, legacyRoutineDigests, false, false, null)) return false
   // A first failed S4 bootstrap creates inert principals before it discovers
   // the missing Step 0 read routine.  Both that exact inert set and no S4
   // principals are safe; every other S4 state is an operator intervention.
-  return exactRoleBoundary(sql, true)
+  return exactRoleBoundary(sql, true, null)
 }
 
 async function repairedFingerprint(sql: postgres.Sql | postgres.TransactionSql): Promise<boolean> {
@@ -659,17 +742,19 @@ async function repairedFingerprint(sql: postgres.Sql | postgres.TransactionSql):
   `
   if (result?.ok !== true || !await exactEmptyReleaseState(sql) || !await exactReleaseCatalog(sql, true)
     || !await exactMigrationLoginBoundary(sql) || !await exactProtectedTableAcls(sql, true)
-    || !await exactLegacyConsumerLocalAuthority(sql, true) || !await exactRoutines(sql, repairedRoutineDigests, false, false)) return false
-  return exactRoleBoundary(sql, true)
+    || !await exactLegacyConsumerLocalAuthority(sql, true)
+    || !await exactRoutines(sql, repairedRoutineDigests, false, false, null)) return false
+  return exactRoleBoundary(sql, true, null)
 }
 
 async function current0026Fingerprint(sql: postgres.Sql | postgres.TransactionSql): Promise<boolean> {
+  const migrationLogin = await exactCurrentMigrationLoginBoundary(sql)
+  if (!migrationLogin) return false
   return await exactEmptyReleaseState(sql)
     && await exactReleaseCatalog(sql, true)
-    && await exactMigrationLoginBoundary(sql)
     && await exactProtectedTableAcls(sql, true)
-    && await exactRoutines(sql, repairedRoutineDigests, false, false)
-    && await exactRoleBoundary(sql, false)
+    && await exactRoutines(sql, repairedRoutineDigests, false, false, migrationLogin)
+    && await exactRoleBoundary(sql, false, migrationLogin)
 }
 
 async function durableRepairedFingerprint(sql: postgres.Sql | postgres.TransactionSql): Promise<boolean> {
@@ -679,7 +764,7 @@ async function durableRepairedFingerprint(sql: postgres.Sql | postgres.Transacti
   return await exactReleaseCatalog(sql, true)
     && await exactProtectedTableAcls(sql, true)
     && await exactLegacyConsumerLocalAuthority(sql, true)
-    && await exactRoutines(sql, repairedRoutineDigests, false, true)
+    && await exactRoutines(sql, repairedRoutineDigests, false, true, null)
     && await exactReleaseRoleBoundary(sql, true)
 }
 
