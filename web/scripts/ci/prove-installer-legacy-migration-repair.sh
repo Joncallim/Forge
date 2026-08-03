@@ -342,6 +342,42 @@ snapshot trigger-routine-acl-near-miss-after
 assert_unchanged trigger-routine-acl-near-miss-before trigger-routine-acl-near-miss-after 'Trigger-routine ACL near-miss'
 
 prepare_legacy_fixture
+admin_psql <<'SQL'
+CREATE OR REPLACE FUNCTION forge.guard_epic_172_s3_state_transition_v1()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, public
+AS $function$
+BEGIN
+  RETURN NEW;
+END;
+$function$;
+SQL
+snapshot s3-state-guard-body-near-miss-before
+expect_refusal 'S3 state guard body near-miss'
+snapshot s3-state-guard-body-near-miss-after
+assert_unchanged s3-state-guard-body-near-miss-before s3-state-guard-body-near-miss-after 'S3 state guard body near-miss'
+
+prepare_legacy_fixture
+admin_psql --command 'DROP TRIGGER forge_epic_172_s3_release_state_one_way ON public.forge_epic_172_s3_release_state;'
+snapshot s3-state-trigger-missing-before
+expect_refusal 'S3 state one-way trigger missing'
+snapshot s3-state-trigger-missing-after
+assert_unchanged s3-state-trigger-missing-before s3-state-trigger-missing-after 'S3 state one-way trigger missing'
+
+prepare_legacy_fixture
+admin_psql <<'SQL'
+SET ROLE forge_release_routines_owner;
+GRANT EXECUTE ON FUNCTION forge.complete_epic_172_s3_release_v1(uuid,text,uuid,integer,text,jsonb,jsonb,text,bigint,jsonb,text,text,uuid,bigint,text,text,text,text,bytea,uuid,timestamptz,jsonb)
+  TO forge_release_evidence_writer;
+RESET ROLE;
+SQL
+snapshot s3-completion-routine-acl-near-miss-before
+expect_refusal 'S3 completion routine ACL near-miss'
+snapshot s3-completion-routine-acl-near-miss-after
+assert_unchanged s3-completion-routine-acl-near-miss-before s3-completion-routine-acl-near-miss-after 'S3 completion routine ACL near-miss'
+
+prepare_legacy_fixture
 admin_psql --command 'REVOKE SELECT ON TABLE public.forge_release_signer_keys FROM forge_release_evidence_consumer;'
 snapshot consumer-near-miss-before
 expect_refusal 'Consumer ACL/role near-miss'

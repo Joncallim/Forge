@@ -148,6 +148,28 @@ const releaseTriggerRoutineFingerprintsNoPublic = [
   releaseTriggerRoutineFingerprintsPublic[0],
   'public.forge_epic_172_reject_mutation_v1()|6c37302b654f96cecd43f1716ffbdd51|forge_release_routines_owner|false|search_path=pg_catalog, public|forge_release_routines_owner:EXECUTE:false:forge_release_routines_owner',
 ] as const
+const s3ReleaseStateAcl = 'PUBLIC:SELECT:false:forge_release_routines_owner,forge_release_evidence_writer:INSERT:false:forge_release_routines_owner,forge_release_evidence_writer:SELECT:false:forge_release_routines_owner,forge_release_evidence_writer:UPDATE:false:forge_release_routines_owner,forge_release_routines_owner:DELETE:false:forge_release_routines_owner,forge_release_routines_owner:INSERT:false:forge_release_routines_owner,forge_release_routines_owner:REFERENCES:false:forge_release_routines_owner,forge_release_routines_owner:SELECT:false:forge_release_routines_owner,forge_release_routines_owner:TRIGGER:false:forge_release_routines_owner,forge_release_routines_owner:TRUNCATE:false:forge_release_routines_owner,forge_release_routines_owner:UPDATE:false:forge_release_routines_owner'
+const s3ReleaseStateConstraints = [
+  'forge_epic_172_s3_release_state_authorization_id_forge_epic_172|f|false|false|true|9cfbaed876d6e720d9e863f7f05c5fc4',
+  'forge_epic_172_s3_release_state_evidence_receipt_id_forge_epic_|f|false|false|true|e66d0dc8f69da2fb17c60af5a5891e03',
+  'forge_epic_172_s3_release_state_fingerprint_chk|c|false|false|true|56aba65ec14a27811d9a7440a7d382e8',
+  'forge_epic_172_s3_release_state_pkey|p|false|false|true|98e18b9f2b704419e4d8f20497d9526f',
+  'forge_epic_172_s3_release_state_predecessor_receipt_id_forge_ep|f|false|false|true|c3caa4ae0ed290070ba1fe2f38dbe6a9',
+  'forge_epic_172_s3_release_state_singleton_chk|c|false|false|true|cae7cb69ddaf41b7594cc1da481dd69f',
+  'forge_epic_172_s3_release_state_state_chk|c|false|false|true|8aedf090633ab3e99c107d479e757ce2',
+  'forge_epic_172_s3_release_state_tuple_chk|c|false|false|true|fc62b8c53ebe4bfffa72b1fc927b742e',
+] as const
+const s3ReleaseStateIndexes = [
+  'forge_epic_172_s3_release_state_pkey|forge_release_routines_owner|i|true|true|true|true|true|false|false|5bd33c7d191248d3103264c12ffddd85',
+] as const
+const s3ReleaseStateTriggers = [
+  'forge_epic_172_s3_release_state_one_way|forge.guard_epic_172_s3_state_transition_v1()|O|b9ac35f8fce63d0a8b919b74673340e3',
+] as const
+const s3CompletionRoutineFingerprints = [
+  'forge.complete_epic_172_s3_release_v1(uuid,text,uuid,integer,text,jsonb,jsonb,text,bigint,jsonb,text,text,uuid,bigint,text,text,text,text,bytea,uuid,timestamp with time zone,jsonb)|73934dc2d3396b83570d0c78fd570d7b|forge_release_routines_owner|true|search_path=pg_catalog, public|forge_release_routines_owner:EXECUTE:false:forge_release_routines_owner,forge_release_transition:EXECUTE:false:forge_release_routines_owner',
+  'forge.guard_epic_172_s3_state_transition_v1()|52a0872ccc03a92995b4aa8afa4b5e21|forge_release_routines_owner|false|search_path=pg_catalog, public|forge_release_routines_owner:EXECUTE:false:forge_release_routines_owner',
+  'forge.lock_epic_172_s3_completion_v1(uuid,uuid,uuid)|e7a9d20d7f7235c908d7d7ddb54f7a80|forge_release_routines_owner|true|search_path=pg_catalog, public|forge_release_routines_owner:EXECUTE:false:forge_release_routines_owner,forge_release_transition:EXECUTE:false:forge_release_routines_owner',
+] as const
 type S4BoundaryState = 'absent' | 'cluster-global-zero-authority' | 'failed-bootstrap-local'
 type ReleaseTriggerRoutineState = 'pre-s4-public' | 'failed-bootstrap-no-public' | 'durable-s4-no-public'
 
@@ -546,6 +568,106 @@ async function exactReleaseCatalog(
     )
 }
 
+async function exactS3CompletionBoundary(sql: postgres.Sql | postgres.TransactionSql): Promise<boolean> {
+  const [table] = await sql<readonly { owner: string; kind: string; acl: string | null }[]>`
+    SELECT owner_role.rolname AS owner, relation.relkind AS kind,
+      (SELECT pg_catalog.string_agg(
+        COALESCE(grantee.rolname, 'PUBLIC') || ':' || privilege.privilege_type || ':'
+          || privilege.is_grantable || ':' || grantor.rolname,
+        ',' ORDER BY COALESCE(grantee.rolname, 'PUBLIC'), privilege.privilege_type,
+          privilege.is_grantable, grantor.rolname
+      )
+      FROM pg_catalog.aclexplode(
+        COALESCE(relation.relacl, pg_catalog.acldefault('r', relation.relowner))
+      ) privilege
+      LEFT JOIN pg_catalog.pg_roles grantee ON grantee.oid = privilege.grantee
+      JOIN pg_catalog.pg_roles grantor ON grantor.oid = privilege.grantor) AS acl
+    FROM pg_catalog.pg_class relation
+    JOIN pg_catalog.pg_roles owner_role ON owner_role.oid = relation.relowner
+    WHERE relation.oid = pg_catalog.to_regclass('public.forge_epic_172_s3_release_state')
+  `
+  if (table?.owner !== 'forge_release_routines_owner' || table.kind !== 'r' || table.acl !== s3ReleaseStateAcl) return false
+
+  const constraints = await sql<readonly { fingerprint: string }[]>`
+    SELECT constraint_row.conname || '|' || constraint_row.contype::text || '|'
+      || constraint_row.condeferrable::text || '|' || constraint_row.condeferred::text || '|'
+      || constraint_row.convalidated::text || '|'
+      || pg_catalog.md5(pg_catalog.pg_get_constraintdef(constraint_row.oid)) AS fingerprint
+    FROM pg_catalog.pg_constraint constraint_row
+    WHERE constraint_row.conrelid = pg_catalog.to_regclass('public.forge_epic_172_s3_release_state')
+    ORDER BY 1
+  `
+  if (constraints.length !== s3ReleaseStateConstraints.length
+    || !constraints.every((constraint, index) => constraint.fingerprint === s3ReleaseStateConstraints[index])) return false
+
+  const indexes = await sql<readonly { fingerprint: string }[]>`
+    SELECT index_class.relname || '|' || owner_role.rolname || '|' || index_class.relkind::text || '|'
+      || index_row.indisunique::text || '|' || index_row.indisprimary::text || '|'
+      || index_row.indisvalid::text || '|' || index_row.indisready::text || '|'
+      || index_row.indislive::text || '|' || (index_row.indpred IS NOT NULL)::text || '|'
+      || (index_row.indexprs IS NOT NULL)::text || '|'
+      || pg_catalog.md5(pg_catalog.pg_get_indexdef(index_row.indexrelid)) AS fingerprint
+    FROM pg_catalog.pg_index index_row
+    JOIN pg_catalog.pg_class index_class ON index_class.oid = index_row.indexrelid
+    JOIN pg_catalog.pg_roles owner_role ON owner_role.oid = index_class.relowner
+    WHERE index_row.indrelid = pg_catalog.to_regclass('public.forge_epic_172_s3_release_state')
+    ORDER BY 1
+  `
+  if (indexes.length !== s3ReleaseStateIndexes.length
+    || !indexes.every((index, position) => index.fingerprint === s3ReleaseStateIndexes[position])) return false
+
+  const triggers = await sql<readonly { fingerprint: string }[]>`
+    SELECT trigger_row.tgname || '|' || trigger_row.tgfoid::pg_catalog.regprocedure::text
+      || '|' || trigger_row.tgenabled::text || '|'
+      || pg_catalog.md5(pg_catalog.pg_get_triggerdef(trigger_row.oid)) AS fingerprint
+    FROM pg_catalog.pg_trigger trigger_row
+    WHERE trigger_row.tgrelid = pg_catalog.to_regclass('public.forge_epic_172_s3_release_state')
+      AND NOT trigger_row.tgisinternal
+    ORDER BY 1
+  `
+  if (triggers.length !== s3ReleaseStateTriggers.length
+    || !triggers.every((trigger, index) => trigger.fingerprint === s3ReleaseStateTriggers[index])) return false
+
+  const routines = await sql<readonly {
+    identity: string
+    definitionDigest: string
+    owner: string
+    securityDefiner: boolean
+    config: readonly string[] | null
+    acl: string | null
+  }[]>`
+    SELECT routine.oid::pg_catalog.regprocedure::text AS identity,
+      pg_catalog.md5(pg_catalog.pg_get_functiondef(routine.oid)) AS "definitionDigest",
+      owner_role.rolname AS owner, routine.prosecdef AS "securityDefiner",
+      routine.proconfig AS config,
+      (SELECT pg_catalog.string_agg(
+        COALESCE(grantee.rolname, 'PUBLIC') || ':' || privilege.privilege_type || ':'
+          || privilege.is_grantable || ':' || grantor.rolname,
+        ',' ORDER BY COALESCE(grantee.rolname, 'PUBLIC'), privilege.privilege_type,
+          privilege.is_grantable, grantor.rolname
+      )
+      FROM pg_catalog.aclexplode(
+        COALESCE(routine.proacl, pg_catalog.acldefault('f', routine.proowner))
+      ) privilege
+      LEFT JOIN pg_catalog.pg_roles grantee ON grantee.oid = privilege.grantee
+      JOIN pg_catalog.pg_roles grantor ON grantor.oid = privilege.grantor) AS acl
+    FROM pg_catalog.pg_proc routine
+    JOIN pg_catalog.pg_roles owner_role ON owner_role.oid = routine.proowner
+    WHERE routine.oid IN (
+      pg_catalog.to_regprocedure('forge.guard_epic_172_s3_state_transition_v1()'),
+      pg_catalog.to_regprocedure('forge.lock_epic_172_s3_completion_v1(uuid,uuid,uuid)'),
+      pg_catalog.to_regprocedure('forge.complete_epic_172_s3_release_v1(uuid,text,uuid,integer,text,jsonb,jsonb,text,bigint,jsonb,text,text,uuid,bigint,text,text,text,text,bytea,uuid,timestamptz,jsonb)')
+    )
+    ORDER BY 1
+  `
+  const routineFingerprints = routines.map((routine) => [
+    routine.identity, routine.definitionDigest, routine.owner, String(routine.securityDefiner),
+    routine.config?.join(',') ?? '<null>', routine.acl ?? '<null>',
+  ].join('|'))
+  return routineFingerprints.length === s3CompletionRoutineFingerprints.length
+    && routineFingerprints.every((fingerprint, index) => fingerprint === s3CompletionRoutineFingerprints[index])
+}
+
 async function exactMigrationLoginBoundary(sql: postgres.Sql | postgres.TransactionSql): Promise<boolean> {
   const [boundary] = await sql<readonly { migrationLogin: string | null; schemaGrants: number; routineGrants: number }[]>`
     WITH migration_login AS (
@@ -836,6 +958,7 @@ async function legacyFingerprint(sql: postgres.Sql | postgres.TransactionSql): P
   if (!s4BoundaryState) return false
   if (!await exactEmptyReleaseState(sql)
     || !await exactReleaseCatalog(sql, false, triggerRoutineStateFor0026(s4BoundaryState))
+    || !await exactS3CompletionBoundary(sql)
     || !await exactMigrationLoginBoundary(sql) || !await exactProtectedTableAcls(sql, false)
     || !await exactLegacyConsumerLocalAuthority(sql, false)
     || !await exactRoutines(sql, legacyRoutineDigests, false, false, null)) return false
@@ -868,6 +991,7 @@ async function repairedFingerprint(sql: postgres.Sql | postgres.TransactionSql):
   if (!s4BoundaryState) return false
   if (!await exactEmptyReleaseState(sql)
     || !await exactReleaseCatalog(sql, true, triggerRoutineStateFor0026(s4BoundaryState))
+    || !await exactS3CompletionBoundary(sql)
     || !await exactMigrationLoginBoundary(sql) || !await exactProtectedTableAcls(sql, true)
     || !await exactLegacyConsumerLocalAuthority(sql, true)
     || !await exactRoutines(sql, repairedRoutineDigests, false, false, null)) return false
@@ -881,6 +1005,7 @@ async function current0026Fingerprint(sql: postgres.Sql | postgres.TransactionSq
   if (!s4BoundaryState) return false
   return await exactEmptyReleaseState(sql)
     && await exactReleaseCatalog(sql, true, triggerRoutineStateFor0026(s4BoundaryState))
+    && await exactS3CompletionBoundary(sql)
     && await exactProtectedTableAcls(sql, true)
     && await exactRoutines(sql, repairedRoutineDigests, false, false, migrationLogin)
 }
@@ -890,6 +1015,7 @@ async function durableRepairedFingerprint(sql: postgres.Sql | postgres.Transacti
   // state.  The stable repair receipt is therefore the complete protected S3
   // catalog, ACL and routine surface plus the inert legacy consumer principal.
   return await exactReleaseCatalog(sql, true, 'durable-s4-no-public')
+    && await exactS3CompletionBoundary(sql)
     && await exactProtectedTableAcls(sql, true)
     && await exactLegacyConsumerLocalAuthority(sql, true)
     && await exactRoutines(sql, repairedRoutineDigests, false, true, null)
