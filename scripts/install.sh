@@ -18,6 +18,7 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd -P "${BASH_SOURCE[0]%/*}" && pwd)"
 REPO_ROOT="$(cd -P "$SCRIPT_DIR/.." && pwd)"
+FORGE_PRIVILEGE_SQL="$SCRIPT_DIR/reconcile-forge-app-privileges.sql"
 expand_home_path_early() {
   case "${1:-}" in
     "~") [ -n "${HOME:-}" ] && printf '%s\n' "$HOME" ;;
@@ -63,7 +64,23 @@ APT_UPDATED=0
 MANAGE_LOCAL_DB=1
 PG_FORMULA="postgresql@16"
 PG_BIN=""
+MANAGED_LOCAL_ADMIN_RESOLUTION=unresolved
+MANAGED_LOCAL_ADMIN_MODE=""
+MANAGED_LOCAL_ADMIN_SOCKET=""
+MANAGED_LOCAL_ADMIN_PORT=""
+MANAGED_LOCAL_ADMIN_USER=""
+MANAGED_LOCAL_PSQL_ADMIN=()
+POSTGRES_ENV_UNSET_ARGS=(
+  -u PGHOST -u PGHOSTADDR -u PGPORT -u PGDATABASE -u PGUSER
+  -u PGPASSWORD -u PGPASSFILE -u PGSERVICE -u PGSERVICEFILE -u PGOPTIONS
+  -u PGSSLMODE -u PGREQUIRESSL -u PGSSLCOMPRESSION -u PGSSLCERT -u PGSSLKEY
+  -u PGSSLROOTCERT -u PGSSLCRL -u PGSSLCRLDIR -u PGSSLSNI -u PGREQUIREPEER
+  -u PGCHANNELBINDING -u PGTARGETSESSIONATTRS -u PGLOADBALANCEHOSTS
+  -u PGCONNECT_TIMEOUT -u PGAPPNAME -u PGCLIENTENCODING -u PGKRBSRVNAME
+  -u PGGSSLIB -u PGGSSENCMODE
+)
 LOCK_DIR="$INSTALL_STATE_DIR/install.lock"
+INSTALL_LOCK_HELD=0
 TEMP_FILES=""
 
 export FORGE_ZERO_CONFIG_MODEL="$ZERO_CONFIG_MODEL"
@@ -155,8 +172,9 @@ cleanup() {
     [ -n "$file" ] && rm -f "$file" 2>/dev/null || true
   done
 
-  if [ "$DRY_RUN" != "1" ] && [ -d "$LOCK_DIR" ]; then
+  if [ "$DRY_RUN" != "1" ] && [ "$INSTALL_LOCK_HELD" = 1 ] && [ -d "$LOCK_DIR" ]; then
     rmdir "$LOCK_DIR" 2>/dev/null || true
+    INSTALL_LOCK_HELD=0
   fi
 }
 trap cleanup EXIT
@@ -383,6 +401,25 @@ record_manifest() {
   if ! manifest_has "$key" "$value"; then
     printf '%s=%s\n' "$key" "$value" >> "$INSTALL_MANIFEST"
   fi
+}
+
+record_current_manifest_value() {
+  local key="$1"
+  local value="$2"
+  local replacement
+  [ "$DRY_RUN" = "1" ] && return 0
+  ensure_install_state
+  replacement="$(mktemp "${INSTALL_MANIFEST}.tmp.XXXXXX")"
+  TEMP_FILES="${TEMP_FILES} ${replacement}"
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      "$key"=*) continue ;;
+    esac
+    printf '%s\n' "$line"
+  done < "$INSTALL_MANIFEST" > "$replacement"
+  printf '%s=%s\n' "$key" "$value" >> "$replacement"
+  chmod 600 "$replacement" 2>/dev/null || true
+  mv "$replacement" "$INSTALL_MANIFEST"
 }
 
 make_temp_file() {
@@ -1043,28 +1080,100 @@ wait_for_redis() {
 }
 
 psql_admin() {
+  local psql_status=0
+
   if [ "$DRY_RUN" = "1" ]; then
     info "[dry-run] psql admin $*"
     return 0
   fi
 
-  if psql -d postgres -tAc 'SELECT 1' >/dev/null 2>&1; then
-    psql -d postgres "$@"
-    return 0
-  fi
+  resolve_managed_local_admin \
+    || die "Could not establish controlled local PostgreSQL administrator access."
+  "${MANAGED_LOCAL_PSQL_ADMIN[@]}" "$@" || psql_status="$?"
+  return "$psql_status"
+}
 
-  if id postgres >/dev/null 2>&1; then
-    if command -v sudo >/dev/null 2>&1; then
-      sudo -u postgres psql -d postgres "$@"
-      return 0
-    fi
-    if command -v runuser >/dev/null 2>&1; then
-      runuser -u postgres -- psql -d postgres "$@"
-      return 0
-    fi
-  fi
+uri_safe_database_password() {
+  local password="${1:-}" index=0 length character hex_pair
+  length="${#password}"
+  [ "$length" -gt 0 ] || return 1
 
-  die "Could not connect to PostgreSQL as an admin user."
+  while [ "$index" -lt "$length" ]; do
+    character="${password:$index:1}"
+    case "$character" in
+      [A-Za-z0-9._~]|'!'|'$'|'&'|"'"|'('|')'|'*'|'+'|','|';'|'='|':'|'-')
+        index=$((index + 1))
+        ;;
+      '%')
+        [ $((index + 2)) -lt "$length" ] || return 1
+        hex_pair="${password:$((index + 1)):2}"
+        case "$hex_pair" in
+          [0-9A-Fa-f][0-9A-Fa-f]) ;;
+          *) return 1 ;;
+        esac
+        index=$((index + 3))
+        ;;
+      *)
+        return 1
+        ;;
+    esac
+  done
+}
+
+percent_decode_database_password() {
+  local encoded="${1:-}"
+  [ -n "$encoded" ] || return 1
+  command -v node >/dev/null 2>&1 || return 1
+
+  # Match the URL parser used by postgres.js. The encoded credential is sent
+  # over stdin so it is never exposed in the validator process arguments.
+  printf '%s' "$encoded" | node -e '
+    const { readFileSync } = require("node:fs")
+    try {
+      const encoded = new TextDecoder("utf-8", { fatal: true }).decode(readFileSync(0))
+      const decoded = decodeURIComponent(encoded)
+      if (!decoded || /[\u0000-\u001f\u007f-\u009f]/u.test(decoded)) process.exit(1)
+      process.stdout.write(decoded)
+    } catch {
+      process.exit(1)
+    }
+  '
+}
+
+database_password_utf8_hex() {
+  command -v node >/dev/null 2>&1 || return 1
+  node -e '
+    const { readFileSync } = require("node:fs")
+    try {
+      const bytes = readFileSync(0)
+      const decoded = new TextDecoder("utf-8", { fatal: true }).decode(bytes)
+      if (!decoded || /[\u0000-\u001f\u007f-\u009f]/u.test(decoded)) process.exit(1)
+      process.stdout.write(bytes.toString("hex"))
+    } catch {
+      process.exit(1)
+    }
+  '
+}
+
+native_forge_database_password() {
+  local database_url="${1:-}" remainder encoded_password
+  local target='@localhost:5432/forge'
+
+  case "$database_url" in
+    postgresql://forge:*) remainder="${database_url#postgresql://forge:}" ;;
+    postgres://forge:*) remainder="${database_url#postgres://forge:}" ;;
+    *) return 1 ;;
+  esac
+  case "$remainder" in
+    *"$target") encoded_password="${remainder%"$target"}" ;;
+    *) return 1 ;;
+  esac
+  uri_safe_database_password "$encoded_password" || return 1
+  percent_decode_database_password "$encoded_password"
+}
+
+is_native_forge_database_url() {
+  native_forge_database_password "${1:-}" >/dev/null
 }
 
 should_manage_local_db() {
@@ -1075,15 +1184,12 @@ should_manage_local_db() {
     return 0
   fi
 
-  case "$existing_database_url" in
-    postgresql://forge:*@localhost:5432/forge|postgres://forge:*@localhost:5432/forge)
-      MANAGE_LOCAL_DB=1
-      ;;
-    *)
-      MANAGE_LOCAL_DB=0
-      warn "Existing DATABASE_URL is custom. The installer will not create or alter a local forge database."
-      ;;
-  esac
+  if is_native_forge_database_url "$existing_database_url"; then
+    MANAGE_LOCAL_DB=1
+  else
+    MANAGE_LOCAL_DB=0
+    warn "Existing DATABASE_URL is custom. The installer will not create or alter a local forge database."
+  fi
 }
 
 provision_database() {
@@ -1099,18 +1205,106 @@ provision_database() {
     return 0
   fi
 
-  local db_password_escaped role_exists db_exists
-  db_password_escaped="$(sql_escape_literal "$DB_PASSWORD")"
+  resolve_managed_local_admin \
+    || die "Could not establish controlled local PostgreSQL administrator access."
 
-  role_exists="$(psql_admin -tAc "SELECT 1 FROM pg_roles WHERE rolname='forge'" | tr -d '[:space:]' || true)"
-  if [ "$role_exists" = "1" ]; then
-    run_quiet_redacted_stdin "Sync forge role password" "ALTER ROLE forge PASSWORD '$db_password_escaped';" psql_admin
-    info "Role forge exists; password synced."
-  else
-    run_quiet_redacted_stdin "Create forge role" "CREATE ROLE forge LOGIN PASSWORD '$db_password_escaped';" psql_admin
-    record_manifest "postgres_role" "forge"
-    info "Created role forge."
+  local db_password_hex role_action role_provision_sql db_exists
+  db_password_hex="$(printf '%s' "$DB_PASSWORD" | database_password_utf8_hex)" \
+    || die "The local forge database password is not valid UTF-8 or contains control bytes."
+  case "$db_password_hex" in
+    ''|*[!0-9a-f]*) die "Could not encode the local forge database password safely." ;;
+  esac
+  [ $(( ${#db_password_hex} % 2 )) -eq 0 ] \
+    || die "Could not encode the local forge database password safely."
+  role_provision_sql="$(cat <<SQL
+BEGIN;
+SET LOCAL application_name = 'forge-installer-role-provision';
+LOCK TABLE pg_catalog.pg_authid IN SHARE ROW EXCLUSIVE MODE;
+LOCK TABLE pg_catalog.pg_auth_members IN SHARE ROW EXCLUSIVE MODE;
+CREATE TEMPORARY TABLE forge_role_provision_input (
+  password text NOT NULL,
+  action text
+) ON COMMIT DROP;
+INSERT INTO forge_role_provision_input (password)
+SELECT pg_catalog.convert_from(pg_catalog.decode('$db_password_hex', 'hex'), 'UTF8');
+DO \$provision\$
+DECLARE
+  role_password text;
+BEGIN
+  SELECT password INTO STRICT role_password FROM forge_role_provision_input;
+  IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'forge') THEN
+    IF EXISTS (
+      SELECT 1 FROM pg_catalog.pg_auth_members membership
+      WHERE membership.roleid = 'forge'::pg_catalog.regrole
+         OR membership.member = 'forge'::pg_catalog.regrole
+    ) THEN
+      RAISE EXCEPTION 'Role forge has membership edges. Remove every grant to or from forge before retrying the installer.';
+    END IF;
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_catalog.pg_roles role_row
+      WHERE role_row.rolname = 'forge'
+        AND role_row.rolcanlogin
+        AND NOT role_row.rolsuper
+        AND NOT role_row.rolcreatedb
+        AND NOT role_row.rolcreaterole
+        AND NOT role_row.rolreplication
+        AND NOT role_row.rolbypassrls
+    ) THEN
+      RAISE EXCEPTION 'Role forge is outside the safe or known legacy app-role boundary; refusing to alter it.';
+    END IF;
+    EXECUTE format(
+      'ALTER ROLE forge LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD %L',
+      role_password
+    );
+    UPDATE forge_role_provision_input SET action = 'existing';
+  ELSE
+    EXECUTE format(
+      'CREATE ROLE forge LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD %L',
+      role_password
+    );
+    UPDATE forge_role_provision_input SET action = 'created';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_catalog.pg_roles role_row
+    WHERE role_row.rolname = 'forge'
+      AND role_row.rolcanlogin
+      AND NOT role_row.rolinherit
+      AND NOT role_row.rolsuper
+      AND NOT role_row.rolcreatedb
+      AND NOT role_row.rolcreaterole
+      AND NOT role_row.rolreplication
+      AND NOT role_row.rolbypassrls
+      AND NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_auth_members membership
+        WHERE membership.roleid = role_row.oid OR membership.member = role_row.oid
+      )
+  ) THEN
+    RAISE EXCEPTION 'Role forge did not reach the exact safe native app-role boundary.';
+  END IF;
+END;
+\$provision\$;
+SELECT action FROM forge_role_provision_input;
+COMMIT;
+SQL
+)"
+  ensure_install_state
+  {
+    printf '\n[%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "Transactionally provision forge role"
+    printf 'Command: [redacted: stdin contains generated secret]\n'
+  } >> "$INSTALL_LOG" 2>&1
+  chmod 600 "$INSTALL_LOG" 2>/dev/null || true
+  if ! role_action="$(printf '%s\n' "$role_provision_sql" | psql_admin -Atq --set ON_ERROR_STOP=1 2>> "$INSTALL_LOG")"; then
+    die "Could not transactionally provision the exact safe forge role. Check the install log for the refused boundary."
   fi
+  role_action="$(printf '%s' "$role_action" | tr -d '[:space:]')"
+  case "$role_action" in
+    created)
+      record_manifest "postgres_role" "forge"
+      info "Created role forge."
+      ;;
+    existing) info "Role forge exists; safe attributes and password synced." ;;
+    *) die "Forge role provisioning returned an unexpected result." ;;
+  esac
 
   db_exists="$(psql_admin -tAc "SELECT 1 FROM pg_database WHERE datname='forge'" | tr -d '[:space:]' || true)"
   if [ "$db_exists" = "1" ]; then
@@ -1138,14 +1332,21 @@ grant_forge_privileges() {
   [ "${MANAGE_LOCAL_DB:-0}" = "1" ] || return 0
 
   if [ "$DRY_RUN" = "1" ]; then
-    info "[dry-run] Grant forge role privileges on all forge database tables"
+    info "[dry-run] Reconcile forge app privileges while excluding protected-owner tables"
     return 0
   fi
 
-  if run_quiet "Grant forge role database privileges" psql_admin -d forge -c "GRANT USAGE, CREATE ON SCHEMA public TO forge; GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO forge; GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO forge; ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO forge; ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO forge;"; then
-    info "Ensured the forge role can read and write all forge tables."
+  # This step is deliberately best-effort. The installer enables inherited ERR
+  # traps globally, so isolate this command from that trap and handle its status
+  # with the surrounding conditional instead.
+  if (
+    trap - ERR
+    run_quiet "Reconcile forge role database privileges" \
+      psql_admin -d forge --set ON_ERROR_STOP=1 --file "$FORGE_PRIVILEGE_SQL"
+  ); then
+    info "Ensured the forge role can read and write ordinary forge tables without protected-table DML access."
   else
-    warn "Could not re-grant table privileges to the forge role (non-fatal). If task-detail logs report a 'not readable' audit table, run as a DB admin: psql -d forge -c 'GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO forge;'"
+    warn "Could not transactionally refresh forge app privileges (non-fatal). Re-run 'forge upgrade' after checking PostgreSQL administrator access."
   fi
   return 0
 }
@@ -1423,44 +1624,144 @@ managed_local_migrations_enabled() {
   [ "$MANAGE_LOCAL_DB" = "1" ]
 }
 
+managed_local_postgres_user_exists() {
+  /usr/bin/id postgres >/dev/null 2>&1
+}
+
 resolve_managed_local_admin() {
-  local psql_bin sudo_bin runuser_bin
+  local socket_dir port psql_bin current_user sudo_bin runuser_bin test_mode=""
+  if [ "$MANAGED_LOCAL_ADMIN_RESOLUTION" = resolved ]; then
+    [ -n "$MANAGED_LOCAL_ADMIN_MODE" ]
+    return
+  fi
+  MANAGED_LOCAL_ADMIN_RESOLUTION=resolved
   MANAGED_LOCAL_ADMIN_MODE=""
   MANAGED_LOCAL_ADMIN_SOCKET=""
+  MANAGED_LOCAL_ADMIN_PORT=""
   MANAGED_LOCAL_ADMIN_USER=""
+  MANAGED_LOCAL_PSQL_ADMIN=()
 
   if [ -n "${FORGE_INSTALL_TEST_ADMIN_MODE:-}" ]; then
     case "$FORGE_INSTALL_TEST_ADMIN_MODE" in
-      current|sudo|runuser) MANAGED_LOCAL_ADMIN_MODE="$FORGE_INSTALL_TEST_ADMIN_MODE" ;;
+      current) test_mode=current ;;
       unavailable) return 1 ;;
       *) die "Unknown installer test admin mode." ;;
     esac
-    MANAGED_LOCAL_ADMIN_SOCKET="/tmp"
-    MANAGED_LOCAL_ADMIN_USER="postgres"
-    return 0
+    socket_dir="${FORGE_INSTALL_TEST_PSQL_SOCKET:-/tmp}"
+    port="${FORGE_INSTALL_TEST_PSQL_PORT:-5432}"
+  else
+    case "$OS_NAME" in
+      Darwin) socket_dir=/tmp ;;
+      Linux) socket_dir=/var/run/postgresql ;;
+      *) return 1 ;;
+    esac
+    port=5432
+  fi
+  case "$socket_dir" in
+    /*) ;;
+    *) return 1 ;;
+  esac
+  case "$port" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || return 1
+  [ -d "$socket_dir" ] || return 1
+
+  if [ -n "$test_mode" ] || [ "$OS_NAME" = Darwin ]; then
+    psql_bin="$(command -v psql 2>/dev/null || true)"
+  else
+    psql_bin="$(trusted_linux_tool psql 2>/dev/null || true)"
+  fi
+  case "$psql_bin" in
+    /*) [ -x "$psql_bin" ] || return 1 ;;
+    *) return 1 ;;
+  esac
+
+  current_user="$(/usr/bin/id -un 2>/dev/null || true)"
+  if [ -n "$current_user" ]; then
+    MANAGED_LOCAL_ADMIN_MODE=current
+    MANAGED_LOCAL_ADMIN_SOCKET="$socket_dir"
+    MANAGED_LOCAL_ADMIN_PORT="$port"
+    MANAGED_LOCAL_ADMIN_USER="$current_user"
+    MANAGED_LOCAL_PSQL_ADMIN=(
+      /usr/bin/env "${POSTGRES_ENV_UNSET_ARGS[@]}"
+      "$psql_bin" -X -h "$socket_dir" -p "$port" -U "$current_user" -d postgres
+    )
+    if probe_managed_local_admin; then
+      return 0
+    fi
   fi
 
-  if psql -d postgres -tAc 'SELECT current_user' >/dev/null 2>&1; then
-    MANAGED_LOCAL_ADMIN_MODE="current"
-    MANAGED_LOCAL_ADMIN_USER="$(psql -d postgres -tAc 'SELECT current_user' | tr -d '[:space:]')"
-    MANAGED_LOCAL_ADMIN_SOCKET="$(psql -d postgres -tAc 'SHOW unix_socket_directories' | tr -d '[:space:]' | cut -d, -f1)"
-  elif [ "$OS_NAME" = "Linux" ] && id postgres >/dev/null 2>&1 \
-    && sudo_bin="$(trusted_linux_tool sudo)" && psql_bin="$(trusted_linux_tool psql)" \
-    && "$sudo_bin" -n -u postgres "$psql_bin" -d postgres -tAc 'SELECT 1' >/dev/null 2>&1; then
-    MANAGED_LOCAL_ADMIN_MODE="sudo"
-    MANAGED_LOCAL_ADMIN_USER="postgres"
-    MANAGED_LOCAL_ADMIN_SOCKET="$("$sudo_bin" -n -u postgres "$psql_bin" -d postgres -tAc 'SHOW unix_socket_directories' | tr -d '[:space:]' | cut -d, -f1)"
-  elif [ "$OS_NAME" = "Linux" ] && id postgres >/dev/null 2>&1 \
-    && runuser_bin="$(trusted_linux_tool runuser)" && psql_bin="$(trusted_linux_tool psql)" \
-    && "$runuser_bin" -u postgres -- "$psql_bin" -d postgres -tAc 'SELECT 1' >/dev/null 2>&1; then
-    MANAGED_LOCAL_ADMIN_MODE="runuser"
-    MANAGED_LOCAL_ADMIN_USER="postgres"
-    MANAGED_LOCAL_ADMIN_SOCKET="$("$runuser_bin" -u postgres -- "$psql_bin" -d postgres -tAc 'SHOW unix_socket_directories' | tr -d '[:space:]' | cut -d, -f1)"
-  else
+  # A test-selected psql is caller-controlled. It may prove current-user
+  # access, but it is never carried across a sudo/runuser boundary.
+  if [ -n "$test_mode" ]; then
+    MANAGED_LOCAL_ADMIN_MODE=""
+    MANAGED_LOCAL_ADMIN_SOCKET=""
+    MANAGED_LOCAL_ADMIN_PORT=""
+    MANAGED_LOCAL_ADMIN_USER=""
+    MANAGED_LOCAL_PSQL_ADMIN=()
     return 1
   fi
 
-  [ -n "$MANAGED_LOCAL_ADMIN_USER" ] && [ -n "$MANAGED_LOCAL_ADMIN_SOCKET" ]
+  if [ "$OS_NAME" = Linux ] && managed_local_postgres_user_exists; then
+    sudo_bin="$(trusted_linux_tool sudo 2>/dev/null || true)"
+    if [ -n "$sudo_bin" ]; then
+      MANAGED_LOCAL_ADMIN_MODE=sudo
+      MANAGED_LOCAL_ADMIN_SOCKET="$socket_dir"
+      MANAGED_LOCAL_ADMIN_PORT="$port"
+      MANAGED_LOCAL_ADMIN_USER=postgres
+      MANAGED_LOCAL_PSQL_ADMIN=(
+        /usr/bin/env "${POSTGRES_ENV_UNSET_ARGS[@]}"
+        "$sudo_bin" -n -u postgres "$psql_bin"
+        -X -h "$socket_dir" -p "$port" -U postgres -d postgres
+      )
+      if probe_managed_local_admin; then
+        return 0
+      fi
+    fi
+  fi
+
+  if [ "$OS_NAME" = Linux ] && managed_local_postgres_user_exists; then
+    runuser_bin="$(trusted_linux_tool runuser 2>/dev/null || true)"
+    if [ -n "$runuser_bin" ]; then
+      MANAGED_LOCAL_ADMIN_MODE=runuser
+      MANAGED_LOCAL_ADMIN_SOCKET="$socket_dir"
+      MANAGED_LOCAL_ADMIN_PORT="$port"
+      MANAGED_LOCAL_ADMIN_USER=postgres
+      MANAGED_LOCAL_PSQL_ADMIN=(
+        /usr/bin/env "${POSTGRES_ENV_UNSET_ARGS[@]}"
+        "$runuser_bin" -u postgres -- "$psql_bin"
+        -X -h "$socket_dir" -p "$port" -U postgres -d postgres
+      )
+      if probe_managed_local_admin; then
+        return 0
+      fi
+    fi
+  fi
+
+  MANAGED_LOCAL_ADMIN_MODE=""
+  MANAGED_LOCAL_ADMIN_SOCKET=""
+  MANAGED_LOCAL_ADMIN_PORT=""
+  MANAGED_LOCAL_ADMIN_USER=""
+  MANAGED_LOCAL_PSQL_ADMIN=()
+  return 1
+}
+
+probe_managed_local_admin() {
+  local is_superuser psql_status=0
+  is_superuser="$("${MANAGED_LOCAL_PSQL_ADMIN[@]}" -tAc \
+    "SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = CURRENT_USER AND rolsuper" \
+    2>/dev/null)" || psql_status="$?"
+  [ "$psql_status" -eq 0 ] && [ "$is_superuser" = 1 ]
+}
+
+clear_postgres_routing_environment() {
+  unset PGHOST PGHOSTADDR PGPORT PGDATABASE PGUSER PGPASSWORD PGPASSFILE
+  unset PGSERVICE PGSERVICEFILE PGOPTIONS PGSSLMODE PGREQUIRESSL
+  unset PGSSLCOMPRESSION PGSSLCERT PGSSLKEY PGSSLROOTCERT PGSSLCRL PGSSLCRLDIR
+  unset PGSSLSNI PGREQUIREPEER PGCHANNELBINDING PGTARGETSESSIONATTRS
+  unset PGLOADBALANCEHOSTS PGCONNECT_TIMEOUT PGAPPNAME PGCLIENTENCODING
+  unset PGKRBSRVNAME PGGSSLIB PGGSSENCMODE
 }
 
 run_managed_local_migration_stage() {
@@ -1532,7 +1833,16 @@ trusted_linux_candidate() {
 }
 
 trusted_linux_tool() {
-  local tool="$1" candidate
+  local tool="$1" candidate version
+  # Ubuntu's /usr/bin/psql is a pg_wrapper symlink. Executing its canonical
+  # target loses argv[0]=psql, so prefer the versioned PostgreSQL 16+ binary.
+  if [ "$tool" = psql ]; then
+    for version in 18 17 16; do
+      for candidate in "/usr/lib/postgresql/$version/bin/psql" "/usr/pgsql-$version/bin/psql"; do
+        trusted_linux_candidate "$candidate" && return 0
+      done
+    done
+  fi
   for candidate in "/usr/local/sbin/$tool" "/usr/local/bin/$tool" "/usr/sbin/$tool" "/usr/bin/$tool" "/sbin/$tool" "/bin/$tool"; do
     trusted_linux_candidate "$candidate" && return 0
   done
@@ -1571,7 +1881,7 @@ run_managed_local_migration_as_runuser() {
     local name
     for name in $(compgen -e); do
       case "$name" in
-        DATABASE_URL|FORGE_DATABASE_ADMIN_URL|PGHOST|PGUSER|FORGE_WORKSPACE_ROOT|FORGE_ENV_FILE|FORGE_SUPPRESS_MIGRATION_NOTICES|PATH) ;;
+        DATABASE_URL|FORGE_DATABASE_ADMIN_URL|PGHOST|PGPORT|PGUSER|FORGE_WORKSPACE_ROOT|FORGE_ENV_FILE|FORGE_SUPPRESS_MIGRATION_NOTICES|PATH) ;;
         *) unset "$name" ;;
       esac
     done
@@ -1600,7 +1910,7 @@ run_managed_local_migration_as_sudo() {
   (
     PATH="$MANAGED_LOCAL_PATH"
     export PATH
-    "$sudo_bin" -n -u postgres --preserve-env=DATABASE_URL,FORGE_DATABASE_ADMIN_URL,PGHOST,PGUSER,FORGE_WORKSPACE_ROOT,FORGE_ENV_FILE,FORGE_SUPPRESS_MIGRATION_NOTICES,PATH "$MANAGED_LOCAL_BASH" -c 'cd "$1"; case "$2" in
+    "$sudo_bin" -n -u postgres --preserve-env=DATABASE_URL,FORGE_DATABASE_ADMIN_URL,PGHOST,PGPORT,PGUSER,FORGE_WORKSPACE_ROOT,FORGE_ENV_FILE,FORGE_SUPPRESS_MIGRATION_NOTICES,PATH "$MANAGED_LOCAL_BASH" -c 'cd "$1"; case "$2" in
       release) npm run protocol:bootstrap-epic-172-release-roles ;;
       migrate-0025) npx tsx scripts/ci/migrate-through-0025.ts ;;
       s3) npm run protocol:bootstrap-epic-172-s3-release-owner ;;
@@ -1624,16 +1934,18 @@ run_managed_local_migrations() {
 
   resolve_managed_local_admin || die "Could not establish passwordless local PostgreSQL administrator access for managed migrations. Use a native local PostgreSQL peer login, or run the documented operator migration procedure for a custom database."
 
-  local DATABASE_URL FORGE_DATABASE_ADMIN_URL PGHOST PGUSER FORGE_WORKSPACE_ROOT FORGE_ENV_FILE FORGE_SUPPRESS_MIGRATION_NOTICES
+  local DATABASE_URL FORGE_DATABASE_ADMIN_URL PGHOST PGPORT PGUSER FORGE_WORKSPACE_ROOT FORGE_ENV_FILE FORGE_SUPPRESS_MIGRATION_NOTICES
+  clear_postgres_routing_environment
   DATABASE_URL="$(env_value DATABASE_URL)"
   [ -n "$DATABASE_URL" ] || die "Managed local migrations require DATABASE_URL in the local Forge environment file."
   FORGE_DATABASE_ADMIN_URL="postgresql:///forge"
   PGHOST="$MANAGED_LOCAL_ADMIN_SOCKET"
+  PGPORT="$MANAGED_LOCAL_ADMIN_PORT"
   PGUSER="$MANAGED_LOCAL_ADMIN_USER"
   FORGE_WORKSPACE_ROOT="$WORKSPACE_ROOT"
   FORGE_ENV_FILE="$ENV_FILE"
   FORGE_SUPPRESS_MIGRATION_NOTICES=1
-  export DATABASE_URL FORGE_DATABASE_ADMIN_URL PGHOST PGUSER FORGE_WORKSPACE_ROOT FORGE_ENV_FILE FORGE_SUPPRESS_MIGRATION_NOTICES
+  export DATABASE_URL FORGE_DATABASE_ADMIN_URL PGHOST PGPORT PGUSER FORGE_WORKSPACE_ROOT FORGE_ENV_FILE FORGE_SUPPRESS_MIGRATION_NOTICES
 
   run_managed_local_migration_sequence
 }
@@ -1745,10 +2057,50 @@ install_cli_entrypoint() {
 }
 
 resolve_service_mode() {
+  local installed_mode
   if [ "$SERVICE_MODE" = "auto" ]; then
-    SERVICE_MODE="native"
+    installed_mode="$(last_install_manifest_value service_mode 2>/dev/null || true)"
+    case "$installed_mode" in
+      native|docker) SERVICE_MODE="$installed_mode" ;;
+      *) SERVICE_MODE="native" ;;
+    esac
   fi
-  record_manifest "service_mode" "$SERVICE_MODE"
+}
+
+last_install_manifest_value() {
+  local key="$1" line value=''
+  [ -f "$INSTALL_MANIFEST" ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      "$key"=*) value="${line#*=}" ;;
+    esac
+  done < "$INSTALL_MANIFEST"
+  [ -n "$value" ] || return 1
+  printf '%s' "$value"
+}
+
+commit_service_mode() {
+  [ "$DRY_RUN" = 1 ] && return 0
+  [ "$INSTALL_LOCK_HELD" = 1 ] \
+    || die "Refusing to record service mode without the Forge install lock."
+  # This is the installed-state commit point: the selected service mode has
+  # completed its controlled startup and attestation/provisioning boundary.
+  record_current_manifest_value "service_mode" "$SERVICE_MODE"
+}
+
+start_attest_and_commit_service_mode() {
+  if [ "$SERVICE_MODE" = "docker" ]; then
+    start_docker_services || return
+    commit_service_mode
+  else
+    install_native_services || return
+    start_native_services || return
+    # A generic localhost listener is not an installed-mode attestation. The
+    # controlled native administrator path must provision the local database
+    # successfully before the manifest authorizes future native repair.
+    provision_database || return
+    commit_service_mode
+  fi
 }
 
 print_preflight_summary() {
@@ -1916,6 +2268,7 @@ acquire_install_lock() {
   [ "$DRY_RUN" = "1" ] && return 0
   ensure_install_state
   if mkdir "$LOCK_DIR" 2>/dev/null; then
+    INSTALL_LOCK_HELD=1
     return 0
   fi
 
@@ -1937,7 +2290,19 @@ fi
 
 if [ "${FORGE_INSTALL_TEST_HOOK:-}" = "managed-local-migrations" ]; then
   SERVICE_MODE="${FORGE_INSTALL_TEST_SERVICE_MODE:-native}"
-  printf 'admin:%s\n' "${FORGE_INSTALL_TEST_ADMIN_MODE:-unset}" >> "${FORGE_INSTALL_TEST_STAGE_LOG:?}"
+  case "${FORGE_INSTALL_TEST_ADMIN_MODE:-current}" in
+    current)
+      MANAGED_LOCAL_ADMIN_RESOLUTION=resolved
+      MANAGED_LOCAL_ADMIN_MODE=current
+      MANAGED_LOCAL_ADMIN_USER="$(/usr/bin/id -un)"
+      ;;
+    unavailable)
+      MANAGED_LOCAL_ADMIN_RESOLUTION=resolved
+      MANAGED_LOCAL_ADMIN_MODE=""
+      ;;
+    *) die "Installer migration test hook supports only current-user administration." ;;
+  esac
+  printf 'admin:%s\n' "${FORGE_INSTALL_TEST_ADMIN_MODE:-current}" >> "${FORGE_INSTALL_TEST_STAGE_LOG:?}"
   run_managed_local_migrations
   exit 0
 fi
@@ -1979,7 +2344,7 @@ fi
 
 install_base_dependencies
 
-DB_PASSWORD="$(initial_env_value DATABASE_URL | sed -n 's#^postgres\(ql\)\?://forge:\(.*\)@localhost:5432/forge.*#\2#p' | head -1)"
+DB_PASSWORD="$(native_forge_database_password "$(initial_env_value DATABASE_URL)" || true)"
 DB_PASSWORD="${DB_PASSWORD:-$(initial_env_value POSTGRES_PASSWORD)}"
 if placeholder_value "$DB_PASSWORD"; then
   DB_PASSWORD=""
@@ -1994,13 +2359,7 @@ SESSION_SECRET="${SESSION_SECRET:-$(random_hex 32)}"
 write_env_file
 install_cli_entrypoint
 
-if [ "$SERVICE_MODE" = "docker" ]; then
-  start_docker_services
-else
-  install_native_services
-  start_native_services
-  provision_database
-fi
+start_attest_and_commit_service_mode
 
 prepare_web_app
 install_ollama_if_needed
