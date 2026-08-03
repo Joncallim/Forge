@@ -99,7 +99,8 @@ snapshot() {
     PGHOST="$FORGE_LEGACY_REPAIR_ADMIN_HOST" \
     PGUSER="$FORGE_LEGACY_REPAIR_ADMIN_USER" \
     PGDATABASE="$FORGE_LEGACY_REPAIR_ADMIN_DATABASE" \
-    pg_dump --schema-only --no-owner --quote-all-identifiers > "$TEMP_ROOT/$label.schema"
+    pg_dump --schema-only --no-owner --quote-all-identifiers \
+      | sed '/^\\restrict /d; /^\\unrestrict /d' > "$TEMP_ROOT/$label.schema"
   admin_psql --no-align --tuples-only --quiet --command '
     SELECT rolname || chr(58) || rolcanlogin || chr(58) || rolinherit || chr(58) || rolsuper || chr(58) || rolcreatedb || chr(58) || rolcreaterole || chr(58) || rolreplication || chr(58) || rolbypassrls
     FROM pg_catalog.pg_roles
@@ -140,6 +141,7 @@ expect_refusal() {
 echo 'Proving exact legacy repair refusal cases against isolated disposable databases.'
 
 prepare_0026_baseline
+strip_current_migration_grants
 snapshot current-0026-before
 run_repair
 snapshot current-0026-after
@@ -151,6 +153,20 @@ snapshot hash-near-miss-before
 expect_refusal 'Migration-hash near-miss'
 snapshot hash-near-miss-after
 assert_unchanged hash-near-miss-before hash-near-miss-after 'Migration-hash near-miss'
+
+prepare_legacy_fixture
+admin_psql <<'SQL'
+UPDATE drizzle.__drizzle_migrations
+SET hash = CASE created_at
+  WHEN 1784258966103 THEN 'e8234134bb5356d2c0093d4618a6e60251e2c16b8bdf8dcacfd5673cbbafbe85'
+  WHEN 1784263200000 THEN '1fa66528143fad4b17dd91e64d64a07135098e4102f6ab5441e167e5458496de'
+END
+WHERE created_at IN (1784258966103, 1784263200000);
+SQL
+snapshot current-hash-legacy-catalog-before
+expect_refusal 'Current hashes with legacy catalog'
+snapshot current-hash-legacy-catalog-after
+assert_unchanged current-hash-legacy-catalog-before current-hash-legacy-catalog-after 'Current hashes with legacy catalog'
 
 prepare_legacy_fixture
 admin_psql <<'SQL'
@@ -171,27 +187,156 @@ expect_refusal 'Consumer ACL/role near-miss'
 snapshot consumer-near-miss-after
 assert_unchanged consumer-near-miss-before consumer-near-miss-after 'Consumer ACL/role near-miss'
 
+prepare_legacy_fixture
+admin_psql --command 'GRANT USAGE ON SCHEMA public TO forge_release_evidence_consumer;'
+snapshot consumer-schema-near-miss-before
+expect_refusal 'Consumer local-authority near-miss'
+snapshot consumer-schema-near-miss-after
+assert_unchanged consumer-schema-near-miss-before consumer-schema-near-miss-after 'Consumer local-authority near-miss'
+
+prepare_legacy_fixture
+admin_psql --command 'GRANT SELECT ON TABLE public.forge_epic_172_enablement_state TO PUBLIC;'
+snapshot public-acl-near-miss-before
+expect_refusal 'PUBLIC table ACL near-miss'
+snapshot public-acl-near-miss-after
+assert_unchanged public-acl-near-miss-before public-acl-near-miss-after 'PUBLIC table ACL near-miss'
+
+prepare_legacy_fixture
+admin_psql --command 'GRANT INSERT ON TABLE public.forge_epic_172_release_evidence TO forge_release_evidence_writer;'
+snapshot writer-acl-near-miss-before
+expect_refusal 'Writer table ACL near-miss'
+snapshot writer-acl-near-miss-after
+assert_unchanged writer-acl-near-miss-before writer-acl-near-miss-after 'Writer table ACL near-miss'
+
+prepare_legacy_fixture
+admin_psql --command 'GRANT SELECT ON TABLE public.forge_epic_172_release_evidence TO forge_release_evidence_writer WITH GRANT OPTION;'
+snapshot grant-option-near-miss-before
+expect_refusal 'Table ACL grant-option near-miss'
+snapshot grant-option-near-miss-after
+assert_unchanged grant-option-near-miss-before grant-option-near-miss-after 'Table ACL grant-option near-miss'
+
+prepare_legacy_fixture
+admin_psql <<'SQL'
+GRANT SELECT ON TABLE public.forge_epic_172_release_evidence TO forge_release_evidence_writer WITH GRANT OPTION;
+SET ROLE forge_release_evidence_writer;
+GRANT SELECT ON TABLE public.forge_epic_172_release_evidence TO forge_release_transition;
+RESET ROLE;
+SQL
+snapshot wrong-grantor-near-miss-before
+expect_refusal 'Table ACL wrong-grantor near-miss'
+snapshot wrong-grantor-near-miss-after
+assert_unchanged wrong-grantor-near-miss-before wrong-grantor-near-miss-after 'Table ACL wrong-grantor near-miss'
+
 echo 'Proving exact repair, ledger immutability, repaired no-op, and managed latest sequence.'
 prepare_legacy_fixture
 snapshot legacy-before-repair
 run_repair
 snapshot repaired-once
 cmp -s "$TEMP_ROOT/legacy-before-repair.ledger" "$TEMP_ROOT/repaired-once.ledger" || { echo 'Repair changed the immutable migration ledger.' >&2; exit 1; }
+# The only authority normalization is removal of migration-login ACLs by
+# strip_current_migration_grants. PostgreSQL appends an ALTER TABLE ADD COLUMN,
+# so repaired required_evidence has a different non-semantic ordinal position
+# than a fresh 0026 column. Raw dumps remain above for no-mutation checks; this
+# comparison removes only that declaration. The repair fingerprint separately
+# requires its exact jsonb type, NOT NULL shape, and check constraint.
+sed '/^    "required_evidence" "jsonb" NOT NULL,$/d' "$TEMP_ROOT/current-0026-before.schema" \
+  > "$TEMP_ROOT/current-0026-canonical.schema"
+sed '/^    "required_evidence" "jsonb" NOT NULL,$/d' "$TEMP_ROOT/repaired-once.schema" \
+  > "$TEMP_ROOT/repaired-canonical.schema"
+cmp -s "$TEMP_ROOT/current-0026-canonical.schema" "$TEMP_ROOT/repaired-canonical.schema" || {
+  diff -u "$TEMP_ROOT/current-0026-canonical.schema" "$TEMP_ROOT/repaired-canonical.schema" >&2 || true
+  echo 'Repaired legacy schema differs from normalized current 0026.' >&2
+  exit 1
+}
 run_repair
 snapshot repaired-twice
 assert_unchanged repaired-once repaired-twice 'Repaired no-op'
 
+run_s4_bootstrap() {
+  (
+    cd "$WEB_ROOT"
+    DATABASE_URL="$FORGE_LEGACY_REPAIR_DATABASE_URL" FORGE_DATABASE_ADMIN_URL="$FORGE_LEGACY_REPAIR_ADMIN_URL" \
+      npm run protocol:bootstrap-epic-172-s4-roles
+  )
+}
+
+expect_s4_bootstrap_failure() {
+  set +e
+  run_s4_bootstrap
+  local status=$?
+  set -e
+  if [ "$status" -eq 0 ]; then
+    echo 'The legacy fixture unexpectedly completed the S4 bootstrap.' >&2
+    exit 1
+  fi
+}
+
+migrate_through_0027() {
+  (
+    cd "$WEB_ROOT"
+    DATABASE_URL="$FORGE_LEGACY_REPAIR_DATABASE_URL" npx tsx scripts/ci/migrate-through-0027.ts
+  )
+}
+
 managed_env="$TEMP_ROOT/managed.env"
 printf 'DATABASE_URL=%s\n' "$FORGE_LEGACY_REPAIR_DATABASE_URL" > "$managed_env"
-(
-  export DATABASE_URL="$FORGE_LEGACY_REPAIR_DATABASE_URL"
-  export FORGE_DATABASE_ADMIN_URL="$FORGE_LEGACY_REPAIR_ADMIN_URL"
-  export FORGE_ENV_FILE="$managed_env"
-  export FORGE_INSTALL_LIBRARY=1
-  source "$REPO_ROOT/scripts/install.sh"
-  MANAGED_LOCAL_ADMIN_MODE=current
-  run_managed_local_migration_sequence
-)
+run_managed_sequence() {
+  (
+    export DATABASE_URL="$FORGE_LEGACY_REPAIR_DATABASE_URL"
+    export FORGE_DATABASE_ADMIN_URL="$FORGE_LEGACY_REPAIR_ADMIN_URL"
+    export FORGE_ENV_FILE="$managed_env"
+    export FORGE_INSTALL_LIBRARY=1
+    source "$REPO_ROOT/scripts/install.sh"
+    MANAGED_LOCAL_ADMIN_MODE=current
+    run_managed_local_migration_sequence
+  )
+}
+
+echo 'Proving accepted S4 boundary variants and later-ledger reruns.'
+prepare_legacy_fixture
+expect_s4_bootstrap_failure
+snapshot failed-bootstrap-before
+run_repair
+snapshot failed-bootstrap-after
+cmp -s "$TEMP_ROOT/failed-bootstrap-before.ledger" "$TEMP_ROOT/failed-bootstrap-after.ledger" || {
+  echo 'Failed-bootstrap S4 repair changed the immutable migration ledger.' >&2
+  exit 1
+}
+cmp -s "$TEMP_ROOT/failed-bootstrap-before.roles" "$TEMP_ROOT/failed-bootstrap-after.roles" || {
+  echo 'Failed-bootstrap S4 repair changed the role boundary.' >&2
+  exit 1
+}
+
+# A database reset drops all local grants and objects but intentionally leaves
+# the cluster-global S4 principals. That exact zero-authority state is safe.
+prepare_legacy_fixture
+snapshot zero-authority-s4-before
+run_repair
+snapshot zero-authority-s4-after
+cmp -s "$TEMP_ROOT/zero-authority-s4-before.ledger" "$TEMP_ROOT/zero-authority-s4-after.ledger" || {
+  echo 'Zero-authority S4 repair changed the immutable migration ledger.' >&2
+  exit 1
+}
+cmp -s "$TEMP_ROOT/zero-authority-s4-before.roles" "$TEMP_ROOT/zero-authority-s4-after.roles" || {
+  echo 'Zero-authority S4 repair changed the role boundary.' >&2
+  exit 1
+}
+
+prepare_legacy_fixture
+run_repair
+run_s4_bootstrap
+migrate_through_0027
+snapshot repaired-0027-before
+run_repair
+snapshot repaired-0027-after
+assert_unchanged repaired-0027-before repaired-0027-after 'Repaired 0027 no-op'
+
+echo 'Proving the full managed sequence is stable at latest when run twice.'
+run_managed_sequence
+snapshot managed-latest-once
+run_managed_sequence
+snapshot managed-latest-twice
+assert_unchanged managed-latest-once managed-latest-twice 'Managed latest rerun'
 admin_psql <<'SQL'
 DO $proof$
 BEGIN
@@ -209,28 +354,18 @@ END;
 $proof$;
 SQL
 
-# S4 principals are cluster-global. Keep this deliberately unsafe case last so
-# its inert principals cannot alter an earlier successful repair proof.
+# S4 principals are cluster-global. Keep this deliberately unsafe membership
+# case last so it cannot alter an earlier successful repair proof.
 prepare_legacy_fixture
-set +e
-(
-  cd "$WEB_ROOT"
-  DATABASE_URL="$FORGE_LEGACY_REPAIR_DATABASE_URL" FORGE_DATABASE_ADMIN_URL="$FORGE_LEGACY_REPAIR_ADMIN_URL" \
-    npm run protocol:bootstrap-epic-172-s4-roles
-)
-s4_bootstrap_status=$?
-set -e
-if [ "$s4_bootstrap_status" -eq 0 ]; then
-  echo 'The legacy fixture unexpectedly completed the S4 bootstrap.' >&2
-  exit 1
-fi
-admin_psql --set migration_role="$FORGE_LEGACY_REPAIR_MIGRATION_USER" \
-  --command 'GRANT forge_s4_routines_owner TO :"migration_role";'
+admin_psql --set migration_role="$FORGE_LEGACY_REPAIR_MIGRATION_USER" <<'SQL'
+GRANT forge_s4_routines_owner TO :"migration_role";
+SQL
 snapshot unsafe-s4-before
-expect_refusal 'Unsafe S4 state'
+expect_refusal 'Unsafe S4 membership'
 snapshot unsafe-s4-after
-assert_unchanged unsafe-s4-before unsafe-s4-after 'Unsafe S4 state'
-admin_psql --set migration_role="$FORGE_LEGACY_REPAIR_MIGRATION_USER" \
-  --command 'REVOKE forge_s4_routines_owner FROM :"migration_role";'
+assert_unchanged unsafe-s4-before unsafe-s4-after 'Unsafe S4 membership'
+admin_psql --set migration_role="$FORGE_LEGACY_REPAIR_MIGRATION_USER" <<'SQL'
+REVOKE forge_s4_routines_owner FROM :"migration_role";
+SQL
 
 echo 'DBR-1 exact legacy repair, refusal isolation, and managed-sequence proof passed.'

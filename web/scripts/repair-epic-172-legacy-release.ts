@@ -12,8 +12,12 @@ const current0025 = '1fa66528143fad4b17dd91e64d64a07135098e4102f6ab5441e167e5458
 const migration0023At = 1784258966103
 const migration0025At = 1784263200000
 const migration0026At = 1784266800000
+const migration0027At = 1784270400000
+const migration0028At = 1784274000000
 const current0026 = '3434290ee6253c1cfe2b26e482228fceeba017417d0f4449aabcefa900d2d207'
-const repairArtifactSha256 = 'ca8d338f5b00f3af86e2a0ccf4f351d1049a7f6d3d21671d942d19f85f5d32e1'
+const current0027 = '8cf249d0ba7f10dca9ac1721677a5c6f4c5080d3f9f478156f72e0ac21c5ebd8'
+const current0028 = '7b6019d9d2a3a069c51e26a729e071982ddbbd20726727107c2b8c0ad08ee78a'
+const repairArtifactSha256 = '1391a720f3215bdfe93ab2092acab2f8d54485efb5e0bb0dc8dcf9812c0b3e77'
 const repairArtifact = resolve(dirname(fileURLToPath(import.meta.url)), '../db/repairs/epic-172-legacy-0023-0025-v1.sql')
 
 // `pg_get_functiondef` is deliberately fingerprinted rather than merely
@@ -29,7 +33,7 @@ const repairedRoutineDigests = [
   'forge.activate_epic_172_release_signer_v1(uuid,uuid,bigint,text,text)|72b10b3063314dc828bf3b543ec7b58d',
   'forge.assert_epic_172_transition_authorization_live_v1(uuid,text)|0f3b6819772f08e543c44443f580628c',
   'forge.constant_time_equal_32_v1(bytea,bytea)|f88bdc5074bead3ba85d8e7ba9c74ce2',
-  'forge.consume_epic_172_release_evidence_v1(uuid,uuid,text,text,text)|f25e14b9e4c0d4421ac1442fcebc5ecf',
+  'forge.consume_epic_172_release_evidence_v1(uuid,uuid,text,text,text)|32055e9fe18f23a6f7be13ebf2fccfbc',
   'forge.epic_172_controller_lease_digest_v1(bytea)|df55e7eaac723e8e1930f28b9113dc9a',
   'forge.install_epic_172_release_signer_v1(uuid,bigint,bytea,text,text,timestamp with time zone,timestamp with time zone,text,text)|a3eba357126595a03e6ce29973c3ab7c',
   'forge.lock_epic_172_release_receipts_v1(uuid[])|34346e7fb66e623c28002a1697e1a727',
@@ -47,6 +51,12 @@ const s4Roles = [
   'forge_packet_issuer', 'forge_review_source_resolver',
   'forge_s4_recovery_operator', 'forge_local_projection_archiver',
   'forge_local_evidence_reader', 'forge_project_root_reconciler',
+] as const
+const protectedReleaseTables = [
+  'forge_epic_172_enablement_state', 'forge_epic_172_enablement_transition_audits',
+  'forge_epic_172_release_evidence', 'forge_epic_172_release_evidence_consumptions',
+  'forge_epic_172_transition_authorizations', 'forge_release_signer_key_lifecycle_audits',
+  'forge_release_signer_keys',
 ] as const
 const releaseRoutineNames = [
   'activate_epic_172_release_signer_v1', 'assert_epic_172_transition_authorization_live_v1',
@@ -99,11 +109,14 @@ const releaseTriggerFingerprints = [
   'forge_release_signer_lifecycle_append_only|forge_release_signer_key_lifecycle_audits|forge_epic_172_reject_mutation_v1()|O|09159d710dac8a28733eedc0296b022d',
 ] as const
 
-function expectedRoutineAcl(identity: string): string {
+function expectedRoutineAcl(identity: string, expectS4ReadExecute: boolean): string {
   const name = identity.slice('forge.'.length, identity.indexOf('('))
   const grants = ['forge_release_routines_owner:EXECUTE:false:forge_release_routines_owner']
   if (writerRoutineNames.has(name)) grants.push('forge_release_evidence_writer:EXECUTE:false:forge_release_routines_owner')
   if (transitionRoutineNames.has(name)) grants.push('forge_release_transition:EXECUTE:false:forge_release_routines_owner')
+  if (expectS4ReadExecute && name === 'read_epic_172_enablement_state_v1') {
+    grants.push('forge_s4_routines_owner:EXECUTE:false:forge_release_routines_owner')
+  }
   return grants.sort().join(',')
 }
 
@@ -111,6 +124,7 @@ async function exactRoutines(
   sql: postgres.Sql | postgres.TransactionSql,
   expected: readonly string[],
   expectPublicExecute: boolean,
+  expectS4ReadExecute: boolean,
 ): Promise<boolean> {
   const rows = await sql<readonly {
     identity: string
@@ -153,11 +167,18 @@ async function exactRoutines(
     && row.config?.length === 1
     && row.config[0] === 'search_path=pg_catalog, public'
     && row.publicExecute === expectPublicExecute
-    && row.acl === expectedRoutineAcl(row.identity)
+    && row.acl === expectedRoutineAcl(row.identity, expectS4ReadExecute)
   ))
 }
 
-async function exactRoleBoundary(sql: postgres.Sql | postgres.TransactionSql, allowInertS4: boolean): Promise<boolean> {
+async function exactReleaseRoleBoundary(
+  sql: postgres.Sql | postgres.TransactionSql,
+  expectLegacyConsumer: boolean,
+): Promise<boolean> {
+  const releaseRoles = [
+    'forge_release_evidence_writer', 'forge_release_transition', 'forge_release_routines_owner',
+    ...(expectLegacyConsumer ? ['forge_release_evidence_consumer'] : []),
+  ].sort()
   const roles = await sql<readonly {
     name: string; login: boolean; inherit: boolean; superuser: boolean; createdb: boolean; createrole: boolean; replication: boolean; bypassrls: boolean
   }[]>`
@@ -165,29 +186,72 @@ async function exactRoleBoundary(sql: postgres.Sql | postgres.TransactionSql, al
       rolsuper AS superuser, rolcreatedb AS createdb, rolcreaterole AS createrole,
       rolreplication AS replication, rolbypassrls AS bypassrls
     FROM pg_catalog.pg_roles
-    WHERE rolname = ANY(${sql.array([...s4Roles, 'forge_release_evidence_writer', 'forge_release_transition', 'forge_release_routines_owner', 'forge_release_evidence_consumer'])}::text[])
+    WHERE rolname = ANY(ARRAY[
+      'forge_release_evidence_writer', 'forge_release_transition',
+      'forge_release_routines_owner', 'forge_release_evidence_consumer'
+    ])
     ORDER BY 1
   `
-  const release = roles.filter((role) => role.name.startsWith('forge_release_'))
-  if (release.length !== 4 || release.some((role) => (
-    role.inherit || role.superuser || role.createdb || role.createrole || role.replication || role.bypassrls
+  if (roles.length !== releaseRoles.length || roles.some((role, index) => (
+    role.name !== releaseRoles[index]
+    || role.inherit || role.superuser || role.createdb || role.createrole || role.replication || role.bypassrls
     || role.login !== (role.name !== 'forge_release_routines_owner')
   ))) return false
-  const s4 = roles.filter((role) => role.name.startsWith('forge_s4_') || s4Roles.includes(role.name as typeof s4Roles[number]))
-  if (!allowInertS4 ? s4.length !== 0 : (s4.length !== s4Roles.length || s4.some((role) => (
+  const [edges] = await sql<readonly { count: number }[]>`
+    SELECT pg_catalog.count(*)::integer AS count
+    FROM pg_catalog.pg_auth_members membership
+    JOIN pg_catalog.pg_roles granted ON granted.oid = membership.roleid
+    JOIN pg_catalog.pg_roles member ON member.oid = membership.member
+    WHERE granted.rolname = ANY(ARRAY[
+      'forge_release_evidence_writer', 'forge_release_transition',
+      'forge_release_routines_owner', 'forge_release_evidence_consumer'
+    ]) OR member.rolname = ANY(ARRAY[
+      'forge_release_evidence_writer', 'forge_release_transition',
+      'forge_release_routines_owner', 'forge_release_evidence_consumer'
+    ])
+  `
+  return edges?.count === 0
+}
+
+async function exactS4RoleBoundary(sql: postgres.Sql | postgres.TransactionSql, allowInertS4: boolean): Promise<boolean> {
+  const roles = await sql<readonly {
+    name: string; login: boolean; inherit: boolean; superuser: boolean; createdb: boolean; createrole: boolean; replication: boolean; bypassrls: boolean
+  }[]>`
+    SELECT rolname AS name, rolcanlogin AS login, rolinherit AS inherit,
+      rolsuper AS superuser, rolcreatedb AS createdb, rolcreaterole AS createrole,
+      rolreplication AS replication, rolbypassrls AS bypassrls
+    FROM pg_catalog.pg_roles
+    WHERE rolname = ANY(${sql.array([...s4Roles])}::text[])
+    ORDER BY 1
+  `
+  if (!allowInertS4 ? roles.length !== 0 : (roles.length !== s4Roles.length || roles.some((role) => (
     role.inherit || role.superuser || role.createdb || role.createrole || role.replication || role.bypassrls
     || role.login !== (role.name !== 'forge_s4_routines_owner')
   )))) return false
-  const [s4Authority] = await sql<readonly { tableGrants: number; ownedObjects: number }[]>`
+  const [s4Authority] = await sql<readonly { relationGrants: number; routineGrants: number; databaseGrants: number; ownedObjects: number }[]>`
     SELECT
-      (SELECT pg_catalog.count(*)::integer FROM information_schema.role_table_grants
-       WHERE grantee = ANY(${sql.array([...s4Roles])}::text[])) AS "tableGrants",
+      (SELECT pg_catalog.count(*)::integer FROM pg_catalog.pg_class relation
+       CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(relation.relacl, pg_catalog.acldefault('r', relation.relowner))) privilege
+       WHERE privilege.grantee IN (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = ANY(${sql.array([...s4Roles])}::text[]))) AS "relationGrants",
+      (SELECT pg_catalog.count(*)::integer FROM pg_catalog.pg_proc routine
+       CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(routine.proacl, pg_catalog.acldefault('f', routine.proowner))) privilege
+       WHERE privilege.grantee IN (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = ANY(${sql.array([...s4Roles])}::text[]))) AS "routineGrants",
+      (SELECT pg_catalog.count(*)::integer FROM pg_catalog.pg_database database_row
+       CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(database_row.datacl, pg_catalog.acldefault('d', database_row.datdba))) privilege
+       WHERE database_row.datname = pg_catalog.current_database()
+         AND privilege.grantee IN (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = ANY(${sql.array([...s4Roles])}::text[]))) AS "databaseGrants",
       ((SELECT pg_catalog.count(*)::integer FROM pg_catalog.pg_class relation
         WHERE relation.relowner IN (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = ANY(${sql.array([...s4Roles])}::text[])))
        + (SELECT pg_catalog.count(*)::integer FROM pg_catalog.pg_proc routine
-          WHERE routine.proowner IN (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = ANY(${sql.array([...s4Roles])}::text[])))) AS "ownedObjects"
+          WHERE routine.proowner IN (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = ANY(${sql.array([...s4Roles])}::text[])))
+       + (SELECT pg_catalog.count(*)::integer FROM pg_catalog.pg_namespace namespace_row
+          WHERE namespace_row.nspowner IN (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = ANY(${sql.array([...s4Roles])}::text[])))
+       + (SELECT pg_catalog.count(*)::integer FROM pg_catalog.pg_database database_row
+          WHERE database_row.datname = pg_catalog.current_database()
+            AND database_row.datdba IN (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = ANY(${sql.array([...s4Roles])}::text[])))) AS "ownedObjects"
   `
-  if (!s4Authority || s4Authority.tableGrants !== 0 || s4Authority.ownedObjects !== 0) return false
+  if (!s4Authority || s4Authority.relationGrants !== 0 || s4Authority.routineGrants !== 0
+    || s4Authority.databaseGrants !== 0 || s4Authority.ownedObjects !== 0) return false
   const schemaGrants = await sql<readonly { role: string; schema: string; privilege: string; grantable: boolean }[]>`
     SELECT grantee.rolname AS role, namespace_row.nspname AS schema,
       privilege.privilege_type AS privilege, privilege.is_grantable AS grantable
@@ -204,8 +268,8 @@ async function exactRoleBoundary(sql: postgres.Sql | postgres.TransactionSql, al
     FROM pg_catalog.pg_auth_members membership
     JOIN pg_catalog.pg_roles granted ON granted.oid = membership.roleid
     JOIN pg_catalog.pg_roles member ON member.oid = membership.member
-    WHERE granted.rolname = ANY(${sql.array([...s4Roles, 'forge_release_evidence_writer', 'forge_release_transition', 'forge_release_routines_owner', 'forge_release_evidence_consumer'])}::text[])
-       OR member.rolname = ANY(${sql.array([...s4Roles, 'forge_release_evidence_writer', 'forge_release_transition', 'forge_release_routines_owner', 'forge_release_evidence_consumer'])}::text[])
+    WHERE granted.rolname = ANY(${sql.array([...s4Roles])}::text[])
+       OR member.rolname = ANY(${sql.array([...s4Roles])}::text[])
   `
   if (edges?.count !== 0) return false
   if (!await exactForgeSchemaAcl(sql, allowInertS4)) return false
@@ -220,6 +284,56 @@ async function exactRoleBoundary(sql: postgres.Sql | postgres.TransactionSql, al
     grant.role === inertUsageRoles[index] && grant.schema === 'forge'
     && grant.privilege === 'USAGE' && !grant.grantable
   ))
+}
+
+async function exactZeroAuthorityS4Roles(sql: postgres.Sql | postgres.TransactionSql): Promise<boolean> {
+  const roles = await sql<readonly { name: string; login: boolean; inherit: boolean; superuser: boolean; createdb: boolean; createrole: boolean; replication: boolean; bypassrls: boolean }[]>`
+    SELECT rolname AS name, rolcanlogin AS login, rolinherit AS inherit, rolsuper AS superuser,
+      rolcreatedb AS createdb, rolcreaterole AS createrole, rolreplication AS replication, rolbypassrls AS bypassrls
+    FROM pg_catalog.pg_roles WHERE rolname = ANY(${sql.array([...s4Roles])}::text[]) ORDER BY 1
+  `
+  if (roles.length !== s4Roles.length || roles.some((role) => (
+    role.inherit || role.superuser || role.createdb || role.createrole || role.replication || role.bypassrls
+    || role.login !== (role.name !== 'forge_s4_routines_owner')
+  ))) return false
+  const [authority] = await sql<readonly { memberships: number; owned: number; tableGrants: number; routineGrants: number; schemaGrants: number; databaseGrants: number }[]>`
+    SELECT
+      (SELECT pg_catalog.count(*)::integer FROM pg_catalog.pg_auth_members membership
+       JOIN pg_catalog.pg_roles granted ON granted.oid = membership.roleid
+       JOIN pg_catalog.pg_roles member ON member.oid = membership.member
+       WHERE granted.rolname = ANY(${sql.array([...s4Roles])}::text[]) OR member.rolname = ANY(${sql.array([...s4Roles])}::text[])) AS memberships,
+      ((SELECT pg_catalog.count(*)::integer FROM pg_catalog.pg_class WHERE relowner IN (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = ANY(${sql.array([...s4Roles])}::text[])))
+       + (SELECT pg_catalog.count(*)::integer FROM pg_catalog.pg_proc WHERE proowner IN (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = ANY(${sql.array([...s4Roles])}::text[])))
+       + (SELECT pg_catalog.count(*)::integer FROM pg_catalog.pg_namespace WHERE nspowner IN (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = ANY(${sql.array([...s4Roles])}::text[])))
+       + (SELECT pg_catalog.count(*)::integer FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database()
+          AND datdba IN (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = ANY(${sql.array([...s4Roles])}::text[])))) AS owned,
+      (SELECT pg_catalog.count(*)::integer FROM pg_catalog.pg_class relation
+       CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(relation.relacl, pg_catalog.acldefault('r', relation.relowner))) privilege
+       WHERE privilege.grantee IN (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = ANY(${sql.array([...s4Roles])}::text[]))) AS "tableGrants",
+      (SELECT pg_catalog.count(*)::integer FROM pg_catalog.pg_proc routine
+       CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(routine.proacl, pg_catalog.acldefault('f', routine.proowner))) privilege
+       WHERE privilege.grantee IN (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = ANY(${sql.array([...s4Roles])}::text[]))) AS "routineGrants",
+      (SELECT pg_catalog.count(*)::integer FROM pg_catalog.pg_namespace namespace_row
+       CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(namespace_row.nspacl, pg_catalog.acldefault('n', namespace_row.nspowner))) privilege
+       WHERE privilege.grantee IN (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = ANY(${sql.array([...s4Roles])}::text[]))) AS "schemaGrants",
+      (SELECT pg_catalog.count(*)::integer FROM pg_catalog.pg_database database_row
+       CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(database_row.datacl, pg_catalog.acldefault('d', database_row.datdba))) privilege
+       WHERE database_row.datname = pg_catalog.current_database()
+         AND privilege.grantee IN (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = ANY(${sql.array([...s4Roles])}::text[]))) AS "databaseGrants"
+  `
+  return authority?.memberships === 0 && authority.owned === 0 && authority.tableGrants === 0
+    && authority.routineGrants === 0 && authority.schemaGrants === 0 && authority.databaseGrants === 0
+    && await exactForgeSchemaAcl(sql, false)
+}
+
+async function exactRoleBoundary(
+  sql: postgres.Sql | postgres.TransactionSql,
+  expectLegacyConsumer: boolean,
+): Promise<boolean> {
+  if (!await exactReleaseRoleBoundary(sql, expectLegacyConsumer)) return false
+  return (await exactS4RoleBoundary(sql, false))
+    || (await exactZeroAuthorityS4Roles(sql))
+    || (await exactS4RoleBoundary(sql, true))
 }
 
 async function exactReleaseCatalog(sql: postgres.Sql | postgres.TransactionSql, repaired: boolean): Promise<boolean> {
@@ -264,16 +378,16 @@ async function exactReleaseCatalog(sql: postgres.Sql | postgres.TransactionSql, 
   const [receiptIndex] = await sql<readonly { unique: boolean; valid: boolean; ready: boolean; live: boolean; partial: boolean; expressions: boolean; columns: string }[]>`
     SELECT index_row.indisunique AS unique, index_row.indisvalid AS valid, index_row.indisready AS ready,
       index_row.indislive AS live, index_row.indpred IS NOT NULL AS partial, index_row.indexprs IS NOT NULL AS expressions,
-      pg_catalog.string_agg(attribute_row.attname, ',' ORDER BY key_column.ordinality) AS columns
+      (SELECT pg_catalog.string_agg(attribute_row.attname, ',' ORDER BY key_column.ordinality)
+       FROM pg_catalog.unnest(index_row.indkey) WITH ORDINALITY key_column(attnum, ordinality)
+       JOIN pg_catalog.pg_attribute attribute_row
+         ON attribute_row.attrelid = table_class.oid AND attribute_row.attnum = key_column.attnum) AS columns
     FROM pg_catalog.pg_index index_row
     JOIN pg_catalog.pg_class index_class ON index_class.oid = index_row.indexrelid
     JOIN pg_catalog.pg_class table_class ON table_class.oid = index_row.indrelid
     JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = table_class.relnamespace
-    JOIN LATERAL pg_catalog.unnest(index_row.indkey) WITH ORDINALITY key_column(attnum, ordinality) ON true
-    JOIN pg_catalog.pg_attribute attribute_row ON attribute_row.attrelid = table_class.oid AND attribute_row.attnum = key_column.attnum
     WHERE namespace_row.nspname = 'public'
       AND index_class.relname = 'forge_epic_172_release_evidence_consumptions_authorization_rece'
-    GROUP BY index_row.indisunique
   `
   const [oldAuthorizationIndex] = await sql<readonly { exists: boolean }[]>`
     SELECT pg_catalog.to_regclass('public.forge_epic_172_release_evidence_consumptions_authorization_idx') IS NOT NULL AS exists
@@ -319,29 +433,88 @@ async function exactMigrationLoginBoundary(sql: postgres.Sql | postgres.Transact
     && boundary.schemaGrants === 0 && boundary.routineGrants === 0
 }
 
-async function exactConsumerBoundary(sql: postgres.Sql | postgres.TransactionSql, repaired: boolean): Promise<boolean> {
-  const grants = await sql<readonly { grant: string }[]>`
-    SELECT relation.relname || '|' || privilege.privilege_type || ':' || privilege.is_grantable || ':' || grantor.rolname AS grant
+async function exactProtectedTableAcls(sql: postgres.Sql | postgres.TransactionSql, repaired: boolean): Promise<boolean> {
+  const grants = await sql<readonly { entry: string }[]>`
+    SELECT relation.relname || '|' || COALESCE(grantee.rolname, 'PUBLIC') || '|'
+      || privilege.privilege_type || '|' || privilege.is_grantable || '|' || grantor.rolname AS entry
     FROM pg_catalog.pg_class relation
     JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = relation.relnamespace
     CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(relation.relacl, pg_catalog.acldefault('r', relation.relowner))) privilege
-    JOIN pg_catalog.pg_roles grantee ON grantee.oid = privilege.grantee
+    LEFT JOIN pg_catalog.pg_roles grantee ON grantee.oid = privilege.grantee
     JOIN pg_catalog.pg_roles grantor ON grantor.oid = privilege.grantor
-    WHERE namespace_row.nspname = 'public' AND grantee.rolname = 'forge_release_evidence_consumer'
-    ORDER BY 1
+    WHERE namespace_row.nspname = 'public'
+      AND relation.relname = ANY(${sql.array([...protectedReleaseTables])}::text[])
   `
-  const expected = [
-    'forge_epic_172_release_evidence|SELECT:false:forge_release_routines_owner',
-    'forge_epic_172_release_evidence_consumptions|SELECT:false:forge_release_routines_owner',
-    'forge_epic_172_transition_authorizations|SELECT:false:forge_release_routines_owner',
-    'forge_release_signer_keys|SELECT:false:forge_release_routines_owner',
-  ]
-  if (repaired ? grants.length !== 0 : (grants.length !== expected.length || grants.some((grant, index) => grant.grant !== expected[index]))) return false
+  const ownerPrivileges = ['DELETE', 'INSERT', 'REFERENCES', 'SELECT', 'TRIGGER', 'TRUNCATE', 'UPDATE']
+  const writerSelect = new Set([
+    'forge_epic_172_release_evidence', 'forge_epic_172_transition_authorizations',
+    'forge_release_signer_key_lifecycle_audits', 'forge_release_signer_keys',
+  ])
+  const transitionSelect = new Set([
+    'forge_epic_172_enablement_state', 'forge_epic_172_enablement_transition_audits',
+    'forge_epic_172_release_evidence', 'forge_epic_172_release_evidence_consumptions',
+    'forge_epic_172_transition_authorizations', 'forge_release_signer_keys',
+  ])
+  const consumerSelect = new Set([
+    'forge_epic_172_release_evidence', 'forge_epic_172_release_evidence_consumptions',
+    'forge_epic_172_transition_authorizations', 'forge_release_signer_keys',
+  ])
+  const expected: string[] = []
+  for (const table of protectedReleaseTables) {
+    for (const privilege of ownerPrivileges) {
+      expected.push(`${table}|forge_release_routines_owner|${privilege}|false|forge_release_routines_owner`)
+    }
+    if (writerSelect.has(table)) expected.push(`${table}|forge_release_evidence_writer|SELECT|false|forge_release_routines_owner`)
+    if (transitionSelect.has(table)) expected.push(`${table}|forge_release_transition|SELECT|false|forge_release_routines_owner`)
+    if (!repaired && consumerSelect.has(table)) expected.push(`${table}|forge_release_evidence_consumer|SELECT|false|forge_release_routines_owner`)
+  }
+  const actual = grants.map((row) => row.entry).sort()
+  expected.sort()
+  if (actual.length !== expected.length || actual.some((entry, index) => entry !== expected[index])) return false
   const [ownership] = await sql<readonly { objects: number }[]>`
-    SELECT ((SELECT pg_catalog.count(*)::integer FROM pg_catalog.pg_class WHERE relowner = 'forge_release_evidence_consumer'::pg_catalog.regrole)
-      + (SELECT pg_catalog.count(*)::integer FROM pg_catalog.pg_proc WHERE proowner = 'forge_release_evidence_consumer'::pg_catalog.regrole)) AS objects
+    SELECT ((SELECT pg_catalog.count(*)::integer FROM pg_catalog.pg_class
+      WHERE relowner = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = 'forge_release_evidence_consumer'))
+      + (SELECT pg_catalog.count(*)::integer FROM pg_catalog.pg_proc
+        WHERE proowner = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = 'forge_release_evidence_consumer'))) AS objects
   `
   return ownership?.objects === 0
+}
+
+async function exactLegacyConsumerLocalAuthority(
+  sql: postgres.Sql | postgres.TransactionSql,
+  repaired: boolean,
+): Promise<boolean> {
+  const [authority] = await sql<readonly {
+    owned: number; relationGrants: number; routineGrants: number; schemaGrants: number; databaseGrants: number
+  }[]>`
+    WITH consumer AS (
+      SELECT oid FROM pg_catalog.pg_roles WHERE rolname = 'forge_release_evidence_consumer'
+    )
+    SELECT
+      ((SELECT pg_catalog.count(*)::integer FROM pg_catalog.pg_class WHERE relowner = (SELECT oid FROM consumer))
+       + (SELECT pg_catalog.count(*)::integer FROM pg_catalog.pg_proc WHERE proowner = (SELECT oid FROM consumer))
+       + (SELECT pg_catalog.count(*)::integer FROM pg_catalog.pg_namespace WHERE nspowner = (SELECT oid FROM consumer))
+       + (SELECT pg_catalog.count(*)::integer FROM pg_catalog.pg_database
+          WHERE datname = pg_catalog.current_database() AND datdba = (SELECT oid FROM consumer))) AS owned,
+      (SELECT pg_catalog.count(*)::integer FROM pg_catalog.pg_class relation
+       CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(relation.relacl, pg_catalog.acldefault('r', relation.relowner))) privilege
+       WHERE privilege.grantee = (SELECT oid FROM consumer)) AS "relationGrants",
+      (SELECT pg_catalog.count(*)::integer FROM pg_catalog.pg_proc routine
+       CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(routine.proacl, pg_catalog.acldefault('f', routine.proowner))) privilege
+       WHERE privilege.grantee = (SELECT oid FROM consumer)) AS "routineGrants",
+      (SELECT pg_catalog.count(*)::integer FROM pg_catalog.pg_namespace namespace_row
+       CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(namespace_row.nspacl, pg_catalog.acldefault('n', namespace_row.nspowner))) privilege
+       WHERE privilege.grantee = (SELECT oid FROM consumer)) AS "schemaGrants",
+      (SELECT pg_catalog.count(*)::integer FROM pg_catalog.pg_database database_row
+       CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(database_row.datacl, pg_catalog.acldefault('d', database_row.datdba))) privilege
+       WHERE database_row.datname = pg_catalog.current_database()
+         AND privilege.grantee = (SELECT oid FROM consumer)) AS "databaseGrants"
+  `
+  return authority?.owned === 0
+    && authority.relationGrants === (repaired ? 0 : 4)
+    && authority.routineGrants === 0
+    && authority.schemaGrants === 0
+    && authority.databaseGrants === 0
 }
 
 async function exactForgeSchemaAcl(sql: postgres.Sql | postgres.TransactionSql, inertS4: boolean): Promise<boolean> {
@@ -457,11 +630,13 @@ async function legacyFingerprint(sql: postgres.Sql | postgres.TransactionSql): P
       )
     ) AS ok
   `
-  if (result?.ok !== true || !await exactEmptyReleaseState(sql) || !await exactReleaseCatalog(sql, false) || !await exactMigrationLoginBoundary(sql) || !await exactConsumerBoundary(sql, false) || !await exactRoutines(sql, legacyRoutineDigests, false)) return false
+  if (result?.ok !== true || !await exactEmptyReleaseState(sql) || !await exactReleaseCatalog(sql, false)
+    || !await exactMigrationLoginBoundary(sql) || !await exactProtectedTableAcls(sql, false)
+    || !await exactLegacyConsumerLocalAuthority(sql, false) || !await exactRoutines(sql, legacyRoutineDigests, false, false)) return false
   // A first failed S4 bootstrap creates inert principals before it discovers
   // the missing Step 0 read routine.  Both that exact inert set and no S4
   // principals are safe; every other S4 state is an operator intervention.
-  return (await exactRoleBoundary(sql, false)) || (await exactRoleBoundary(sql, true))
+  return exactRoleBoundary(sql, true)
 }
 
 async function repairedFingerprint(sql: postgres.Sql | postgres.TransactionSql): Promise<boolean> {
@@ -483,8 +658,29 @@ async function repairedFingerprint(sql: postgres.Sql | postgres.TransactionSql):
     ) AS ok
   `
   if (result?.ok !== true || !await exactEmptyReleaseState(sql) || !await exactReleaseCatalog(sql, true)
-    || !await exactMigrationLoginBoundary(sql) || !await exactConsumerBoundary(sql, true) || !await exactRoutines(sql, repairedRoutineDigests, false)) return false
-  return (await exactRoleBoundary(sql, false)) || (await exactRoleBoundary(sql, true))
+    || !await exactMigrationLoginBoundary(sql) || !await exactProtectedTableAcls(sql, true)
+    || !await exactLegacyConsumerLocalAuthority(sql, true) || !await exactRoutines(sql, repairedRoutineDigests, false, false)) return false
+  return exactRoleBoundary(sql, true)
+}
+
+async function current0026Fingerprint(sql: postgres.Sql | postgres.TransactionSql): Promise<boolean> {
+  return await exactEmptyReleaseState(sql)
+    && await exactReleaseCatalog(sql, true)
+    && await exactMigrationLoginBoundary(sql)
+    && await exactProtectedTableAcls(sql, true)
+    && await exactRoutines(sql, repairedRoutineDigests, false, false)
+    && await exactRoleBoundary(sql, false)
+}
+
+async function durableRepairedFingerprint(sql: postgres.Sql | postgres.TransactionSql): Promise<boolean> {
+  // Later migrations legitimately add S4/S5 objects and may populate release
+  // state.  The stable repair receipt is therefore the complete protected S3
+  // catalog, ACL and routine surface plus the inert legacy consumer principal.
+  return await exactReleaseCatalog(sql, true)
+    && await exactProtectedTableAcls(sql, true)
+    && await exactLegacyConsumerLocalAuthority(sql, true)
+    && await exactRoutines(sql, repairedRoutineDigests, false, true)
+    && await exactReleaseRoleBoundary(sql, true)
 }
 
 async function loadRepairArtifact(): Promise<string> {
@@ -498,77 +694,97 @@ async function loadRepairArtifact(): Promise<string> {
 async function main(): Promise<void> {
   const client = postgres(process.env.FORGE_DATABASE_ADMIN_URL ?? getRequiredEnv('DATABASE_URL'), { max: 1, onnotice: () => {} })
   try {
-    const ledger = await client<readonly { hash: string; created_at: number }[]>`
-      SELECT hash, created_at FROM drizzle.__drizzle_migrations
-      WHERE created_at IN (${migration0023At}, ${migration0025At}) ORDER BY created_at
-    `
-    // postgres.js returns PostgreSQL bigint values as strings by default.
-    // Normalise the journal clock values before using them as Map keys.
-    const hashes = new Map(ledger.map((row) => [Number(row.created_at), row.hash]))
-    const isCurrent = hashes.get(migration0023At) === current0023 && hashes.get(migration0025At) === current0025
-    if (isCurrent) {
-      console.log('✓ Epic 172 legacy release repair is not needed.')
-      return
-    }
-    if (hashes.get(migration0023At) !== legacy0023 || hashes.get(migration0025At) !== legacy0025) {
-      throw new Error('Refusing legacy release repair: migration ledger is not the exact known 0023/0025 drift pair.')
-    }
-    const repairSql = await loadRepairArtifact()
-    let repaired = false
-    await client.begin(async (sql) => {
+    const outcome = await client.begin(async (sql) => {
+      // Classification belongs to the same critical section as repair.  This
+      // prevents an installer from accepting a journal shape that changed
+      // between an optimistic read and the migration-ledger lock.
       await sql.unsafe('LOCK TABLE drizzle.__drizzle_migrations IN SHARE ROW EXCLUSIVE MODE')
       const lockedLedger = await sql<readonly { hash: string; created_at: number }[]>`
-        SELECT hash, created_at FROM drizzle.__drizzle_migrations
-        WHERE created_at IN (${migration0023At}, ${migration0025At}, ${migration0026At})
-        ORDER BY created_at FOR UPDATE
+        SELECT hash, created_at
+        FROM drizzle.__drizzle_migrations
+        ORDER BY created_at
+        FOR UPDATE
       `
       const lockedHashes = new Map(lockedLedger.map((row) => [Number(row.created_at), row.hash]))
-      const [ledgerShape] = await sql<readonly { count: number; maxCreatedAt: number | null }[]>`
-        SELECT pg_catalog.count(*)::integer AS count, pg_catalog.max(created_at) AS "maxCreatedAt"
-        FROM drizzle.__drizzle_migrations
-      `
-      if (
-        lockedLedger.length !== 3
-        || ledgerShape?.count !== 27
-        || Number(ledgerShape.maxCreatedAt) !== migration0026At
-        || lockedHashes.get(migration0023At) !== legacy0023
-        || lockedHashes.get(migration0025At) !== legacy0025
-        || lockedHashes.get(migration0026At) !== current0026
-      ) {
-        throw new Error('Refusing legacy release repair: locked migration ledger no longer matches the exact known legacy position.')
+      const count = lockedLedger.length
+      const maxCreatedAt = count === 0 ? null : Number(lockedLedger[count - 1]?.created_at)
+      const pair = lockedHashes.get(migration0023At) === current0023
+        && lockedHashes.get(migration0025At) === current0025
+        ? 'current'
+        : lockedHashes.get(migration0023At) === legacy0023
+          && lockedHashes.get(migration0025At) === legacy0025
+          ? 'legacy'
+          : null
+      const position = count === 27 && maxCreatedAt === migration0026At
+        && lockedHashes.get(migration0026At) === current0026
+        ? '0026'
+        : count === 28 && maxCreatedAt === migration0027At
+          && lockedHashes.get(migration0026At) === current0026
+          && lockedHashes.get(migration0027At) === current0027
+          ? '0027'
+          : count === 29 && maxCreatedAt === migration0028At
+            && lockedHashes.get(migration0026At) === current0026
+            && lockedHashes.get(migration0027At) === current0027
+            && lockedHashes.get(migration0028At) === current0028
+            ? '0028'
+            : null
+      if (!pair || !position) {
+        throw new Error('Refusing legacy release repair: locked migration ledger is not an exact supported 0026, 0027, or 0028 position.')
       }
-      if (await repairedFingerprint(sql)) return
+
+      if (pair === 'current') {
+        if (position === '0026' && !await current0026Fingerprint(sql)) {
+          throw new Error('Refusing legacy release repair: current 0023/0025 hashes do not have the exact current 0026 catalog.')
+        }
+        return 'current' as const
+      }
+
+      if (position !== '0026') {
+        if (!await durableRepairedFingerprint(sql)) {
+          throw new Error('Refusing legacy release repair: a later legacy-hash ledger lacks the durable repaired catalog fingerprint.')
+        }
+        return 'later-repaired' as const
+      }
+
+      if (await repairedFingerprint(sql)) {
+        return 'already-repaired' as const
+      }
       if (!await legacyFingerprint(sql)) {
         throw new Error('Refusing legacy release repair: physical catalog fingerprint is not the exact known legacy state.')
       }
+
+      const repairSql = await loadRepairArtifact()
       await sql.unsafe(repairSql)
       const ledgerAfter = await sql<readonly { hash: string; created_at: number }[]>`
-        SELECT hash, created_at FROM drizzle.__drizzle_migrations
-        WHERE created_at IN (${migration0023At}, ${migration0025At}, ${migration0026At})
+        SELECT hash, created_at
+        FROM drizzle.__drizzle_migrations
         ORDER BY created_at
       `
-      const hashesAfter = new Map(ledgerAfter.map((row) => [Number(row.created_at), row.hash]))
-      if (
-        ledgerAfter.length !== 3
-        || hashesAfter.get(migration0023At) !== legacy0023
-        || hashesAfter.get(migration0025At) !== legacy0025
-        || hashesAfter.get(migration0026At) !== current0026
-      ) {
+      if (ledgerAfter.length !== lockedLedger.length || ledgerAfter.some((row, index) => (
+        row.hash !== lockedLedger[index]?.hash
+        || Number(row.created_at) !== Number(lockedLedger[index]?.created_at)
+      ))) {
         throw new Error('Legacy release repair unexpectedly altered the immutable migration ledger.')
       }
       if (!await repairedFingerprint(sql)) {
         throw new Error('Legacy release repair did not produce the exact repaired catalog fingerprint.')
       }
-      repaired = true
+      return 'repaired' as const
     })
-    console.log(repaired
-      ? '✓ Repaired the exact known Epic 172 legacy release catalog drift without altering the migration ledger.'
-      : '✓ Epic 172 legacy release catalog is already repaired; migration ledger was left unchanged.')
+
+    if (outcome === 'repaired') {
+      console.log('✓ Repaired the exact known Epic 172 legacy release catalog drift without altering the migration ledger.')
+    } else if (outcome === 'already-repaired') {
+      console.log('✓ Epic 172 legacy release catalog is already repaired at 0026; migration ledger was left unchanged.')
+    } else if (outcome === 'later-repaired') {
+      console.log('✓ Durable Epic 172 legacy release repair is present at the later migration position; migration ledger was left unchanged.')
+    } else {
+      console.log('✓ Epic 172 legacy release repair is not needed.')
+    }
   } finally {
     await client.end({ timeout: 5 })
   }
 }
-
 main().catch((error) => {
   console.error(`✗ ${error instanceof Error ? error.message : String(error)}`)
   process.exit(1)

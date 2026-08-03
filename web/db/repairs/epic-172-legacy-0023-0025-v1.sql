@@ -935,89 +935,6 @@ BEGIN
 END;
 $$;
 --> statement-breakpoint
-CREATE OR REPLACE FUNCTION forge.consume_epic_172_release_evidence_v1(
-  p_receipt_id uuid,
-  p_authorization_id uuid,
-  p_consumer_node text,
-  p_transition_identity_digest text,
-  p_operation_id text
-)
-RETURNS TABLE (consumption_id uuid, consumed_at timestamptz)
-LANGUAGE plpgsql
-SECURITY DEFINER
-SET search_path = pg_catalog, public
-AS $$
-DECLARE
-  v_now timestamptz := pg_catalog.clock_timestamp();
-  v_receipt public.forge_epic_172_release_evidence%ROWTYPE;
-  v_authorization public.forge_epic_172_transition_authorizations%ROWTYPE;
-  v_receipt_key public.forge_release_signer_keys%ROWTYPE;
-  v_authorization_key public.forge_release_signer_keys%ROWTYPE;
-BEGIN
-  IF session_user <> 'forge_release_transition' THEN
-    RAISE EXCEPTION 'Epic 172 evidence consumption requires the dedicated transition login'
-      USING ERRCODE = '42501';
-  END IF;
-
-  PERFORM pg_catalog.pg_advisory_xact_lock(
-    pg_catalog.hashtextextended('forge:epic-172:consumption:receipt:' || p_receipt_id::text, 0)
-  );
-  PERFORM pg_catalog.pg_advisory_xact_lock(
-    pg_catalog.hashtextextended('forge:epic-172:consumption:identity:' || p_transition_identity_digest || ':' || p_consumer_node, 0)
-  );
-
-  SELECT * INTO STRICT v_receipt
-  FROM public.forge_epic_172_release_evidence
-  WHERE id = p_receipt_id
-  FOR KEY SHARE;
-  SELECT * INTO STRICT v_authorization
-  FROM public.forge_epic_172_transition_authorizations
-  WHERE id = p_authorization_id
-  FOR KEY SHARE;
-  SELECT * INTO STRICT v_receipt_key
-  FROM public.forge_release_signer_keys
-  WHERE id = v_receipt.signer_key_id
-  FOR UPDATE;
-  IF v_authorization.signer_key_id = v_receipt.signer_key_id THEN
-    v_authorization_key := v_receipt_key;
-  ELSE
-    SELECT * INTO STRICT v_authorization_key
-    FROM public.forge_release_signer_keys
-    WHERE id = v_authorization.signer_key_id
-    FOR UPDATE;
-  END IF;
-
-  IF v_authorization.transition_identity_digest <> p_transition_identity_digest
-     OR v_authorization.target_node <> p_consumer_node
-     OR v_authorization.operation_id <> p_operation_id
-     OR NOT v_authorization.source_receipt_ids @> pg_catalog.jsonb_build_array(p_receipt_id::text)
-     OR v_authorization.controller_login_id = ''
-     OR v_receipt.signer_generation <> v_receipt_key.generation
-     OR v_authorization.signer_generation <> v_authorization_key.generation
-     OR v_receipt.github_app_id <> v_receipt_key.github_app_id
-     OR v_receipt.issued_at < v_receipt_key.valid_from
-     OR v_receipt.issued_at >= v_receipt_key.valid_until
-     OR (v_receipt_key.retirement_started_at IS NOT NULL AND v_receipt.issued_at >= v_receipt_key.retirement_started_at)
-     OR v_authorization.issued_at < v_authorization_key.valid_from
-     OR v_authorization.issued_at >= v_authorization_key.valid_until
-     OR (v_authorization_key.retirement_started_at IS NOT NULL AND v_authorization.issued_at >= v_authorization_key.retirement_started_at)
-     OR v_now >= v_authorization.expires_at THEN
-    RAISE EXCEPTION 'Epic 172 receipt and authorization are not an exact live transition binding'
-      USING ERRCODE = '22023';
-  END IF;
-
-  RETURN QUERY
-  INSERT INTO public.forge_epic_172_release_evidence_consumptions (
-    receipt_id, transition_identity_digest, authorization_id, consumer_node,
-    operation_id, actor, consumed_at
-  ) VALUES (
-    p_receipt_id, v_receipt.transition_identity_digest, p_authorization_id,
-    p_consumer_node, p_operation_id, v_authorization.controller_login_id, v_now
-  )
-  RETURNING id, forge_epic_172_release_evidence_consumptions.consumed_at;
-END;
-$$;
---> statement-breakpoint
 CREATE OR REPLACE FUNCTION forge.assert_epic_172_transition_authorization_live_v1(
   p_authorization_id uuid,
   p_operation_id text
@@ -1051,8 +968,6 @@ ALTER FUNCTION forge.record_epic_172_release_evidence_v1(uuid,text,integer,text,
   OWNER TO forge_release_routines_owner;
 ALTER FUNCTION forge.record_epic_172_transition_authorization_v1(uuid,text,text,jsonb,text,integer,text,jsonb,text,bigint,text,text,text,text,uuid,bigint,text,bytea,uuid,timestamptz,timestamptz,jsonb)
   OWNER TO forge_release_routines_owner;
-ALTER FUNCTION forge.consume_epic_172_release_evidence_v1(uuid,uuid,text,text,text)
-  OWNER TO forge_release_routines_owner;
 ALTER FUNCTION forge.assert_epic_172_transition_authorization_live_v1(uuid,text)
   OWNER TO forge_release_routines_owner;
 ALTER FUNCTION forge.install_epic_172_release_signer_v1(uuid,bigint,bytea,text,text,timestamptz,timestamptz,text,text)
@@ -1077,8 +992,6 @@ ALTER FUNCTION forge.constant_time_equal_32_v1(bytea,bytea)
 REVOKE ALL ON FUNCTION forge.record_epic_172_release_evidence_v1(uuid,text,integer,text,jsonb,jsonb,text,bigint,jsonb,text,text,uuid,bigint,text,text,text,text,bytea,uuid,timestamptz,jsonb)
   FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.record_epic_172_transition_authorization_v1(uuid,text,text,jsonb,text,integer,text,jsonb,text,bigint,text,text,text,text,uuid,bigint,text,bytea,uuid,timestamptz,timestamptz,jsonb)
-  FROM PUBLIC;
-REVOKE ALL ON FUNCTION forge.consume_epic_172_release_evidence_v1(uuid,uuid,text,text,text)
   FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.assert_epic_172_transition_authorization_live_v1(uuid,text)
   FROM PUBLIC;
@@ -1106,8 +1019,6 @@ GRANT EXECUTE ON FUNCTION forge.record_epic_172_release_evidence_v1(uuid,text,in
   TO forge_release_evidence_writer;
 GRANT EXECUTE ON FUNCTION forge.record_epic_172_transition_authorization_v1(uuid,text,text,jsonb,text,integer,text,jsonb,text,bigint,text,text,text,text,uuid,bigint,text,bytea,uuid,timestamptz,timestamptz,jsonb)
   TO forge_release_evidence_writer;
-GRANT EXECUTE ON FUNCTION forge.consume_epic_172_release_evidence_v1(uuid,uuid,text,text,text)
-  TO forge_release_transition;
 GRANT EXECUTE ON FUNCTION forge.assert_epic_172_transition_authorization_live_v1(uuid,text)
   TO forge_release_transition;
 GRANT EXECUTE ON FUNCTION forge.install_epic_172_release_signer_v1(uuid,bigint,bytea,text,text,timestamptz,timestamptz,text,text)
