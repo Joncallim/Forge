@@ -11,6 +11,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 WEB_DIR="$REPO_ROOT/web"
+FORGE_PRIVILEGE_SQL="$SCRIPT_DIR/reconcile-forge-app-privileges.sql"
 
 DRY_RUN=0
 SKIP_INSTALL=0
@@ -225,6 +226,23 @@ load_database_url_from_local_fallbacks() {
   done
 }
 
+reconcile_forge_privileges() {
+  local database_name="${1:-forge}"
+  case "$database_name" in
+    ''|*[!A-Za-z0-9_]*) die "unsafe local database name for privilege reconciliation" ;;
+  esac
+
+  command -v psql >/dev/null 2>&1 || return 0
+  psql -d postgres -tAc 'SELECT 1' >/dev/null 2>&1 || return 0
+  if psql -d postgres -d "$database_name" --set ON_ERROR_STOP=1 \
+    --file "$FORGE_PRIVILEGE_SQL" >/dev/null 2>&1; then
+    info "Ensured the forge role can read ordinary forge tables without protected-table DML access."
+  else
+    warn "Could not transactionally refresh forge app privileges (non-fatal). Re-run 'forge repair' after checking PostgreSQL administrator access."
+  fi
+  return 0
+}
+
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --dry-run) DRY_RUN=1 ;;
@@ -242,6 +260,11 @@ while [ "$#" -gt 0 ]; do
   esac
   shift
 done
+
+if [ "${FORGE_REPAIR_TEST_HOOK:-}" = "reconcile-forge-privileges" ]; then
+  reconcile_forge_privileges "${FORGE_REPAIR_TEST_DATABASE_NAME:-forge}"
+  exit 0
+fi
 
 [ -f "$WEB_DIR/package.json" ] || die "could not find web/package.json under $REPO_ROOT"
 
@@ -295,16 +318,11 @@ else
   warn "DATABASE_URL is not set; skipping database migrations."
 fi
 
-# If a migration was ever applied by a non-forge role, newer tables (e.g. the
-# filesystem MCP audit tables) become unreadable to the forge app role, which the
-# app logs as "table is not readable". When a local admin psql connection is
-# reachable, re-grant table privileges to forge so those tables are readable
-# again. Best-effort: no admin connection means we leave the database untouched.
-if [ "$SKIP_MIGRATE" != "1" ] && command -v psql >/dev/null 2>&1 \
-  && psql -d postgres -tAc 'SELECT 1' >/dev/null 2>&1; then
-  if psql -d postgres -d forge -c 'GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO forge; GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO forge;' >/dev/null 2>&1; then
-    info "Ensured the forge role can read all forge tables."
-  fi
+# A local administrator can restore ordinary app-table access without opening
+# direct DML access to protected owner tables. Best-effort: no administrator
+# connection leaves the database untouched.
+if [ "$SKIP_MIGRATE" != "1" ]; then
+  reconcile_forge_privileges forge
 fi
 
 if [ "$SKIP_DOCTOR" = "1" ]; then

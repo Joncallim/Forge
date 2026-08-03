@@ -4,6 +4,8 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALLER="$SCRIPT_DIR/install.sh"
+REPAIR="$SCRIPT_DIR/repair.sh"
+PRIVILEGE_SQL="$SCRIPT_DIR/reconcile-forge-app-privileges.sql"
 TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/forge-managed-migrations.XXXXXX")"
 trap 'rm -rf "$TEST_ROOT"' EXIT
 TEST_SECRET='TEST_APP_DATABASE_URL_MUST_NOT_APPEAR'
@@ -35,23 +37,49 @@ sed -n '/^grant_forge_privileges() {/,/^}/p' "$INSTALLER" > "$grant_function"
 assert_contains "trap 'on_error" "$INSTALLER"
 assert_contains '--set ON_ERROR_STOP=1' "$grant_function"
 assert_contains 'trap - ERR' "$grant_function"
-assert_contains 'ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO forge;' "$grant_function"
-assert_contains 'ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO forge;' "$grant_function"
-assert_contains "owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner')" "$grant_function"
-assert_contains 'FOR UPDATE OF relation;' "$grant_function"
-assert_contains 'FOR UPDATE OF attribute;' "$grant_function"
-assert_contains "'REVOKE ALL PRIVILEGES ON TABLE %I.%I FROM forge'" "$grant_function"
-assert_contains "'REVOKE ALL PRIVILEGES (%s) ON TABLE %I.%I FROM forge'" "$grant_function"
-assert_contains 'public.work_package_local_projection_sources,' "$grant_function"
-assert_contains 'public.work_package_local_projection_heads' "$grant_function"
-assert_contains "RAISE EXCEPTION 'forge retained unexpected protected table or column authority'" "$grant_function"
-assert_not_contains 'public.forge_epic_172_enablement_state,' "$grant_function"
-assert_not_contains 'projection_count' "$grant_function"
-grant_function_sql="$(tr '\n' ' ' < "$grant_function")"
-case "$grant_function_sql" in
-  *'BEGIN;'*'FOR UPDATE OF relation;'*'FOR UPDATE OF attribute;'*'GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO forge;'*'REVOKE ALL PRIVILEGES ON TABLE'*'GRANT SELECT ON TABLE'*'COMMIT;'*) ;;
+assert_contains '--file "$FORGE_PRIVILEGE_SQL"' "$grant_function"
+assert_contains "Re-run 'forge upgrade'" "$grant_function"
+assert_not_contains "Re-run 'forge repair'" "$grant_function"
+assert_contains '--file "$FORGE_PRIVILEGE_SQL"' "$REPAIR"
+assert_contains "Re-run 'forge repair'" "$REPAIR"
+assert_contains 'GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO forge;' "$PRIVILEGE_SQL"
+assert_contains 'GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO forge;' "$PRIVILEGE_SQL"
+assert_contains "owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner')" "$PRIVILEGE_SQL"
+assert_contains 'FOR UPDATE OF relation;' "$PRIVILEGE_SQL"
+assert_contains 'FOR UPDATE OF attribute;' "$PRIVILEGE_SQL"
+assert_contains "'REVOKE ALL PRIVILEGES ON TABLE %I.%I FROM forge'" "$PRIVILEGE_SQL"
+assert_contains "'REVOKE ALL PRIVILEGES (%s) ON TABLE %I.%I FROM forge'" "$PRIVILEGE_SQL"
+assert_contains 'public.work_package_local_projection_sources,' "$PRIVILEGE_SQL"
+assert_contains 'public.work_package_local_projection_heads' "$PRIVILEGE_SQL"
+assert_contains "RAISE EXCEPTION 'forge retained unexpected protected table or column authority'" "$PRIVILEGE_SQL"
+assert_contains "RAISE EXCEPTION 'fixed protected owner inventory is incomplete or has ownership drift'" "$PRIVILEGE_SQL"
+assert_contains "RAISE EXCEPTION 'forge app role is not a safe or known legacy login'" "$PRIVILEGE_SQL"
+assert_contains 'ALTER ROLE forge NOINHERIT;' "$PRIVILEGE_SQL"
+assert_not_contains 'public.forge_epic_172_enablement_state,' "$PRIVILEGE_SQL"
+assert_not_contains 'projection_count' "$PRIVILEGE_SQL"
+broad_grant_sources="$(grep -lF 'GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO forge;' \
+  "$INSTALLER" "$REPAIR" "$PRIVILEGE_SQL" || true)"
+[ "$broad_grant_sources" = "$PRIVILEGE_SQL" ] \
+  || fail 'the shared reconciliation SQL must be the only broad table-GRANT source'
+privilege_sql="$(tr '\n' ' ' < "$PRIVILEGE_SQL")"
+case "$privilege_sql" in
+  *'BEGIN;'*'fixed protected owner inventory is incomplete or has ownership drift'*'ALTER ROLE forge NOINHERIT;'*'FOR UPDATE OF relation;'*'FOR UPDATE OF attribute;'*'GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO forge;'*'REVOKE ALL PRIVILEGES ON TABLE'*'GRANT SELECT ON TABLE'*'COMMIT;'*) ;;
   *) fail 'forge app grants and owner-driven protected reconciliation must share one ordered transaction' ;;
 esac
+
+sql_owner_map="$TEST_ROOT/sql-owner-map"
+ts_owner_map="$TEST_ROOT/ts-owner-map"
+sed -n '/canonical-protected-owner-map-begin/,/canonical-protected-owner-map-end/p' "$PRIVILEGE_SQL" \
+  | sed -n "s/^  ('\([^']*\)', '\([^']*\)').*/\1|\2/p" | sort > "$sql_owner_map"
+sed -n '/canonical-protected-owner-map-begin/,/canonical-protected-owner-map-end/p' \
+  "$SCRIPT_DIR/../web/scripts/repair-epic-172-legacy-release.ts" \
+  | sed -n "s/^  { name: '\([^']*\)', owner: \([^,]*\),.*/\1|\2/p" \
+  | sed 's/|releaseOwner$/|forge_release_routines_owner/; s/|s4Owner$/|forge_s4_routines_owner/' \
+  | sort > "$ts_owner_map"
+[ "$(wc -l < "$sql_owner_map" | tr -d '[:space:]')" = 37 ] \
+  || fail 'shared SQL must define the exact 37-table protected owner map'
+cmp -s "$sql_owner_map" "$ts_owner_map" \
+  || fail 'shared SQL and legacy normalizer protected owner maps drifted'
 
 provision_function="$TEST_ROOT/provision-database"
 sed -n '/^provision_database() {/,/^}/p' "$INSTALLER" > "$provision_function"
@@ -59,11 +87,69 @@ assert_contains 'CREATE ROLE forge LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREA
 assert_contains 'ALTER ROLE forge LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD' "$provision_function"
 assert_contains "FROM pg_catalog.pg_auth_members WHERE roleid = 'forge'::pg_catalog.regrole OR member = 'forge'::pg_catalog.regrole" "$provision_function"
 assert_contains 'Role forge has membership edges.' "$provision_function"
+assert_contains 'Role forge is outside the safe or known legacy app-role boundary' "$provision_function"
 provision_function_sql="$(tr '\n' ' ' < "$provision_function")"
 case "$provision_function_sql" in
-  *'pg_catalog.pg_auth_members'*'ALTER ROLE forge LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD'*) ;;
-  *) fail 'existing forge membership refusal must precede role hardening' ;;
+  *'pg_catalog.pg_auth_members'*'role_normalizable='*'ALTER ROLE forge LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD'*) ;;
+  *) fail 'existing forge membership and role-shape refusal must precede role hardening' ;;
 esac
+
+psql_status_case="$TEST_ROOT/psql-status"
+mkdir -p "$psql_status_case/bin"
+cat > "$psql_status_case/bin/psql" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FORGE_TEST_PSQL_CALLS"
+case "$*" in
+  *'-tAc SELECT 1'*) exit 0 ;;
+  *) exit 73 ;;
+esac
+EOF
+chmod +x "$psql_status_case/bin/psql"
+: > "$psql_status_case/calls"
+set +e
+PATH="$psql_status_case/bin:$PATH" \
+  FORGE_TEST_PSQL_CALLS="$psql_status_case/calls" \
+  FORGE_INSTALL_STATE_DIR="$psql_status_case/grant-state" \
+  FORGE_WORKSPACE_ROOT="$psql_status_case/grant-workspace" \
+  FORGE_ENV_FILE="$psql_status_case/grant.env" \
+  bash -c '
+    export FORGE_INSTALL_LIBRARY=1
+    source "$1"
+    SERVICE_MODE=native
+    MANAGE_LOCAL_DB=1
+    DRY_RUN=0
+    if psql_admin -c "SELECT wrapper_failure"; then
+      printf "unexpected psql_admin success\n"
+      exit 65
+    else
+      printf "psql-admin-status=%s\n" "$?"
+    fi
+    grant_forge_privileges
+    printf "grant-return=%s\n" "$?"
+  ' _ "$INSTALLER" > "$psql_status_case/grant-stdout" 2> "$psql_status_case/grant-stderr"
+grant_status=$?
+set -e
+[ "$grant_status" -eq 0 ] || fail 'grant refresh psql failure must remain non-fatal'
+assert_contains 'psql-admin-status=73' "$psql_status_case/grant-stdout"
+assert_contains 'grant-return=0' "$psql_status_case/grant-stdout"
+assert_contains 'Could not transactionally refresh forge app privileges (non-fatal).' "$psql_status_case/grant-stdout"
+assert_contains "Re-run 'forge upgrade'" "$psql_status_case/grant-stdout"
+assert_not_contains 'Ensured the forge role can read and write ordinary forge tables' "$psql_status_case/grant-stdout"
+assert_not_contains 'unexpected psql_admin success' "$psql_status_case/grant-stdout"
+
+set +e
+PATH="$psql_status_case/bin:$PATH" \
+  FORGE_TEST_PSQL_CALLS="$psql_status_case/calls" \
+  FORGE_INSTALL_STATE_DIR="$psql_status_case/fatal-state" \
+  FORGE_WORKSPACE_ROOT="$psql_status_case/fatal-workspace" \
+  FORGE_ENV_FILE="$psql_status_case/fatal.env" \
+  bash -c 'export FORGE_INSTALL_LIBRARY=1; source "$1"; psql_admin -c "SELECT fatal_wrapper_failure"; printf "unexpected continuation\n"' \
+  _ "$INSTALLER" > "$psql_status_case/fatal-stdout" 2> "$psql_status_case/fatal-stderr"
+fatal_psql_status=$?
+set -e
+[ "$fatal_psql_status" -ne 0 ] || fail 'ordinary psql_admin failures must remain fatal'
+assert_contains 'Installer failed near line' "$psql_status_case/fatal-stderr"
+assert_not_contains 'unexpected continuation' "$psql_status_case/fatal-stdout"
 
 global_err_case="$TEST_ROOT/global-err-trap"
 mkdir -p "$global_err_case"

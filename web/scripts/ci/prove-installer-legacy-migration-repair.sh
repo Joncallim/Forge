@@ -226,36 +226,62 @@ SQL
 }
 
 grant_exact_forge_contamination() {
+  # Reproduce the old installer exactly: its administrator broadly granted CRUD
+  # after migrations, so PostgreSQL records each protected grant from its owner.
   admin_psql <<'SQL'
-SET ROLE forge_release_routines_owner;
-GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE
-  public.forge_epic_172_enablement_state,
-  public.forge_epic_172_enablement_transition_audits,
-  public.forge_epic_172_release_evidence,
-  public.forge_epic_172_release_evidence_consumptions,
-  public.forge_epic_172_transition_authorizations,
-  public.forge_release_signer_key_lifecycle_audits,
-  public.forge_release_signer_keys,
-  public.forge_epic_172_s3_release_state
-TO forge;
-RESET ROLE;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO forge;
 SQL
 }
 
 revoke_forge_contamination() {
   admin_psql <<'SQL'
-SET ROLE forge_release_routines_owner;
-REVOKE ALL ON TABLE
-  public.forge_epic_172_enablement_state,
-  public.forge_epic_172_enablement_transition_audits,
-  public.forge_epic_172_release_evidence,
-  public.forge_epic_172_release_evidence_consumptions,
-  public.forge_epic_172_transition_authorizations,
-  public.forge_release_signer_key_lifecycle_audits,
-  public.forge_release_signer_keys,
-  public.forge_epic_172_s3_release_state
-FROM forge;
-RESET ROLE;
+DO $cleanup$
+DECLARE
+  protected_relation record;
+  protected_columns text;
+BEGIN
+  FOR protected_relation IN
+    SELECT namespace_row.nspname AS schema_name, relation.relname AS relation_name, relation.oid
+    FROM pg_catalog.pg_class relation
+    JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = relation.relnamespace
+    JOIN pg_catalog.pg_roles owner_role ON owner_role.oid = relation.relowner
+    WHERE namespace_row.nspname = 'public'
+      AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
+      AND owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner')
+    ORDER BY relation.oid
+  LOOP
+    EXECUTE pg_catalog.format(
+      'REVOKE ALL PRIVILEGES ON TABLE %I.%I FROM forge',
+      protected_relation.schema_name,
+      protected_relation.relation_name
+    );
+    SELECT pg_catalog.string_agg(pg_catalog.format('%I', attribute.attname), ', ' ORDER BY attribute.attnum)
+    INTO protected_columns
+    FROM pg_catalog.pg_attribute attribute
+    WHERE attribute.attrelid = protected_relation.oid
+      AND attribute.attnum > 0
+      AND NOT attribute.attisdropped;
+    IF protected_columns IS NOT NULL THEN
+      EXECUTE pg_catalog.format(
+        'REVOKE ALL PRIVILEGES (%s) ON TABLE %I.%I FROM forge',
+        protected_columns,
+        protected_relation.schema_name,
+        protected_relation.relation_name
+      );
+    END IF;
+  END LOOP;
+END;
+$cleanup$;
+SQL
+}
+
+restore_canonical_forge_boundary() {
+  revoke_forge_contamination
+  admin_psql <<'SQL'
+GRANT SELECT ON TABLE
+  public.work_package_local_projection_sources,
+  public.work_package_local_projection_heads
+TO forge;
 SQL
 }
 
@@ -264,55 +290,59 @@ assert_protected_forge_acl_count() {
   local actual_count exact_live_count
   actual_count="$(admin_psql --no-align --tuples-only --quiet --command "
   SELECT count(*)
-  FROM pg_catalog.pg_class table_row
-  JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = table_row.relnamespace
+  FROM pg_catalog.pg_class relation
+  JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = relation.relnamespace
+  JOIN pg_catalog.pg_roles owner_role ON owner_role.oid = relation.relowner
   CROSS JOIN LATERAL pg_catalog.aclexplode(
-    COALESCE(table_row.relacl, pg_catalog.acldefault('r', table_row.relowner))
+    COALESCE(relation.relacl, pg_catalog.acldefault('r', relation.relowner))
   ) privilege
   JOIN pg_catalog.pg_roles grantee ON grantee.oid = privilege.grantee
   WHERE namespace_row.nspname = 'public'
-    AND table_row.relname IN (
-      'forge_epic_172_enablement_state',
-      'forge_epic_172_enablement_transition_audits',
-      'forge_epic_172_release_evidence',
-      'forge_epic_172_release_evidence_consumptions',
-      'forge_epic_172_transition_authorizations',
-      'forge_release_signer_key_lifecycle_audits',
-      'forge_release_signer_keys',
-      'forge_epic_172_s3_release_state'
-    )
+    AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
+    AND owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner')
     AND grantee.rolname = 'forge';")"
   [ "$actual_count" = "$expected_count" ] || {
     echo "Expected $expected_count protected forge ACL rows, found $actual_count." >&2
     exit 1
   }
-  if [ "$expected_count" = 32 ]; then
+  if [ "$expected_count" = 148 ]; then
     exact_live_count="$(admin_psql --no-align --tuples-only --quiet --command "
     SELECT count(*)
-    FROM pg_catalog.pg_class table_row
-    JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = table_row.relnamespace
+    FROM pg_catalog.pg_class relation
+    JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = relation.relnamespace
+    JOIN pg_catalog.pg_roles owner_role ON owner_role.oid = relation.relowner
     CROSS JOIN LATERAL pg_catalog.aclexplode(
-      COALESCE(table_row.relacl, pg_catalog.acldefault('r', table_row.relowner))
+      COALESCE(relation.relacl, pg_catalog.acldefault('r', relation.relowner))
     ) privilege
     JOIN pg_catalog.pg_roles grantee ON grantee.oid = privilege.grantee
-    JOIN pg_catalog.pg_roles grantor ON grantor.oid = privilege.grantor
     WHERE namespace_row.nspname = 'public'
-      AND table_row.relname IN (
-        'forge_epic_172_enablement_state',
-        'forge_epic_172_enablement_transition_audits',
-        'forge_epic_172_release_evidence',
-        'forge_epic_172_release_evidence_consumptions',
-        'forge_epic_172_transition_authorizations',
-        'forge_release_signer_key_lifecycle_audits',
-        'forge_release_signer_keys',
-        'forge_epic_172_s3_release_state'
-      )
+      AND relation.relkind IN ('r', 'p')
+      AND owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner')
       AND grantee.rolname = 'forge'
       AND privilege.privilege_type IN ('DELETE', 'INSERT', 'SELECT', 'UPDATE')
       AND NOT privilege.is_grantable
-      AND grantor.rolname = 'forge_release_routines_owner';")"
-    [ "$exact_live_count" = 32 ] || {
-      echo "Exact installer contamination expected 32 owner-granted ACL rows, found $exact_live_count." >&2
+      AND privilege.grantor = relation.relowner;")"
+    [ "$exact_live_count" = 148 ] || {
+      echo "Exact installer contamination expected 148 owner-granted ACL rows, found $exact_live_count." >&2
+      exit 1
+    }
+  elif [ "$expected_count" = 2 ]; then
+    exact_live_count="$(admin_psql --no-align --tuples-only --quiet --command "
+    SELECT count(*)
+    FROM pg_catalog.pg_class relation
+    JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = relation.relnamespace
+    CROSS JOIN LATERAL pg_catalog.aclexplode(
+      COALESCE(relation.relacl, pg_catalog.acldefault('r', relation.relowner))
+    ) privilege
+    JOIN pg_catalog.pg_roles grantee ON grantee.oid = privilege.grantee
+    WHERE namespace_row.nspname = 'public'
+      AND relation.relname IN ('work_package_local_projection_sources', 'work_package_local_projection_heads')
+      AND grantee.rolname = 'forge'
+      AND privilege.privilege_type = 'SELECT'
+      AND NOT privilege.is_grantable
+      AND privilege.grantor = relation.relowner;")"
+    [ "$exact_live_count" = 2 ] || {
+      echo "Canonical projection boundary expected two exact SELECT grants, found $exact_live_count." >&2
       exit 1
     }
   fi
@@ -349,6 +379,17 @@ run_installer_grant_privileges() {
     }
     grant_forge_privileges
   )
+}
+
+run_repair_grant_privileges() {
+  local label="$1"
+  PGPASSWORD="$FORGE_LEGACY_REPAIR_ADMIN_PASSWORD" \
+    PGHOST="$FORGE_LEGACY_REPAIR_ADMIN_HOST" \
+    PGUSER="$FORGE_LEGACY_REPAIR_ADMIN_USER" \
+    PGDATABASE="$FORGE_LEGACY_REPAIR_ADMIN_DATABASE" \
+    FORGE_REPAIR_TEST_HOOK=reconcile-forge-privileges \
+    FORGE_REPAIR_TEST_DATABASE_NAME="$FORGE_LEGACY_REPAIR_ADMIN_DATABASE" \
+    bash "$REPO_ROOT/scripts/repair.sh" > "$TEMP_ROOT/$label.log" 2>&1
 }
 
 assert_no_direct_forge_app_authority() {
@@ -907,15 +948,22 @@ assert_unchanged repaired-0027-before repaired-0027-after 'Repaired 0027 no-op'
 
 ensure_forge_app_role
 grant_exact_forge_contamination
+assert_protected_forge_acl_count 148
 snapshot contaminated-0027-before
 expect_refusal 'Exact installer-grant contamination at 0027'
 snapshot contaminated-0027-after
 assert_unchanged contaminated-0027-before contaminated-0027-after 'Exact installer-grant contamination at 0027 refusal'
 revoke_forge_contamination
 
-echo 'Proving the full managed sequence is stable at latest when run twice.'
+echo 'Proving the full managed sequence normalizes once and is then stable at latest.'
+run_managed_sequence
+# A real legacy install ran the broad app grant after reaching latest. Recreate
+# that state before the next upgrade so the 0028 normalizer sees a real shape.
+grant_exact_forge_contamination
+assert_protected_forge_acl_count 148
 run_managed_sequence
 snapshot managed-latest-once
+assert_protected_forge_acl_count 2
 run_managed_sequence
 snapshot managed-latest-twice
 assert_unchanged managed-latest-once managed-latest-twice 'Managed latest rerun'
@@ -938,8 +986,14 @@ SQL
 
 echo 'Proving exact installer-grant normalization and near-miss refusal at the 29-row ledger.'
 ensure_forge_app_role
+admin_psql <<'SQL'
+CREATE TABLE public.forge_legacy_ordinary_acl_probe (
+  id integer PRIMARY KEY,
+  value text NOT NULL
+);
+SQL
 grant_exact_forge_contamination
-assert_protected_forge_acl_count 32
+assert_protected_forge_acl_count 148
 snapshot exact-installer-contamination-before
 run_repair
 snapshot exact-installer-contamination-after
@@ -947,7 +1001,28 @@ cmp -s "$TEMP_ROOT/exact-installer-contamination-before.ledger" "$TEMP_ROOT/exac
   echo 'Installer-grant normalization changed the immutable migration ledger.' >&2
   exit 1
 }
-assert_protected_forge_acl_count 0
+assert_protected_forge_acl_count 2
+admin_psql <<'SQL'
+DO $proof$
+BEGIN
+  IF (
+    SELECT count(*)
+    FROM pg_catalog.pg_class relation
+    JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = relation.relnamespace
+    CROSS JOIN LATERAL pg_catalog.aclexplode(
+      COALESCE(relation.relacl, pg_catalog.acldefault('r', relation.relowner))
+    ) privilege
+    WHERE namespace_row.nspname = 'public'
+      AND relation.relname = 'forge_legacy_ordinary_acl_probe'
+      AND privilege.grantee = 'forge'::pg_catalog.regrole
+      AND privilege.privilege_type IN ('DELETE', 'INSERT', 'SELECT', 'UPDATE')
+      AND NOT privilege.is_grantable
+  ) <> 4 THEN
+    RAISE EXCEPTION 'Legacy normalization removed ordinary table CRUD grants';
+  END IF;
+END;
+$proof$;
+SQL
 run_repair
 snapshot exact-installer-contamination-rerun
 assert_unchanged exact-installer-contamination-after exact-installer-contamination-rerun 'Normalized installer-grant rerun'
@@ -996,7 +1071,7 @@ SET ROLE forge_release_routines_owner;
 REVOKE SELECT (reviewed_sha) ON TABLE public.forge_epic_172_enablement_state FROM forge;
 RESET ROLE;
 SQL
-revoke_forge_contamination
+restore_canonical_forge_boundary
 
 admin_psql <<'SQL'
 SET ROLE forge_release_routines_owner;
@@ -1007,7 +1082,40 @@ snapshot partial-installer-contamination-before
 expect_refusal 'Partial installer-grant contamination'
 snapshot partial-installer-contamination-after
 assert_unchanged partial-installer-contamination-before partial-installer-contamination-after 'Partial installer-grant contamination refusal'
-revoke_forge_contamination
+restore_canonical_forge_boundary
+
+admin_psql <<'SQL'
+SET ROLE forge_s4_routines_owner;
+GRANT INSERT ON TABLE public.architect_plan_versions TO forge;
+RESET ROLE;
+SQL
+snapshot partial-s4-contamination-before
+expect_refusal 'Partial non-release S4 installer-grant contamination'
+snapshot partial-s4-contamination-after
+assert_unchanged partial-s4-contamination-before partial-s4-contamination-after 'Partial non-release S4 contamination refusal'
+restore_canonical_forge_boundary
+
+admin_psql <<'SQL'
+SET ROLE forge_release_routines_owner;
+GRANT INSERT ON TABLE public.work_package_local_projection_sources TO forge;
+RESET ROLE;
+SQL
+snapshot partial-projection-contamination-before
+expect_refusal 'Partial projection installer-grant contamination'
+snapshot partial-projection-contamination-after
+assert_unchanged partial-projection-contamination-before partial-projection-contamination-after 'Partial projection contamination refusal'
+restore_canonical_forge_boundary
+
+admin_psql --set migration_role="$FORGE_LEGACY_REPAIR_MIGRATION_USER" <<'SQL'
+ALTER TABLE public.architect_plan_versions OWNER TO :"migration_role";
+SQL
+snapshot protected-owner-drift-before
+expect_refusal 'Fixed protected inventory wrong owner'
+snapshot protected-owner-drift-after
+assert_unchanged protected-owner-drift-before protected-owner-drift-after 'Fixed protected inventory wrong-owner refusal'
+admin_psql <<'SQL'
+ALTER TABLE public.architect_plan_versions OWNER TO forge_s4_routines_owner;
+SQL
 
 grant_exact_forge_contamination
 admin_psql <<'SQL'
@@ -1019,16 +1127,16 @@ snapshot extra-installer-contamination-before
 expect_refusal 'Extra installer-grant contamination'
 snapshot extra-installer-contamination-after
 assert_unchanged extra-installer-contamination-before extra-installer-contamination-after 'Extra installer-grant contamination refusal'
-revoke_forge_contamination
+restore_canonical_forge_boundary
 
-echo 'Proving concurrent table and column ACL changes serialize before repair classification.'
-assert_protected_forge_acl_count 0
+echo 'Proving concurrent table and column ACL changes serialize across the full protected inventory.'
+assert_protected_forge_acl_count 2
 snapshot table-acl-race-before
-prove_acl_grant_race_refusal table "SET ROLE forge_release_routines_owner;
-GRANT SELECT ON TABLE public.forge_epic_172_enablement_state TO forge;
+prove_acl_grant_race_refusal table "SET ROLE forge_s4_routines_owner;
+GRANT INSERT ON TABLE public.architect_plan_versions TO forge;
 RESET ROLE;"
 snapshot table-acl-race-after
-assert_only_external_acl_changed table-acl-race-before table-acl-race-after 'Concurrent protected table grant'
+assert_only_external_acl_changed table-acl-race-before table-acl-race-after 'Concurrent protected S4 table grant'
 admin_psql <<'SQL'
 DO $proof$
 BEGIN
@@ -1036,28 +1144,14 @@ BEGIN
     SELECT count(*)
     FROM pg_catalog.pg_class relation
     JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = relation.relnamespace
+    JOIN pg_catalog.pg_roles owner_role ON owner_role.oid = relation.relowner
     CROSS JOIN LATERAL pg_catalog.aclexplode(
       COALESCE(relation.relacl, pg_catalog.acldefault('r', relation.relowner))
     ) privilege
-    JOIN pg_catalog.pg_roles grantee ON grantee.oid = privilege.grantee
-    JOIN pg_catalog.pg_roles grantor ON grantor.oid = privilege.grantor
     WHERE namespace_row.nspname = 'public'
-      AND relation.relname IN (
-        'forge_epic_172_enablement_state',
-        'forge_epic_172_enablement_transition_audits',
-        'forge_epic_172_release_evidence',
-        'forge_epic_172_release_evidence_consumptions',
-        'forge_epic_172_transition_authorizations',
-        'forge_release_signer_key_lifecycle_audits',
-        'forge_release_signer_keys',
-        'forge_epic_172_s3_release_state'
-      )
-      AND grantee.rolname = 'forge'
-      AND relation.relname = 'forge_epic_172_enablement_state'
-      AND privilege.privilege_type = 'SELECT'
-      AND NOT privilege.is_grantable
-      AND grantor.rolname = 'forge_release_routines_owner'
-  ) <> 1 OR (
+      AND owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner')
+      AND privilege.grantee = 'forge'::pg_catalog.regrole
+  ) <> 3 OR (
     SELECT count(*)
     FROM pg_catalog.pg_class relation
     JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = relation.relnamespace
@@ -1065,90 +1159,84 @@ BEGIN
       COALESCE(relation.relacl, pg_catalog.acldefault('r', relation.relowner))
     ) privilege
     WHERE namespace_row.nspname = 'public'
-      AND relation.relname IN (
-        'forge_epic_172_enablement_state',
-        'forge_epic_172_enablement_transition_audits',
-        'forge_epic_172_release_evidence',
-        'forge_epic_172_release_evidence_consumptions',
-        'forge_epic_172_transition_authorizations',
-        'forge_release_signer_key_lifecycle_audits',
-        'forge_release_signer_keys',
-        'forge_epic_172_s3_release_state'
-      )
+      AND relation.relname = 'architect_plan_versions'
       AND privilege.grantee = 'forge'::pg_catalog.regrole
-  ) <> 1 OR EXISTS (
-    SELECT 1
-    FROM pg_catalog.pg_attribute attribute
-    CROSS JOIN LATERAL pg_catalog.aclexplode(attribute.attacl) privilege
-    WHERE privilege.grantee = 'forge'::pg_catalog.regrole
-  ) THEN
-    RAISE EXCEPTION 'Concurrent table grant was not preserved as the sole external ACL change';
+      AND privilege.privilege_type = 'INSERT'
+      AND NOT privilege.is_grantable
+      AND privilege.grantor = relation.relowner
+  ) <> 1 THEN
+    RAISE EXCEPTION 'Concurrent S4 table grant was not preserved as the sole external ACL change';
   END IF;
 END;
 $proof$;
 SQL
-expect_refusal 'Committed concurrent protected table grant'
+expect_refusal 'Committed concurrent protected S4 table grant'
 snapshot table-acl-race-rerun
-assert_unchanged table-acl-race-after table-acl-race-rerun 'Committed concurrent protected table-grant refusal'
+assert_unchanged table-acl-race-after table-acl-race-rerun 'Committed concurrent S4 table-grant refusal'
 admin_psql <<'SQL'
-SET ROLE forge_release_routines_owner;
-REVOKE SELECT ON TABLE public.forge_epic_172_enablement_state FROM forge;
+SET ROLE forge_s4_routines_owner;
+REVOKE INSERT ON TABLE public.architect_plan_versions FROM forge;
 RESET ROLE;
 SQL
+assert_protected_forge_acl_count 2
 
 snapshot column-acl-race-before
-prove_acl_grant_race_refusal column "SET ROLE forge_release_routines_owner;
-GRANT SELECT (reviewed_sha) ON TABLE public.forge_epic_172_enablement_state TO forge;
+prove_acl_grant_race_refusal column "SET ROLE forge_s4_routines_owner;
+GRANT SELECT (task_id) ON TABLE public.architect_plan_versions TO forge;
 RESET ROLE;"
 snapshot column-acl-race-after
-assert_only_external_acl_changed column-acl-race-before column-acl-race-after 'Concurrent protected column grant'
+assert_only_external_acl_changed column-acl-race-before column-acl-race-after 'Concurrent protected S4 column grant'
 admin_psql <<'SQL'
 DO $proof$
 BEGIN
-  IF EXISTS (
-    SELECT 1
+  IF (
+    SELECT count(*)
     FROM pg_catalog.pg_class relation
+    JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = relation.relnamespace
+    JOIN pg_catalog.pg_roles owner_role ON owner_role.oid = relation.relowner
     CROSS JOIN LATERAL pg_catalog.aclexplode(
       COALESCE(relation.relacl, pg_catalog.acldefault('r', relation.relowner))
     ) privilege
-    WHERE privilege.grantee = 'forge'::pg_catalog.regrole
-  ) OR (
+    WHERE namespace_row.nspname = 'public'
+      AND owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner')
+      AND privilege.grantee = 'forge'::pg_catalog.regrole
+  ) <> 2 OR (
     SELECT count(*)
     FROM pg_catalog.pg_attribute attribute
     JOIN pg_catalog.pg_class relation ON relation.oid = attribute.attrelid
     JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = relation.relnamespace
     CROSS JOIN LATERAL pg_catalog.aclexplode(attribute.attacl) privilege
-    JOIN pg_catalog.pg_roles grantee ON grantee.oid = privilege.grantee
-    JOIN pg_catalog.pg_roles grantor ON grantor.oid = privilege.grantor
     WHERE namespace_row.nspname = 'public'
-      AND relation.relname = 'forge_epic_172_enablement_state'
-      AND attribute.attname = 'reviewed_sha'
-      AND grantee.rolname = 'forge'
+      AND relation.relname = 'architect_plan_versions'
+      AND attribute.attname = 'task_id'
+      AND privilege.grantee = 'forge'::pg_catalog.regrole
       AND privilege.privilege_type = 'SELECT'
       AND NOT privilege.is_grantable
-      AND grantor.rolname = 'forge_release_routines_owner'
+      AND privilege.grantor = relation.relowner
   ) <> 1 OR (
     SELECT count(*)
     FROM pg_catalog.pg_attribute attribute
     CROSS JOIN LATERAL pg_catalog.aclexplode(attribute.attacl) privilege
-    WHERE attribute.attnum > 0 AND NOT attribute.attisdropped
+    WHERE attribute.attnum > 0
+      AND NOT attribute.attisdropped
       AND privilege.grantee = 'forge'::pg_catalog.regrole
   ) <> 1 THEN
-    RAISE EXCEPTION 'Concurrent column grant was not preserved as the sole external ACL change';
+    RAISE EXCEPTION 'Concurrent S4 column grant was not preserved as the sole external ACL change';
   END IF;
 END;
 $proof$;
 SQL
-expect_refusal 'Committed concurrent protected column grant'
+expect_refusal 'Committed concurrent protected S4 column grant'
 snapshot column-acl-race-rerun
-assert_unchanged column-acl-race-after column-acl-race-rerun 'Committed concurrent protected column-grant refusal'
+assert_unchanged column-acl-race-after column-acl-race-rerun 'Committed concurrent S4 column-grant refusal'
 admin_psql <<'SQL'
-SET ROLE forge_release_routines_owner;
-REVOKE SELECT (reviewed_sha) ON TABLE public.forge_epic_172_enablement_state FROM forge;
+SET ROLE forge_s4_routines_owner;
+REVOKE SELECT (task_id) ON TABLE public.architect_plan_versions FROM forge;
 RESET ROLE;
 SQL
+assert_protected_forge_acl_count 2
 
-echo 'Proving the real installer app-grant transaction against disposable PostgreSQL.'
+echo 'Proving the real installer and repair app-grant transaction against disposable PostgreSQL.'
 admin_psql <<'SQL'
 CREATE TABLE public.forge_installer_privilege_probe (
   id integer PRIMARY KEY,
@@ -1156,7 +1244,78 @@ CREATE TABLE public.forge_installer_privilege_probe (
 );
 SQL
 run_installer_grant_privileges installer-grant-success
-assert_protected_forge_acl_count 0
+assert_protected_forge_acl_count 2
+assert_owner_driven_forge_boundary
+run_repair_grant_privileges repair-grant-success
+grep -Fq 'Ensured the forge role can read ordinary forge tables without protected-table DML access.' \
+  "$TEMP_ROOT/repair-grant-success.log" || {
+  sed -n '1,120p' "$TEMP_ROOT/repair-grant-success.log" >&2
+  echo 'Repair did not execute the shared privilege reconciliation successfully.' >&2
+  exit 1
+}
+assert_protected_forge_acl_count 2
+assert_owner_driven_forge_boundary
+
+admin_server_psql --command 'ALTER ROLE forge INHERIT;'
+run_repair_grant_privileges repair-legacy-inherit
+admin_server_psql <<'SQL'
+DO $proof$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_catalog.pg_roles
+    WHERE rolname = 'forge' AND rolcanlogin AND NOT rolinherit AND NOT rolsuper
+      AND NOT rolcreatedb AND NOT rolcreaterole AND NOT rolreplication AND NOT rolbypassrls
+  ) THEN
+    RAISE EXCEPTION 'Shared reconciliation did not normalize the known legacy INHERIT delta';
+  END IF;
+END;
+$proof$;
+SQL
+assert_protected_forge_acl_count 2
+
+admin_server_psql --command 'ALTER ROLE forge CREATEROLE;'
+snapshot shared-unsafe-role-before
+run_repair_grant_privileges repair-unsafe-role
+snapshot shared-unsafe-role-after
+assert_unchanged shared-unsafe-role-before shared-unsafe-role-after 'Shared SQL unsafe-role refusal'
+grep -Fq 'Could not transactionally refresh forge app privileges (non-fatal).' \
+  "$TEMP_ROOT/repair-unsafe-role.log" || {
+  echo 'Repair did not report the shared SQL unsafe-role refusal.' >&2
+  exit 1
+}
+admin_server_psql --command 'ALTER ROLE forge NOCREATEROLE;'
+
+admin_server_psql --command 'ALTER ROLE forge NOLOGIN;'
+snapshot shared-nologin-role-before
+run_repair_grant_privileges repair-nologin-role
+snapshot shared-nologin-role-after
+assert_unchanged shared-nologin-role-before shared-nologin-role-after 'Shared SQL NOLOGIN-role refusal'
+admin_server_psql --command 'ALTER ROLE forge LOGIN;'
+
+admin_server_psql --command 'GRANT forge_release_transition TO forge;'
+snapshot shared-membership-before
+run_repair_grant_privileges repair-membership
+snapshot shared-membership-after
+assert_unchanged shared-membership-before shared-membership-after 'Shared SQL membership refusal'
+admin_server_psql --command 'REVOKE forge_release_transition FROM forge;'
+
+admin_psql --set migration_role="$FORGE_LEGACY_REPAIR_MIGRATION_USER" <<'SQL'
+ALTER TABLE public.architect_plan_versions OWNER TO :"migration_role";
+SQL
+snapshot shared-wrong-owner-before
+run_repair_grant_privileges repair-wrong-owner
+snapshot shared-wrong-owner-after
+assert_unchanged shared-wrong-owner-before shared-wrong-owner-after 'Shared SQL wrong-owner refusal'
+grep -Fq 'Could not transactionally refresh forge app privileges (non-fatal).' \
+  "$TEMP_ROOT/repair-wrong-owner.log" || {
+  echo 'Repair did not report the shared SQL wrong-owner refusal.' >&2
+  exit 1
+}
+admin_psql <<'SQL'
+ALTER TABLE public.architect_plan_versions OWNER TO forge_s4_routines_owner;
+SQL
+run_repair_grant_privileges repair-after-owner-restore
+assert_protected_forge_acl_count 2
 assert_owner_driven_forge_boundary
 admin_psql <<'SQL'
 DO $proof$
@@ -1193,8 +1352,18 @@ REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM forge;
 REVOKE USAGE, CREATE ON SCHEMA public FROM forge;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE SELECT, INSERT, UPDATE, DELETE ON TABLES FROM forge;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE USAGE, SELECT, UPDATE ON SEQUENCES FROM forge;
-ALTER TABLE public.work_package_local_projection_heads
-  RENAME TO work_package_local_projection_heads_revoke_failure_probe;
+CREATE FUNCTION public.forge_fail_privilege_reconciliation_proof()
+RETURNS event_trigger
+LANGUAGE plpgsql
+AS $proof$
+BEGIN
+  RAISE EXCEPTION 'forced shared privilege reconciliation failure';
+END;
+$proof$;
+CREATE EVENT TRIGGER forge_fail_privilege_reconciliation_proof
+ON ddl_command_end
+WHEN TAG IN ('ALTER DEFAULT PRIVILEGES')
+EXECUTE FUNCTION public.forge_fail_privilege_reconciliation_proof();
 SQL
 assert_no_direct_forge_app_authority
 snapshot installer-grant-rollback-before
@@ -1206,14 +1375,25 @@ grep -Fq 'ERROR:' "$TEMP_ROOT/installer-grant-failure-state/install.log" || {
   echo 'Installer revoke-stage failure was not recorded in the isolated install log.' >&2
   exit 1
 }
-grep -Fq 'work_package_local_projection_heads' "$TEMP_ROOT/installer-grant-failure-state/install.log" || {
-  echo 'Installer failure log did not identify the missing protected table.' >&2
+grep -Fq 'forced shared privilege reconciliation failure' "$TEMP_ROOT/installer-grant-failure-state/install.log" || {
+  echo 'Installer failure log did not identify the forced post-broad-grant failure.' >&2
+  exit 1
+}
+snapshot repair-grant-rollback-before
+run_repair_grant_privileges repair-grant-failure
+snapshot repair-grant-rollback-after
+assert_unchanged repair-grant-rollback-before repair-grant-rollback-after 'Repair shared-SQL transaction rollback'
+assert_no_direct_forge_app_authority
+grep -Fq 'Could not transactionally refresh forge app privileges (non-fatal).' \
+  "$TEMP_ROOT/repair-grant-failure.log" || {
+  echo 'Repair did not report the shared SQL rollback failure.' >&2
   exit 1
 }
 admin_psql <<'SQL'
-ALTER TABLE public.work_package_local_projection_heads_revoke_failure_probe
-  RENAME TO work_package_local_projection_heads;
+DROP EVENT TRIGGER forge_fail_privilege_reconciliation_proof;
+DROP FUNCTION public.forge_fail_privilege_reconciliation_proof();
 DROP TABLE public.forge_installer_privilege_probe;
+DROP TABLE public.forge_legacy_ordinary_acl_probe;
 SQL
 
 # S4 principals are cluster-global. Keep this deliberately unsafe membership

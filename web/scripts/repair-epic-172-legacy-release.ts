@@ -83,16 +83,59 @@ const s4Roles = [
   'forge_s4_recovery_operator', 'forge_local_projection_archiver',
   'forge_local_evidence_reader', 'forge_project_root_reconciler',
 ] as const
-const protectedReleaseTables = [
-  'forge_epic_172_enablement_state', 'forge_epic_172_enablement_transition_audits',
-  'forge_epic_172_release_evidence', 'forge_epic_172_release_evidence_consumptions',
-  'forge_epic_172_transition_authorizations', 'forge_release_signer_key_lifecycle_audits',
-  'forge_release_signer_keys',
+const releaseOwner = 'forge_release_routines_owner'
+const s4Owner = 'forge_s4_routines_owner'
+// canonical-protected-owner-map-begin
+const protectedInstallerRelations = [
+  { name: 'forge_epic_172_enablement_state', owner: releaseOwner, scope: 'release' },
+  { name: 'forge_epic_172_enablement_transition_audits', owner: releaseOwner, scope: 'release' },
+  { name: 'forge_epic_172_release_evidence', owner: releaseOwner, scope: 'release' },
+  { name: 'forge_epic_172_release_evidence_consumptions', owner: releaseOwner, scope: 'release' },
+  { name: 'forge_epic_172_transition_authorizations', owner: releaseOwner, scope: 'release' },
+  { name: 'forge_release_signer_key_lifecycle_audits', owner: releaseOwner, scope: 'release' },
+  { name: 'forge_release_signer_keys', owner: releaseOwner, scope: 'release' },
+  { name: 'forge_epic_172_s3_release_state', owner: releaseOwner, scope: 's3' },
+  { name: 'work_package_local_projection_sources', owner: releaseOwner, scope: 'projection' },
+  { name: 'work_package_local_projection_heads', owner: releaseOwner, scope: 'projection' },
+  { name: 'architect_plan_versions', owner: s4Owner, scope: 's4' },
+  { name: 'architect_plan_entries', owner: s4Owner, scope: 's4' },
+  { name: 'architect_plan_execution_references', owner: s4Owner, scope: 's4' },
+  { name: 'architect_plan_history_reads', owner: s4Owner, scope: 's4' },
+  { name: 'architect_clarification_answers', owner: s4Owner, scope: 's4' },
+  { name: 'architect_clarification_answer_writes', owner: s4Owner, scope: 's4' },
+  { name: 'protected_package_entry_registrations', owner: s4Owner, scope: 's4' },
+  { name: 'protected_entry_capability_bindings', owner: s4Owner, scope: 's4' },
+  { name: 'mcp_operator_review_versions', owner: s4Owner, scope: 's4' },
+  { name: 'mcp_operator_review_entries', owner: s4Owner, scope: 's4' },
+  { name: 'work_package_local_run_evidence', owner: s4Owner, scope: 's4' },
+  { name: 'filesystem_mcp_decision_nonce_claims', owner: s4Owner, scope: 's4' },
+  { name: 'project_root_ref_reconciliation', owner: s4Owner, scope: 's4' },
+  { name: 'project_root_change_journal_counter', owner: s4Owner, scope: 's4' },
+  { name: 'project_root_change_journal', owner: s4Owner, scope: 's4' },
+  { name: 'project_root_reconciliation_operations', owner: s4Owner, scope: 's4' },
+  { name: 'project_root_reconciliation_checkpoints', owner: s4Owner, scope: 's4' },
+  { name: 'project_root_reconciliation_outcomes', owner: s4Owner, scope: 's4' },
+  { name: 'project_root_reconciliation_write_contexts', owner: s4Owner, scope: 's4' },
+  { name: 's4_completion_handoffs', owner: s4Owner, scope: 's4' },
+  { name: 's4_protected_review_sources', owner: s4Owner, scope: 's4' },
+  { name: 's4_protected_review_source_reads', owner: s4Owner, scope: 's4' },
+  { name: 's4_max_attempt_finalizations', owner: s4Owner, scope: 's4' },
+  { name: 'filesystem_mcp_issuance_recovery_actions', owner: s4Owner, scope: 's4' },
+  { name: 'local_effect_recovery_actions', owner: s4Owner, scope: 's4' },
+  { name: 'local_projection_archive_operations', owner: s4Owner, scope: 's4' },
+  { name: 'local_projection_archive_operation_checkpoints', owner: s4Owner, scope: 's4' },
 ] as const
-const protectedInstallerGrantTables = [
-  ...protectedReleaseTables,
-  'forge_epic_172_s3_release_state',
-] as const
+// canonical-protected-owner-map-end
+const protectedReleaseTables = protectedInstallerRelations
+  .filter((relation) => relation.scope === 'release')
+  .map((relation) => relation.name)
+const protectedInstallerGrantTables = protectedInstallerRelations.map((relation) => relation.name)
+const preS4ProtectedInstallerTables = protectedInstallerRelations
+  .filter((relation) => relation.scope === 'release' || relation.scope === 's3')
+  .map((relation) => relation.name)
+const protectedProjectionTables = new Set<string>(protectedInstallerRelations
+  .filter((relation) => relation.scope === 'projection')
+  .map((relation) => relation.name))
 const protectedInstallerGrantTableSql = protectedInstallerGrantTables
   .map((table) => `public.${table}`)
   .join(', ')
@@ -843,6 +886,7 @@ async function exactProtectedTableAcls(
 
 async function exactProtectedInstallerColumnAcls(
   sql: postgres.Sql | postgres.TransactionSql,
+  relationNames: readonly string[] = preS4ProtectedInstallerTables,
 ): Promise<boolean> {
   const columnGrants = await sql<readonly { entry: string }[]>`
     SELECT relation.relname || '|' || attribute.attname || '|'
@@ -856,10 +900,68 @@ async function exactProtectedInstallerColumnAcls(
     LEFT JOIN pg_catalog.pg_roles grantee ON grantee.oid = privilege.grantee
     JOIN pg_catalog.pg_roles grantor ON grantor.oid = privilege.grantor
     WHERE namespace_row.nspname = 'public'
-      AND relation.relname = ANY(${sql.array([...protectedInstallerGrantTables])}::text[])
+      AND relation.relname = ANY(${sql.array([...relationNames])}::text[])
     ORDER BY 1
   `
   return columnGrants.length === 0
+}
+
+type ProtectedInstallerAclMode = 'pre-0028-clean' | 'canonical' | 'legacy-dirty'
+
+async function exactProtectedInstallerBoundary(
+  sql: postgres.Sql | postgres.TransactionSql,
+  mode: ProtectedInstallerAclMode,
+): Promise<boolean> {
+  const relations = await sql<readonly { name: string; owner: string; kind: string }[]>`
+    SELECT relation.relname AS name, owner_role.rolname AS owner, relation.relkind AS kind
+    FROM pg_catalog.pg_class relation
+    JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = relation.relnamespace
+    JOIN pg_catalog.pg_roles owner_role ON owner_role.oid = relation.relowner
+    WHERE namespace_row.nspname = 'public'
+      AND relation.relname = ANY(${sql.array([...protectedInstallerGrantTables])}::text[])
+    ORDER BY relation.relname
+  `
+  const expectedByName = new Map<string, string>(protectedInstallerRelations
+    .map((relation) => [relation.name, relation.owner] as const))
+  if (relations.length !== protectedInstallerRelations.length || relations.some((relation) => (
+    relation.kind !== 'r' && relation.kind !== 'p'
+  ) || expectedByName.get(relation.name) !== relation.owner)) return false
+
+  if (!await exactProtectedInstallerColumnAcls(sql, protectedInstallerGrantTables)) return false
+
+  const grants = await sql<readonly { entry: string }[]>`
+    SELECT relation.relname || '|' || privilege.privilege_type || '|'
+      || privilege.is_grantable || '|' || grantor.rolname AS entry
+    FROM pg_catalog.pg_class relation
+    JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = relation.relnamespace
+    CROSS JOIN LATERAL pg_catalog.aclexplode(
+      COALESCE(relation.relacl, pg_catalog.acldefault('r', relation.relowner))
+    ) privilege
+    JOIN pg_catalog.pg_roles grantee ON grantee.oid = privilege.grantee
+    JOIN pg_catalog.pg_roles grantor ON grantor.oid = privilege.grantor
+    WHERE namespace_row.nspname = 'public'
+      AND relation.relname = ANY(${sql.array([...protectedInstallerGrantTables])}::text[])
+      AND grantee.rolname = 'forge'
+    ORDER BY 1
+  `
+  const expected: string[] = []
+  if (mode === 'canonical') {
+    for (const relation of protectedInstallerRelations) {
+      if (protectedProjectionTables.has(relation.name)) {
+        expected.push(`${relation.name}|SELECT|false|${relation.owner}`)
+      }
+    }
+  } else if (mode === 'legacy-dirty') {
+    for (const relation of protectedInstallerRelations) {
+      for (const privilege of forgeContaminationPrivileges) {
+        expected.push(`${relation.name}|${privilege}|false|${relation.owner}`)
+      }
+    }
+  }
+  const actual = grants.map((row) => row.entry).sort()
+  expected.sort()
+  return actual.length === expected.length
+    && actual.every((entry, index) => entry === expected[index])
 }
 
 async function exactOptionalForgeAppRoleBoundary(
@@ -888,10 +990,11 @@ async function exactOptionalForgeAppRoleBoundary(
 async function lockProtectedInstallerAclCatalog(
   sql: postgres.TransactionSql,
 ): Promise<void> {
-  const lockedRelations = await sql<readonly { oid: number; name: string }[]>`
-    SELECT relation.oid::integer AS oid, relation.relname AS name
+  const lockedRelations = await sql<readonly { oid: number; name: string; owner: string }[]>`
+    SELECT relation.oid::integer AS oid, relation.relname AS name, owner_role.rolname AS owner
     FROM pg_catalog.pg_class relation
     JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = relation.relnamespace
+    JOIN pg_catalog.pg_roles owner_role ON owner_role.oid = relation.relowner
     WHERE namespace_row.nspname = 'public'
       AND relation.relkind IN ('r', 'p')
       AND relation.relname = ANY(${sql.array([...protectedInstallerGrantTables])}::text[])
@@ -899,9 +1002,12 @@ async function lockProtectedInstallerAclCatalog(
     FOR UPDATE OF relation
   `
   const expectedNames = [...protectedInstallerGrantTables].sort()
+  const expectedOwners = new Map<string, string>(protectedInstallerRelations
+    .map((relation) => [relation.name, relation.owner] as const))
   const lockedNames = lockedRelations.map((relation) => relation.name).sort()
   if (lockedRelations.length !== expectedNames.length
-    || lockedNames.some((name, index) => name !== expectedNames[index])) {
+    || lockedNames.some((name, index) => name !== expectedNames[index])
+    || lockedRelations.some((relation) => expectedOwners.get(relation.name) !== relation.owner)) {
     throw new Error('Refusing legacy release repair: protected relation catalog lock set is incomplete.')
   }
 
@@ -1161,15 +1267,16 @@ async function current0026Fingerprint(sql: postgres.Sql | postgres.TransactionSq
 
 async function durableRepairedFingerprint(
   sql: postgres.Sql | postgres.TransactionSql,
-  expectForgeContamination = false,
+  protectedAclMode: ProtectedInstallerAclMode,
 ): Promise<boolean> {
   // Later migrations legitimately add S4/S5 objects and may populate release
   // state.  The stable repair receipt is therefore the complete protected S3
   // catalog, ACL and routine surface plus the inert legacy consumer principal.
+  const expectForgeContamination = protectedAclMode === 'legacy-dirty'
   return await exactReleaseCatalog(sql, true, 'durable-s4-no-public')
     && await exactS3CompletionBoundary(sql, expectForgeContamination)
     && await exactProtectedTableAcls(sql, true, expectForgeContamination)
-    && await exactProtectedInstallerColumnAcls(sql)
+    && await exactProtectedInstallerBoundary(sql, protectedAclMode)
     && await exactLegacyConsumerLocalAuthority(sql, true)
     && await exactRoutines(sql, repairedRoutineDigests, false, true, null)
     && await exactReleaseRoleBoundary(sql, true)
@@ -1233,7 +1340,8 @@ async function main(): Promise<void> {
 
       if (position !== '0026') {
         await lockProtectedInstallerAclCatalog(sql)
-        if (await durableRepairedFingerprint(sql)) return 'later-repaired' as const
+        const cleanAclMode = position === '0027' ? 'pre-0028-clean' : 'canonical'
+        if (await durableRepairedFingerprint(sql, cleanAclMode)) return 'later-repaired' as const
         if (position !== '0028') {
           throw new Error('Refusing legacy release repair: protected installer grants are normalizable only at the exact 0028 ledger position.')
         }
@@ -1242,10 +1350,11 @@ async function main(): Promise<void> {
         // public table after migrations. The exact protected relation and
         // column catalog tuples are already locked, so concurrent table- or
         // column-level GRANT/REVOKE changes serialize before classification.
-        if (!await durableRepairedFingerprint(sql, true)) {
+        if (!await durableRepairedFingerprint(sql, 'legacy-dirty')) {
           throw new Error('Refusing legacy release repair: a later legacy-hash ledger lacks the durable repaired catalog fingerprint.')
         }
         await sql.unsafe(`REVOKE ALL ON TABLE ${protectedInstallerGrantTableSql} FROM forge`)
+        await sql.unsafe(`GRANT SELECT ON TABLE public.work_package_local_projection_sources, public.work_package_local_projection_heads TO forge`)
         const ledgerAfterNormalization = await sql<readonly { hash: string; created_at: number }[]>`
           SELECT hash, created_at
           FROM drizzle.__drizzle_migrations
@@ -1258,7 +1367,7 @@ async function main(): Promise<void> {
           ))) {
           throw new Error('Legacy release protected-grant normalization unexpectedly altered the immutable migration ledger.')
         }
-        if (!await durableRepairedFingerprint(sql)) {
+        if (!await durableRepairedFingerprint(sql, 'canonical')) {
           throw new Error('Legacy release protected-grant normalization did not restore the exact durable catalog fingerprint.')
         }
         return 'later-normalized' as const
@@ -1297,7 +1406,7 @@ async function main(): Promise<void> {
     } else if (outcome === 'later-repaired') {
       console.log('✓ Durable Epic 172 legacy release repair is present at the later migration position; migration ledger was left unchanged.')
     } else if (outcome === 'later-normalized') {
-      console.log('✓ Removed the exact known installer app grants from protected release tables without altering the migration ledger.')
+      console.log('✓ Removed the exact known installer app grants from protected-owner tables without altering the migration ledger.')
     } else {
       console.log('✓ Epic 172 legacy release repair is not needed.')
     }
