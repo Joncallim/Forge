@@ -204,6 +204,44 @@ run_library_argument_case() {
 
 run_library_argument_case
 
+run_trusted_candidate_toc_tou_case() {
+  local case_dir="$TEST_ROOT/trusted-candidate-toc-tou"
+  mkdir -p "$case_dir"
+  : > "$case_dir/target-one"
+  : > "$case_dir/target-two"
+  chmod +x "$case_dir/target-one" "$case_dir/target-two"
+  ln -s "$case_dir/target-one" "$case_dir/candidate"
+  INSTALLER="$INSTALLER" \
+    FORGE_TOC_TOU_CANDIDATE="$case_dir/candidate" \
+    FORGE_TOC_TOU_TARGET_ONE="$case_dir/target-one" \
+    FORGE_TOC_TOU_TARGET_TWO="$case_dir/target-two" \
+    FORGE_TOC_TOU_COUNT="$case_dir/canonicalizer-count" \
+    /bin/bash -c '
+      FORGE_INSTALL_LIBRARY=1 source "$INSTALLER"
+      trusted_linux_path_chain() { return 0; }
+      canonicalize_trusted_linux_candidate() {
+        printf x >> "$FORGE_TOC_TOU_COUNT"
+        if [ "$(<"$FORGE_TOC_TOU_COUNT")" = x ]; then
+          printf "%s\\n" "$FORGE_TOC_TOU_TARGET_ONE"
+        else
+          printf "%s\\n" "$FORGE_TOC_TOU_TARGET_TWO"
+        fi
+      }
+      resolved="$(trusted_linux_candidate "$FORGE_TOC_TOU_CANDIDATE")"
+      [ "$resolved" = "$FORGE_TOC_TOU_TARGET_ONE" ]
+      [ "$(<"$FORGE_TOC_TOU_COUNT")" = x ]
+      trusted_linux_path_chain() {
+        [ "$1" = "$FORGE_TOC_TOU_CANDIDATE" ] && [ -L "$1" ] && return 1
+        return 0
+      }
+      rm -f "$FORGE_TOC_TOU_COUNT"
+      ! trusted_linux_candidate "$FORGE_TOC_TOU_CANDIDATE"
+      [ ! -e "$FORGE_TOC_TOU_COUNT" ]
+    ' > "$case_dir/stdout" 2> "$case_dir/stderr" || fail 'trusted candidate canonicalization was not single-resolution and fail-closed'
+}
+
+run_trusted_candidate_toc_tou_case
+
 if rg -F "$TEST_SECRET" "$TEST_ROOT" --glob '!forge.env' >/dev/null; then
   fail 'test sentinel leaked outside the local environment fixture'
 fi

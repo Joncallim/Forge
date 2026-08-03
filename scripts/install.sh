@@ -1500,25 +1500,40 @@ run_managed_local_migration_stage() {
   esac
 }
 
+trusted_linux_path_chain() {
+  local path="$1" owner mode
+  while :; do
+    [ -e "$path" ] || [ -L "$path" ] || return 1
+    owner="$(/usr/bin/stat -c '%U' "$path" 2>/dev/null || true)"
+    [ "$owner" = root ] || return 1
+    if [ ! -L "$path" ]; then
+      mode="$(/usr/bin/stat -c '%a' "$path" 2>/dev/null || true)"
+      [ -n "$mode" ] && [ $((8#$mode & 022)) -eq 0 ] || return 1
+    fi
+    [ "$path" = / ] && return 0
+    path="${path%/*}"
+    [ -n "$path" ] || path=/
+  done
+}
+
+canonicalize_trusted_linux_candidate() {
+  /usr/bin/readlink -f "$1" 2>/dev/null
+}
+
+trusted_linux_candidate() {
+  local candidate="$1" canonical
+  [ -x "$candidate" ] || return 1
+  trusted_linux_path_chain "$candidate" || return 1
+  canonical="$(canonicalize_trusted_linux_candidate "$candidate")" || return 1
+  [ -n "$canonical" ] && [ -f "$canonical" ] || return 1
+  trusted_linux_path_chain "$canonical" || return 1
+  printf '%s\n' "$canonical"
+}
+
 trusted_linux_tool() {
-  local tool="$1" candidate resolved owner mode
+  local tool="$1" candidate
   for candidate in "/usr/local/sbin/$tool" "/usr/local/bin/$tool" "/usr/sbin/$tool" "/usr/bin/$tool" "/sbin/$tool" "/bin/$tool"; do
-    [ -x "$candidate" ] || continue
-    resolved="$(/usr/bin/readlink -f "$candidate" 2>/dev/null || true)"
-    [ -n "$resolved" ] && [ -f "$resolved" ] || continue
-    owner="$(/usr/bin/stat -c '%U' "$resolved" 2>/dev/null || true)"
-    mode="$(/usr/bin/stat -c '%a' "$resolved" 2>/dev/null || true)"
-    [ "$owner" = root ] && [ -n "$mode" ] || continue
-    [ $((8#$mode & 022)) -eq 0 ] || continue
-    while [ "$resolved" != / ]; do
-      resolved="${resolved%/*}"
-      [ -n "$resolved" ] || resolved=/
-      owner="$(/usr/bin/stat -c '%U' "$resolved" 2>/dev/null || true)"
-      mode="$(/usr/bin/stat -c '%a' "$resolved" 2>/dev/null || true)"
-      [ "$owner" = root ] && [ -n "$mode" ] && [ $((8#$mode & 022)) -eq 0 ] || break 2
-    done
-    printf '%s\n' "$(/usr/bin/readlink -f "$candidate")"
-    return 0
+    trusted_linux_candidate "$candidate" && return 0
   done
   return 1
 }
