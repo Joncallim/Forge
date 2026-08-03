@@ -104,12 +104,12 @@ run_runuser_environment_case() {
   printf 'DATABASE_URL=postgresql://forge:%s@localhost:5432/forge\n' "$TEST_SECRET" > "$case_dir/forge.env"
   cat > "$case_dir/bin/runuser" <<'EOF'
 #!/bin/bash
-marker_dir="$(dirname "$FORGE_ENV_FILE")"
-if printenv | cut -d= -f1 | grep -Fx 'UNRELATED_SECRET_SENTINEL' >/dev/null; then
+marker_dir="${FORGE_ENV_FILE%/*}"
+if [ -n "${UNRELATED_SECRET_SENTINEL+x}" ]; then
   printf 'unrelated-secret-leaked\n' > "$marker_dir/runuser-result"
   exit 1
 fi
-printenv | cut -d= -f1 | sort > "$marker_dir/runuser-environment-names"
+compgen -e > "$marker_dir/runuser-environment-names"
 printf 'clean\n' > "$marker_dir/runuser-result"
 while [ "$1" != "--" ]; do shift; done
 shift
@@ -164,17 +164,45 @@ assert_not_contains "$TEST_SECRET" "$CASE_DIR/runuser-environment-names"
 run_shadow_refusal_case() {
   local case_dir="$TEST_ROOT/shadow-refusal"
   mkdir -p "$case_dir/bin"
-  printf '#!/bin/bash\nprintf shadow-used > "$FORGE_SHADOW_MARKER"\nexit 0\n' > "$case_dir/bin/sudo"
-  chmod +x "$case_dir/bin/sudo"
-  INSTALLER="$INSTALLER" FORGE_SHADOW_MARKER="$case_dir/marker" PATH="$case_dir/bin:$PATH" /bin/bash -c '
+  local command
+  for command in dirname node npm npx bash sudo runuser; do
+    printf '#!/bin/bash\nprintf shadow-used > "$FORGE_SHADOW_MARKER"\nexit 0\n' > "$case_dir/bin/$command"
+  done
+  chmod +x "$case_dir/bin"/*
+  set +e
+  INSTALLER="$INSTALLER" FORGE_SHADOW_MARKER="$case_dir/marker" FORGE_SHADOW_DIRECTORY="$case_dir/bin" PATH="$case_dir/bin:$PATH" /bin/bash -c '
     FORGE_INSTALL_LIBRARY=1 source "$INSTALLER"
-    resolved="$(trusted_linux_tool sudo 2>/dev/null || true)"
-    [ "$resolved" != "$PWD/bin/sudo" ]
+    OS_NAME=Linux
+    prepare_trusted_linux_migration_toolchain
+    [ ":$MANAGED_LOCAL_PATH:" != *":$FORGE_SHADOW_DIRECTORY:"* ]
   ' > "$case_dir/stdout" 2> "$case_dir/stderr"
+  local shadow_status=$?
+  set -e
+  if [ "$shadow_status" -eq 0 ]; then
+    assert_not_contains "$case_dir/bin" "$case_dir/stdout"
+  fi
   [ ! -e "$case_dir/marker" ] || fail 'caller PATH shadow reached the privileged sudo resolver'
 }
 
 run_shadow_refusal_case
+
+run_library_argument_case() {
+  local case_dir="$TEST_ROOT/library-arguments"
+  mkdir -p "$case_dir"
+  INSTALLER="$INSTALLER" /bin/bash -c '
+    set -- postgresql://argument-must-not-reach-installer
+    FORGE_INSTALL_LIBRARY=1 source "$INSTALLER"
+    [ "$#" -eq 1 ]
+    (
+      set --
+      FORGE_INSTALL_LIBRARY=1 source "$INSTALLER"
+      [ "$#" -eq 0 ]
+      declare -F run_managed_local_migration_sequence >/dev/null
+    )
+  ' > "$case_dir/stdout" 2> "$case_dir/stderr" || fail 'library source did not ignore caller positional arguments'
+}
+
+run_library_argument_case
 
 if rg -F "$TEST_SECRET" "$TEST_ROOT" --glob '!forge.env' >/dev/null; then
   fail 'test sentinel leaked outside the local environment fixture'

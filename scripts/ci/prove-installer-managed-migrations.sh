@@ -33,6 +33,7 @@ run_real_managed_sequence() {
   local database_url="$1" admin_url="$2" env_file="$3"
   printf 'DATABASE_URL=%s\n' "$database_url" > "$env_file"
   (
+    set --
     export DATABASE_URL="$database_url"
     export FORGE_DATABASE_ADMIN_URL="$admin_url"
     export FORGE_ENV_FILE="$env_file"

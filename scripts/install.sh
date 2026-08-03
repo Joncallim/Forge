@@ -16,7 +16,7 @@
 #
 set -Eeuo pipefail
 
-SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd -P "${BASH_SOURCE[0]%/*}" && pwd)"
 REPO_ROOT="$(cd -P "$SCRIPT_DIR/.." && pwd)"
 expand_home_path_early() {
   case "${1:-}" in
@@ -161,8 +161,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-while [ "$#" -gt 0 ]; do
-  case "$1" in
+if ! { [ "${FORGE_INSTALL_LIBRARY:-0}" = "1" ] && [ "${BASH_SOURCE[0]}" != "$0" ]; }; then
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
     --skip-ollama)
       SKIP_OLLAMA=1
       ;;
@@ -207,9 +208,10 @@ while [ "$#" -gt 0 ]; do
     *)
       die "Unknown option: $1"
       ;;
-  esac
-  shift
-done
+    esac
+    shift
+  done
+fi
 
 case "$SERVICE_MODE" in
   auto|native|docker) ;;
@@ -1422,6 +1424,7 @@ managed_local_migrations_enabled() {
 }
 
 resolve_managed_local_admin() {
+  local psql_bin sudo_bin runuser_bin
   MANAGED_LOCAL_ADMIN_MODE=""
   MANAGED_LOCAL_ADMIN_SOCKET=""
   MANAGED_LOCAL_ADMIN_USER=""
@@ -1441,14 +1444,18 @@ resolve_managed_local_admin() {
     MANAGED_LOCAL_ADMIN_MODE="current"
     MANAGED_LOCAL_ADMIN_USER="$(psql -d postgres -tAc 'SELECT current_user' | tr -d '[:space:]')"
     MANAGED_LOCAL_ADMIN_SOCKET="$(psql -d postgres -tAc 'SHOW unix_socket_directories' | tr -d '[:space:]' | cut -d, -f1)"
-  elif [ "$OS_NAME" = "Linux" ] && id postgres >/dev/null 2>&1 && trusted_linux_tool sudo >/dev/null 2>&1 && "$(trusted_linux_tool sudo)" -n -u postgres psql -d postgres -tAc 'SELECT 1' >/dev/null 2>&1; then
+  elif [ "$OS_NAME" = "Linux" ] && id postgres >/dev/null 2>&1 \
+    && sudo_bin="$(trusted_linux_tool sudo)" && psql_bin="$(trusted_linux_tool psql)" \
+    && "$sudo_bin" -n -u postgres "$psql_bin" -d postgres -tAc 'SELECT 1' >/dev/null 2>&1; then
     MANAGED_LOCAL_ADMIN_MODE="sudo"
     MANAGED_LOCAL_ADMIN_USER="postgres"
-    MANAGED_LOCAL_ADMIN_SOCKET="$("$(trusted_linux_tool sudo)" -n -u postgres psql -d postgres -tAc 'SHOW unix_socket_directories' | tr -d '[:space:]' | cut -d, -f1)"
-  elif [ "$OS_NAME" = "Linux" ] && id postgres >/dev/null 2>&1 && trusted_linux_tool runuser >/dev/null 2>&1 && "$(trusted_linux_tool runuser)" -u postgres -- psql -d postgres -tAc 'SELECT 1' >/dev/null 2>&1; then
+    MANAGED_LOCAL_ADMIN_SOCKET="$("$sudo_bin" -n -u postgres "$psql_bin" -d postgres -tAc 'SHOW unix_socket_directories' | tr -d '[:space:]' | cut -d, -f1)"
+  elif [ "$OS_NAME" = "Linux" ] && id postgres >/dev/null 2>&1 \
+    && runuser_bin="$(trusted_linux_tool runuser)" && psql_bin="$(trusted_linux_tool psql)" \
+    && "$runuser_bin" -u postgres -- "$psql_bin" -d postgres -tAc 'SELECT 1' >/dev/null 2>&1; then
     MANAGED_LOCAL_ADMIN_MODE="runuser"
     MANAGED_LOCAL_ADMIN_USER="postgres"
-    MANAGED_LOCAL_ADMIN_SOCKET="$("$(trusted_linux_tool runuser)" -u postgres -- psql -d postgres -tAc 'SHOW unix_socket_directories' | tr -d '[:space:]' | cut -d, -f1)"
+    MANAGED_LOCAL_ADMIN_SOCKET="$("$runuser_bin" -u postgres -- "$psql_bin" -d postgres -tAc 'SHOW unix_socket_directories' | tr -d '[:space:]' | cut -d, -f1)"
   else
     return 1
   fi
@@ -1504,7 +1511,8 @@ trusted_linux_tool() {
     [ "$owner" = root ] && [ -n "$mode" ] || continue
     [ $((8#$mode & 022)) -eq 0 ] || continue
     while [ "$resolved" != / ]; do
-      resolved="$(/usr/bin/dirname "$resolved")"
+      resolved="${resolved%/*}"
+      [ -n "$resolved" ] || resolved=/
       owner="$(/usr/bin/stat -c '%U' "$resolved" 2>/dev/null || true)"
       mode="$(/usr/bin/stat -c '%a' "$resolved" 2>/dev/null || true)"
       [ "$owner" = root ] && [ -n "$mode" ] && [ $((8#$mode & 022)) -eq 0 ] || break 2
@@ -1516,19 +1524,28 @@ trusted_linux_tool() {
 }
 
 prepare_trusted_linux_migration_toolchain() {
+  local tool directory path_result=""
   [ "$OS_NAME" = Linux ] || die "Elevated managed local migrations are only supported on Linux."
   MANAGED_LOCAL_BASH="$(trusted_linux_tool bash)" || die "Could not find a root-owned non-writable bash for elevated managed migrations."
   MANAGED_LOCAL_NODE="$(trusted_linux_tool node)" || die "Could not find a root-owned non-writable node for elevated managed migrations."
   MANAGED_LOCAL_NPM="$(trusted_linux_tool npm)" || die "Could not find a root-owned non-writable npm for elevated managed migrations."
   MANAGED_LOCAL_NPX="$(trusted_linux_tool npx)" || die "Could not find a root-owned non-writable npx for elevated managed migrations."
-  MANAGED_LOCAL_PATH="$(dirname "$MANAGED_LOCAL_NODE"):$(dirname "$MANAGED_LOCAL_NPM"):$(dirname "$MANAGED_LOCAL_NPX"):$(dirname "$MANAGED_LOCAL_BASH"):/usr/local/bin:/usr/bin:/bin"
+  for tool in "$MANAGED_LOCAL_NODE" "$MANAGED_LOCAL_NPM" "$MANAGED_LOCAL_NPX" "$MANAGED_LOCAL_BASH"; do
+    directory="${tool%/*}"
+    case ":$path_result:" in
+      *":$directory:"*) ;;
+      *) path_result="${path_result:+$path_result:}$directory" ;;
+    esac
+  done
+  MANAGED_LOCAL_PATH="$path_result"
 }
 
 run_managed_local_migration_as_runuser() {
   local description="$1" stage="$2"
-  local controlled_path
+  local controlled_path runuser_bin
   prepare_trusted_linux_migration_toolchain
   controlled_path="$MANAGED_LOCAL_PATH"
+  runuser_bin="$(trusted_linux_tool runuser)" || die "Could not find a root-owned non-writable runuser for elevated managed migrations."
 
   # `runuser --preserve-environment` is needed so the child receives the
   # process-only socket/admin context without serialising a credential into an
@@ -1544,7 +1561,7 @@ run_managed_local_migration_as_runuser() {
     done
     PATH="$controlled_path"
     export PATH
-    run "$description" "$(trusted_linux_tool runuser)" -u postgres --preserve-environment -- "$MANAGED_LOCAL_BASH" -c 'cd "$1"; case "$2" in
+    run "$description" "$runuser_bin" -u postgres --preserve-environment -- "$MANAGED_LOCAL_BASH" -c 'cd "$1"; case "$2" in
       release) npm run protocol:bootstrap-epic-172-release-roles ;;
       migrate-0025) npx tsx scripts/ci/migrate-through-0025.ts ;;
       s3) npm run protocol:bootstrap-epic-172-s3-release-owner ;;
