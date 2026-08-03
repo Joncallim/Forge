@@ -130,8 +130,11 @@ const protectedReleaseTables = protectedInstallerRelations
   .filter((relation) => relation.scope === 'release')
   .map((relation) => relation.name)
 const protectedInstallerGrantTables = protectedInstallerRelations.map((relation) => relation.name)
-const preS4ProtectedInstallerTables = protectedInstallerRelations
-  .filter((relation) => relation.scope === 'release' || relation.scope === 's3')
+const exact0026ProtectedInstallerTables = protectedInstallerRelations
+  .filter((relation) => relation.scope === 'release' || relation.scope === 's3' || relation.scope === 'projection')
+  .map((relation) => relation.name)
+const exact0026ProjectionTables = protectedInstallerRelations
+  .filter((relation) => relation.scope === 'projection')
   .map((relation) => relation.name)
 const protectedProjectionTables = new Set<string>(protectedInstallerRelations
   .filter((relation) => relation.scope === 'projection')
@@ -887,9 +890,37 @@ async function exactProtectedTableAcls(
   return ownership?.objects === 0
 }
 
+async function exact0026ProjectionTableAcls(
+  sql: postgres.Sql | postgres.TransactionSql,
+): Promise<boolean> {
+  // Migration 0026 transfers both projection tables to the release owner and
+  // revokes PUBLIC, writer, and transition access. The remaining table ACL is
+  // therefore exactly the owner's seven ordinary table privileges.
+  const grants = await sql<readonly { entry: string }[]>`
+    SELECT relation.relname || '|' || COALESCE(grantee.rolname, 'PUBLIC') || '|'
+      || privilege.privilege_type || '|' || privilege.is_grantable || '|' || grantor.rolname AS entry
+    FROM pg_catalog.pg_class relation
+    JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = relation.relnamespace
+    CROSS JOIN LATERAL pg_catalog.aclexplode(
+      COALESCE(relation.relacl, pg_catalog.acldefault('r', relation.relowner))
+    ) privilege
+    LEFT JOIN pg_catalog.pg_roles grantee ON grantee.oid = privilege.grantee
+    JOIN pg_catalog.pg_roles grantor ON grantor.oid = privilege.grantor
+    WHERE namespace_row.nspname = 'public'
+      AND relation.relname = ANY(${sql.array([...exact0026ProjectionTables])}::text[])
+    ORDER BY 1
+  `
+  const ownerPrivileges = ['DELETE', 'INSERT', 'REFERENCES', 'SELECT', 'TRIGGER', 'TRUNCATE', 'UPDATE']
+  const expected = exact0026ProjectionTables.flatMap((table) => ownerPrivileges.map((privilege) => (
+    `${table}|forge_release_routines_owner|${privilege}|false|forge_release_routines_owner`
+  ))).sort()
+  const actual = grants.map((row) => row.entry).sort()
+  return actual.length === expected.length && actual.every((entry, index) => entry === expected[index])
+}
+
 async function exactProtectedInstallerColumnAcls(
   sql: postgres.Sql | postgres.TransactionSql,
-  relationNames: readonly string[] = preS4ProtectedInstallerTables,
+  relationNames: readonly string[] = exact0026ProtectedInstallerTables,
 ): Promise<boolean> {
   const columnGrants = await sql<readonly { entry: string }[]>`
     SELECT relation.relname || '|' || attribute.attname || '|'
@@ -1280,6 +1311,7 @@ async function legacyFingerprint(sql: postgres.Sql | postgres.TransactionSql): P
     || !await exactReleaseCatalog(sql, false, triggerRoutineStateFor0026(s4BoundaryState))
     || !await exactS3CompletionBoundary(sql)
     || !await exactMigrationLoginBoundary(sql) || !await exactProtectedTableAcls(sql, false)
+    || !await exact0026ProjectionTableAcls(sql)
     || !await exactProtectedInstallerColumnAcls(sql)
     || !await exactLegacyConsumerLocalAuthority(sql, false)
     || !await exactRoutines(sql, legacyRoutineDigests, false, false, null)) return false
@@ -1314,6 +1346,7 @@ async function repairedFingerprint(sql: postgres.Sql | postgres.TransactionSql):
     || !await exactReleaseCatalog(sql, true, triggerRoutineStateFor0026(s4BoundaryState))
     || !await exactS3CompletionBoundary(sql)
     || !await exactMigrationLoginBoundary(sql) || !await exactProtectedTableAcls(sql, true)
+    || !await exact0026ProjectionTableAcls(sql)
     || !await exactProtectedInstallerColumnAcls(sql)
     || !await exactLegacyConsumerLocalAuthority(sql, true)
     || !await exactRoutines(sql, repairedRoutineDigests, false, false, null)) return false
@@ -1335,6 +1368,7 @@ async function current0026Fingerprint(sql: postgres.Sql | postgres.TransactionSq
     && exactCurrentCatalog
     && await exactS3CompletionBoundary(sql)
     && await exactProtectedTableAcls(sql, true)
+    && await exact0026ProjectionTableAcls(sql)
     && await exactProtectedInstallerColumnAcls(sql)
     && await exactRoutines(sql, repairedRoutineDigests, false, false, migrationLogin)
 }
@@ -1407,7 +1441,7 @@ async function main(): Promise<void> {
         throw new Error('Refusing legacy release repair: literal forge role is outside the exact safe app-role boundary.')
       }
       if (position === '0026') {
-        await lockProtectedInstallerAclCatalog(sql, preS4ProtectedInstallerTables)
+        await lockProtectedInstallerAclCatalog(sql, exact0026ProtectedInstallerTables)
       }
 
       if (pair === 'current') {

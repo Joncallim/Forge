@@ -230,22 +230,13 @@ assert_only_external_acl_changed() {
 }
 
 assert_only_exact_0026_external_acl_changed() {
-  local before="$1" after="$2" kind="$3" expected_entry filtered
+  local before="$1" after="$2" expected_entry="$3" case_name="$4" filtered
   filtered="$TEMP_ROOT/$after.filtered-relation-acls"
-  case "$kind" in
-    table)
-      expected_entry='table|public|forge_epic_172_enablement_state|forge|INSERT|false|forge_release_routines_owner'
-      ;;
-    column)
-      expected_entry='column|public|forge_epic_172_enablement_state|state|forge|SELECT|false|forge_release_routines_owner'
-      ;;
-    *) echo "Unknown exact-0026 ACL inventory kind: $kind" >&2; exit 64 ;;
-  esac
   [ "$(grep -Fxc "$expected_entry" "$TEMP_ROOT/$after.relation-acls")" = 1 ] \
-    || { echo "Exact-0026 $kind race lacks its one external ACL entry." >&2; exit 1; }
+    || { echo "$case_name lacks its one external ACL entry." >&2; exit 1; }
   grep -Fvx "$expected_entry" "$TEMP_ROOT/$after.relation-acls" > "$filtered"
   cmp -s "$TEMP_ROOT/$before.relation-acls" "$filtered" \
-    || { echo "Exact-0026 $kind race changed another relation ACL." >&2; exit 1; }
+    || { echo "$case_name changed another relation ACL." >&2; exit 1; }
 }
 
 run_repair() {
@@ -745,57 +736,46 @@ prepare_0026_acl_race_state() {
   ensure_forge_app_role
 }
 
-assert_exact_0026_external_acl() {
-  local kind="$1" table_grants column_grants
-  table_grants="$(admin_psql --no-align --tuples-only --quiet --command "
-    SELECT pg_catalog.count(*)
-    FROM pg_catalog.pg_class relation
-    JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = relation.relnamespace
-    CROSS JOIN LATERAL pg_catalog.aclexplode(
-      COALESCE(relation.relacl, pg_catalog.acldefault('r', relation.relowner))
-    ) privilege
-    WHERE namespace_row.nspname = 'public'
-      AND relation.relname = 'forge_epic_172_enablement_state'
-      AND privilege.grantee = 'forge'::pg_catalog.regrole
-      AND privilege.privilege_type = 'INSERT';")"
-  column_grants="$(admin_psql --no-align --tuples-only --quiet --command "
-    SELECT pg_catalog.count(*)
-    FROM pg_catalog.pg_attribute attribute
-    JOIN pg_catalog.pg_class relation ON relation.oid = attribute.attrelid
-    JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = relation.relnamespace
-    CROSS JOIN LATERAL pg_catalog.aclexplode(attribute.attacl) privilege
-    WHERE namespace_row.nspname = 'public'
-      AND relation.relname = 'forge_epic_172_enablement_state'
-      AND attribute.attname = 'state'
-      AND privilege.grantee = 'forge'::pg_catalog.regrole
-      AND privilege.privilege_type = 'SELECT';")"
-  case "$kind" in
-    table) [ "$table_grants|$column_grants" = '1|0' ] ;;
-    column) [ "$table_grants|$column_grants" = '0|1' ] ;;
-    *) return 1 ;;
-  esac || { echo "Exact-0026 $kind race did not preserve only its external grant." >&2; exit 1; }
-}
-
 prove_0026_acl_race_refusal() {
-  local state="$1" kind="$2" grant_sql cleanup_sql
-  local label="0026-$state-$kind-acl-race"
+  local state="$1" kind="$2" surface="${3:-release}" grant_sql cleanup_sql
+  local relation column grantee expected_entry
+  local label="0026-$state-$surface-$kind-acl-race"
   prepare_0026_acl_race_state "$state"
+  case "$surface" in
+    release)
+      relation=forge_epic_172_enablement_state
+      column=state
+      grantee=forge
+      ;;
+    projection)
+      relation=work_package_local_projection_heads
+      column=head_kind
+      case "$state" in
+        current) grantee=forge ;;
+        legacy) grantee=PUBLIC ;;
+        repaired) grantee=forge_release_transition ;;
+      esac
+      ;;
+    *) echo "Unknown exact-0026 ACL race surface: $surface" >&2; exit 64 ;;
+  esac
   case "$kind" in
     table)
       grant_sql="SET ROLE forge_release_routines_owner;
-GRANT INSERT ON TABLE public.forge_epic_172_enablement_state TO forge;
+GRANT INSERT ON TABLE public.$relation TO $grantee;
 RESET ROLE;"
       cleanup_sql="SET ROLE forge_release_routines_owner;
-REVOKE INSERT ON TABLE public.forge_epic_172_enablement_state FROM forge;
+REVOKE INSERT ON TABLE public.$relation FROM $grantee;
 RESET ROLE;"
+      expected_entry="table|public|$relation|$grantee|INSERT|false|forge_release_routines_owner"
       ;;
     column)
       grant_sql="SET ROLE forge_release_routines_owner;
-GRANT SELECT (state) ON TABLE public.forge_epic_172_enablement_state TO forge;
+GRANT SELECT ($column) ON TABLE public.$relation TO $grantee;
 RESET ROLE;"
       cleanup_sql="SET ROLE forge_release_routines_owner;
-REVOKE SELECT (state) ON TABLE public.forge_epic_172_enablement_state FROM forge;
+REVOKE SELECT ($column) ON TABLE public.$relation FROM $grantee;
 RESET ROLE;"
+      expected_entry="column|public|$relation|$column|$grantee|SELECT|false|forge_release_routines_owner"
       ;;
     *) echo "Unknown exact-0026 ACL race kind: $kind" >&2; exit 64 ;;
   esac
@@ -803,12 +783,12 @@ RESET ROLE;"
   snapshot "$label-before"
   prove_acl_grant_race_refusal "$label" "$grant_sql"
   snapshot "$label-after"
-  assert_only_external_acl_changed "$label-before" "$label-after" "Exact-0026 $state $kind GRANT race"
-  assert_only_exact_0026_external_acl_changed "$label-before" "$label-after" "$kind"
-  assert_exact_0026_external_acl "$kind"
-  expect_refusal "Committed exact-0026 $state $kind GRANT drift"
+  assert_only_external_acl_changed "$label-before" "$label-after" "Exact-0026 $state $surface $kind GRANT race"
+  assert_only_exact_0026_external_acl_changed \
+    "$label-before" "$label-after" "$expected_entry" "Exact-0026 $state $surface $kind GRANT race"
+  expect_refusal "Committed exact-0026 $state $surface $kind GRANT drift"
   snapshot "$label-rerun"
-  assert_unchanged "$label-after" "$label-rerun" "Committed exact-0026 $state $kind GRANT refusal"
+  assert_unchanged "$label-after" "$label-rerun" "Committed exact-0026 $state $surface $kind GRANT refusal"
   admin_psql --command "$cleanup_sql"
 }
 
@@ -997,6 +977,12 @@ echo 'Proving every exact-0026 ACL fingerprint serializes table and column GRANT
 for acl_state in current legacy repaired; do
   prove_0026_acl_race_refusal "$acl_state" table
   prove_0026_acl_race_refusal "$acl_state" column
+done
+
+echo 'Proving exact-0026 projection ACL fingerprints serialize forge, PUBLIC, and protocol-role GRANT races.'
+for acl_state in current legacy repaired; do
+  prove_0026_acl_race_refusal "$acl_state" table projection
+  prove_0026_acl_race_refusal "$acl_state" column projection
 done
 
 prepare_0026_baseline
