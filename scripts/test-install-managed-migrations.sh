@@ -44,7 +44,7 @@ run_managed_case() {
     FORGE_DRY_RUN="$dry_run" \
     FORGE_ENV_FILE="$case_dir/forge.env" \
     FORGE_INSTALL_STATE_DIR="$case_dir/state" \
-    bash "$INSTALLER" > "$case_dir/stdout" 2> "$case_dir/stderr"
+    /bin/bash "$INSTALLER" > "$case_dir/stdout" 2> "$case_dir/stderr"
   CASE_STATUS=$?
   set -e
   CASE_DIR="$case_dir"
@@ -89,7 +89,7 @@ run_enabled_case() {
     FORGE_INSTALL_TEST_SERVICE_MODE="$service_mode" \
     FORGE_ENV_FILE="$case_dir/forge.env" \
     FORGE_INSTALL_STATE_DIR="$case_dir/state" \
-    bash "$INSTALLER" > "$case_dir/stdout" 2> "$case_dir/stderr"
+    /bin/bash "$INSTALLER" > "$case_dir/stdout" 2> "$case_dir/stderr"
   CASE_DIR="$case_dir"
 }
 
@@ -97,6 +97,50 @@ run_enabled_case custom native "postgresql://custom:${TEST_SECRET}@example.inval
 assert_contains 'managed-local-migrations-bypassed' "$CASE_DIR/stdout"
 run_enabled_case docker docker "postgresql://forge:${TEST_SECRET}@localhost:5432/forge"
 assert_contains 'managed-local-migrations-bypassed' "$CASE_DIR/stdout"
+
+run_runuser_environment_case() {
+  local case_dir="$TEST_ROOT/runuser-environment"
+  mkdir -p "$case_dir/bin" "$case_dir/state"
+  printf 'DATABASE_URL=postgresql://forge:%s@localhost:5432/forge\n' "$TEST_SECRET" > "$case_dir/forge.env"
+  cat > "$case_dir/bin/runuser" <<'EOF'
+#!/bin/bash
+marker_dir="$(dirname "$FORGE_ENV_FILE")"
+if printenv | cut -d= -f1 | grep -Fx 'UNRELATED_SECRET_SENTINEL' >/dev/null; then
+  printf 'unrelated-secret-leaked\n' > "$marker_dir/runuser-result"
+  exit 1
+fi
+printenv | cut -d= -f1 | sort > "$marker_dir/runuser-environment-names"
+printf 'clean\n' > "$marker_dir/runuser-result"
+while [ "$1" != "--" ]; do shift; done
+shift
+exec "$@"
+EOF
+  cat > "$case_dir/bin/bash" <<'EOF'
+#!/bin/bash
+exit 0
+EOF
+  for command in node npm npx; do
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$case_dir/bin/$command"
+  done
+  chmod +x "$case_dir/bin/runuser" "$case_dir/bin/bash" "$case_dir/bin/node" "$case_dir/bin/npm" "$case_dir/bin/npx"
+  PATH="$case_dir/bin:$PATH" \
+    UNRELATED_SECRET_SENTINEL='unrelated-value-must-not-reach-postgres' \
+    FORGE_INSTALL_TEST_HOOK=managed-local-migrations-runuser-environment \
+    FORGE_INSTALL_TEST_ADMIN_MODE=runuser \
+    FORGE_ENV_FILE="$case_dir/forge.env" \
+    FORGE_INSTALL_STATE_DIR="$case_dir/state" \
+    /bin/bash "$INSTALLER" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  CASE_DIR="$case_dir"
+}
+
+run_runuser_environment_case
+assert_contains 'clean' "$CASE_DIR/runuser-result"
+assert_not_contains 'UNRELATED_SECRET_SENTINEL' "$CASE_DIR/runuser-environment-names"
+assert_contains 'DATABASE_URL' "$CASE_DIR/runuser-environment-names"
+assert_contains 'FORGE_DATABASE_ADMIN_URL' "$CASE_DIR/runuser-environment-names"
+assert_contains 'PGHOST' "$CASE_DIR/runuser-environment-names"
+assert_contains 'PGUSER' "$CASE_DIR/runuser-environment-names"
+assert_not_contains "$TEST_SECRET" "$CASE_DIR/runuser-environment-names"
 
 if rg -F "$TEST_SECRET" "$TEST_ROOT" --glob '!forge.env' >/dev/null; then
   fail 'test sentinel leaked outside the local environment fixture'

@@ -1497,20 +1497,55 @@ run_managed_local_migration_stage() {
       esac' _ "$REPO_ROOT/web" "$stage"
       ;;
     runuser)
-      run "$description" runuser -u postgres --preserve-environment -- bash -c 'cd "$1"; case "$2" in
-        release) npm run protocol:bootstrap-epic-172-release-roles ;;
-        migrate-0025) npx tsx scripts/ci/migrate-through-0025.ts ;;
-        s3) npm run protocol:bootstrap-epic-172-s3-release-owner ;;
-        migrate-0026) npx tsx scripts/ci/migrate-through-0026.ts ;;
-        s4) npm run protocol:bootstrap-epic-172-s4-roles ;;
-        migrate-0027) npx tsx scripts/ci/migrate-through-0027.ts ;;
-        s5) bash scripts/ci/apply-epic-172-s5-recovery-migration.sh ;;
-        latest) npm run db:migrate ;;
-        *) exit 64 ;;
-      esac' _ "$REPO_ROOT/web" "$stage"
+      run_managed_local_migration_as_runuser "$description" "$stage"
       ;;
     *) die "Managed local PostgreSQL administrator mode is unavailable." ;;
   esac
+}
+
+managed_local_executable_path() {
+  local tool path result=""
+  for tool in node npm npx bash; do
+    path="$(command -v "$tool")" || die "Managed local migrations require $tool on PATH."
+    case ":$result:" in
+      *":$(dirname "$path"):"*) ;;
+      *) result="${result:+$result:}$(dirname "$path")" ;;
+    esac
+  done
+  printf '%s:/usr/local/bin:/usr/bin:/bin\n' "$result"
+}
+
+run_managed_local_migration_as_runuser() {
+  local description="$1" stage="$2"
+  local controlled_path
+  controlled_path="$(managed_local_executable_path)"
+
+  # `runuser --preserve-environment` is needed so the child receives the
+  # process-only socket/admin context without serialising a credential into an
+  # argv value. Constrain its parent environment first: this subshell exports
+  # exactly the migration inputs and a controlled executable path.
+  (
+    local name
+    for name in $(compgen -e); do
+      case "$name" in
+        DATABASE_URL|FORGE_DATABASE_ADMIN_URL|PGHOST|PGUSER|FORGE_WORKSPACE_ROOT|FORGE_ENV_FILE|FORGE_SUPPRESS_MIGRATION_NOTICES|PATH) ;;
+        *) unset "$name" ;;
+      esac
+    done
+    PATH="$controlled_path"
+    export PATH
+    run "$description" runuser -u postgres --preserve-environment -- bash -c 'cd "$1"; case "$2" in
+      release) npm run protocol:bootstrap-epic-172-release-roles ;;
+      migrate-0025) npx tsx scripts/ci/migrate-through-0025.ts ;;
+      s3) npm run protocol:bootstrap-epic-172-s3-release-owner ;;
+      migrate-0026) npx tsx scripts/ci/migrate-through-0026.ts ;;
+      s4) npm run protocol:bootstrap-epic-172-s4-roles ;;
+      migrate-0027) npx tsx scripts/ci/migrate-through-0027.ts ;;
+      s5) bash scripts/ci/apply-epic-172-s5-recovery-migration.sh ;;
+      latest) npm run db:migrate ;;
+      *) exit 64 ;;
+    esac' _ "$REPO_ROOT/web" "$stage"
+  )
 }
 
 run_managed_local_migrations() {
@@ -1525,7 +1560,11 @@ run_managed_local_migrations() {
   local DATABASE_URL FORGE_DATABASE_ADMIN_URL PGHOST PGUSER FORGE_WORKSPACE_ROOT FORGE_ENV_FILE FORGE_SUPPRESS_MIGRATION_NOTICES
   DATABASE_URL="$(env_value DATABASE_URL)"
   [ -n "$DATABASE_URL" ] || die "Managed local migrations require DATABASE_URL in the local Forge environment file."
-  FORGE_DATABASE_ADMIN_URL="postgresql:///forge"
+  if [ "${FORGE_INSTALL_TEST_HOOK:-}" = "managed-local-migrations-real" ] && [ -n "${FORGE_INSTALL_TEST_ADMIN_URL:-}" ]; then
+    FORGE_DATABASE_ADMIN_URL="$FORGE_INSTALL_TEST_ADMIN_URL"
+  else
+    FORGE_DATABASE_ADMIN_URL="postgresql:///forge"
+  fi
   PGHOST="$MANAGED_LOCAL_ADMIN_SOCKET"
   PGUSER="$MANAGED_LOCAL_ADMIN_USER"
   FORGE_WORKSPACE_ROOT="$WORKSPACE_ROOT"
@@ -1827,6 +1866,18 @@ fi
 if [ "${FORGE_INSTALL_TEST_HOOK:-}" = "managed-local-migrations" ]; then
   SERVICE_MODE="${FORGE_INSTALL_TEST_SERVICE_MODE:-native}"
   printf 'admin:%s\n' "${FORGE_INSTALL_TEST_ADMIN_MODE:-unset}" >> "${FORGE_INSTALL_TEST_STAGE_LOG:?}"
+  run_managed_local_migrations
+  exit 0
+fi
+
+if [ "${FORGE_INSTALL_TEST_HOOK:-}" = "managed-local-migrations-runuser-environment" ]; then
+  SERVICE_MODE="native"
+  run_managed_local_migrations
+  exit 0
+fi
+
+if [ "${FORGE_INSTALL_TEST_HOOK:-}" = "managed-local-migrations-real" ]; then
+  SERVICE_MODE="native"
   run_managed_local_migrations
   exit 0
 fi
