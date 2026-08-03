@@ -140,14 +140,22 @@ const releaseTriggerFingerprints = [
   'forge_release_signer_keys_no_delete|forge_release_signer_keys|forge_epic_172_reject_mutation_v1()|O|13c0c6f1e332701344f8131ac2693e2d',
   'forge_release_signer_lifecycle_append_only|forge_release_signer_key_lifecycle_audits|forge_epic_172_reject_mutation_v1()|O|09159d710dac8a28733eedc0296b022d',
 ] as const
-const releaseTriggerRoutineFingerprintsPreS4 = [
+const releaseTriggerRoutineFingerprintsPublic = [
   'forge.guard_epic_172_s3_evidence_insert_v1()|4d09e72e463d8264bfc80d560bc74560|forge_release_routines_owner|false|search_path=pg_catalog, public|forge_release_routines_owner:EXECUTE:false:forge_release_routines_owner',
   'public.forge_epic_172_reject_mutation_v1()|6c37302b654f96cecd43f1716ffbdd51|forge_release_routines_owner|false|search_path=pg_catalog, public|PUBLIC:EXECUTE:false:forge_release_routines_owner,forge_release_routines_owner:EXECUTE:false:forge_release_routines_owner',
 ] as const
-const releaseTriggerRoutineFingerprintsS4 = [
-  releaseTriggerRoutineFingerprintsPreS4[0],
+const releaseTriggerRoutineFingerprintsNoPublic = [
+  releaseTriggerRoutineFingerprintsPublic[0],
   'public.forge_epic_172_reject_mutation_v1()|6c37302b654f96cecd43f1716ffbdd51|forge_release_routines_owner|false|search_path=pg_catalog, public|forge_release_routines_owner:EXECUTE:false:forge_release_routines_owner',
 ] as const
+type S4BoundaryState = 'absent' | 'cluster-global-zero-authority' | 'failed-bootstrap-local'
+type ReleaseTriggerRoutineState = 'pre-s4-public' | 'failed-bootstrap-no-public' | 'durable-s4-no-public'
+
+function triggerRoutineStateFor0026(s4BoundaryState: S4BoundaryState): ReleaseTriggerRoutineState {
+  return s4BoundaryState === 'failed-bootstrap-local'
+    ? 'failed-bootstrap-no-public'
+    : 'pre-s4-public'
+}
 
 function expectedRoutineAcl(
   identity: string,
@@ -381,38 +389,40 @@ async function exactZeroAuthorityS4Roles(
     && await exactForgeSchemaAcl(sql, false, migrationLogin)
 }
 
-async function exactS4Boundary(
+async function exactS4BoundaryState(
   sql: postgres.Sql | postgres.TransactionSql,
   migrationLogin: string | null,
-): Promise<boolean> {
-  return (await exactS4RoleBoundary(sql, false, migrationLogin))
-    || (await exactZeroAuthorityS4Roles(sql, migrationLogin))
-    || (await exactS4RoleBoundary(sql, true, migrationLogin))
+): Promise<S4BoundaryState | null> {
+  if (await exactS4RoleBoundary(sql, false, migrationLogin)) return 'absent'
+  if (await exactZeroAuthorityS4Roles(sql, migrationLogin)) return 'cluster-global-zero-authority'
+  if (await exactS4RoleBoundary(sql, true, migrationLogin)) return 'failed-bootstrap-local'
+  return null
 }
 
-async function exactRoleBoundary(
+async function exactRoleBoundaryState(
   sql: postgres.Sql | postgres.TransactionSql,
   expectLegacyConsumer: boolean,
   migrationLogin: string | null,
-): Promise<boolean> {
-  return await exactReleaseRoleBoundary(sql, expectLegacyConsumer)
-    && await exactS4Boundary(sql, migrationLogin)
+): Promise<S4BoundaryState | null> {
+  if (!await exactReleaseRoleBoundary(sql, expectLegacyConsumer)) return null
+  return exactS4BoundaryState(sql, migrationLogin)
 }
 
-async function exactCurrentRoleBoundary(
+async function exactCurrentRoleBoundaryState(
   sql: postgres.Sql | postgres.TransactionSql,
   migrationLogin: string,
-): Promise<boolean> {
+): Promise<S4BoundaryState | null> {
   const exactReleaseBoundary = (await exactReleaseRoleBoundary(sql, false))
     || ((await exactReleaseRoleBoundary(sql, true))
       && await exactLegacyConsumerLocalAuthority(sql, true))
-  return exactReleaseBoundary && await exactS4Boundary(sql, migrationLogin)
+  if (!exactReleaseBoundary) return null
+  return exactS4BoundaryState(sql, migrationLogin)
 }
 
 async function exactReleaseCatalog(
   sql: postgres.Sql | postgres.TransactionSql,
   repaired: boolean,
-  expectS4TriggerAcl = false,
+  triggerRoutineState: ReleaseTriggerRoutineState,
 ): Promise<boolean> {
   const [shape] = await sql<readonly { owners: number; forgeOwner: boolean; requiredEvidence: number; tokenType: string | null; signerDefault: string | null }[]>`
     SELECT
@@ -527,9 +537,9 @@ async function exactReleaseCatalog(
     routine.config?.join(',') ?? '<null>',
     routine.acl ?? '<null>',
   ].join('|'))
-  const expectedTriggerRoutines = expectS4TriggerAcl
-    ? releaseTriggerRoutineFingerprintsS4
-    : releaseTriggerRoutineFingerprintsPreS4
+  const expectedTriggerRoutines = triggerRoutineState === 'pre-s4-public'
+    ? releaseTriggerRoutineFingerprintsPublic
+    : releaseTriggerRoutineFingerprintsNoPublic
   return triggerRoutineFingerprints.length === expectedTriggerRoutines.length
     && triggerRoutineFingerprints.every(
       (fingerprint, index) => fingerprint === expectedTriggerRoutines[index],
@@ -821,14 +831,18 @@ async function legacyFingerprint(sql: postgres.Sql | postgres.TransactionSql): P
       )
     ) AS ok
   `
-  if (result?.ok !== true || !await exactEmptyReleaseState(sql) || !await exactReleaseCatalog(sql, false)
+  if (result?.ok !== true) return false
+  const s4BoundaryState = await exactRoleBoundaryState(sql, true, null)
+  if (!s4BoundaryState) return false
+  if (!await exactEmptyReleaseState(sql)
+    || !await exactReleaseCatalog(sql, false, triggerRoutineStateFor0026(s4BoundaryState))
     || !await exactMigrationLoginBoundary(sql) || !await exactProtectedTableAcls(sql, false)
     || !await exactLegacyConsumerLocalAuthority(sql, false)
     || !await exactRoutines(sql, legacyRoutineDigests, false, false, null)) return false
-  // A first failed S4 bootstrap creates inert principals before it discovers
-  // the missing Step 0 read routine.  Both that exact inert set and no S4
-  // principals are safe; every other S4 state is an operator intervention.
-  return exactRoleBoundary(sql, true, null)
+  // A prior S4 bootstrap can leave an exact inert local role boundary.  That
+  // state is accepted only with its matching no-PUBLIC trigger ACL; absent or
+  // cluster-global-only S4 roles require the pristine pre-S4 PUBLIC ACL.
+  return true
 }
 
 async function repairedFingerprint(sql: postgres.Sql | postgres.TransactionSql): Promise<boolean> {
@@ -849,28 +863,33 @@ async function repairedFingerprint(sql: postgres.Sql | postgres.TransactionSql):
       AND to_regprocedure('forge.record_epic_172_release_evidence_v1(uuid,text,integer,text,jsonb,jsonb,text,bigint,jsonb,text,text,uuid,bigint,text,text,text,text,bytea,uuid,timestamptz,jsonb)') IS NOT NULL
     ) AS ok
   `
-  if (result?.ok !== true || !await exactEmptyReleaseState(sql) || !await exactReleaseCatalog(sql, true)
+  if (result?.ok !== true) return false
+  const s4BoundaryState = await exactRoleBoundaryState(sql, true, null)
+  if (!s4BoundaryState) return false
+  if (!await exactEmptyReleaseState(sql)
+    || !await exactReleaseCatalog(sql, true, triggerRoutineStateFor0026(s4BoundaryState))
     || !await exactMigrationLoginBoundary(sql) || !await exactProtectedTableAcls(sql, true)
     || !await exactLegacyConsumerLocalAuthority(sql, true)
     || !await exactRoutines(sql, repairedRoutineDigests, false, false, null)) return false
-  return exactRoleBoundary(sql, true, null)
+  return true
 }
 
 async function current0026Fingerprint(sql: postgres.Sql | postgres.TransactionSql): Promise<boolean> {
   const migrationLogin = await exactCurrentMigrationLoginBoundary(sql)
   if (!migrationLogin) return false
+  const s4BoundaryState = await exactCurrentRoleBoundaryState(sql, migrationLogin)
+  if (!s4BoundaryState) return false
   return await exactEmptyReleaseState(sql)
-    && await exactReleaseCatalog(sql, true)
+    && await exactReleaseCatalog(sql, true, triggerRoutineStateFor0026(s4BoundaryState))
     && await exactProtectedTableAcls(sql, true)
     && await exactRoutines(sql, repairedRoutineDigests, false, false, migrationLogin)
-    && await exactCurrentRoleBoundary(sql, migrationLogin)
 }
 
 async function durableRepairedFingerprint(sql: postgres.Sql | postgres.TransactionSql): Promise<boolean> {
   // Later migrations legitimately add S4/S5 objects and may populate release
   // state.  The stable repair receipt is therefore the complete protected S3
   // catalog, ACL and routine surface plus the inert legacy consumer principal.
-  return await exactReleaseCatalog(sql, true, true)
+  return await exactReleaseCatalog(sql, true, 'durable-s4-no-public')
     && await exactProtectedTableAcls(sql, true)
     && await exactLegacyConsumerLocalAuthority(sql, true)
     && await exactRoutines(sql, repairedRoutineDigests, false, true, null)

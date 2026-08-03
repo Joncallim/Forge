@@ -209,6 +209,13 @@ run_repair
 snapshot current-managed-0026-after
 assert_unchanged current-managed-0026-before current-managed-0026-after 'Current managed 0026 no-op'
 
+prepare_0026_baseline
+admin_psql --command 'REVOKE EXECUTE ON FUNCTION public.forge_epic_172_reject_mutation_v1() FROM PUBLIC;'
+snapshot current-no-public-without-s4-before
+expect_refusal 'Current 0026 no-PUBLIC ACL without local S4 state'
+snapshot current-no-public-without-s4-after
+assert_unchanged current-no-public-without-s4-before current-no-public-without-s4-after 'Current 0026 no-PUBLIC ACL without local S4 state'
+
 prepare_cross_database_consumer
 prepare_0026_baseline
 snapshot current-cross-database-consumer-before
@@ -289,6 +296,13 @@ snapshot extra-trigger-near-miss-before
 expect_refusal 'Protected-table extra-trigger near-miss'
 snapshot extra-trigger-near-miss-after
 assert_unchanged extra-trigger-near-miss-before extra-trigger-near-miss-after 'Protected-table extra-trigger near-miss'
+
+prepare_legacy_fixture
+admin_psql --command 'REVOKE EXECUTE ON FUNCTION public.forge_epic_172_reject_mutation_v1() FROM PUBLIC;'
+snapshot legacy-no-public-without-s4-before
+expect_refusal 'Legacy no-PUBLIC ACL without local S4 state'
+snapshot legacy-no-public-without-s4-after
+assert_unchanged legacy-no-public-without-s4-before legacy-no-public-without-s4-after 'Legacy no-PUBLIC ACL without local S4 state'
 
 prepare_legacy_fixture
 admin_psql <<'SQL'
@@ -442,6 +456,14 @@ run_managed_sequence() {
 echo 'Proving accepted S4 boundary variants and later-ledger reruns.'
 prepare_legacy_fixture
 expect_s4_bootstrap_failure
+snapshot failed-bootstrap-public-mismatch-before
+expect_refusal 'Failed-bootstrap local S4 with PUBLIC trigger ACL'
+snapshot failed-bootstrap-public-mismatch-after
+assert_unchanged failed-bootstrap-public-mismatch-before failed-bootstrap-public-mismatch-after 'Failed-bootstrap local S4 with PUBLIC trigger ACL'
+
+prepare_legacy_fixture
+expect_s4_bootstrap_failure
+admin_psql --command 'REVOKE EXECUTE ON FUNCTION public.forge_epic_172_reject_mutation_v1() FROM PUBLIC;'
 snapshot failed-bootstrap-before
 run_repair
 snapshot failed-bootstrap-after
@@ -453,6 +475,9 @@ cmp -s "$TEMP_ROOT/failed-bootstrap-before.roles" "$TEMP_ROOT/failed-bootstrap-a
   echo 'Failed-bootstrap S4 repair changed the role boundary.' >&2
   exit 1
 }
+run_repair
+snapshot failed-bootstrap-repaired-twice
+assert_unchanged failed-bootstrap-after failed-bootstrap-repaired-twice 'Failed-bootstrap repaired no-op'
 
 # A database reset drops all local grants and objects but intentionally leaves
 # the cluster-global S4 principals. That exact zero-authority state is safe.
