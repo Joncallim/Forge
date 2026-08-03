@@ -1406,9 +1406,141 @@ prepare_web_app() {
       bash -c 'cd "$1" && npm install --no-audit --no-fund --progress=true' _ "$REPO_ROOT/web"
     mark_web_node_modules_clean
   fi
-  run "npm run db:migrate" bash -c 'cd "$1" && FORGE_WORKSPACE_ROOT="$2" FORGE_ENV_FILE="$3" FORGE_SUPPRESS_MIGRATION_NOTICES=1 npm run db:migrate --silent' _ "$REPO_ROOT/web" "$WORKSPACE_ROOT" "$ENV_FILE"
+  if managed_local_migrations_enabled; then
+    run_managed_local_migrations
+  else
+    run "npm run db:migrate" bash -c 'cd "$1" && FORGE_WORKSPACE_ROOT="$2" FORGE_ENV_FILE="$3" FORGE_SUPPRESS_MIGRATION_NOTICES=1 npm run db:migrate --silent' _ "$REPO_ROOT/web" "$WORKSPACE_ROOT" "$ENV_FILE"
+  fi
   grant_forge_privileges
   run "npm run db:seed-agents" bash -c 'cd "$1" && FORGE_WORKSPACE_ROOT="$2" FORGE_ENV_FILE="$3" FORGE_PROMPT_UPGRADE_MODE="$4" npm run db:seed-agents' _ "$REPO_ROOT/web" "$WORKSPACE_ROOT" "$ENV_FILE" "$PROMPT_UPGRADE_MODE"
+}
+
+managed_local_migrations_enabled() {
+  [ "$SERVICE_MODE" = "native" ] || return 1
+  should_manage_local_db
+  [ "$MANAGE_LOCAL_DB" = "1" ]
+}
+
+resolve_managed_local_admin() {
+  MANAGED_LOCAL_ADMIN_MODE=""
+  MANAGED_LOCAL_ADMIN_SOCKET=""
+  MANAGED_LOCAL_ADMIN_USER=""
+
+  if [ -n "${FORGE_INSTALL_TEST_ADMIN_MODE:-}" ]; then
+    case "$FORGE_INSTALL_TEST_ADMIN_MODE" in
+      current|sudo|runuser) MANAGED_LOCAL_ADMIN_MODE="$FORGE_INSTALL_TEST_ADMIN_MODE" ;;
+      unavailable) return 1 ;;
+      *) die "Unknown installer test admin mode." ;;
+    esac
+    MANAGED_LOCAL_ADMIN_SOCKET="/tmp"
+    MANAGED_LOCAL_ADMIN_USER="postgres"
+    return 0
+  fi
+
+  if psql -d postgres -tAc 'SELECT current_user' >/dev/null 2>&1; then
+    MANAGED_LOCAL_ADMIN_MODE="current"
+    MANAGED_LOCAL_ADMIN_USER="$(psql -d postgres -tAc 'SELECT current_user' | tr -d '[:space:]')"
+    MANAGED_LOCAL_ADMIN_SOCKET="$(psql -d postgres -tAc 'SHOW unix_socket_directories' | tr -d '[:space:]' | cut -d, -f1)"
+  elif [ "$OS_NAME" = "Linux" ] && id postgres >/dev/null 2>&1 && command -v sudo >/dev/null 2>&1 && sudo -n -u postgres psql -d postgres -tAc 'SELECT 1' >/dev/null 2>&1; then
+    MANAGED_LOCAL_ADMIN_MODE="sudo"
+    MANAGED_LOCAL_ADMIN_USER="postgres"
+    MANAGED_LOCAL_ADMIN_SOCKET="$(sudo -n -u postgres psql -d postgres -tAc 'SHOW unix_socket_directories' | tr -d '[:space:]' | cut -d, -f1)"
+  elif [ "$OS_NAME" = "Linux" ] && id postgres >/dev/null 2>&1 && command -v runuser >/dev/null 2>&1 && runuser -u postgres -- psql -d postgres -tAc 'SELECT 1' >/dev/null 2>&1; then
+    MANAGED_LOCAL_ADMIN_MODE="runuser"
+    MANAGED_LOCAL_ADMIN_USER="postgres"
+    MANAGED_LOCAL_ADMIN_SOCKET="$(runuser -u postgres -- psql -d postgres -tAc 'SHOW unix_socket_directories' | tr -d '[:space:]' | cut -d, -f1)"
+  else
+    return 1
+  fi
+
+  [ -n "$MANAGED_LOCAL_ADMIN_USER" ] && [ -n "$MANAGED_LOCAL_ADMIN_SOCKET" ]
+}
+
+run_managed_local_migration_stage() {
+  local description="$1" stage="$2"
+  shift 2
+
+  if [ "${FORGE_INSTALL_TEST_HOOK:-}" = "managed-local-migrations" ]; then
+    printf '%s\n' "$stage" >> "${FORGE_INSTALL_TEST_STAGE_LOG:?}"
+    if [ "${FORGE_INSTALL_TEST_FAIL_STAGE:-}" = "$stage" ]; then
+      [ "$stage" != "s5" ] || printf 's5-cleanup-attempted\n' >> "${FORGE_INSTALL_TEST_STAGE_LOG:?}"
+      return 1
+    fi
+    return 0
+  fi
+
+  case "$MANAGED_LOCAL_ADMIN_MODE" in
+    current)
+      run "$description" bash -c 'cd "$1"; case "$2" in
+        release) npm run protocol:bootstrap-epic-172-release-roles ;;
+        migrate-0025) npx tsx scripts/ci/migrate-through-0025.ts ;;
+        s3) npm run protocol:bootstrap-epic-172-s3-release-owner ;;
+        migrate-0026) npx tsx scripts/ci/migrate-through-0026.ts ;;
+        s4) npm run protocol:bootstrap-epic-172-s4-roles ;;
+        migrate-0027) npx tsx scripts/ci/migrate-through-0027.ts ;;
+        s5) bash scripts/ci/apply-epic-172-s5-recovery-migration.sh ;;
+        latest) npm run db:migrate ;;
+        *) exit 64 ;;
+      esac' _ "$REPO_ROOT/web" "$stage"
+      ;;
+    sudo)
+      run "$description" sudo -n -u postgres --preserve-env=DATABASE_URL,FORGE_DATABASE_ADMIN_URL,PGHOST,PGUSER,FORGE_WORKSPACE_ROOT,FORGE_ENV_FILE,FORGE_SUPPRESS_MIGRATION_NOTICES,PATH bash -c 'cd "$1"; case "$2" in
+        release) npm run protocol:bootstrap-epic-172-release-roles ;;
+        migrate-0025) npx tsx scripts/ci/migrate-through-0025.ts ;;
+        s3) npm run protocol:bootstrap-epic-172-s3-release-owner ;;
+        migrate-0026) npx tsx scripts/ci/migrate-through-0026.ts ;;
+        s4) npm run protocol:bootstrap-epic-172-s4-roles ;;
+        migrate-0027) npx tsx scripts/ci/migrate-through-0027.ts ;;
+        s5) bash scripts/ci/apply-epic-172-s5-recovery-migration.sh ;;
+        latest) npm run db:migrate ;;
+        *) exit 64 ;;
+      esac' _ "$REPO_ROOT/web" "$stage"
+      ;;
+    runuser)
+      run "$description" runuser -u postgres --preserve-environment -- bash -c 'cd "$1"; case "$2" in
+        release) npm run protocol:bootstrap-epic-172-release-roles ;;
+        migrate-0025) npx tsx scripts/ci/migrate-through-0025.ts ;;
+        s3) npm run protocol:bootstrap-epic-172-s3-release-owner ;;
+        migrate-0026) npx tsx scripts/ci/migrate-through-0026.ts ;;
+        s4) npm run protocol:bootstrap-epic-172-s4-roles ;;
+        migrate-0027) npx tsx scripts/ci/migrate-through-0027.ts ;;
+        s5) bash scripts/ci/apply-epic-172-s5-recovery-migration.sh ;;
+        latest) npm run db:migrate ;;
+        *) exit 64 ;;
+      esac' _ "$REPO_ROOT/web" "$stage"
+      ;;
+    *) die "Managed local PostgreSQL administrator mode is unavailable." ;;
+  esac
+}
+
+run_managed_local_migrations() {
+  step "Applying managed local database migrations"
+  if [ "$DRY_RUN" = "1" ]; then
+    info "[dry-run] Bootstrap release roles, migrate through 0025, bootstrap S3, migrate through 0026, bootstrap S4, migrate through 0027, apply S5 with cleanup, then run the latest migrator."
+    return 0
+  fi
+
+  resolve_managed_local_admin || die "Could not establish passwordless local PostgreSQL administrator access for managed migrations. Use a native local PostgreSQL peer login, or run the documented operator migration procedure for a custom database."
+
+  local DATABASE_URL FORGE_DATABASE_ADMIN_URL PGHOST PGUSER FORGE_WORKSPACE_ROOT FORGE_ENV_FILE FORGE_SUPPRESS_MIGRATION_NOTICES
+  DATABASE_URL="$(env_value DATABASE_URL)"
+  [ -n "$DATABASE_URL" ] || die "Managed local migrations require DATABASE_URL in the local Forge environment file."
+  FORGE_DATABASE_ADMIN_URL="postgresql:///forge"
+  PGHOST="$MANAGED_LOCAL_ADMIN_SOCKET"
+  PGUSER="$MANAGED_LOCAL_ADMIN_USER"
+  FORGE_WORKSPACE_ROOT="$WORKSPACE_ROOT"
+  FORGE_ENV_FILE="$ENV_FILE"
+  FORGE_SUPPRESS_MIGRATION_NOTICES=1
+  export DATABASE_URL FORGE_DATABASE_ADMIN_URL PGHOST PGUSER FORGE_WORKSPACE_ROOT FORGE_ENV_FILE FORGE_SUPPRESS_MIGRATION_NOTICES
+
+  run_managed_local_migration_stage "Bootstrap release roles for managed local migration" release || die "Managed local migration failed while bootstrapping release roles."
+  run_managed_local_migration_stage "Migrate managed local database through 0025" migrate-0025 || die "Managed local migration failed while applying migrations through 0025."
+  run_managed_local_migration_stage "Bootstrap S3 owner handoff for managed local migration" s3 || die "Managed local migration failed while bootstrapping the S3 owner handoff."
+  run_managed_local_migration_stage "Migrate managed local database through 0026" migrate-0026 || die "Managed local migration failed while applying migrations through 0026."
+  run_managed_local_migration_stage "Bootstrap S4 owner handoff for managed local migration" s4 || die "Managed local migration failed while bootstrapping the S4 owner handoff."
+  run_managed_local_migration_stage "Migrate managed local database through 0027" migrate-0027 || die "Managed local migration failed while applying migrations through 0027."
+  run_managed_local_migration_stage "Apply S5 managed local migration with mandatory cleanup" s5 || die "Managed local migration failed while applying S5; its cleanup wrapper preserves the original migration failure."
+  run_managed_local_migration_stage "Run the latest managed local migrator" latest || die "Managed local migration failed while applying the latest migration set."
 }
 
 run_doctor() {
@@ -1689,6 +1821,23 @@ if [ "${FORGE_INSTALL_TEST_HOOK:-}" = "start-native-services" ]; then
   PACKAGE_MANAGER="${FORGE_INSTALL_TEST_PACKAGE_MANAGER:-brew}"
   PG_FORMULA="${FORGE_INSTALL_TEST_PG_FORMULA:-postgresql@16}"
   start_native_services
+  exit 0
+fi
+
+if [ "${FORGE_INSTALL_TEST_HOOK:-}" = "managed-local-migrations" ]; then
+  SERVICE_MODE="${FORGE_INSTALL_TEST_SERVICE_MODE:-native}"
+  printf 'admin:%s\n' "${FORGE_INSTALL_TEST_ADMIN_MODE:-unset}" >> "${FORGE_INSTALL_TEST_STAGE_LOG:?}"
+  run_managed_local_migrations
+  exit 0
+fi
+
+if [ "${FORGE_INSTALL_TEST_HOOK:-}" = "managed-local-migrations-enabled" ]; then
+  SERVICE_MODE="${FORGE_INSTALL_TEST_SERVICE_MODE:-native}"
+  if managed_local_migrations_enabled; then
+    printf 'managed-local-migrations-enabled\n'
+  else
+    printf 'managed-local-migrations-bypassed\n'
+  fi
   exit 0
 fi
 

@@ -79,6 +79,9 @@ jobs:
           cache-dependency-path: web/package-lock.json
 
       - run: npm install
+      - name: Exercise managed local installer migration orchestration
+        working-directory: .
+        run: bash scripts/test-install-managed-migrations.sh
       - name: Install redis-cli for migration proof
         working-directory: .
         run: |
