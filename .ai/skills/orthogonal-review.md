@@ -2,15 +2,40 @@
 
 Use this skill whenever Jonathan asks to review code, review an implementation, review a pull request, check a fix, verify a task, do another review pass, or see whether anything was missed.
 
-Do not perform a single generic review pass. Run separate orthogonal passes with distinct objectives, then report both findings and coverage. A review is not complete just because one pass found nothing.
+Do not perform a single generic review pass. Run separate, change-scoped
+orthogonal passes with distinct objectives, then report both findings and
+coverage. A review is not complete just because one pass found nothing.
 
 ## Core rule
 
-A full review is complete only when each required angle has been checked, findings are separated by angle, and unverified areas are explicitly listed. A quick review is complete when at least two relevant independent angles were checked and every omitted angle is disclosed.
+A full review is complete only when each relevant angle has been checked against
+the current requested change, findings are separated by angle, and unverified
+areas are explicitly listed. A quick review is complete when at least two
+relevant independent angles were checked and every omitted angle is disclosed.
+
+## Change scope and evidence
+
+Start with the current task, issue, acceptance criteria, non-goals, and diff.
+The review asks whether that requested change safely satisfies its requirements;
+it is not a general repository audit. Inspect surrounding code only to validate a
+specific concern caused by a changed line or behavior. Do not use broad
+repository exploration to discover more findings.
+
+A blocking finding is valid only when it is introduced, exposed, or materially
+worsened by the current change; identifies the changed file, line, or behavior;
+states a concrete plausible failure scenario; explains why correction is required
+before this change merges; and stays inside the approved task scope. If that
+causal relationship cannot be established, do not classify the finding as
+blocking.
+
+Do not report unrelated pre-existing defects, optional refactors, general
+architectural preferences, speculative future improvements, stylistic cleanup,
+unrelated missing tests, or enhancements outside the stated acceptance criteria.
+Such work needs a separate issue or explicit human approval.
 
 ## Review depth
 
-- **Full review** — use for pull requests, implementations, merge/readiness decisions, broad fixes, security-sensitive work, or requests for a comprehensive/another sweep. Run all relevant passes below and explain any pass that is not applicable.
+- **Full review** — use for pull requests, implementations, merge/readiness decisions, security-sensitive work, or requests for a comprehensive/another sweep. Run all relevant passes below that apply to the current change and explain any pass that is not applicable.
 - **Quick review** — use only for a trivial or explicitly narrow check. Run at least two relevant independent angles, keep the report compact, and list the full-review passes not run. Escalate to full review if scope, risk, or evidence is uncertain.
 
 Do not turn a one-line or clearly bounded check into a ceremonial ten-pass report. Do not use quick mode to weaken a PR, merge, security, or release review.
@@ -41,18 +66,27 @@ Confidence: Low / Medium / High
 
 Reason: One short paragraph.
 
-### Findings
+### Blocking Findings
 
-For each finding, use this structure:
+List only problems that must be fixed before the current change merges. For each
+finding, use this structure:
 
 - Severity: Blocker / High / Medium / Low / Nit
-- Disposition: Blocking / Advisory
 - Angle:
-- Evidence:
 - File / location:
-- Why it matters:
-- Suggested fix:
-- Verification:
+- Changed line / behavior that caused or worsened it:
+- Observed problem:
+- Concrete failure scenario:
+- Why it blocks this change:
+- Required correction:
+- Suggested verification:
+
+### Follow-up Observations
+
+Optional. List at most three directly adjacent non-blocking observations, and
+state that each requires separate human prioritisation. Omit this section when it
+would add little value. Follow-up observations never cause a `Needs changes`
+verdict and must not be automatically sent to the Implementer.
 
 ### Orthogonal Pass Coverage
 
@@ -71,9 +105,11 @@ For each finding, use this structure:
 
 ### Required Next Actions
 
-List only concrete actions.
+List only concrete corrections for blocking findings. Do not add follow-up work
+to this handoff.
 
-Blocking findings must be addressed before completion or merge. Advisory findings may be deferred when the residual risk and owner are explicit.
+Blocking findings must be addressed before completion or merge. Follow-up
+observations are separate triage items and may not expand the current task.
 
 ### Final Statement
 
@@ -89,15 +125,20 @@ If findings were found, use this form:
 
 ### 1. Contract / requirements review
 
-Compare the implementation against the user request, GitHub issue, acceptance criteria, README, design docs, prior review comments, and stated non-goals.
+Compare the implementation against the user request, GitHub issue, acceptance
+criteria, relevant contract/docs, and stated non-goals. Only use surrounding
+material needed to validate the current change.
 
-Look for missing requirements, accidental scope expansion, incorrect interpretation, incomplete edge cases, and work marked done without evidence.
+Look for missing requirements, accidental scope expansion, incorrect
+interpretation, incomplete changed-path edge cases, and work marked done without
+evidence.
 
 Do not inspect style here unless it affects the contract.
 
 ### 2. Diff correctness review
 
-Inspect changed files only.
+Inspect changed files first. Inspect surrounding code only to validate a concern
+caused by the diff.
 
 Look for obvious bugs, wrong imports, dead code, inconsistent naming, broken types, incorrect assumptions, missing awaits, incorrect null handling, accidental deletion, and hidden coupling.
 
@@ -131,7 +172,10 @@ Ask: what happens after this fails halfway?
 
 Check whether the implementation is proven.
 
-Look for missing tests, tests that do not assert the real behavior, tests that would pass even if broken, untested edge cases, stale snapshots, CI not running the relevant path, lint/typecheck not run, and missing manual verification.
+Look for missing tests or evidence only when the current change requires them to
+establish its safety. Check tests that do not assert the changed behavior, tests
+that would pass if the changed behavior were broken, relevant changed-path edge
+cases, CI not running the relevant path, and missing required verification.
 
 Separate evidence actually seen, evidence claimed by the agent, and evidence still needed.
 
@@ -143,7 +187,8 @@ For agent systems, check tool permissions, prompt-injection surfaces, and whethe
 
 ### 8. UX / API / operator experience review
 
-Review from the human/operator perspective.
+Review from the human/operator perspective only for behavior affected by the
+current change.
 
 Look for confusing status messages, unclear failure states, missing logs, bad names, misleading UI, hard-to-debug output, missing documentation, unclear commands, and bad defaults.
 
@@ -151,7 +196,7 @@ Ask: would Jonathan know what happened and what to do next?
 
 ### 9. Regression / compatibility review
 
-Compare against existing behavior.
+Compare the changed behavior against the existing behavior it can affect.
 
 Look for broken workflows, changed public APIs, changed CLI behavior, changed config defaults, migration risks, backwards-incompatible assumptions, changed file layout, and changed environment assumptions.
 
@@ -159,7 +204,7 @@ Do not assume a new implementation is better just because it is cleaner.
 
 ### 10. Evidence / release readiness review
 
-Check whether the work is safe to merge, ship, or mark complete.
+Check whether the current change is safe to merge, ship, or mark complete.
 
 Look for unresolved prior findings, missing test runs, missing logs, stale docs, missing screenshots or artifacts where relevant, missing manual verification, unknown risks, and missing rollback path.
 
@@ -176,10 +221,14 @@ Do not:
 - repeat the same review prompt until the model gives up
 - hide uncertainty
 - treat "no findings" as proof
+- turn adjacent observations into required implementation work
 
 ## Follow-up review after fixes
 
-After a fix, first run a regression pass against the previous findings. Then run fresh passes for call-path, tests, error recovery, state/persistence, and evidence readiness.
+After a fix, first verify the prior blocking findings are resolved. Then run
+fresh, change-scoped passes for call-path, tests, error recovery,
+state/persistence, and evidence readiness. Do not use the new pass to expand the
+task into adjacent improvements.
 
 This prevents the review from only checking whether the old finding was patched and forces the reviewer to look for new issues introduced by the fix.
 

@@ -54,6 +54,13 @@ your full context. Include:
 - Docs impact.
 - Open questions that block execution.
 
+For a Reviewer package, also provide the exact change set or source artifact to
+review, the approved acceptance criteria and non-goals, and any specific risk
+lenses that the diff warrants. A Reviewer rework handoff may contain only
+blocking findings caused or materially worsened by that package's change and
+within those criteria. Adjacent follow-up observations require separate human
+prioritisation; they never expand the implementation package automatically.
+
 Name agent roles, not model/provider choices. Provider routing is PM/runtime
 configuration.
 

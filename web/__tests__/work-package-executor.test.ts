@@ -71,6 +71,7 @@ vi.mock('@/worker/execution-context-packet', async (importOriginal) => {
 })
 
 import {
+  buildPriorReviewPromptLines,
   executeWorkPackage,
   ConfinedMaterializationUnavailableError,
   hasLocalConflictCopyPathSegment,
@@ -114,6 +115,23 @@ function immutableProjectAuthorityFromConfig(mcpConfig: unknown) {
 function fixtureSecret(...parts: string[]) {
   return parts.join('')
 }
+
+describe('review rework prompt scope', () => {
+  it('authorizes only recorded blocking rework reasons', () => {
+    expect(buildPriorReviewPromptLines({
+      packageBlockedReason: 'The changed API route must reject malformed input.',
+      notes: [{
+        gateId: 'gate-1',
+        gateType: 'reviewer_review',
+        reason: 'The new validation accepts an invalid payload.',
+        sourceArtifactId: 'artifact-1',
+        status: 'needs_rework',
+      }],
+    }).join('\n')).toContain('Only the listed blocking rework reasons authorize corrections')
+    expect(buildPriorReviewPromptLines({ packageBlockedReason: null, notes: [] }).join('\n'))
+      .not.toContain('Prior review/rework context:')
+  })
+})
 
 function context(overrides: Partial<WorkPackageExecutionContext> = {}): WorkPackageExecutionContext {
   const defaultWorkPackage: WorkPackageExecutionContext['workPackage'] = {

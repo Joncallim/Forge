@@ -2313,11 +2313,21 @@ describe('protected review-source rework context', () => {
         metadata: { decisionReason: 'Add regression coverage.' },
         sourceArtifactId: '00000000-0000-4000-8000-000000000302',
         status: 'needs_rework',
+      }, {
+        id: '00000000-0000-4000-8000-000000000305',
+        gateType: 'reviewer_review',
+        metadata: { decisionReason: 'Looks good.' },
+        sourceArtifactId: '00000000-0000-4000-8000-000000000306',
+        status: 'completed',
       }]))
       .mockReturnValueOnce(chain([{
         id: '00000000-0000-4000-8000-000000000302',
         content: 'Protected review source available through its approval gate.',
         metadata: { schemaVersion: 1, protectedReviewSource: true },
+      }, {
+        id: '00000000-0000-4000-8000-000000000306',
+        content: 'Completed review source that must not be handed back.',
+        metadata: {},
       }]))
     mocks.resolveS4ReviewSourceV1.mockResolvedValue({
       sourceArtifactId: '00000000-0000-4000-8000-000000000302',

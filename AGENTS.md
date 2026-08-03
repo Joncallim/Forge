@@ -83,11 +83,13 @@ When Jonathan or a task asks to "review", "check this", "review implementation",
 "review PR", "verify a fix", or "do another review pass", use
 `.ai/skills/orthogonal-review.md` by default.
 
-Do not perform a single generic review pass. Use full review for PR, implementation,
-merge, security, and release-readiness work. A trivial or explicitly narrow check
-may use quick review with at least two relevant independent angles and all omitted
-passes disclosed. Report evidence-backed findings with severity and
-blocking/advisory disposition, inspected scope, confidence, and unchecked areas.
+Do not perform a single generic review pass. Use full, change-scoped review for
+PR, implementation, merge, security, and release-readiness work. A trivial or
+explicitly narrow check may use quick review with at least two relevant
+independent angles and all omitted passes disclosed. Inspect surrounding code
+only to validate a concern caused by the current diff; do not use review as a
+general repository audit. Report evidence-backed findings with severity,
+inspected scope, confidence, and unchecked areas.
 Never claim that no issues exist. Use the scoped verdict language from the skill,
 especially "No blockers found in the inspected scope" and the explicit
 "not proof of correctness" caveat.
@@ -100,8 +102,17 @@ Architect-designated review-report artifact; that is evidence, not authorization
 to edit implementation files. A missing safe artifact path is a blocked work
 package, never a reason to invent a repository path.
 
-After fixes, first check whether prior findings were resolved, then run fresh
-orthogonal passes so the review also catches regressions introduced by the fix.
+Only a finding introduced, exposed, or materially worsened by the current change,
+with a concrete failure scenario and a required correction inside the approved
+scope, may block merge or be passed to an Implementer. Directly adjacent
+follow-up observations are optional, capped at three, require separate human
+prioritisation, and never produce `CHANGES REQUIRED` or automatic implementation.
+Work outside the acceptance criteria requires explicit human approval or a
+separate issue.
+
+After fixes, first check whether prior blocking findings were resolved, then run
+fresh change-scoped orthogonal passes so the review also catches regressions
+introduced by the fix.
 
 The web runtime does not load `.ai/skills` into a Reviewer run. Its concise,
 self-contained default is embedded in `.codex/agents/reviewer.toml`, seeded into

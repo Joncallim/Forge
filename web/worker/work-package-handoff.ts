@@ -1789,7 +1789,10 @@ export async function loadPriorReviewContext(
           status: row.status,
         }
       })
-      .filter((note) => note.reason !== '' || note.status === 'needs_rework'),
+      // Only a gate that requested rework can authorize a new implementation
+      // attempt. Completed-review notes and their source excerpts are useful
+      // audit evidence, but must not expand the next implementer's scope.
+      .filter((note) => note.status === 'needs_rework'),
   }
 }
 
