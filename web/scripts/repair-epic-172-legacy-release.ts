@@ -17,6 +17,37 @@ const migration0028At = 1784274000000
 const current0026 = '3434290ee6253c1cfe2b26e482228fceeba017417d0f4449aabcefa900d2d207'
 const current0027 = '8cf249d0ba7f10dca9ac1721677a5c6f4c5080d3f9f478156f72e0ac21c5ebd8'
 const current0028 = '7b6019d9d2a3a069c51e26a729e071982ddbbd20726727107c2b8c0ad08ee78a'
+const currentLedger = [
+  [1781742014357, '2e2e7eba2ad7f025658d955307b6373ed8ce7defc547312aec66dec1f5cda342'],
+  [1782012541882, '9996a5b53d9a71f07097536f633d1abcb79bf97720095f1c7d0b673ef773d14c'],
+  [1782026263629, 'b12065c0398e2a2ed1814c5968830261dfc22d04747a08346fe9a87e09df205c'],
+  [1782085781675, 'fc6fff3a0df6abd7201e16da76bd7f7aad776e58eb457e37961faac2f400fca0'],
+  [1782095027784, '107f11504dd019b345caffe740d90f9315b5e94fd00077527ab90724542cb372'],
+  [1782112105039, 'e6f95574374061fc45e8342d1d63c1fc4464f1bea782d07cd6218518b689a0f0'],
+  [1782133269954, '7cc7d05a5a8acd462d410f34fa08d2710dccc912413cb75015184df216587d99'],
+  [1782166200157, 'e57aba019f7cdd8d07b4bd26786ff4788fac1293832aa437c4b4c75a7c9c326d'],
+  [1782281947388, '8eb85069a0227e9472b828c4b9fc16e57272249707ce726b6ed3a8606d562242'],
+  [1782306574337, 'b0ffb122d84bf8d547debff4074e577aa2ff1191c41990dff04264aee8543428'],
+  [1782318570599, 'a3848fd6c32ba08f5ad3e3cc88e5aa8712d5013212d41a0ae944aee2785a736f'],
+  [1782369932000, 'cd2efd3ca624d799ea95b0d30b595903461460618252eea2baee639f3b0e38e1'],
+  [1782450000000, '89e07479c8523b690562d4e4667e91d94cecd087c4f16c1fed84d20941982b4a'],
+  [1782548917748, 'e0bc24fd4596b25f4b9f01264333294380a3ebe6c3423ef4fffdd4d406c52e43'],
+  [1782548917749, '74694bdfff2d4d651454838491667be035ed80e304dd238fc205d14ff8a0f18b'],
+  [1782566725886, 'a289d0adf1f8169998a1a85a872d1aaf6bb873751825a00b85fe4d8135eb8033'],
+  [1782654792737, '62fac7ab21adc32bf7efc9f07514f7805866b0adb47418ddfa3973bf065776af'],
+  [1782793555591, '3acd573ab928180c1ff5f25050ae122bf2061461812b7a95cea4a8099c56bdca'],
+  [1782954337498, '5b9866ac95f63e3e8d3fc9245276ea1520903fa9c7f296ee21cd6babacce40b6'],
+  [1782961997571, '4aa4146a58f15c4caccffb2f6fe51aeede7b910fbdc9bc5b1faa656fe56a875e'],
+  [1782969000000, '49ac3d71c9b750c0d7f1d3ff71cde7f1d8a914bd893e9439d1bb8c61b6dd08f3'],
+  [1783121342969, 'ee6d6d4ba6b4bfe1591ae990e6c9799c8938744d34e2a3a022380518876139b3'],
+  [1783296000000, '48f00f98d7a4529310c8506e5d8d00afe37e4892635158397f06a5506df5b230'],
+  [migration0023At, current0023],
+  [1784259621495, '50390b4c98c20cfe698106064283e39a535949b717ced13e1334275ff15b6ad5'],
+  [migration0025At, current0025],
+  [migration0026At, current0026],
+  [migration0027At, current0027],
+  [migration0028At, current0028],
+] as const
 const repairArtifactSha256 = '1391a720f3215bdfe93ab2092acab2f8d54485efb5e0bb0dc8dcf9812c0b3e77'
 const repairArtifact = resolve(dirname(fileURLToPath(import.meta.url)), '../db/repairs/epic-172-legacy-0023-0025-v1.sql')
 
@@ -104,6 +135,7 @@ const releaseTriggerFingerprints = [
   'forge_epic_172_enablement_state_no_delete|forge_epic_172_enablement_state|forge_epic_172_reject_mutation_v1()|O|4e035d84c983bfabe00688a2e059836e',
   'forge_epic_172_release_consumptions_append_only|forge_epic_172_release_evidence_consumptions|forge_epic_172_reject_mutation_v1()|O|ab4fab26e1ee5369aa5f1004a72134be',
   'forge_epic_172_release_evidence_append_only|forge_epic_172_release_evidence|forge_epic_172_reject_mutation_v1()|O|b4e0230edcf7317ad9a9c24655909bad',
+  'forge_epic_172_s3_evidence_atomic_insert|forge_epic_172_release_evidence|forge.guard_epic_172_s3_evidence_insert_v1()|O|518949611349cca1d8f9bffd16596df0',
   'forge_epic_172_transition_authorizations_append_only|forge_epic_172_transition_authorizations|forge_epic_172_reject_mutation_v1()|O|7b4f12a1508031c69000d952fa12e522',
   'forge_release_signer_keys_no_delete|forge_release_signer_keys|forge_epic_172_reject_mutation_v1()|O|13c0c6f1e332701344f8131ac2693e2d',
   'forge_release_signer_lifecycle_append_only|forge_release_signer_key_lifecycle_audits|forge_epic_172_reject_mutation_v1()|O|09159d710dac8a28733eedc0296b022d',
@@ -341,15 +373,32 @@ async function exactZeroAuthorityS4Roles(
     && await exactForgeSchemaAcl(sql, false, migrationLogin)
 }
 
+async function exactS4Boundary(
+  sql: postgres.Sql | postgres.TransactionSql,
+  migrationLogin: string | null,
+): Promise<boolean> {
+  return (await exactS4RoleBoundary(sql, false, migrationLogin))
+    || (await exactZeroAuthorityS4Roles(sql, migrationLogin))
+    || (await exactS4RoleBoundary(sql, true, migrationLogin))
+}
+
 async function exactRoleBoundary(
   sql: postgres.Sql | postgres.TransactionSql,
   expectLegacyConsumer: boolean,
   migrationLogin: string | null,
 ): Promise<boolean> {
-  if (!await exactReleaseRoleBoundary(sql, expectLegacyConsumer)) return false
-  return (await exactS4RoleBoundary(sql, false, migrationLogin))
-    || (await exactZeroAuthorityS4Roles(sql, migrationLogin))
-    || (await exactS4RoleBoundary(sql, true, migrationLogin))
+  return await exactReleaseRoleBoundary(sql, expectLegacyConsumer)
+    && await exactS4Boundary(sql, migrationLogin)
+}
+
+async function exactCurrentRoleBoundary(
+  sql: postgres.Sql | postgres.TransactionSql,
+  migrationLogin: string,
+): Promise<boolean> {
+  const exactReleaseBoundary = (await exactReleaseRoleBoundary(sql, false))
+    || ((await exactReleaseRoleBoundary(sql, true))
+      && await exactLegacyConsumerLocalAuthority(sql, true))
+  return exactReleaseBoundary && await exactS4Boundary(sql, migrationLogin)
 }
 
 async function exactReleaseCatalog(sql: postgres.Sql | postgres.TransactionSql, repaired: boolean): Promise<boolean> {
@@ -416,12 +465,11 @@ async function exactReleaseCatalog(sql: postgres.Sql | postgres.TransactionSql, 
       || '|' || trigger_row.tgenabled::text || '|' || pg_catalog.md5(pg_catalog.pg_get_triggerdef(trigger_row.oid)) AS fingerprint
     FROM pg_catalog.pg_trigger trigger_row
     JOIN pg_catalog.pg_class table_row ON table_row.oid = trigger_row.tgrelid
-    WHERE NOT trigger_row.tgisinternal AND trigger_row.tgname = ANY(ARRAY[
-      'forge_release_signer_keys_no_delete', 'forge_release_signer_lifecycle_append_only',
-      'forge_epic_172_release_evidence_append_only', 'forge_epic_172_transition_authorizations_append_only',
-      'forge_epic_172_release_consumptions_append_only', 'forge_epic_172_enablement_state_no_delete',
-      'forge_epic_172_enablement_audits_append_only'
-    ]) ORDER BY 1
+    JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = table_row.relnamespace
+    WHERE NOT trigger_row.tgisinternal
+      AND namespace_row.nspname = 'public'
+      AND table_row.relname = ANY(${sql.array([...protectedReleaseTables])}::text[])
+    ORDER BY 1
   `
   return triggers.length === releaseTriggerFingerprints.length
     && triggers.every((trigger, index) => trigger.fingerprint === releaseTriggerFingerprints[index])
@@ -754,7 +802,7 @@ async function current0026Fingerprint(sql: postgres.Sql | postgres.TransactionSq
     && await exactReleaseCatalog(sql, true)
     && await exactProtectedTableAcls(sql, true)
     && await exactRoutines(sql, repairedRoutineDigests, false, false, migrationLogin)
-    && await exactRoleBoundary(sql, false, migrationLogin)
+    && await exactCurrentRoleBoundary(sql, migrationLogin)
 }
 
 async function durableRepairedFingerprint(sql: postgres.Sql | postgres.TransactionSql): Promise<boolean> {
@@ -792,7 +840,6 @@ async function main(): Promise<void> {
       `
       const lockedHashes = new Map(lockedLedger.map((row) => [Number(row.created_at), row.hash]))
       const count = lockedLedger.length
-      const maxCreatedAt = count === 0 ? null : Number(lockedLedger[count - 1]?.created_at)
       const pair = lockedHashes.get(migration0023At) === current0023
         && lockedHashes.get(migration0025At) === current0025
         ? 'current'
@@ -800,20 +847,18 @@ async function main(): Promise<void> {
           && lockedHashes.get(migration0025At) === legacy0025
           ? 'legacy'
           : null
-      const position = count === 27 && maxCreatedAt === migration0026At
-        && lockedHashes.get(migration0026At) === current0026
-        ? '0026'
-        : count === 28 && maxCreatedAt === migration0027At
-          && lockedHashes.get(migration0026At) === current0026
-          && lockedHashes.get(migration0027At) === current0027
-          ? '0027'
-          : count === 29 && maxCreatedAt === migration0028At
-            && lockedHashes.get(migration0026At) === current0026
-            && lockedHashes.get(migration0027At) === current0027
-            && lockedHashes.get(migration0028At) === current0028
-            ? '0028'
-            : null
-      if (!pair || !position) {
+      const position = count === 27 ? '0026' : count === 28 ? '0027' : count === 29 ? '0028' : null
+      const exactLedger = pair && position && lockedLedger.every((row, index) => {
+        const expected = currentLedger[index]
+        if (!expected || Number(row.created_at) !== expected[0]) return false
+        const expectedHash = pair === 'legacy' && expected[0] === migration0023At
+          ? legacy0023
+          : pair === 'legacy' && expected[0] === migration0025At
+            ? legacy0025
+            : expected[1]
+        return row.hash === expectedHash
+      })
+      if (!exactLedger || !position) {
         throw new Error('Refusing legacy release repair: locked migration ledger is not an exact supported 0026, 0027, or 0028 position.')
       }
 

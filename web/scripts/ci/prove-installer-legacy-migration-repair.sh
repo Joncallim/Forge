@@ -18,6 +18,7 @@ SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WEB_ROOT="$(cd -P "$SCRIPT_DIR/../.." && pwd)"
 REPO_ROOT="$(cd -P "$WEB_ROOT/.." && pwd)"
 FIXTURE="$SCRIPT_DIR/sql/installer-legacy-0023-0025-fixture.sql"
+CONSUMER_OTHER_DATABASE=forge_installer_legacy_consumer_other_test
 TEMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/forge-legacy-repair-dbr1.XXXXXX")"
 trap 'rm -rf "$TEMP_ROOT"' EXIT
 
@@ -26,6 +27,9 @@ case "$FORGE_LEGACY_REPAIR_ADMIN_DATABASE" in
 esac
 case "$FORGE_LEGACY_REPAIR_MIGRATION_USER" in
   ''|*[!A-Za-z0-9_]* ) echo 'Unsafe disposable migration role name.' >&2; exit 64 ;;
+esac
+case "$CONSUMER_OTHER_DATABASE" in
+  ''|*[!A-Za-z0-9_]* ) echo 'Unsafe disposable consumer database name.' >&2; exit 64 ;;
 esac
 
 migration_psql() {
@@ -50,6 +54,40 @@ admin_server_psql() {
     PGUSER="$FORGE_LEGACY_REPAIR_ADMIN_USER" \
     PGDATABASE=postgres \
     psql --set ON_ERROR_STOP=1 "$@"
+}
+
+admin_consumer_other_psql() {
+  PGPASSWORD="$FORGE_LEGACY_REPAIR_ADMIN_PASSWORD" \
+    PGHOST="$FORGE_LEGACY_REPAIR_ADMIN_HOST" \
+    PGUSER="$FORGE_LEGACY_REPAIR_ADMIN_USER" \
+    PGDATABASE="$CONSUMER_OTHER_DATABASE" \
+    psql --set ON_ERROR_STOP=1 "$@"
+}
+
+prepare_cross_database_consumer() {
+  admin_server_psql --quiet --command "SELECT pg_catalog.pg_terminate_backend(pid) FROM pg_catalog.pg_stat_activity WHERE datname = '${CONSUMER_OTHER_DATABASE}' AND pid <> pg_catalog.pg_backend_pid();"
+  admin_server_psql --command "DROP DATABASE IF EXISTS \"${CONSUMER_OTHER_DATABASE}\";"
+  admin_server_psql --command "CREATE DATABASE \"${CONSUMER_OTHER_DATABASE}\" OWNER \"${FORGE_LEGACY_REPAIR_MIGRATION_USER}\";"
+  admin_server_psql <<'SQL'
+DO $role$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'forge_release_evidence_consumer') THEN
+    CREATE ROLE forge_release_evidence_consumer
+      LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+  END IF;
+END;
+$role$;
+SQL
+  admin_consumer_other_psql <<'SQL'
+CREATE TABLE public.forge_consumer_cross_database_probe (id integer PRIMARY KEY);
+GRANT USAGE ON SCHEMA public TO forge_release_evidence_consumer;
+GRANT SELECT ON TABLE public.forge_consumer_cross_database_probe TO forge_release_evidence_consumer;
+SQL
+}
+
+drop_cross_database_consumer_database() {
+  admin_server_psql --quiet --command "SELECT pg_catalog.pg_terminate_backend(pid) FROM pg_catalog.pg_stat_activity WHERE datname = '${CONSUMER_OTHER_DATABASE}' AND pid <> pg_catalog.pg_backend_pid();"
+  admin_server_psql --command "DROP DATABASE IF EXISTS \"${CONSUMER_OTHER_DATABASE}\";"
 }
 
 reset_database() {
@@ -146,6 +184,14 @@ run_repair
 snapshot current-managed-0026-after
 assert_unchanged current-managed-0026-before current-managed-0026-after 'Current managed 0026 no-op'
 
+prepare_cross_database_consumer
+prepare_0026_baseline
+snapshot current-cross-database-consumer-before
+run_repair
+snapshot current-cross-database-consumer-after
+assert_unchanged current-cross-database-consumer-before current-cross-database-consumer-after 'Current 0026 cross-database consumer no-op'
+drop_cross_database_consumer_database
+
 prepare_0026_baseline
 admin_psql --set migration_role="$FORGE_LEGACY_REPAIR_MIGRATION_USER" <<'SQL'
 REVOKE EXECUTE ON FUNCTION forge.read_epic_172_enablement_state_v1() FROM :"migration_role";
@@ -176,6 +222,13 @@ snapshot hash-near-miss-after
 assert_unchanged hash-near-miss-before hash-near-miss-after 'Migration-hash near-miss'
 
 prepare_legacy_fixture
+admin_psql --command "UPDATE drizzle.__drizzle_migrations SET hash = '0000000000000000000000000000000000000000000000000000000000000000' WHERE created_at = 1784259621495;"
+snapshot non-pair-hash-near-miss-before
+expect_refusal 'Non-pair migration-hash near-miss'
+snapshot non-pair-hash-near-miss-after
+assert_unchanged non-pair-hash-near-miss-before non-pair-hash-near-miss-after 'Non-pair migration-hash near-miss'
+
+prepare_legacy_fixture
 admin_psql <<'SQL'
 UPDATE drizzle.__drizzle_migrations
 SET hash = CASE created_at
@@ -200,6 +253,17 @@ snapshot constraint-near-miss-before
 expect_refusal 'Constraint/schema near-miss'
 snapshot constraint-near-miss-after
 assert_unchanged constraint-near-miss-before constraint-near-miss-after 'Constraint/schema near-miss'
+
+prepare_legacy_fixture
+admin_psql <<'SQL'
+CREATE TRIGGER forge_unexpected_release_trigger
+BEFORE UPDATE ON public.forge_release_signer_keys
+FOR EACH STATEMENT EXECUTE FUNCTION public.forge_epic_172_reject_mutation_v1();
+SQL
+snapshot extra-trigger-near-miss-before
+expect_refusal 'Protected-table extra-trigger near-miss'
+snapshot extra-trigger-near-miss-after
+assert_unchanged extra-trigger-near-miss-before extra-trigger-near-miss-after 'Protected-table extra-trigger near-miss'
 
 prepare_legacy_fixture
 admin_psql --command 'REVOKE SELECT ON TABLE public.forge_release_signer_keys FROM forge_release_evidence_consumer;'
