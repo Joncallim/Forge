@@ -79,6 +79,9 @@ jobs:
           cache-dependency-path: web/package-lock.json
 
       - run: npm install
+      - name: Exercise managed local installer migration orchestration
+        working-directory: .
+        run: bash scripts/test-install-managed-migrations.sh
       - name: Install redis-cli for migration proof
         working-directory: .
         run: |
@@ -109,6 +112,8 @@ jobs:
           CREATE DATABASE forge_migration_0027_upgrade_test OWNER forge_migration_test;
           CREATE DATABASE forge_migration_0028_upgrade_test OWNER forge_migration_test;
           CREATE DATABASE forge_s5_handoff_failure_test OWNER forge_migration_test;
+          CREATE DATABASE forge_installer_managed_migration_test OWNER forge_migration_test;
+          CREATE DATABASE forge_installer_managed_s5_failure_test OWNER forge_migration_test;
           CREATE DATABASE forge_s4_ci_test OWNER forge_migration_test;
           SQL
       - name: Prove populated migration 0025 to 0026 upgrade
@@ -116,6 +121,19 @@ jobs:
         env:
           FORGE_MIGRATION_0026_DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_migration_0026_upgrade_test
           FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_migration_0026_upgrade_test
+      - name: Prove real installer-managed migration sequence and S5 cleanup
+        working-directory: .
+        run: bash scripts/ci/prove-installer-managed-migrations.sh
+        env:
+          FORGE_INSTALLER_MANAGED_DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_installer_managed_migration_test
+          FORGE_INSTALLER_MANAGED_FAILURE_DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_installer_managed_s5_failure_test
+          FORGE_INSTALLER_MANAGED_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_installer_managed_migration_test
+          FORGE_INSTALLER_MANAGED_FAILURE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_installer_managed_s5_failure_test
+          FORGE_INSTALLER_MANAGED_ADMIN_HOST: localhost
+          FORGE_INSTALLER_MANAGED_ADMIN_USER: forge_e2e
+          FORGE_INSTALLER_MANAGED_ADMIN_PASSWORD: forge
+          FORGE_INSTALLER_MANAGED_ADMIN_DATABASE: forge_installer_managed_migration_test
+          FORGE_INSTALLER_MANAGED_FAILURE_ADMIN_DATABASE: forge_installer_managed_s5_failure_test
       - name: Prove populated migration 0026 to latest recovery upgrade and strict cutover
         run: npm run test:migration-0027-upgrade
         env:
