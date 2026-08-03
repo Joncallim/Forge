@@ -65,17 +65,30 @@ assert_not_contains 'command -v sudo' "$REPAIR"
 assert_not_contains 'command -v runuser' "$REPAIR"
 assert_contains 'repair_trusted_linux_path_chain' "$REPAIR"
 assert_contains 'repair_trusted_darwin_psql' "$REPAIR"
+assert_contains 'repair_library_test_route_enabled' "$REPAIR"
+assert_not_contains 'FORGE_REPAIR_TEST_HOOK' "$REPAIR"
+assert_not_contains 'FORGE_REPAIR_PRODUCTION_NATIVE_ROUTE' "$REPAIR"
 assert_not_contains 'postgresql://forge:*@localhost:5432/forge|postgres://forge:*@localhost:5432/forge' "$INSTALLER"
 assert_not_contains 'postgresql://forge:*@localhost:5432/forge|postgres://forge:*@localhost:5432/forge' "$REPAIR"
-assert_contains 'FORGE_REPAIR_TEST_DATABASE_NAME is required for the privilege reconciliation test hook.' "$REPAIR"
+assert_contains 'new TextDecoder("utf-8", { fatal: true })' "$INSTALLER"
+assert_contains 'new TextDecoder("utf-8", { fatal: true })' "$REPAIR"
+assert_contains 'readFileSync(0)' "$INSTALLER"
+assert_contains 'readFileSync(0)' "$REPAIR"
 installer_main="$TEST_ROOT/installer-main"
 sed -n '/^bold "Forge installer"/,$p' "$INSTALLER" > "$installer_main"
 installer_main_text="$(tr '\n' ' ' < "$installer_main")"
 case "$installer_main_text" in
-  *'resolve_service_mode'*'print_preflight_summary'*'if [ "$CHECK_ONLY" = "1" ]'*'acquire_install_lock'*'start_docker_services'*'commit_service_mode'*'start_native_services'*'commit_service_mode'*'provision_database'*) ;;
-  *) fail 'service mode must resolve before check and commit only after the locked successful service transition' ;;
+  *'resolve_service_mode'*'print_preflight_summary'*'if [ "$CHECK_ONLY" = "1" ]'*'acquire_install_lock'*'start_attest_and_commit_service_mode'*) ;;
+  *) fail 'service mode must resolve before check and transition only under the install lock' ;;
 esac
 assert_not_contains 'record_current_manifest_value' "$installer_main"
+service_transition_function="$TEST_ROOT/service-transition"
+sed -n '/^start_attest_and_commit_service_mode() {/,/^}/p' "$INSTALLER" > "$service_transition_function"
+service_transition_text="$(tr '\n' ' ' < "$service_transition_function")"
+case "$service_transition_text" in
+  *'start_docker_services'*'commit_service_mode'*'install_native_services'*'start_native_services'*'provision_database'*'commit_service_mode'*) ;;
+  *) fail 'service mode must commit only after the selected controlled attestation boundary' ;;
+esac
 assert_contains 'GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO forge;' "$PRIVILEGE_SQL"
 assert_contains 'GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO forge;' "$PRIVILEGE_SQL"
 assert_contains "owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner')" "$PRIVILEGE_SQL"
@@ -220,22 +233,80 @@ assert_contains 'service_mode=native' "$manifest_case/state/install-manifest"
 assert_contains 'unrelated=preserved' "$manifest_case/state/install-manifest"
 assert_contains 'another=value' "$manifest_case/state/install-manifest"
 
+run_service_mode_transition docker
+FORGE_INSTALL_LIBRARY=1 \
+  FORGE_SERVICE_MODE=auto \
+  FORGE_INSTALL_STATE_DIR="$manifest_case/state" \
+  FORGE_WORKSPACE_ROOT="$manifest_case/workspace" \
+  FORGE_ENV_FILE="$manifest_case/forge.env" \
+  /bin/bash -c '
+    source "$1"
+    resolve_service_mode
+    [ "$SERVICE_MODE" = docker ]
+  ' _ "$INSTALLER"
+assert_contains 'service_mode=docker' "$manifest_case/state/install-manifest"
+
+cp "$manifest_case/state/install-manifest" "$manifest_case/unrelated-listener-before"
+set +e
+FORGE_INSTALL_LIBRARY=1 \
+  FORGE_SERVICE_MODE=native \
+  FORGE_INSTALL_STATE_DIR="$manifest_case/state" \
+  FORGE_WORKSPACE_ROOT="$manifest_case/workspace" \
+  FORGE_ENV_FILE="$manifest_case/forge.env" \
+  /bin/bash -c '
+    source "$1"
+    resolve_service_mode
+    acquire_install_lock
+    install_native_services() { return 0; }
+    start_native_services() { return 0; }
+    provision_database() { return 73; }
+    start_attest_and_commit_service_mode
+  ' _ "$INSTALLER" > "$manifest_case/unrelated-listener-stdout" 2> "$manifest_case/unrelated-listener-stderr"
+unrelated_listener_status=$?
+set -e
+[ "$unrelated_listener_status" -ne 0 ] \
+  || fail 'failed native provisioning did not preserve its attestation failure'
+cmp -s "$manifest_case/unrelated-listener-before" "$manifest_case/state/install-manifest" \
+  || fail 'an unrelated ready PostgreSQL listener changed the recorded docker mode'
+
+run_service_mode_transition native
+[ "$(grep -c '^service_mode=' "$manifest_case/state/install-manifest")" = 1 ] \
+  || fail 'explicit docker-to-native transition did not retain one terminal service mode'
+assert_contains 'service_mode=native' "$manifest_case/state/install-manifest"
+
 credential_case="$TEST_ROOT/native-url-credential"
 mkdir -p "$credential_case/state"
+for credential_surface in "$INSTALLER" "$REPAIR"; do
+  if [ "$credential_surface" = "$INSTALLER" ]; then
+    credential_library_variable=FORGE_INSTALL_LIBRARY
+  else
+    credential_library_variable=FORGE_REPAIR_LIBRARY
+  fi
+  env "$credential_library_variable=1" \
+    FORGE_INSTALL_STATE_DIR="$credential_case/state" \
+    FORGE_WORKSPACE_ROOT="$credential_case/workspace" \
+    FORGE_ENV_FILE="$credential_case/forge.env" \
+    /bin/bash -c '
+      source "$1"
+      [ "$(native_forge_database_password "postgresql://forge:p%40ss%3Aword!@localhost:5432/forge")" = "p@ss:word!" ]
+      [ "$(native_forge_database_password "postgres://forge:p%2540literal@localhost:5432/forge")" = "p%40literal" ]
+      [ "$(native_forge_database_password "postgresql://forge:caf%C3%A9%F0%9F%94%92@localhost:5432/forge")" = "café🔒" ]
+      [ "$(native_forge_database_password "postgresql://forge:plain:literal!@localhost:5432/forge")" = "plain:literal!" ]
+      for invalid in bad%2 bad%00value bad%1Fvalue bad%7Fvalue bad%FF bad%C0%80 bad%E2%28%A1 bad%E2%82 bad%ED%A0%80 bad%F4%90%80%80; do
+        ! native_forge_database_password "postgresql://forge:${invalid}@localhost:5432/forge" >/dev/null
+      done
+      ! native_forge_database_password "postgresql://forge:raw@ambiguous@localhost:5432/forge" >/dev/null
+      ! native_forge_database_password "postgresql://forge:p%40ss@remote.invalid:5432/forge" >/dev/null
+      ! native_forge_database_password "postgresql://forge:p%40ss@localhost:5432/forge?sslmode=disable" >/dev/null
+    ' _ "$credential_surface"
+done
 FORGE_INSTALL_LIBRARY=1 \
   FORGE_INSTALL_STATE_DIR="$credential_case/state" \
   FORGE_WORKSPACE_ROOT="$credential_case/workspace" \
   FORGE_ENV_FILE="$credential_case/forge.env" \
   /bin/bash -c '
     source "$1"
-    [ "$(native_forge_database_password "postgresql://forge:p%40ss%3Aword!@localhost:5432/forge")" = "p@ss:word!" ]
-    [ "$(native_forge_database_password "postgres://forge:p%2540literal@localhost:5432/forge")" = "p%40literal" ]
-    [ "$(native_forge_database_password "postgresql://forge:plain:literal!@localhost:5432/forge")" = "plain:literal!" ]
-    ! native_forge_database_password "postgresql://forge:bad%2@localhost:5432/forge" >/dev/null
-    ! native_forge_database_password "postgresql://forge:bad%00value@localhost:5432/forge" >/dev/null
-    ! native_forge_database_password "postgresql://forge:raw@ambiguous@localhost:5432/forge" >/dev/null
-    ! native_forge_database_password "postgresql://forge:p%40ss@remote.invalid:5432/forge" >/dev/null
-    ! native_forge_database_password "postgresql://forge:p%40ss@localhost:5432/forge?sslmode=disable" >/dev/null
+    [ "$(printf %s "backslash\\quote'\''" | database_password_utf8_hex)" = "6261636b736c6173685c71756f746527" ]
   ' _ "$INSTALLER"
 
 hostile_path_case="$TEST_ROOT/repair-hostile-linux-path"
@@ -273,7 +344,7 @@ chmod 555 "$hostile_path_case/shadow/"* "$hostile_path_case/trusted/"*
 : > "$hostile_path_case/trusted-calls"
 PATH="$hostile_path_case/shadow:/usr/bin:/bin" \
   FORGE_REPAIR_LIBRARY=1 \
-  FORGE_REPAIR_TEST_HOOK=full-process \
+  FORGE_REPAIR_TEST_ROUTE=current \
   FORGE_REPAIR_TEST_OS_NAME=Linux \
   FORGE_REPAIR_TEST_PSQL_SOCKET="$hostile_path_case/socket" \
   FORGE_REPAIR_TEST_PSQL_PORT=5432 \
@@ -378,7 +449,7 @@ for surface in installer repair; do
       ' _ "$INSTALLER"
   else
     FORGE_REPAIR_LIBRARY=1 \
-      FORGE_REPAIR_TEST_HOOK=full-process \
+      FORGE_REPAIR_TEST_ROUTE=current \
       FORGE_REPAIR_TEST_OS_NAME=Linux \
       FORGE_REPAIR_TEST_PSQL_BIN="$test_hook_boundary_case/repair-writable/psql" \
       FORGE_REPAIR_TEST_PSQL_SOCKET="$test_hook_boundary_case/socket" \
@@ -405,12 +476,45 @@ for surface in installer repair; do
     || fail "$surface writable-parent replacement executed after the current-user probe"
 done
 
+cat > "$test_hook_boundary_case/trusted-psql" <<'EOF'
+#!/usr/bin/env bash
+printf 'direct\n' >> "$FORGE_HOOK_DIRECT_CALLS"
+exit 74
+EOF
+chmod 555 "$test_hook_boundary_case/trusted-psql"
+: > "$test_hook_boundary_case/repair-trusted-direct"
+: > "$test_hook_boundary_case/repair-trusted-lookups"
+FORGE_REPAIR_LIBRARY=1 \
+  FORGE_REPAIR_TEST_ROUTE=current \
+  FORGE_REPAIR_TEST_OS_NAME=Linux \
+  FORGE_REPAIR_TEST_PSQL_SOCKET="$test_hook_boundary_case/socket" \
+  FORGE_REPAIR_TEST_PSQL_PORT=5432 \
+  FORGE_HOOK_DIRECT_CALLS="$test_hook_boundary_case/repair-trusted-direct" \
+  FORGE_HOOK_ELEVATOR_MARKER="$test_hook_boundary_case/repair-trusted-lookups" \
+  FORGE_HOOK_TRUSTED_PSQL="$test_hook_boundary_case/trusted-psql" \
+  /bin/bash -c '
+    source "$1"
+    repair_trusted_linux_tool() {
+      printf "%s\n" "$1" >> "$FORGE_HOOK_ELEVATOR_MARKER"
+      [ "$1" = psql ] || exit 93
+      printf "%s\n" "$FORGE_HOOK_TRUSTED_PSQL"
+    }
+    ! resolve_repair_psql_admin
+  ' _ "$REPAIR"
+[ "$(wc -l < "$test_hook_boundary_case/repair-trusted-direct" | tr -d '[:space:]')" = 1 ] \
+  || fail 'repair test route without a custom psql did not run one current-user probe'
+[ "$(<"$test_hook_boundary_case/repair-trusted-lookups")" = psql ] \
+  || fail 'repair test route without a custom psql reached id, sudo, or runuser resolution'
+
 provision_function="$TEST_ROOT/provision-database"
 sed -n '/^provision_database() {/,/^}/p' "$INSTALLER" > "$provision_function"
 assert_contains 'CREATE ROLE forge LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD' "$provision_function"
 assert_contains 'ALTER ROLE forge LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD' "$provision_function"
 assert_contains 'LOCK TABLE pg_catalog.pg_authid IN SHARE ROW EXCLUSIVE MODE;' "$provision_function"
 assert_contains 'LOCK TABLE pg_catalog.pg_auth_members IN SHARE ROW EXCLUSIVE MODE;' "$provision_function"
+assert_contains "pg_catalog.convert_from(pg_catalog.decode('\$db_password_hex', 'hex'), 'UTF8')" "$provision_function"
+assert_not_contains 'sql_escape_literal' "$provision_function"
+assert_not_contains "VALUES ('\$db_password" "$provision_function"
 assert_contains "membership.roleid = 'forge'::pg_catalog.regrole" "$provision_function"
 assert_contains 'Role forge has membership edges.' "$provision_function"
 assert_contains 'Role forge is outside the safe or known legacy app-role boundary' "$provision_function"
@@ -527,6 +631,13 @@ assert_not_contains 'unexpected continuation' "$global_err_case/stdout"
 run_repair_process_case() {
   local name="$1" database_url="$2" manifest_fixture="$3"
   shift 3
+  local repair_dry_run=0 repair_skip_migrate=0 option
+  for option in "$@"; do
+    case "$option" in
+      --dry-run) repair_dry_run=1 ;;
+      --skip-migrate) repair_skip_migrate=1 ;;
+    esac
+  done
   local case_dir="$TEST_ROOT/repair-process-$name"
   local repo_dir="$case_dir/repo"
   mkdir -p \
@@ -627,19 +738,22 @@ EOF
   env -u DATABASE_URL \
     PATH="$case_dir/bin:$PATH" \
     HOME="$case_dir/home" \
+    FORGE_REPAIR_LIBRARY=1 \
+    FORGE_REPAIR_TEST_ROUTE=current \
     FORGE_WORKSPACE_ROOT="$case_dir/workspace" \
     FORGE_ENV_FILE="$case_dir/forge.env" \
-    FORGE_REPAIR_TEST_DATABASE_NAME='must_not_leak_into_normal_routing' \
+    FORGE_REPAIR_TEST_DATABASE_NAME='must_not_leak_into_library_routing' \
     FORGE_REPAIR_TEST_PSQL_CALLS="$case_dir/psql-calls" \
     FORGE_REPAIR_TEST_RECONCILER_CALLS="$case_dir/reconciler-calls" \
     FORGE_REPAIR_TEST_NPM_CALLS="$case_dir/npm-calls" \
     FORGE_REPAIR_TEST_SENTINEL="$case_dir/sentinel" \
     FORGE_REPAIR_TEST_EXPECTED_SOCKET="$REPAIR_EXPECTED_SOCKET" \
     FORGE_REPAIR_TEST_PROBE_EXIT="${REPAIR_CASE_PROBE_EXIT:-0}" \
-    FORGE_REPAIR_TEST_HOOK=full-process \
     FORGE_REPAIR_TEST_PSQL_BIN="$case_dir/bin/psql" \
     FORGE_REPAIR_TEST_PSQL_SOCKET="$REPAIR_EXPECTED_SOCKET" \
     FORGE_REPAIR_TEST_PSQL_PORT=5432 \
+    FORGE_REPAIR_CASE_DRY_RUN="$repair_dry_run" \
+    FORGE_REPAIR_CASE_SKIP_MIGRATE="$repair_skip_migrate" \
     PGHOST=remote.invalid \
     PGHOSTADDR=203.0.113.7 \
     PGPORT=6543 \
@@ -650,7 +764,15 @@ EOF
     PGSERVICE=ambient_service \
     PGSERVICEFILE="$case_dir/ambient-service.conf" \
     PGOPTIONS='-c search_path=ambient' \
-    /bin/bash "$repo_dir/scripts/repair.sh" --skip-install --skip-doctor "$@" \
+    /bin/bash -c '
+      source "$1"
+      WORKSPACE_ROOT="$FORGE_WORKSPACE_ROOT"
+      ENV_FILE="$FORGE_ENV_FILE"
+      DRY_RUN="$FORGE_REPAIR_CASE_DRY_RUN"
+      SKIP_MIGRATE="$FORGE_REPAIR_CASE_SKIP_MIGRATE"
+      export_env_file "$ENV_FILE"
+      reconcile_local_forge_privileges_if_managed
+    ' _ "$repo_dir/scripts/repair.sh" \
     > "$case_dir/stdout" 2> "$case_dir/stderr"
   CASE_STATUS=$?
   set -e
@@ -680,6 +802,13 @@ invalid_routing_urls=(
   "postgresql://other:${TEST_SECRET}@localhost:5432/forge"
   "postgresql://forge:${TEST_SECRET}@localhost:6543/forge"
   "postgresql://forge:bad%2@localhost:5432/forge"
+  "postgresql://forge:bad%00value@localhost:5432/forge"
+  "postgresql://forge:bad%FF@localhost:5432/forge"
+  "postgresql://forge:bad%C0%80@localhost:5432/forge"
+  "postgresql://forge:bad%E2%28%A1@localhost:5432/forge"
+  "postgresql://forge:bad%E2%82@localhost:5432/forge"
+  "postgresql://forge:bad%ED%A0%80@localhost:5432/forge"
+  "postgresql://forge:bad%F4%90%80%80@localhost:5432/forge"
   "postgresql://forge:@localhost:5432/forge"
   'not-a-database-url'
 )
@@ -701,7 +830,7 @@ run_repair_process_case managed "$managed_repair_url" native
 [ "$CASE_STATUS" -eq 0 ] || fail 'full-process managed local repair should succeed'
 [ "$(wc -l < "$CASE_DIR/reconciler-calls" | tr -d '[:space:]')" = 1 ] \
   || fail 'managed local repair must invoke the shared reconciler exactly once'
-assert_not_contains 'must_not_leak_into_normal_routing' "$CASE_DIR/psql-calls"
+assert_not_contains 'must_not_leak_into_library_routing' "$CASE_DIR/psql-calls"
 assert_contains "-X -h $REPAIR_EXPECTED_SOCKET -p 5432 -d postgres" "$CASE_DIR/psql-calls"
 assert_contains "-X -h $REPAIR_EXPECTED_SOCKET -p 5432 -d forge" "$CASE_DIR/psql-calls"
 assert_not_contains 'ambient-' "$CASE_DIR/psql-calls"
@@ -737,42 +866,33 @@ run_repair_process_case skip-migrate "$managed_repair_url" native --skip-migrate
 [ ! -s "$CASE_DIR/psql-calls" ] || fail '--skip-migrate must not invoke psql reconciliation'
 [ "$(<"$CASE_DIR/sentinel")" = untouched ] || fail '--skip-migrate touched the database sentinel'
 
-repair_hook_case="$TEST_ROOT/repair-hook"
-mkdir -p "$repair_hook_case/bin"
-cp "$TEST_ROOT/repair-process-managed/bin/psql" "$repair_hook_case/bin/psql"
-chmod 555 "$repair_hook_case/bin/psql"
-: > "$repair_hook_case/psql-calls"
-: > "$repair_hook_case/reconciler-calls"
-printf 'untouched\n' > "$repair_hook_case/sentinel"
-set +e
-PATH="$repair_hook_case/bin:$PATH" \
-  FORGE_REPAIR_TEST_HOOK=reconcile-forge-privileges \
-  FORGE_REPAIR_TEST_PSQL_BIN="$repair_hook_case/bin/psql" \
-  FORGE_REPAIR_TEST_PSQL_SOCKET="$REPAIR_EXPECTED_SOCKET" \
-  FORGE_REPAIR_TEST_PSQL_PORT=5432 \
-  FORGE_REPAIR_TEST_PSQL_CALLS="$repair_hook_case/psql-calls" \
-  FORGE_REPAIR_TEST_RECONCILER_CALLS="$repair_hook_case/reconciler-calls" \
-  FORGE_REPAIR_TEST_SENTINEL="$repair_hook_case/sentinel" \
-  /bin/bash "$REPAIR" --dry-run > "$repair_hook_case/missing-target-stdout" 2> "$repair_hook_case/missing-target-stderr"
-missing_hook_target_status=$?
-set -e
-[ "$missing_hook_target_status" -ne 0 ] || fail 'repair test hook must require an explicit target'
-assert_contains 'FORGE_REPAIR_TEST_DATABASE_NAME is required' "$repair_hook_case/missing-target-stderr"
-[ ! -s "$repair_hook_case/psql-calls" ] || fail 'targetless repair test hook must not invoke psql'
-
-PATH="$repair_hook_case/bin:$PATH" \
-  FORGE_REPAIR_TEST_HOOK=reconcile-forge-privileges \
-  FORGE_REPAIR_TEST_PSQL_BIN="$repair_hook_case/bin/psql" \
-  FORGE_REPAIR_TEST_PSQL_SOCKET="$REPAIR_EXPECTED_SOCKET" \
-  FORGE_REPAIR_TEST_PSQL_PORT=5432 \
-  FORGE_REPAIR_TEST_DATABASE_NAME=explicit_disposable_target \
-  FORGE_REPAIR_TEST_PSQL_CALLS="$repair_hook_case/psql-calls" \
-  FORGE_REPAIR_TEST_RECONCILER_CALLS="$repair_hook_case/reconciler-calls" \
-  FORGE_REPAIR_TEST_SENTINEL="$repair_hook_case/sentinel" \
-  /bin/bash "$REPAIR" --dry-run > "$repair_hook_case/dry-run-stdout" 2> "$repair_hook_case/dry-run-stderr"
-assert_contains 'Would reconcile local forge app privileges in database explicit_disposable_target.' "$repair_hook_case/dry-run-stdout"
-[ ! -s "$repair_hook_case/psql-calls" ] || fail 'dry-run repair test hook must not invoke psql'
-[ "$(<"$repair_hook_case/sentinel")" = untouched ] || fail 'dry-run repair test hook touched the database sentinel'
+for bypass_case in manifest-docker nonlocal-2; do
+  bypass_root="$TEST_ROOT/repair-process-$bypass_case"
+  : > "$bypass_root/psql-calls"
+  printf 'untouched\n' > "$bypass_root/sentinel"
+  env -u DATABASE_URL \
+    PATH="$bypass_root/bin:$PATH" \
+    HOME="$bypass_root/home" \
+    FORGE_WORKSPACE_ROOT="$bypass_root/workspace" \
+    FORGE_ENV_FILE="$bypass_root/forge.env" \
+    FORGE_REPAIR_LIBRARY=1 \
+    FORGE_REPAIR_TEST_ROUTE=current \
+    FORGE_REPAIR_TEST_PSQL_BIN="$bypass_root/bin/psql" \
+    FORGE_REPAIR_TEST_PSQL_SOCKET="$REPAIR_EXPECTED_SOCKET" \
+    FORGE_REPAIR_TEST_PSQL_PORT=5432 \
+    FORGE_REPAIR_TEST_DATABASE_NAME=forged_bypass_target \
+    FORGE_REPAIR_TEST_PSQL_CALLS="$bypass_root/psql-calls" \
+    FORGE_REPAIR_TEST_RECONCILER_CALLS="$bypass_root/reconciler-calls" \
+    FORGE_REPAIR_TEST_NPM_CALLS="$bypass_root/npm-calls" \
+    FORGE_REPAIR_TEST_SENTINEL="$bypass_root/sentinel" \
+    FORGE_REPAIR_TEST_EXPECTED_SOCKET="$REPAIR_EXPECTED_SOCKET" \
+    /bin/bash "$bypass_root/repo/scripts/repair.sh" --skip-install --skip-doctor \
+      > "$bypass_root/executable-stdout" 2> "$bypass_root/executable-stderr"
+  [ ! -s "$bypass_root/psql-calls" ] \
+    || fail "normal executable repair let test routing bypass $bypass_case gates"
+  [ "$(<"$bypass_root/sentinel")" = untouched ] \
+    || fail "normal executable repair test routing mutated $bypass_case"
+done
 
 run_managed_case() {
   local name="$1" admin_mode="$2" dry_run="${3:-0}" fail_stage="${4:-}"
@@ -883,7 +1003,7 @@ case "$*" in
   *'-Atq --set ON_ERROR_STOP=1'*)
     provision_sql="$(cat)"
     case "$provision_sql" in
-      *'LOCK TABLE pg_catalog.pg_authid IN SHARE ROW EXCLUSIVE MODE;'*'LOCK TABLE pg_catalog.pg_auth_members IN SHARE ROW EXCLUSIVE MODE;'*'COMMIT;'*) ;;
+      *'LOCK TABLE pg_catalog.pg_authid IN SHARE ROW EXCLUSIVE MODE;'*'LOCK TABLE pg_catalog.pg_auth_members IN SHARE ROW EXCLUSIVE MODE;'*"pg_catalog.convert_from(pg_catalog.decode('726f7574696e672d746573742d70617373776f7264', 'hex'), 'UTF8')"*'COMMIT;'*) ;;
       *) exit 94 ;;
     esac
     printf 'existing\n'

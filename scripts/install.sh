@@ -1121,32 +1121,38 @@ uri_safe_database_password() {
 }
 
 percent_decode_database_password() {
-  local encoded="${1:-}" decoded='' index=0 length character hex_pair byte_value decoded_character
-  length="${#encoded}"
-  [ "$length" -gt 0 ] || return 1
+  local encoded="${1:-}"
+  [ -n "$encoded" ] || return 1
+  command -v node >/dev/null 2>&1 || return 1
 
-  while [ "$index" -lt "$length" ]; do
-    character="${encoded:$index:1}"
-    if [ "$character" != '%' ]; then
-      decoded+="$character"
-      index=$((index + 1))
-      continue
-    fi
-    [ $((index + 2)) -lt "$length" ] || return 1
-    hex_pair="${encoded:$((index + 1)):2}"
-    case "$hex_pair" in
-      [0-9A-Fa-f][0-9A-Fa-f]) ;;
-      *) return 1 ;;
-    esac
-    byte_value=$((16#$hex_pair))
-    # Bash strings cannot preserve NUL. Other ASCII control bytes are rejected
-    # as ambiguous credential/config delimiters before SQL is constructed.
-    [ "$byte_value" -gt 31 ] && [ "$byte_value" -ne 127 ] || return 1
-    printf -v decoded_character '%b' "\\x$hex_pair"
-    decoded+="$decoded_character"
-    index=$((index + 3))
-  done
-  printf '%s' "$decoded"
+  # Match the URL parser used by postgres.js. The encoded credential is sent
+  # over stdin so it is never exposed in the validator process arguments.
+  printf '%s' "$encoded" | node -e '
+    const { readFileSync } = require("node:fs")
+    try {
+      const encoded = new TextDecoder("utf-8", { fatal: true }).decode(readFileSync(0))
+      const decoded = decodeURIComponent(encoded)
+      if (!decoded || /[\u0000-\u001f\u007f-\u009f]/u.test(decoded)) process.exit(1)
+      process.stdout.write(decoded)
+    } catch {
+      process.exit(1)
+    }
+  '
+}
+
+database_password_utf8_hex() {
+  command -v node >/dev/null 2>&1 || return 1
+  node -e '
+    const { readFileSync } = require("node:fs")
+    try {
+      const bytes = readFileSync(0)
+      const decoded = new TextDecoder("utf-8", { fatal: true }).decode(bytes)
+      if (!decoded || /[\u0000-\u001f\u007f-\u009f]/u.test(decoded)) process.exit(1)
+      process.stdout.write(bytes.toString("hex"))
+    } catch {
+      process.exit(1)
+    }
+  '
 }
 
 native_forge_database_password() {
@@ -1202,8 +1208,14 @@ provision_database() {
   resolve_managed_local_admin \
     || die "Could not establish controlled local PostgreSQL administrator access."
 
-  local db_password_escaped role_action role_provision_sql db_exists
-  db_password_escaped="$(sql_escape_literal "$DB_PASSWORD")"
+  local db_password_hex role_action role_provision_sql db_exists
+  db_password_hex="$(printf '%s' "$DB_PASSWORD" | database_password_utf8_hex)" \
+    || die "The local forge database password is not valid UTF-8 or contains control bytes."
+  case "$db_password_hex" in
+    ''|*[!0-9a-f]*) die "Could not encode the local forge database password safely." ;;
+  esac
+  [ $(( ${#db_password_hex} % 2 )) -eq 0 ] \
+    || die "Could not encode the local forge database password safely."
   role_provision_sql="$(cat <<SQL
 BEGIN;
 SET LOCAL application_name = 'forge-installer-role-provision';
@@ -1213,7 +1225,8 @@ CREATE TEMPORARY TABLE forge_role_provision_input (
   password text NOT NULL,
   action text
 ) ON COMMIT DROP;
-INSERT INTO forge_role_provision_input (password) VALUES ('$db_password_escaped');
+INSERT INTO forge_role_provision_input (password)
+SELECT pg_catalog.convert_from(pg_catalog.decode('$db_password_hex', 'hex'), 'UTF8');
 DO \$provision\$
 DECLARE
   role_password text;
@@ -2044,19 +2057,50 @@ install_cli_entrypoint() {
 }
 
 resolve_service_mode() {
+  local installed_mode
   if [ "$SERVICE_MODE" = "auto" ]; then
-    SERVICE_MODE="native"
+    installed_mode="$(last_install_manifest_value service_mode 2>/dev/null || true)"
+    case "$installed_mode" in
+      native|docker) SERVICE_MODE="$installed_mode" ;;
+      *) SERVICE_MODE="native" ;;
+    esac
   fi
+}
+
+last_install_manifest_value() {
+  local key="$1" line value=''
+  [ -f "$INSTALL_MANIFEST" ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      "$key"=*) value="${line#*=}" ;;
+    esac
+  done < "$INSTALL_MANIFEST"
+  [ -n "$value" ] || return 1
+  printf '%s' "$value"
 }
 
 commit_service_mode() {
   [ "$DRY_RUN" = 1 ] && return 0
   [ "$INSTALL_LOCK_HELD" = 1 ] \
     || die "Refusing to record service mode without the Forge install lock."
-  # This is the installed-state commit point: the selected PostgreSQL/Redis
-  # service transition has completed successfully, while later dependency,
-  # migration, seed, or doctor failures cannot make that running mode untrue.
+  # This is the installed-state commit point: the selected service mode has
+  # completed its controlled startup and attestation/provisioning boundary.
   record_current_manifest_value "service_mode" "$SERVICE_MODE"
+}
+
+start_attest_and_commit_service_mode() {
+  if [ "$SERVICE_MODE" = "docker" ]; then
+    start_docker_services || return
+    commit_service_mode
+  else
+    install_native_services || return
+    start_native_services || return
+    # A generic localhost listener is not an installed-mode attestation. The
+    # controlled native administrator path must provision the local database
+    # successfully before the manifest authorizes future native repair.
+    provision_database || return
+    commit_service_mode
+  fi
 }
 
 print_preflight_summary() {
@@ -2315,15 +2359,7 @@ SESSION_SECRET="${SESSION_SECRET:-$(random_hex 32)}"
 write_env_file
 install_cli_entrypoint
 
-if [ "$SERVICE_MODE" = "docker" ]; then
-  start_docker_services
-  commit_service_mode
-else
-  install_native_services
-  start_native_services
-  commit_service_mode
-  provision_database
-fi
+start_attest_and_commit_service_mode
 
 prepare_web_app
 install_ollama_if_needed

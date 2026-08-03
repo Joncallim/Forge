@@ -322,14 +322,18 @@ repair_trusted_darwin_psql() {
 
 repair_test_psql() {
   local candidate="${FORGE_REPAIR_TEST_PSQL_BIN:-}"
-  [ "${FORGE_REPAIR_TEST_HOOK:-}" = full-process ] \
-    || [ "${FORGE_REPAIR_TEST_HOOK:-}" = reconcile-forge-privileges ] \
-    || return 1
+  repair_library_test_route_enabled || return 1
   case "$candidate" in
     /*) [ -f "$candidate" ] && [ -x "$candidate" ] && [ ! -w "$candidate" ] || return 1 ;;
     *) return 1 ;;
   esac
   printf '%s\n' "$candidate"
+}
+
+repair_library_test_route_enabled() {
+  [ "${FORGE_REPAIR_LIBRARY:-0}" = 1 ] \
+    && [ "${BASH_SOURCE[0]}" != "$0" ] \
+    && [ "${FORGE_REPAIR_TEST_ROUTE:-}" = current ]
 }
 
 probe_repair_psql_admin() {
@@ -341,7 +345,7 @@ probe_repair_psql_admin() {
 }
 
 resolve_repair_psql_admin() {
-  local os_name socket_dir port psql_bin id_bin sudo_bin runuser_bin test_psql=0
+  local os_name socket_dir port psql_bin id_bin sudo_bin runuser_bin test_route=0
   if [ "$REPAIR_PSQL_ADMIN_RESOLUTION" = resolved ]; then
     [ "${#REPAIR_PSQL_ADMIN[@]}" -gt 0 ]
     return
@@ -349,9 +353,8 @@ resolve_repair_psql_admin() {
   REPAIR_PSQL_ADMIN_RESOLUTION=resolved
   REPAIR_PSQL_ADMIN=()
 
-  if { [ "${FORGE_REPAIR_TEST_HOOK:-}" = reconcile-forge-privileges ] \
-    || [ "${FORGE_REPAIR_TEST_HOOK:-}" = full-process ]; } \
-    && [ "${FORGE_REPAIR_PRODUCTION_NATIVE_ROUTE:-0}" != 1 ]; then
+  if repair_library_test_route_enabled; then
+    test_route=1
     socket_dir="${FORGE_REPAIR_TEST_PSQL_SOCKET:-}"
     port="${FORGE_REPAIR_TEST_PSQL_PORT:-}"
     os_name="${FORGE_REPAIR_TEST_OS_NAME:-$(/usr/bin/uname -s 2>/dev/null || true)}"
@@ -373,8 +376,7 @@ resolve_repair_psql_admin() {
   esac
   [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || return 1
   [ -d "$socket_dir" ] || return 1
-  if [ -n "${FORGE_REPAIR_TEST_PSQL_BIN:-}" ]; then
-    test_psql=1
+  if [ "$test_route" = 1 ] && [ -n "${FORGE_REPAIR_TEST_PSQL_BIN:-}" ]; then
     psql_bin="$(repair_test_psql 2>/dev/null || true)"
   elif [ "$os_name" = Darwin ]; then
     psql_bin="$(repair_trusted_darwin_psql 2>/dev/null || true)"
@@ -401,9 +403,9 @@ resolve_repair_psql_admin() {
     return 0
   fi
 
-  # Test-provided executables are permitted only for a current-user probe.
-  # Never carry a replaceable test path across a privilege boundary.
-  if [ "$test_psql" = 1 ]; then
+  # Every library-only test route is current-user-only, even when it selects a
+  # trusted production psql. No test-controlled routing can reach elevation.
+  if [ "$test_route" = 1 ]; then
     REPAIR_PSQL_ADMIN=()
     return 1
   fi
@@ -515,7 +517,7 @@ uri_safe_database_password() {
 }
 
 native_forge_database_password() {
-  local database_url="${1:-}" remainder password
+  local database_url="${1:-}" remainder encoded_password
   local target='@localhost:5432/forge'
 
   case "$database_url" in
@@ -524,11 +526,29 @@ native_forge_database_password() {
     *) return 1 ;;
   esac
   case "$remainder" in
-    *"$target") password="${remainder%"$target"}" ;;
+    *"$target") encoded_password="${remainder%"$target"}" ;;
     *) return 1 ;;
   esac
-  uri_safe_database_password "$password" || return 1
-  printf '%s' "$password"
+  uri_safe_database_password "$encoded_password" || return 1
+  percent_decode_database_password "$encoded_password"
+}
+
+percent_decode_database_password() {
+  local encoded="${1:-}"
+  [ -n "$encoded" ] || return 1
+  command -v node >/dev/null 2>&1 || return 1
+
+  printf '%s' "$encoded" | node -e '
+    const { readFileSync } = require("node:fs")
+    try {
+      const encoded = new TextDecoder("utf-8", { fatal: true }).decode(readFileSync(0))
+      const decoded = decodeURIComponent(encoded)
+      if (!decoded || /[\u0000-\u001f\u007f-\u009f]/u.test(decoded)) process.exit(1)
+      process.stdout.write(decoded)
+    } catch {
+      process.exit(1)
+    }
+  '
 }
 
 is_native_forge_database_url() {
@@ -540,8 +560,23 @@ should_reconcile_local_forge_privileges() {
   installed_service_mode_is_native
 }
 
-if [ "${FORGE_REPAIR_LIBRARY:-0}" = 1 ]; then
-  return 0 2>/dev/null || exit 0
+reconcile_local_forge_privileges_if_managed() {
+  [ "$SKIP_MIGRATE" != "1" ] || return 0
+  if ! is_native_forge_database_url "${DATABASE_URL:-}"; then
+    if [ -n "${DATABASE_URL:-}" ]; then
+      info "Skipping local forge privilege reconciliation for a custom DATABASE_URL."
+    else
+      info "Skipping local forge privilege reconciliation because DATABASE_URL is not set."
+    fi
+  elif ! installed_service_mode_is_native; then
+    info "Skipping local forge privilege reconciliation because the install manifest does not end in service_mode=native."
+  elif should_reconcile_local_forge_privileges; then
+    reconcile_forge_privileges forge
+  fi
+}
+
+if [ "${FORGE_REPAIR_LIBRARY:-0}" = 1 ] && [ "${BASH_SOURCE[0]}" != "$0" ]; then
+  return 0
 fi
 
 while [ "$#" -gt 0 ]; do
@@ -561,21 +596,6 @@ while [ "$#" -gt 0 ]; do
   esac
   shift
 done
-
-if [ -n "${FORGE_REPAIR_TEST_HOOK:-}" ]; then
-  case "$FORGE_REPAIR_TEST_HOOK" in
-    full-process) ;;
-    reconcile-forge-privileges)
-      [ -n "${FORGE_REPAIR_TEST_DATABASE_NAME:-}" ] \
-        || die "FORGE_REPAIR_TEST_DATABASE_NAME is required for the privilege reconciliation test hook."
-      reconcile_forge_privileges "$FORGE_REPAIR_TEST_DATABASE_NAME"
-      exit 0
-      ;;
-    *)
-      die "unknown repair test hook: $FORGE_REPAIR_TEST_HOOK"
-      ;;
-  esac
-fi
 
 [ -f "$WEB_DIR/package.json" ] || die "could not find web/package.json under $REPO_ROOT"
 
@@ -632,19 +652,7 @@ fi
 # A local administrator can restore ordinary app-table access without opening
 # direct DML access to protected owner tables. Best-effort: no administrator
 # connection leaves the database untouched.
-if [ "$SKIP_MIGRATE" != "1" ]; then
-  if ! is_native_forge_database_url "${DATABASE_URL:-}"; then
-    if [ -n "${DATABASE_URL:-}" ]; then
-      info "Skipping local forge privilege reconciliation for a custom DATABASE_URL."
-    else
-      info "Skipping local forge privilege reconciliation because DATABASE_URL is not set."
-    fi
-  elif ! installed_service_mode_is_native; then
-    info "Skipping local forge privilege reconciliation because the install manifest does not end in service_mode=native."
-  elif should_reconcile_local_forge_privileges; then
-    reconcile_forge_privileges forge
-  fi
-fi
+reconcile_local_forge_privileges_if_managed
 
 if [ "$SKIP_DOCTOR" = "1" ]; then
   warn "Skipping doctor by request."

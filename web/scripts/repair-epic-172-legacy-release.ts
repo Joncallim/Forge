@@ -1062,6 +1062,7 @@ async function exactOptionalForgeAppRoleBoundary(
 
 async function lockProtectedInstallerAclCatalog(
   sql: postgres.TransactionSql,
+  relationNames: readonly string[] = protectedInstallerGrantTables,
 ): Promise<void> {
   const lockedRelations = await sql<readonly { oid: number; name: string; owner: string }[]>`
     SELECT relation.oid::integer AS oid, relation.relname AS name, owner_role.rolname AS owner
@@ -1070,11 +1071,11 @@ async function lockProtectedInstallerAclCatalog(
     JOIN pg_catalog.pg_roles owner_role ON owner_role.oid = relation.relowner
     WHERE namespace_row.nspname = 'public'
       AND relation.relkind IN ('r', 'p')
-      AND relation.relname = ANY(${sql.array([...protectedInstallerGrantTables])}::text[])
+      AND relation.relname = ANY(${sql.array([...relationNames])}::text[])
     ORDER BY relation.oid
     FOR UPDATE OF relation
   `
-  const expectedNames = [...protectedInstallerGrantTables].sort()
+  const expectedNames = [...relationNames].sort()
   const expectedOwners = new Map<string, string>(protectedInstallerRelations
     .map((relation) => [relation.name, relation.owner] as const))
   const lockedNames = lockedRelations.map((relation) => relation.name).sort()
@@ -1092,7 +1093,7 @@ async function lockProtectedInstallerAclCatalog(
     JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = relation.relnamespace
     WHERE namespace_row.nspname = 'public'
       AND relation.relkind IN ('r', 'p')
-      AND relation.relname = ANY(${sql.array([...protectedInstallerGrantTables])}::text[])
+      AND relation.relname = ANY(${sql.array([...relationNames])}::text[])
       AND attribute.attnum > 0
       AND NOT attribute.attisdropped
     ORDER BY attribute.attrelid, attribute.attnum
@@ -1106,7 +1107,7 @@ async function lockProtectedInstallerAclCatalog(
     JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = relation.relnamespace
     WHERE namespace_row.nspname = 'public'
       AND relation.relkind IN ('r', 'p')
-      AND relation.relname = ANY(${sql.array([...protectedInstallerGrantTables])}::text[])
+      AND relation.relname = ANY(${sql.array([...relationNames])}::text[])
       AND attribute.attnum > 0
       AND NOT attribute.attisdropped
   `
@@ -1404,6 +1405,9 @@ async function main(): Promise<void> {
       }
       if (!await exactOptionalForgeAppRoleBoundary(sql)) {
         throw new Error('Refusing legacy release repair: literal forge role is outside the exact safe app-role boundary.')
+      }
+      if (position === '0026') {
+        await lockProtectedInstallerAclCatalog(sql, preS4ProtectedInstallerTables)
       }
 
       if (pair === 'current') {

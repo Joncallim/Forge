@@ -183,6 +183,34 @@ snapshot() {
       pg_catalog.to_regprocedure($q$forge.guard_epic_172_s3_evidence_insert_v1()$q$)
     )
     ORDER BY 1;' > "$TEMP_ROOT/$label.trigger-routines"
+  admin_psql --no-align --tuples-only --quiet --command '
+    WITH acl_inventory AS (
+      SELECT $q$table$q$ || chr(124) || namespace_row.nspname || chr(124)
+        || relation.relname || chr(124) || COALESCE(grantee.rolname, $q$PUBLIC$q$) || chr(124)
+        || privilege.privilege_type || chr(124) || privilege.is_grantable || chr(124) || grantor.rolname AS entry
+      FROM pg_catalog.pg_class relation
+      JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = relation.relnamespace
+      CROSS JOIN LATERAL pg_catalog.aclexplode(
+        COALESCE(relation.relacl, pg_catalog.acldefault($q$r$q$, relation.relowner))
+      ) privilege
+      LEFT JOIN pg_catalog.pg_roles grantee ON grantee.oid = privilege.grantee
+      JOIN pg_catalog.pg_roles grantor ON grantor.oid = privilege.grantor
+      WHERE namespace_row.nspname = $q$public$q$ AND relation.relkind IN ($q$r$q$, $q$p$q$)
+      UNION ALL
+      SELECT $q$column$q$ || chr(124) || namespace_row.nspname || chr(124)
+        || relation.relname || chr(124) || attribute.attname || chr(124)
+        || COALESCE(grantee.rolname, $q$PUBLIC$q$) || chr(124) || privilege.privilege_type
+        || chr(124) || privilege.is_grantable || chr(124) || grantor.rolname AS entry
+      FROM pg_catalog.pg_attribute attribute
+      JOIN pg_catalog.pg_class relation ON relation.oid = attribute.attrelid
+      JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = relation.relnamespace
+      CROSS JOIN LATERAL pg_catalog.aclexplode(attribute.attacl) privilege
+      LEFT JOIN pg_catalog.pg_roles grantee ON grantee.oid = privilege.grantee
+      JOIN pg_catalog.pg_roles grantor ON grantor.oid = privilege.grantor
+      WHERE namespace_row.nspname = $q$public$q$ AND relation.relkind IN ($q$r$q$, $q$p$q$)
+        AND attribute.attnum > 0 AND NOT attribute.attisdropped
+    )
+    SELECT entry FROM acl_inventory ORDER BY entry;' > "$TEMP_ROOT/$label.relation-acls"
 }
 
 assert_unchanged() {
@@ -191,6 +219,7 @@ assert_unchanged() {
   cmp -s "$TEMP_ROOT/$before.schema" "$TEMP_ROOT/$after.schema" || { echo "$case_name changed the database catalog." >&2; exit 1; }
   cmp -s "$TEMP_ROOT/$before.roles" "$TEMP_ROOT/$after.roles" || { echo "$case_name changed the role boundary." >&2; exit 1; }
   cmp -s "$TEMP_ROOT/$before.trigger-routines" "$TEMP_ROOT/$after.trigger-routines" || { echo "$case_name changed the trigger-routine boundary." >&2; exit 1; }
+  cmp -s "$TEMP_ROOT/$before.relation-acls" "$TEMP_ROOT/$after.relation-acls" || { echo "$case_name changed relation ACLs." >&2; exit 1; }
 }
 
 assert_only_external_acl_changed() {
@@ -198,6 +227,25 @@ assert_only_external_acl_changed() {
   cmp -s "$TEMP_ROOT/$before.ledger" "$TEMP_ROOT/$after.ledger" || { echo "$case_name changed the migration ledger." >&2; exit 1; }
   cmp -s "$TEMP_ROOT/$before.roles" "$TEMP_ROOT/$after.roles" || { echo "$case_name changed the role boundary." >&2; exit 1; }
   cmp -s "$TEMP_ROOT/$before.trigger-routines" "$TEMP_ROOT/$after.trigger-routines" || { echo "$case_name changed the trigger-routine boundary." >&2; exit 1; }
+}
+
+assert_only_exact_0026_external_acl_changed() {
+  local before="$1" after="$2" kind="$3" expected_entry filtered
+  filtered="$TEMP_ROOT/$after.filtered-relation-acls"
+  case "$kind" in
+    table)
+      expected_entry='table|public|forge_epic_172_enablement_state|forge|INSERT|false|forge_release_routines_owner'
+      ;;
+    column)
+      expected_entry='column|public|forge_epic_172_enablement_state|state|forge|SELECT|false|forge_release_routines_owner'
+      ;;
+    *) echo "Unknown exact-0026 ACL inventory kind: $kind" >&2; exit 64 ;;
+  esac
+  [ "$(grep -Fxc "$expected_entry" "$TEMP_ROOT/$after.relation-acls")" = 1 ] \
+    || { echo "Exact-0026 $kind race lacks its one external ACL entry." >&2; exit 1; }
+  grep -Fvx "$expected_entry" "$TEMP_ROOT/$after.relation-acls" > "$filtered"
+  cmp -s "$TEMP_ROOT/$before.relation-acls" "$filtered" \
+    || { echo "Exact-0026 $kind race changed another relation ACL." >&2; exit 1; }
 }
 
 run_repair() {
@@ -391,21 +439,22 @@ run_installer_provision_database() {
     SERVICE_MODE=native
     MANAGE_LOCAL_DB=1
     DRY_RUN=0
-    DB_PASSWORD="$(native_forge_database_password "$(initial_env_value DATABASE_URL)")"
+    DB_PASSWORD="$(native_forge_database_password "$(initial_env_value DATABASE_URL)")" || return
     provision_database
   )
 }
 
-prove_encoded_installer_password() {
-  local encoded_password='p%40ss%3Aword!'
+assert_encoded_installer_password() {
+  local label="$1" encoded_password="$2" expected_password="$3"
   local endpoint="${FORGE_LEGACY_REPAIR_DATABASE_URL#*@}"
   local login_url="postgresql://forge:${encoded_password}@${endpoint}"
-  run_installer_provision_database encoded-password-first "$encoded_password"
-  run_installer_provision_database encoded-password-rerun "$encoded_password"
+  run_installer_provision_database "$label-first" "$encoded_password"
+  run_installer_provision_database "$label-rerun" "$encoded_password"
   (
     cd "$WEB_ROOT"
     FORGE_ENCODED_LOGIN_URL="$login_url" \
-      FORGE_ENCODED_ADMIN_URL="$FORGE_LEGACY_REPAIR_ADMIN_URL" node <<'NODE'
+      FORGE_ENCODED_ADMIN_URL="$FORGE_LEGACY_REPAIR_ADMIN_URL" \
+      FORGE_EXPECTED_PASSWORD="$expected_password" node <<'NODE'
 const crypto = require('node:crypto')
 const postgres = require('postgres')
 const client = postgres(process.env.FORGE_ENCODED_LOGIN_URL, { max: 1 })
@@ -421,7 +470,7 @@ Promise.all([
     const verifier = passwordRows[0]?.rolpassword ?? ''
     const match = /^SCRAM-SHA-256\$(\d+):([^$]+)\$([^:]+):(.+)$/.exec(verifier)
     if (!match) throw new Error('forge role did not retain a SCRAM password verifier')
-    const salted = crypto.pbkdf2Sync('p@ss:word!', Buffer.from(match[2], 'base64'), Number(match[1]), 32, 'sha256')
+    const salted = crypto.pbkdf2Sync(process.env.FORGE_EXPECTED_PASSWORD, Buffer.from(match[2], 'base64'), Number(match[1]), 32, 'sha256')
     const clientKey = crypto.createHmac('sha256', salted).update('Client Key').digest()
     const storedKey = crypto.createHash('sha256').update(clientKey).digest()
     if (!crypto.timingSafeEqual(storedKey, Buffer.from(match[3], 'base64'))) {
@@ -438,18 +487,48 @@ NODE
   )
 }
 
+prove_encoded_installer_password() {
+  assert_encoded_installer_password encoded-password 'p%40ss%3Aword!' 'p@ss:word!'
+  assert_encoded_installer_password multibyte-password 'caf%C3%A9%F0%9F%94%92' 'café🔒'
+
+  local injection_encoded='x%5C%27%29%3B%20CREATE%20TABLE%20public.forge_password_injection_sentinel%28id%20integer%29%3B%20--'
+  local injection_decoded="x\\'); CREATE TABLE public.forge_password_injection_sentinel(id integer); --"
+  admin_server_psql --set admin_role="$FORGE_LEGACY_REPAIR_ADMIN_USER" <<'SQL'
+ALTER ROLE :"admin_role" SET standard_conforming_strings = off;
+SQL
+  assert_encoded_installer_password injection-password "$injection_encoded" "$injection_decoded"
+  admin_server_psql --set admin_role="$FORGE_LEGACY_REPAIR_ADMIN_USER" <<'SQL'
+ALTER ROLE :"admin_role" RESET standard_conforming_strings;
+SQL
+  [ "$(admin_psql --no-align --tuples-only --quiet --command "SELECT pg_catalog.to_regclass('public.forge_password_injection_sentinel') IS NULL;")" = t ] \
+    || { echo 'Encoded installer password created the SQL injection sentinel.' >&2; exit 1; }
+
+  local verifier_before verifier_after invalid_encoded
+  verifier_before="$(admin_server_psql --no-align --tuples-only --quiet --command "SELECT rolpassword FROM pg_catalog.pg_authid WHERE rolname = 'forge';")"
+  for invalid_encoded in bad%FF bad%C0%80 bad%E2%28%A1 bad%E2%82 bad%ED%A0%80 bad%F4%90%80%80 bad%00value; do
+    if run_installer_provision_database "invalid-${invalid_encoded//\%/}" "$invalid_encoded" >/dev/null 2>&1; then
+      echo "Malformed encoded installer password was unexpectedly accepted: $invalid_encoded" >&2
+      exit 1
+    fi
+  done
+  verifier_after="$(admin_server_psql --no-align --tuples-only --quiet --command "SELECT rolpassword FROM pg_catalog.pg_authid WHERE rolname = 'forge';")"
+  [ "$verifier_before" = "$verifier_after" ] \
+    || { echo 'Malformed encoded installer password mutated the forge verifier.' >&2; exit 1; }
+}
+
 run_repair_grant_privileges() {
   local label="$1"
-  PGPASSWORD="$FORGE_LEGACY_REPAIR_ADMIN_PASSWORD" \
-    PGHOST="$FORGE_LEGACY_REPAIR_ADMIN_HOST" \
-    PGUSER="$FORGE_LEGACY_REPAIR_ADMIN_USER" \
-    PGDATABASE="$FORGE_LEGACY_REPAIR_ADMIN_DATABASE" \
-    FORGE_REPAIR_TEST_HOOK=reconcile-forge-privileges \
-    FORGE_REPAIR_TEST_DATABASE_NAME="$FORGE_LEGACY_REPAIR_ADMIN_DATABASE" \
-    FORGE_REPAIR_TEST_PSQL_SOCKET="${FORGE_LEGACY_REPAIR_ADMIN_SOCKET:-/tmp}" \
-    FORGE_REPAIR_TEST_PSQL_PORT="${PGPORT:-5432}" \
-    FORGE_REPAIR_PRODUCTION_NATIVE_ROUTE="${FORGE_LEGACY_REPAIR_PRODUCTION_NATIVE_ROUTE:-0}" \
-    bash "$REPO_ROOT/scripts/repair.sh" > "$TEMP_ROOT/$label.log" 2>&1
+  (
+    export FORGE_REPAIR_LIBRARY=1
+    if [ "${FORGE_LEGACY_REPAIR_PRODUCTION_NATIVE_ROUTE:-0}" != 1 ]; then
+      export FORGE_REPAIR_TEST_ROUTE=current
+      export FORGE_REPAIR_TEST_PSQL_SOCKET="${FORGE_LEGACY_REPAIR_ADMIN_SOCKET:-/tmp}"
+      export FORGE_REPAIR_TEST_PSQL_PORT="${PGPORT:-5432}"
+    fi
+    source "$REPO_ROOT/scripts/repair.sh"
+    DRY_RUN=0
+    reconcile_forge_privileges "$FORGE_LEGACY_REPAIR_ADMIN_DATABASE"
+  ) > "$TEMP_ROOT/$label.log" 2>&1
 }
 
 assert_no_direct_forge_app_authority() {
@@ -649,6 +728,90 @@ prove_acl_grant_race_refusal() {
   fi
 }
 
+prepare_0026_acl_race_state() {
+  case "$1" in
+    current)
+      prepare_0026_baseline
+      ;;
+    legacy)
+      prepare_legacy_fixture
+      ;;
+    repaired)
+      prepare_legacy_fixture
+      run_repair >/dev/null
+      ;;
+    *) echo "Unknown exact-0026 ACL race state: $1" >&2; exit 64 ;;
+  esac
+  ensure_forge_app_role
+}
+
+assert_exact_0026_external_acl() {
+  local kind="$1" table_grants column_grants
+  table_grants="$(admin_psql --no-align --tuples-only --quiet --command "
+    SELECT pg_catalog.count(*)
+    FROM pg_catalog.pg_class relation
+    JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = relation.relnamespace
+    CROSS JOIN LATERAL pg_catalog.aclexplode(
+      COALESCE(relation.relacl, pg_catalog.acldefault('r', relation.relowner))
+    ) privilege
+    WHERE namespace_row.nspname = 'public'
+      AND relation.relname = 'forge_epic_172_enablement_state'
+      AND privilege.grantee = 'forge'::pg_catalog.regrole
+      AND privilege.privilege_type = 'INSERT';")"
+  column_grants="$(admin_psql --no-align --tuples-only --quiet --command "
+    SELECT pg_catalog.count(*)
+    FROM pg_catalog.pg_attribute attribute
+    JOIN pg_catalog.pg_class relation ON relation.oid = attribute.attrelid
+    JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = relation.relnamespace
+    CROSS JOIN LATERAL pg_catalog.aclexplode(attribute.attacl) privilege
+    WHERE namespace_row.nspname = 'public'
+      AND relation.relname = 'forge_epic_172_enablement_state'
+      AND attribute.attname = 'state'
+      AND privilege.grantee = 'forge'::pg_catalog.regrole
+      AND privilege.privilege_type = 'SELECT';")"
+  case "$kind" in
+    table) [ "$table_grants|$column_grants" = '1|0' ] ;;
+    column) [ "$table_grants|$column_grants" = '0|1' ] ;;
+    *) return 1 ;;
+  esac || { echo "Exact-0026 $kind race did not preserve only its external grant." >&2; exit 1; }
+}
+
+prove_0026_acl_race_refusal() {
+  local state="$1" kind="$2" grant_sql cleanup_sql
+  local label="0026-$state-$kind-acl-race"
+  prepare_0026_acl_race_state "$state"
+  case "$kind" in
+    table)
+      grant_sql="SET ROLE forge_release_routines_owner;
+GRANT INSERT ON TABLE public.forge_epic_172_enablement_state TO forge;
+RESET ROLE;"
+      cleanup_sql="SET ROLE forge_release_routines_owner;
+REVOKE INSERT ON TABLE public.forge_epic_172_enablement_state FROM forge;
+RESET ROLE;"
+      ;;
+    column)
+      grant_sql="SET ROLE forge_release_routines_owner;
+GRANT SELECT (state) ON TABLE public.forge_epic_172_enablement_state TO forge;
+RESET ROLE;"
+      cleanup_sql="SET ROLE forge_release_routines_owner;
+REVOKE SELECT (state) ON TABLE public.forge_epic_172_enablement_state FROM forge;
+RESET ROLE;"
+      ;;
+    *) echo "Unknown exact-0026 ACL race kind: $kind" >&2; exit 64 ;;
+  esac
+
+  snapshot "$label-before"
+  prove_acl_grant_race_refusal "$label" "$grant_sql"
+  snapshot "$label-after"
+  assert_only_external_acl_changed "$label-before" "$label-after" "Exact-0026 $state $kind GRANT race"
+  assert_only_exact_0026_external_acl_changed "$label-before" "$label-after" "$kind"
+  assert_exact_0026_external_acl "$kind"
+  expect_refusal "Committed exact-0026 $state $kind GRANT drift"
+  snapshot "$label-rerun"
+  assert_unchanged "$label-after" "$label-rerun" "Committed exact-0026 $state $kind GRANT refusal"
+  admin_psql --command "$cleanup_sql"
+}
+
 assert_only_external_role_changed() {
   local before="$1" after="$2" case_name="$3"
   cmp -s "$TEMP_ROOT/$before.ledger" "$TEMP_ROOT/$after.ledger" \
@@ -829,6 +992,12 @@ snapshot current-extra-schema-grant-before
 expect_refusal 'Current 0026 extra schema grant'
 snapshot current-extra-schema-grant-after
 assert_unchanged current-extra-schema-grant-before current-extra-schema-grant-after 'Current 0026 extra schema grant'
+
+echo 'Proving every exact-0026 ACL fingerprint serializes table and column GRANT races.'
+for acl_state in current legacy repaired; do
+  prove_0026_acl_race_refusal "$acl_state" table
+  prove_0026_acl_race_refusal "$acl_state" column
+done
 
 prepare_0026_baseline
 strip_current_migration_grants
