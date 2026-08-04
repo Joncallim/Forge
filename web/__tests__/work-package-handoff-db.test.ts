@@ -23,6 +23,7 @@ const mocks = vi.hoisted(() => ({
   publishTaskEvent: vi.fn(),
   projectionContributions: [] as Array<Record<string, unknown>>,
   recordTaskLogBestEffort: vi.fn(),
+  upsertExecutionOutcome: vi.fn(),
   readS4RuntimeModeV1: vi.fn(),
   recoverLinkedS4LifecycleV2: vi.fn(),
   claimWorkPackageLifecycleV2: vi.fn(),
@@ -126,6 +127,10 @@ vi.mock('@/worker/work-package-executor', () => ({
   WorkPackageExecutionError: mocks.WorkPackageExecutionError,
   isArchitectReservedExecutionRole: (role: string) =>
     ['architect', 'security', 'security-review', 'security_review'].includes(role.trim().toLowerCase()),
+}))
+
+vi.mock('@/worker/execution-outcomes', () => ({
+  upsertExecutionOutcome: mocks.upsertExecutionOutcome,
 }))
 
 vi.mock('@/lib/mcps/filesystem-grant-reconciliation', async (importOriginal) => ({
