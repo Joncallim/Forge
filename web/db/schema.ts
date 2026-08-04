@@ -1455,6 +1455,51 @@ export type AgentRun = InferSelectModel<typeof agentRuns>
 export type NewAgentRun = InferInsertModel<typeof agentRuns>
 
 // ---------------------------------------------------------------------------
+// executionOutcomes
+// ---------------------------------------------------------------------------
+// Canonical, append-compatible outcome ledger. Existing task/package/run rows
+// remain the authority for lifecycle state; this table records the normalized
+// interpretation of one attempted execution.
+export const executionOutcomes = pgTable(
+  'execution_outcomes',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    taskId: uuid('task_id').notNull().references(() => tasks.id, { onDelete: 'restrict' }),
+    // Admission may stop before a run or queue-attempt row exists.
+    workPackageId: uuid('work_package_id').references(() => workPackages.id, { onDelete: 'set null' }),
+    agentRunId: uuid('agent_run_id').references(() => agentRuns.id, { onDelete: 'set null' }),
+    taskAttemptId: uuid('task_attempt_id').references(() => taskAttempts.id, { onDelete: 'set null' }),
+    attemptKey: text('attempt_key').notNull(),
+    schemaVersion: integer('schema_version').notNull().default(1),
+    transportStatus: text('transport_status').notNull(),
+    result: text('result').notNull(),
+    stopReasonCode: text('stop_reason_code'),
+    stopReasonSummary: text('stop_reason_summary'),
+    retryable: boolean('retryable').notNull(),
+    evidenceRefs: jsonb('evidence_refs').$type<string[]>().notNull().default(sql`'[]'::jsonb`),
+    verifierRequired: boolean('verifier_required').notNull().default(false),
+    verificationStatus: text('verification_status').notNull().default('not_required'),
+    createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [
+    uniqueIndex('execution_outcomes_task_attempt_key_idx').on(t.taskId, t.attemptKey),
+    index('execution_outcomes_work_package_id_idx').on(t.workPackageId),
+    index('execution_outcomes_agent_run_id_idx').on(t.agentRunId),
+    index('execution_outcomes_task_attempt_id_idx').on(t.taskAttemptId),
+    check('execution_outcomes_schema_version_check', sql`${t.schemaVersion} = 1`),
+    check('execution_outcomes_transport_status_check', sql`${t.transportStatus} IN ('ok', 'error')`),
+    check('execution_outcomes_result_check', sql`${t.result} IN ('completed', 'partial', 'refused', 'blocked', 'needs_attention', 'failed', 'cancelled')`),
+    check('execution_outcomes_stop_reason_code_check', sql`${t.stopReasonCode} IS NULL OR ${t.stopReasonCode} IN ('provider_transport_failure', 'model_refusal', 'invalid_output', 'validation_failed', 'missing_capability', 'admission_denied', 'policy_blocked', 'security_blocked', 'missing_repository_context', 'timeout', 'context_limit', 'output_limit', 'retry_exhausted', 'human_cancelled', 'unknown')`),
+    check('execution_outcomes_verification_status_check', sql`${t.verificationStatus} IN ('not_required', 'pending', 'passed', 'failed', 'inconclusive')`),
+    check('execution_outcomes_verifier_consistency_check', sql`(${t.verifierRequired} AND ${t.verificationStatus} IN ('pending', 'passed', 'failed', 'inconclusive')) OR (NOT ${t.verifierRequired} AND ${t.verificationStatus} = 'not_required')`),
+  ],
+)
+
+export type ExecutionOutcomeRow = InferSelectModel<typeof executionOutcomes>
+export type NewExecutionOutcomeRow = InferInsertModel<typeof executionOutcomes>
+
+// ---------------------------------------------------------------------------
 // artifacts
 // ---------------------------------------------------------------------------
 export const artifacts = pgTable(

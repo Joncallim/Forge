@@ -70,6 +70,8 @@ import {
 } from './repository-evidence'
 import { explicitOptInFeatureFlagEnabled } from './feature-flags'
 import { sanitizeWorkerMessage } from './redaction'
+import { upsertExecutionOutcome } from './execution-outcomes'
+import { executionFailureOutcome, outcomeEvidenceRefsFromArtifact } from '../lib/execution-outcomes'
 import { recordTaskLogBestEffort } from './task-logs'
 import { packetCandidateGuard } from '../lib/mcps/packet-issuance-v2'
 import { localEffectCandidateGuard } from '../lib/mcps/local-run-evidence-v2'
@@ -1896,9 +1898,10 @@ async function persistWorkPackageHandoffBlock(input: {
 }): Promise<HandoffAdmissionResult> {
   input.assertOwned()
   const common = { pkg: input.pkg, project: input.project, taskId: input.taskId }
+  let result: HandoffAdmissionResult
   switch (input.decision.kind) {
     case 'broker':
-      return failWorkPackageForMcpBroker({
+      result = await failWorkPackageForMcpBroker({
         ...common,
         assertOwned: input.assertOwned,
         blocked: input.decision.blocked,
@@ -1906,8 +1909,9 @@ async function persistWorkPackageHandoffBlock(input: {
         check: input.decision.check,
         warnings: input.decision.warnings,
       })
+      break
     case 'filesystem_grant':
-      return failWorkPackageForFilesystemGrant({
+      result = await failWorkPackageForFilesystemGrant({
         ...common,
         assertOwned: input.assertOwned,
         blockedReason: input.decision.blockedReason,
@@ -1916,13 +1920,38 @@ async function persistWorkPackageHandoffBlock(input: {
         requirementKeys: input.decision.requirementKeys,
         requestedCapabilities: input.decision.requestedCapabilities,
       })
+      break
     case 'reserved_role':
-      return failWorkPackageForReservedRole({
+      result = await failWorkPackageForReservedRole({
         ...common,
         assertOwned: input.assertOwned,
         blockedReason: input.decision.blockedReason,
       })
+      break
   }
+  if (result.status === 'blocked') {
+    await upsertExecutionOutcome({
+      taskId: input.taskId,
+      workPackageId: input.pkg.id,
+      attemptKey: `work-package:${input.pkg.id}:admission`,
+      outcome: {
+        schemaVersion: 1,
+        transportStatus: 'ok',
+        result: 'blocked',
+        stopReasonCode: input.decision.kind === 'reserved_role'
+          ? 'policy_blocked'
+          : input.decision.kind === 'broker'
+            ? 'admission_denied'
+            : 'missing_capability',
+        stopReasonSummary: result.blockedReason,
+        retryable: !result.terminalBlock,
+        evidenceRefs: [],
+        verifierRequired: false,
+        verificationStatus: 'not_required',
+      },
+    })
+  }
+  return result
 }
 
 /**
@@ -3260,6 +3289,23 @@ async function executeReadyWorkPackage(
       artifact = protectedArtifact ?? null
     }
     if (!artifact) throw new Error('Work package completion did not create a source artifact.')
+    await upsertExecutionOutcome({
+      taskId,
+      workPackageId: nextPackage.id,
+      agentRunId: run.id,
+      attemptKey: `work-package:${nextPackage.id}:run:${run.id}`,
+      outcome: {
+        schemaVersion: 1,
+        transportStatus: 'ok',
+        result: 'completed',
+        stopReasonCode: null,
+        stopReasonSummary: null,
+        retryable: false,
+        evidenceRefs: [artifact.id],
+        verifierRequired: (nextPackage.reviewRequirement ?? 'both') !== 'none',
+        verificationStatus: (nextPackage.reviewRequirement ?? 'both') === 'none' ? 'not_required' : 'pending',
+      },
+    })
     const packageStatus = reviewGates.packageStatus === 'awaiting_review' || reviewGates.packageStatus === 'completed'
       ? reviewGates.packageStatus
       : null
@@ -3483,6 +3529,25 @@ async function executeReadyWorkPackage(
         },
       })
       .returning()
+
+    // A failure outcome is authoritative even when the artifact write did not
+    // return a row. Keep evidence empty in that case rather than losing the
+    // outcome record or inventing an evidence reference.
+    await upsertExecutionOutcome({
+      taskId,
+      workPackageId: nextPackage.id,
+      agentRunId: run.id,
+      attemptKey: `work-package:${nextPackage.id}:run:${run.id}`,
+      outcome: {
+        ...executionFailureOutcome({
+          message,
+          retryable: !finalAttempt,
+          validationFailed: validationStatusForPackage === 'failed',
+          repositoryContextMissing: repositoryEvidenceBlocked,
+        }),
+        evidenceRefs: outcomeEvidenceRefsFromArtifact(artifact),
+      },
+    })
 
     assertQueueClaimOwned(options)
     await publishTaskEventBestEffort(taskId, 'run:failed', {
