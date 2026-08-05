@@ -1500,6 +1500,104 @@ export type ExecutionOutcomeRow = InferSelectModel<typeof executionOutcomes>
 export type NewExecutionOutcomeRow = InferInsertModel<typeof executionOutcomes>
 
 // ---------------------------------------------------------------------------
+// operationRuns and operationRunEvents
+// ---------------------------------------------------------------------------
+// A run has one immutable identity/idempotency tuple and is terminalized once.
+// Detailed phase history is kept in the append-only event table below.
+export const operationRuns = pgTable(
+  'operation_runs',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    taskId: uuid('task_id').notNull().references(() => tasks.id, { onDelete: 'restrict' }),
+    projectId: uuid('project_id').notNull().references(() => projects.id, { onDelete: 'restrict' }),
+    workPackageId: uuid('work_package_id').references(() => workPackages.id, { onDelete: 'set null' }),
+    agentRunId: uuid('agent_run_id').references(() => agentRuns.id, { onDelete: 'set null' }),
+    taskAttemptId: uuid('task_attempt_id').references(() => taskAttempts.id, { onDelete: 'set null' }),
+    executionOutcomeId: uuid('execution_outcome_id').references(() => executionOutcomes.id, { onDelete: 'restrict' }),
+    definitionSchemaVersion: integer('definition_schema_version').notNull().default(1),
+    operationId: text('operation_id').notNull(),
+    operationVersion: integer('operation_version').notNull(),
+    capability: text('capability').notNull(),
+    idempotencyKey: text('idempotency_key').notNull(),
+    definitionDigest: text('definition_digest').notNull(),
+    scopeFingerprint: text('scope_fingerprint').notNull(),
+    requestFingerprint: text('request_fingerprint').notNull(),
+    inputsFingerprint: text('inputs_fingerprint').notNull(),
+    reasonFingerprint: text('reason_fingerprint').notNull(),
+    policyDecision: jsonb('policy_decision').$type<Record<string, unknown>>().notNull(),
+    status: text('status').notNull().default('running'),
+    verificationStatus: text('verification_status').notNull().default('not_started'),
+    outputFingerprint: text('output_fingerprint'),
+    outcomeFingerprint: text('outcome_fingerprint'),
+    startedAt: timestamp('started_at', tsOpts).defaultNow().notNull(),
+    completedAt: timestamp('completed_at', tsOpts),
+    createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [
+    uniqueIndex('operation_runs_task_idempotency_key_idx').on(t.taskId, t.idempotencyKey),
+    index('operation_runs_project_id_created_at_idx').on(t.projectId, t.createdAt),
+    index('operation_runs_operation_version_idx').on(t.operationId, t.operationVersion),
+    index('operation_runs_execution_outcome_id_idx').on(t.executionOutcomeId),
+    check('operation_runs_definition_schema_check', sql`${t.definitionSchemaVersion} = 1`),
+    check('operation_runs_operation_version_check', sql`${t.operationVersion} > 0`),
+    check('operation_runs_status_check', sql`${t.status} IN ('running', 'completed', 'blocked', 'failed')`),
+    check('operation_runs_verification_status_check', sql`${t.verificationStatus} IN ('not_started', 'passed', 'failed')`),
+    check('operation_runs_fingerprints_check', sql`
+      ${t.idempotencyKey} ~ '^[0-9a-f]{64}$' AND
+      ${t.definitionDigest} ~ '^[0-9a-f]{64}$' AND
+      ${t.scopeFingerprint} ~ '^[0-9a-f]{64}$' AND
+      ${t.requestFingerprint} ~ '^[0-9a-f]{64}$' AND
+      ${t.inputsFingerprint} ~ '^[0-9a-f]{64}$' AND
+      ${t.reasonFingerprint} ~ '^[0-9a-f]{64}$' AND
+      (${t.outputFingerprint} IS NULL OR ${t.outputFingerprint} ~ '^[0-9a-f]{64}$')
+      AND (${t.outcomeFingerprint} IS NULL OR ${t.outcomeFingerprint} ~ '^[0-9a-f]{64}$')
+    `),
+    check('operation_runs_terminal_shape_check', sql`
+      (${t.status} = 'running' AND ${t.completedAt} IS NULL AND ${t.executionOutcomeId} IS NULL AND ${t.outcomeFingerprint} IS NULL) OR
+      (${t.status} <> 'running' AND ${t.completedAt} IS NOT NULL AND ${t.executionOutcomeId} IS NOT NULL AND ${t.outcomeFingerprint} IS NOT NULL)
+    `),
+  ],
+)
+
+export type OperationRun = InferSelectModel<typeof operationRuns>
+export type NewOperationRun = InferInsertModel<typeof operationRuns>
+
+export const operationRunEvents = pgTable(
+  'operation_run_events',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    operationRunId: uuid('operation_run_id')
+      .notNull()
+      .references(() => operationRuns.id, { onDelete: 'restrict' }),
+    sequence: integer('sequence').notNull(),
+    phase: text('phase').notNull(),
+    status: text('status').notNull(),
+    detailCode: text('detail_code').notNull(),
+    detailFingerprint: text('detail_fingerprint').notNull(),
+    evidenceRefs: jsonb('evidence_refs').$type<string[]>().notNull().default(sql`'[]'::jsonb`),
+    createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [
+    uniqueIndex('operation_run_events_run_sequence_idx').on(t.operationRunId, t.sequence),
+    index('operation_run_events_run_created_at_idx').on(t.operationRunId, t.createdAt),
+    check('operation_run_events_status_check', sql`${t.status} IN ('passed', 'blocked', 'failed')`),
+    check('operation_run_events_detail_fingerprint_check', sql`${t.detailFingerprint} ~ '^[0-9a-f]{64}$'`),
+    check('operation_run_events_evidence_refs_check', sql`jsonb_typeof(${t.evidenceRefs}) = 'array'`),
+    check('operation_run_events_phase_sequence_check', sql`
+      (${t.phase} = 'request_validation' AND ${t.sequence} = 0) OR
+      (${t.phase} = 'policy' AND ${t.sequence} = 1) OR
+      (${t.phase} = 'preflight' AND ${t.sequence} = 2) OR
+      (${t.phase} = 'execution' AND ${t.sequence} = 3) OR
+      (${t.phase} = 'verification' AND ${t.sequence} = 4) OR
+      (${t.phase} = 'outcome' AND ${t.sequence} = 5)
+    `),
+  ],
+)
+
+export type OperationRunEvent = InferSelectModel<typeof operationRunEvents>
+export type NewOperationRunEvent = InferInsertModel<typeof operationRunEvents>
+
+// ---------------------------------------------------------------------------
 // artifacts
 // ---------------------------------------------------------------------------
 export const artifacts = pgTable(

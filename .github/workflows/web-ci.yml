@@ -268,8 +268,11 @@ jobs:
             ] LOOP
               EXECUTE format('GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.%I TO forge_app_test', table_name);
             END LOOP;
-            REVOKE ALL ON TABLE public.execution_outcomes FROM forge_app_test;
-            GRANT SELECT, INSERT, UPDATE ON TABLE public.execution_outcomes TO forge_app_test;
+            REVOKE ALL ON TABLE public.execution_outcomes, public.operation_runs,
+              public.operation_run_events FROM forge_app_test;
+            GRANT SELECT, INSERT, UPDATE ON TABLE public.execution_outcomes,
+              public.operation_runs TO forge_app_test;
+            GRANT SELECT, INSERT ON TABLE public.operation_run_events TO forge_app_test;
             GRANT USAGE, SELECT ON SEQUENCE public.task_logs_sequence_seq TO forge_app_test;
           END;
           $grant_s4_application_acl$;
@@ -509,7 +512,7 @@ jobs:
               'app_settings', 'task_questions'
             ];
             operation_ledger_tables constant text[] := ARRAY[
-              'execution_outcomes'
+              'execution_outcomes', 'operation_runs', 'operation_run_events'
             ];
             protected_tables constant text[] := ARRAY[
               'forge_release_signer_keys', 'forge_release_signer_key_lifecycle_audits',
@@ -541,22 +544,37 @@ jobs:
             IF EXISTS (
               SELECT 1 FROM pg_catalog.pg_tables
               WHERE schemaname = 'public'
-                AND tablename <> ALL (ordinary_tables || operation_ledger_tables || protected_tables || projection_tables)
+                AND tablename <> ALL (
+                  ordinary_tables || operation_ledger_tables || protected_tables || projection_tables
+                )
             ) THEN
               RAISE EXCEPTION 'A public table is missing from the closed application ACL inventory';
             END IF;
             FOREACH table_name IN ARRAY ordinary_tables LOOP
               EXECUTE format('GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.%I TO forge_app_test', table_name);
             END LOOP;
-            REVOKE ALL ON TABLE public.execution_outcomes FROM forge_app_test;
-            GRANT SELECT, INSERT, UPDATE ON TABLE public.execution_outcomes TO forge_app_test;
-            FOREACH table_privilege IN ARRAY ARRAY['DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER'] LOOP
-              IF has_table_privilege(
-                'forge_app_test', 'public.execution_outcomes', table_privilege
-              ) THEN
-                RAISE EXCEPTION 'ordinary app has unexpected % on operation ledger table public.execution_outcomes',
-                  table_privilege;
-              END IF;
+            FOREACH table_name IN ARRAY operation_ledger_tables LOOP
+              EXECUTE format('REVOKE ALL ON TABLE public.%I FROM forge_app_test', table_name);
+            END LOOP;
+            GRANT SELECT, INSERT, UPDATE ON TABLE public.execution_outcomes,
+              public.operation_runs TO forge_app_test;
+            GRANT SELECT, INSERT ON TABLE public.operation_run_events TO forge_app_test;
+            FOREACH table_name IN ARRAY operation_ledger_tables LOOP
+              FOREACH table_privilege IN ARRAY ARRAY[
+                'SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER'
+              ] LOOP
+                IF has_table_privilege(
+                  'forge_app_test', format('public.%I', table_name), table_privilege
+                ) IS DISTINCT FROM (
+                  (table_name IN ('execution_outcomes', 'operation_runs')
+                    AND table_privilege IN ('SELECT', 'INSERT', 'UPDATE'))
+                  OR (table_name = 'operation_run_events'
+                    AND table_privilege IN ('SELECT', 'INSERT'))
+                ) THEN
+                  RAISE EXCEPTION 'ordinary app has unexpected % on operation ledger table public.%',
+                    table_privilege, table_name;
+                END IF;
+              END LOOP;
             END LOOP;
             FOREACH table_name IN ARRAY protected_tables LOOP
               EXECUTE format('REVOKE ALL ON TABLE public.%I FROM forge_app_test', table_name);
@@ -709,6 +727,8 @@ jobs:
         run: npm run test:unit:zero-skip
         env:
           FORGE_EPIC_172_REQUIRE_POSTGRES_TEST: '1'
+          FORGE_OPERATION_LEDGER_REQUIRE_POSTGRES_TEST: '1'
+          FORGE_OPERATION_LEDGER_POSTGRES_ADMIN_TEST_URL: postgresql://forge_e2e:forge@localhost:5432/forge_epic_172_ci_test
           FORGE_EPIC_172_TEST_APP_DATABASE_URL: postgresql://forge_app_test:forge_app_test@localhost:5432/forge_epic_172_ci_test
           FORGE_EPIC_172_TEST_WRITER_DATABASE_URL: postgresql://forge_release_evidence_writer:forge_writer_test@localhost:5432/forge_epic_172_ci_test
           FORGE_EPIC_172_TEST_TRANSITION_DATABASE_URL: postgresql://forge_release_transition:forge_transition_test@localhost:5432/forge_epic_172_ci_test
