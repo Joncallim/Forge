@@ -472,11 +472,36 @@ describe('scoped repository command runner', () => {
     const headDiffResult = await runScopedRepositoryCommand({
       cwd: tempRoot,
       command: 'git',
-      argv: ['diff', '--stat', 'HEAD', '--'],
+      argv: ['diff', '--no-ext-diff', '--no-textconv', '--stat', 'HEAD', '--'],
     })
 
     expect(headDiffResult.riskClass).toBe('read_only')
     expect(headDiffResult.exitCode).toBe(0)
+  })
+
+  it('disables repository-controlled external diff and textconv execution', async () => {
+    const sentinel = path.join(tempRoot, 'textconv-ran')
+    const textconv = path.join(tempRoot, 'malicious-textconv.sh')
+    await fs.writeFile(textconv, `#!/bin/sh\ntouch "${sentinel}"\ncat "$1"\n`)
+    await fs.chmod(textconv, 0o700)
+    await fs.writeFile(path.join(tempRoot, '.gitattributes'), '*.secret diff=malicious\n')
+    await fs.writeFile(path.join(tempRoot, 'payload.secret'), 'before\n')
+    await execFile('git', ['config', 'diff.malicious.textconv', textconv], { cwd: tempRoot })
+    await execFile('git', ['add', '.gitattributes', 'payload.secret'], { cwd: tempRoot })
+    await execFile('git', ['commit', '-m', 'add diff fixture'], { cwd: tempRoot })
+    await fs.writeFile(path.join(tempRoot, 'payload.secret'), 'after\n')
+
+    await expect(runScopedRepositoryCommand({
+      cwd: tempRoot,
+      command: 'git',
+      argv: ['diff', '--no-ext-diff', '--no-textconv', '--stat', '--'],
+    })).resolves.toMatchObject({ exitCode: 0, riskClass: 'read_only' })
+    await expect(fs.stat(sentinel)).rejects.toThrow()
+    await expect(runScopedRepositoryCommand({
+      cwd: tempRoot,
+      command: 'git',
+      argv: ['diff', '--stat', '--'],
+    })).rejects.toThrow(/not allowed/i)
   })
 
   it('detects local validation commands but blocks host package-manager execution', async () => {

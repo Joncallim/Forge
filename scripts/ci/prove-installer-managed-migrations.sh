@@ -49,8 +49,8 @@ assert_latest_and_clean() {
   PGPASSWORD="$FORGE_INSTALLER_MANAGED_ADMIN_PASSWORD" PGHOST="$FORGE_INSTALLER_MANAGED_ADMIN_HOST" PGUSER="$FORGE_INSTALLER_MANAGED_ADMIN_USER" PGDATABASE="$database_name" psql --set ON_ERROR_STOP=1 <<'SQL'
 DO $proof$
 BEGIN
-  IF (SELECT count(*) FROM drizzle.__drizzle_migrations) <> 30
-     OR (SELECT max(created_at) FROM drizzle.__drizzle_migrations) <> 1785820800000 THEN
+  IF (SELECT count(*) FROM drizzle.__drizzle_migrations) <> 31
+     OR (SELECT max(created_at) FROM drizzle.__drizzle_migrations) <> 1785993600000 THEN
     RAISE EXCEPTION 'Managed installer did not apply the exact latest migration ledger';
   END IF;
   IF pg_catalog.to_regclass('public.forge_epic_172_s3_release_state') IS NULL THEN

@@ -1307,8 +1307,8 @@ assert_unchanged managed-latest-once managed-latest-twice 'Managed latest rerun'
 admin_psql <<'SQL'
 DO $proof$
 BEGIN
-  IF (SELECT count(*) FROM drizzle.__drizzle_migrations) <> 30
-     OR (SELECT max(created_at) FROM drizzle.__drizzle_migrations) <> 1785820800000 THEN
+  IF (SELECT count(*) FROM drizzle.__drizzle_migrations) <> 31
+     OR (SELECT max(created_at) FROM drizzle.__drizzle_migrations) <> 1785993600000 THEN
     RAISE EXCEPTION 'Managed sequence did not reach the exact latest ledger';
   END IF;
   IF EXISTS (

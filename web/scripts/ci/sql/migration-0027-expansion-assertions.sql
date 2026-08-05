@@ -13,11 +13,11 @@ BEGIN
   -- role.rolpassword IS NULL is verified by the administrator-only S4
   -- bootstrap; pg_roles intentionally masks it from this ordinary migration
   -- proof. This block verifies every attribute visible to the ordinary login.
-  IF (SELECT count(*) FROM drizzle.__drizzle_migrations) <> 30
-     OR (SELECT count(DISTINCT created_at) FROM drizzle.__drizzle_migrations) <> 30
+  IF (SELECT count(*) FROM drizzle.__drizzle_migrations) <> 31
+     OR (SELECT count(DISTINCT created_at) FROM drizzle.__drizzle_migrations) <> 31
      OR NOT EXISTS (SELECT 1 FROM drizzle.__drizzle_migrations WHERE created_at = 1784270400000)
      OR NOT EXISTS (SELECT 1 FROM drizzle.__drizzle_migrations WHERE created_at = 1784274000000)
-     OR (SELECT max(created_at) FROM drizzle.__drizzle_migrations) <> 1785820800000 THEN
+     OR (SELECT max(created_at) FROM drizzle.__drizzle_migrations) <> 1785993600000 THEN
     RAISE EXCEPTION 'The normal migrator did not retain the immutable 0027/0028 release boundary while reaching the exact latest ledger';
   END IF;
 

@@ -3129,7 +3129,7 @@ async function executeReadyWorkPackage(
       const diffResult = await runScopedRepositoryCommand({
         cwd: repositoryContext.projectLocalPath,
         command: 'git',
-        argv: ['diff', '--stat', 'HEAD', '--'],
+        argv: ['diff', '--no-ext-diff', '--no-textconv', '--stat', 'HEAD', '--'],
       })
       assertQueueClaimOwned(options)
       diffSummary = diffResult.outputSummary || 'No tracked-file diff detected.'
@@ -3140,7 +3140,7 @@ async function executeReadyWorkPackage(
         executionLease: { runId: run.id },
         metadata: {
           artifactKind: 'repository_diff_summary',
-          command: ['git', 'diff', '--stat', 'HEAD', '--'],
+          command: ['git', 'diff', '--no-ext-diff', '--no-textconv', '--stat', 'HEAD', '--'],
           exitCode: diffResult.exitCode,
           riskClass: diffResult.riskClass,
           source: 'repository-evidence',

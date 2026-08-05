@@ -89,10 +89,11 @@ export type ScopedCommandAuditSink = (
   record: ScopedCommandAuditRecord,
 ) => Promise<{ id: string }>
 
-type ScopedCommandInput = {
+export type ScopedCommandInput = {
   cwd: string
   command: string
   argv: string[]
+  signal?: AbortSignal
 }
 
 function truncate(value: string, maxBytes = MAX_OUTPUT_BYTES): string {
@@ -387,10 +388,10 @@ function isAllowedGitReadOnly(argv: string[]): boolean {
     'status --short',
     'branch --show-current',
     'remote -v',
-    'diff --stat',
-    'diff --stat --',
-    'diff --stat HEAD --',
-    'diff --name-status',
+    'diff --no-ext-diff --no-textconv --stat',
+    'diff --no-ext-diff --no-textconv --stat --',
+    'diff --no-ext-diff --no-textconv --stat HEAD --',
+    'diff --no-ext-diff --no-textconv --name-status',
   ].includes(normalized)
 }
 
@@ -494,6 +495,7 @@ export async function runScopedRepositoryCommand(input: ScopedCommandInput): Pro
       env: scopedCommandEnv(),
       maxBuffer: Math.max(MAX_OUTPUT_BYTES, MAX_DIFF_BYTES) * 2,
       timeout: COMMAND_TIMEOUT_MS,
+      signal: input.signal,
     })
     const stdout = truncate(result.stdout, input.command === 'git' && input.argv[0] === 'diff' ? MAX_DIFF_BYTES : MAX_OUTPUT_BYTES)
     const stderr = truncate(result.stderr)
