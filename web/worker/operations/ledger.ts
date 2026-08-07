@@ -82,6 +82,18 @@ async function replayResult(
   }
 }
 
+/**
+ * drizzle-orm wraps every failed query in a DrizzleQueryError whose message
+ * is a generic "Failed query: ..." dump of the SQL and params; the real
+ * driver/database error (e.g. a trigger's RAISE EXCEPTION text) is only
+ * reachable via `.cause`. Surface that instead so callers -- and anyone
+ * reading logs -- see the actual reason a ledger write was rejected.
+ */
+function unwrapDatabaseError(err: unknown): never {
+  if (err instanceof Error && err.cause instanceof Error) throw err.cause
+  throw err
+}
+
 function eventValues(event: OperationRunEventWrite) {
   return {
     operationRunId: event.runId,
@@ -144,37 +156,26 @@ export function createDatabaseOperationLedger(database: typeof db = db): Operati
     },
 
     async appendEvent(event: OperationRunEventWrite) {
-      await database.insert(operationRunEvents).values(eventValues(event))
+      try {
+        await database.insert(operationRunEvents).values(eventValues(event))
+      } catch (err) {
+        unwrapDatabaseError(err)
+      }
     },
 
     async finalize(input: OperationRunFinalization) {
-      return database.transaction(async (tx) => {
-        const outcome = normalizeExecutionOutcome(input.outcome, sanitizeWorkerMessage)
-        const [outcomeRow] = await tx
-          .insert(executionOutcomes)
-          .values({
-            taskId: input.taskId,
-            workPackageId: input.workPackageId,
-            agentRunId: input.agentRunId,
-            taskAttemptId: input.taskAttemptId,
-            attemptKey: input.attemptKey,
-            schemaVersion: outcome.schemaVersion,
-            transportStatus: outcome.transportStatus,
-            result: outcome.result,
-            stopReasonCode: outcome.stopReasonCode,
-            stopReasonSummary: outcome.stopReasonSummary,
-            retryable: outcome.retryable,
-            evidenceRefs: outcome.evidenceRefs,
-            verifierRequired: outcome.verifierRequired,
-            verificationStatus: outcome.verificationStatus,
-            updatedAt: new Date(),
-          })
-          .onConflictDoUpdate({
-            target: [executionOutcomes.taskId, executionOutcomes.attemptKey],
-            set: {
+      try {
+        return await database.transaction(async (tx) => {
+          const outcome = normalizeExecutionOutcome(input.outcome, sanitizeWorkerMessage)
+          const [outcomeRow] = await tx
+            .insert(executionOutcomes)
+            .values({
+              taskId: input.taskId,
               workPackageId: input.workPackageId,
               agentRunId: input.agentRunId,
               taskAttemptId: input.taskAttemptId,
+              attemptKey: input.attemptKey,
+              schemaVersion: outcome.schemaVersion,
               transportStatus: outcome.transportStatus,
               result: outcome.result,
               stopReasonCode: outcome.stopReasonCode,
@@ -184,27 +185,46 @@ export function createDatabaseOperationLedger(database: typeof db = db): Operati
               verifierRequired: outcome.verifierRequired,
               verificationStatus: outcome.verificationStatus,
               updatedAt: new Date(),
-            },
-          })
-          .returning({ id: executionOutcomes.id })
-        if (!outcomeRow) throw new Error('Canonical operation outcome was not stored.')
+            })
+            .onConflictDoUpdate({
+              target: [executionOutcomes.taskId, executionOutcomes.attemptKey],
+              set: {
+                workPackageId: input.workPackageId,
+                agentRunId: input.agentRunId,
+                taskAttemptId: input.taskAttemptId,
+                transportStatus: outcome.transportStatus,
+                result: outcome.result,
+                stopReasonCode: outcome.stopReasonCode,
+                stopReasonSummary: outcome.stopReasonSummary,
+                retryable: outcome.retryable,
+                evidenceRefs: outcome.evidenceRefs,
+                verifierRequired: outcome.verifierRequired,
+                verificationStatus: outcome.verificationStatus,
+                updatedAt: new Date(),
+              },
+            })
+            .returning({ id: executionOutcomes.id })
+          if (!outcomeRow) throw new Error('Canonical operation outcome was not stored.')
 
-        await tx.insert(operationRunEvents).values(eventValues(input.outcomeEvent))
-        const [completed] = await tx
-          .update(operationRuns)
-          .set({
-            executionOutcomeId: outcomeRow.id,
-            status: input.status,
-            verificationStatus: input.verificationStatus,
-            outputFingerprint: input.outputFingerprint,
-            outcomeFingerprint: operationFingerprint('canonical-outcome', outcome),
-            completedAt: new Date(),
-          })
-          .where(and(eq(operationRuns.id, input.runId), eq(operationRuns.status, 'running')))
-          .returning({ id: operationRuns.id })
-        if (!completed) throw new Error('Operation run was not in a finalizable state.')
-        return { executionOutcomeId: outcomeRow.id }
-      })
+          await tx.insert(operationRunEvents).values(eventValues(input.outcomeEvent))
+          const [completed] = await tx
+            .update(operationRuns)
+            .set({
+              executionOutcomeId: outcomeRow.id,
+              status: input.status,
+              verificationStatus: input.verificationStatus,
+              outputFingerprint: input.outputFingerprint,
+              outcomeFingerprint: operationFingerprint('canonical-outcome', outcome),
+              completedAt: new Date(),
+            })
+            .where(and(eq(operationRuns.id, input.runId), eq(operationRuns.status, 'running')))
+            .returning({ id: operationRuns.id })
+          if (!completed) throw new Error('Operation run was not in a finalizable state.')
+          return { executionOutcomeId: outcomeRow.id }
+        })
+      } catch (err) {
+        unwrapDatabaseError(err)
+      }
     },
   }
 }
