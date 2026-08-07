@@ -1,8 +1,17 @@
 # Continuous Verification and Earned Autonomy Roadmap
 
-Last updated: 2026-07-12
+Last updated: 2026-08-07
 
 Epic: [#184 — Continuous verification and earned autonomy](https://github.com/Joncallim/Forge/issues/184)
+
+## Current Position
+
+| Phase | Issue | State |
+|---|---|---|
+| Phase 0 — Deterministic operation catalog | #201 | Delivered — ADR 0011, `operation_runs` |
+| Phase 1 — Canonical outcomes | #185 | Delivered — ADR 0010, `execution_outcomes` |
+| Phase 2 — Capability reliability ledger | #186 | Architecture accepted, implementation not started — ADR 0012, `docs/architecture/issue-186-capability-reliability-ledger.md` |
+| Phases 3–7 | #187–#191 | Not started |
 
 ## Placement In The Forge Roadmap
 
@@ -92,6 +101,8 @@ Store append-only comparable capability attempts and calculate deterministic met
 - evidence freshness.
 
 Do not collapse materially different capability scopes, models, runtimes, harnesses, or policy versions into one score.
+
+Design accepted: `docs/architecture/issue-186-capability-reliability-ledger.md` and ADR 0012. It keeps attempts immutable, appends later evidence (verification, human decisions, rollback, drift) separately, computes metrics as a pure function per cohort, and stores no free text at all.
 
 ### Phase 3 — Project Verification Goals
 
