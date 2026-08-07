@@ -848,6 +848,20 @@ describe('handoffApprovedWorkPackages', () => {
       status: 'blocked',
       workPackageId: 'pkg-1',
     }))
+    expect(mocks.upsertExecutionOutcome).toHaveBeenCalledWith(expect.objectContaining({
+      taskId: 'task-1',
+      workPackageId: 'pkg-1',
+      attemptKey: 'work-package:pkg-1:admission',
+      outcome: expect.objectContaining({
+        result: 'blocked',
+        stopReasonCode: 'admission_denied',
+        stopReasonSummary: expect.stringContaining('planning context was not materialized'),
+        retryable: true,
+        evidenceRefs: [],
+        verifierRequired: false,
+        verificationStatus: 'not_required',
+      }),
+    }))
   })
 
   it.each([
@@ -928,6 +942,20 @@ describe('handoffApprovedWorkPackages', () => {
     expect(mocks.publishTaskEvent).toHaveBeenCalledWith('task-1', 'task:status', expect.objectContaining({
       errorMessage: 'legacy_task_log_unavailable',
       status: 'failed',
+    }))
+    expect(mocks.upsertExecutionOutcome).toHaveBeenCalledWith(expect.objectContaining({
+      taskId: 'task-1',
+      workPackageId: 'pkg-review',
+      attemptKey: 'work-package:pkg-review:admission',
+      outcome: expect.objectContaining({
+        result: 'blocked',
+        stopReasonCode: 'policy_blocked',
+        stopReasonSummary: expect.stringContaining('reserved for review gates'),
+        retryable: false,
+        evidenceRefs: [],
+        verifierRequired: false,
+        verificationStatus: 'not_required',
+      }),
     }))
   })
 
@@ -1028,6 +1056,20 @@ describe('handoffApprovedWorkPackages', () => {
         transition: 'hold',
       }),
     ])
+    expect(mocks.upsertExecutionOutcome).toHaveBeenCalledWith(expect.objectContaining({
+      taskId: 'task-1',
+      workPackageId: 'pkg-fs',
+      attemptKey: 'work-package:pkg-fs:admission',
+      outcome: expect.objectContaining({
+        result: 'blocked',
+        stopReasonCode: 'missing_capability',
+        stopReasonSummary: expect.stringContaining('requires filesystem grant approval'),
+        retryable: true,
+        evidenceRefs: [],
+        verifierRequired: false,
+        verificationStatus: 'not_required',
+      }),
+    }))
   })
 
   it('holds a stale project-level filesystem grant when the project grant was revoked', async () => {
