@@ -1423,19 +1423,28 @@ async function main(): Promise<void> {
           && lockedHashes.get(migration0025At) === legacy0025
           ? 'legacy'
           : null
-      const position = count === 27 ? '0026' : count === 28 ? '0027' : count === 29 ? '0028' : null
-      const exactLedger = pair && position && lockedLedger.every((row, index) => {
-        const expected = currentLedger[index]
-        if (!expected || Number(row.created_at) !== expected[0]) return false
-        const expectedHash = pair === 'legacy' && expected[0] === migration0023At
-          ? legacy0023
-          : pair === 'legacy' && expected[0] === migration0025At
-            ? legacy0025
-            : expected[1]
-        return row.hash === expectedHash
-      })
+      // Migrations applied after 0028 (e.g. 0029, 0030, ...) are outside this
+      // script's epic-172 legacy-release scope and are not individually
+      // fingerprinted here: their own migration files and the CI journal-parity
+      // gate are the source of truth for that later history. So a ledger that
+      // already reaches or exceeds the 0028 checkpoint is still an exact 0028
+      // position for this script's purposes, as long as its first 29 entries
+      // are byte-for-byte the known-good 0000-0028 ledger.
+      const position = count === 27 ? '0026' : count === 28 ? '0027' : count >= 29 ? '0028' : null
+      const checkpointLength = position === '0026' ? 27 : position === '0027' ? 28 : 29
+      const exactLedger = pair && position && lockedLedger.length >= checkpointLength
+        && lockedLedger.slice(0, checkpointLength).every((row, index) => {
+          const expected = currentLedger[index]
+          if (!expected || Number(row.created_at) !== expected[0]) return false
+          const expectedHash = pair === 'legacy' && expected[0] === migration0023At
+            ? legacy0023
+            : pair === 'legacy' && expected[0] === migration0025At
+              ? legacy0025
+              : expected[1]
+          return row.hash === expectedHash
+        })
       if (!exactLedger || !position) {
-        throw new Error('Refusing legacy release repair: locked migration ledger is not an exact supported 0026, 0027, or 0028 position.')
+        throw new Error('Refusing legacy release repair: locked migration ledger is not an exact supported 0026, 0027, or 0028-or-later position.')
       }
       if (!await exactOptionalForgeAppRoleBoundary(sql)) {
         throw new Error('Refusing legacy release repair: literal forge role is outside the exact safe app-role boundary.')
