@@ -1321,7 +1321,7 @@ END;
 $proof$;
 SQL
 
-echo 'Proving exact installer-grant normalization and near-miss refusal at the 29-row ledger.'
+echo 'Proving exact installer-grant normalization and near-miss refusal at the 0028 checkpoint.'
 ensure_forge_app_role
 admin_psql <<'SQL'
 CREATE TABLE public.forge_legacy_ordinary_acl_probe (
