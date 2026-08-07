@@ -378,8 +378,8 @@ describe('local-projection over-limit operator commands', () => {
       'utf8',
     )
     for (const evidence of [
-      'count(*) FROM drizzle.__drizzle_migrations) <> 29',
-      'count(DISTINCT created_at) FROM drizzle.__drizzle_migrations) <> 29',
+      'count(*) FROM drizzle.__drizzle_migrations) <> 30',
+      'count(DISTINCT created_at) FROM drizzle.__drizzle_migrations) <> 30',
       'created_at = 1784270400000',
       'created_at = 1784274000000',
       "role.rolname = 'forge_local_projection_archiver'",
