@@ -418,6 +418,25 @@ async function publishTaskEventBestEffort(
   }
 }
 
+/**
+ * The outcome ledger is evidence for later verification/reporting, not the
+ * source of truth for work-package state. A ledger write failure must not
+ * block admission blocking, run completion, or run-failure recording (all of
+ * which have already durably persisted through their own writes) -- the
+ * upsert is idempotent on (taskId, attemptKey), so a missed write here is
+ * safe to retry or backfill later.
+ */
+async function upsertExecutionOutcomeBestEffort(
+  input: Parameters<typeof upsertExecutionOutcome>[0],
+): Promise<void> {
+  try {
+    await upsertExecutionOutcome(input)
+  } catch (err) {
+    const message = sanitizeWorkerMessage(err instanceof Error ? err.message : String(err))
+    console.warn(`Failed to record execution outcome for ${input.attemptKey}: ${message}`)
+  }
+}
+
 async function continueWorkforceAfterPackageCompletionOrThrow(
   taskId: string,
   packageStatus: 'awaiting_review' | 'completed' | null,
@@ -1930,7 +1949,7 @@ async function persistWorkPackageHandoffBlock(input: {
       break
   }
   if (result.status === 'blocked') {
-    await upsertExecutionOutcome({
+    await upsertExecutionOutcomeBestEffort({
       taskId: input.taskId,
       workPackageId: input.pkg.id,
       attemptKey: `work-package:${input.pkg.id}:admission`,
@@ -3289,7 +3308,7 @@ async function executeReadyWorkPackage(
       artifact = protectedArtifact ?? null
     }
     if (!artifact) throw new Error('Work package completion did not create a source artifact.')
-    await upsertExecutionOutcome({
+    await upsertExecutionOutcomeBestEffort({
       taskId,
       workPackageId: nextPackage.id,
       agentRunId: run.id,
@@ -3533,7 +3552,7 @@ async function executeReadyWorkPackage(
     // A failure outcome is authoritative even when the artifact write did not
     // return a row. Keep evidence empty in that case rather than losing the
     // outcome record or inventing an evidence reference.
-    await upsertExecutionOutcome({
+    await upsertExecutionOutcomeBestEffort({
       taskId,
       workPackageId: nextPackage.id,
       agentRunId: run.id,
