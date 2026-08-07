@@ -131,6 +131,8 @@ BEGIN
 END;
 $$;
 --> statement-breakpoint
+REVOKE ALL ON FUNCTION public.forge_guard_operation_event_insert_v1() FROM PUBLIC;
+--> statement-breakpoint
 CREATE TRIGGER "operation_run_events_order_guard"
 BEFORE INSERT ON "operation_run_events"
 FOR EACH ROW EXECUTE FUNCTION "forge_guard_operation_event_insert_v1"();
@@ -172,6 +174,8 @@ BEGIN
 END;
 $$;
 --> statement-breakpoint
+REVOKE ALL ON FUNCTION public.forge_guard_operation_run_history_v1() FROM PUBLIC;
+--> statement-breakpoint
 CREATE TRIGGER "operation_runs_history_guard"
 BEFORE UPDATE OR DELETE ON "operation_runs"
 FOR EACH ROW EXECUTE FUNCTION "forge_guard_operation_run_history_v1"();
@@ -184,6 +188,8 @@ BEGIN
   RAISE EXCEPTION 'operation run events are append-only';
 END;
 $$;
+--> statement-breakpoint
+REVOKE ALL ON FUNCTION public.forge_reject_operation_event_mutation_v1() FROM PUBLIC;
 --> statement-breakpoint
 CREATE TRIGGER "operation_run_events_append_only"
 BEFORE UPDATE OR DELETE ON "operation_run_events"
