@@ -1,0 +1,134 @@
+import { and, desc, eq, gte, inArray } from 'drizzle-orm'
+
+import { db } from '@/db'
+import { capabilityAttemptAdjudications, capabilityAttempts, executionOutcomes } from '@/db/schema'
+import {
+  isExecutionOutcome,
+  normalizeExecutionOutcome,
+  type ExecutionOutcome,
+} from '@/lib/execution-outcomes'
+import { computeReliability } from '@/lib/reliability/metrics'
+import {
+  DEFAULT_RELIABILITY_WINDOW,
+  outcomeDigest,
+  type CapabilityAdjudicationRecord,
+  type CapabilityAttemptRecord,
+  type ReliabilitySummary,
+  type ReliabilityWindow,
+} from '@/lib/reliability/contracts'
+import { recordEvidenceDriftAdjudicationBestEffort } from './ledger'
+import { sanitizeWorkerMessage } from '../redaction'
+
+function storedOutcome(row: typeof executionOutcomes.$inferSelect): ExecutionOutcome | null {
+  const candidate: unknown = {
+    schemaVersion: row.schemaVersion,
+    transportStatus: row.transportStatus,
+    result: row.result,
+    stopReasonCode: row.stopReasonCode,
+    stopReasonSummary: row.stopReasonSummary,
+    retryable: row.retryable,
+    evidenceRefs: row.evidenceRefs,
+    verifierRequired: row.verifierRequired,
+    verificationStatus: row.verificationStatus,
+  }
+  if (!isExecutionOutcome(candidate)) return null
+  return candidate
+}
+
+/**
+ * Reads a cohort's attempts and adjudications, detects drift against the
+ * linked execution_outcomes row, and computes the summary with the pure
+ * metrics function. Performs no arithmetic itself.
+ */
+export async function readCohortReliability(input: {
+  cohortFingerprint: string
+  window?: ReliabilityWindow
+  now?: Date
+}): Promise<ReliabilitySummary> {
+  const window = input.window ?? DEFAULT_RELIABILITY_WINDOW
+  const now = input.now ?? new Date()
+  const cutoff = new Date(now.getTime() - window.maxAgeMs)
+
+  const attemptRows = await db
+    .select()
+    .from(capabilityAttempts)
+    .where(and(
+      eq(capabilityAttempts.cohortFingerprint, input.cohortFingerprint),
+      gte(capabilityAttempts.observedAt, cutoff),
+    ))
+    .orderBy(desc(capabilityAttempts.observedAt))
+    .limit(window.maxAttempts)
+
+  if (attemptRows.length === 0) {
+    return computeReliability({ attempts: [], adjudications: [], window, now })
+  }
+
+  const outcomeIds = [...new Set(attemptRows.map((r) => r.executionOutcomeId))]
+  const outcomeRows = await db
+    .select()
+    .from(executionOutcomes)
+    .where(inArray(executionOutcomes.id, outcomeIds))
+  const outcomesById = new Map(outcomeRows.map((row) => [row.id, row]))
+
+  const attempts: CapabilityAttemptRecord[] = []
+  for (const row of attemptRows) {
+    const outcomeRow = outcomesById.get(row.executionOutcomeId)
+    let currentDigest: string | undefined
+    if (outcomeRow) {
+      const outcome = storedOutcome(outcomeRow)
+      if (outcome) {
+        const normalized = normalizeExecutionOutcome(outcome, sanitizeWorkerMessage)
+        currentDigest = outcomeDigest(normalized)
+      }
+    }
+    if (currentDigest && currentDigest !== row.outcomeDigest) {
+      await recordEvidenceDriftAdjudicationBestEffort({
+        capabilityAttemptId: row.id,
+        observedOutcomeDigest: currentDigest,
+        observedAt: now,
+      })
+    }
+    attempts.push({
+      id: row.id,
+      attemptGroupId: row.attemptGroupId,
+      executionOutcomeId: row.executionOutcomeId,
+      capabilityKey: row.capabilityKey,
+      classificationState: row.classificationState as CapabilityAttemptRecord['classificationState'],
+      capabilityMultiplicity: row.capabilityMultiplicity,
+      cohortFingerprint: row.cohortFingerprint,
+      outcomeDigest: row.outcomeDigest,
+      transportStatus: row.transportStatus as CapabilityAttemptRecord['transportStatus'],
+      result: row.result as CapabilityAttemptRecord['result'],
+      stopReasonCode: row.stopReasonCode,
+      retryable: row.retryable,
+      attemptNumber: row.attemptNumber,
+      severityClass: row.severityClass as CapabilityAttemptRecord['severityClass'],
+      verifierRequired: row.verifierRequired,
+      verificationMode: row.verificationMode as CapabilityAttemptRecord['verificationMode'],
+      verificationStatus: row.verificationStatus as CapabilityAttemptRecord['verificationStatus'],
+      observedAt: row.observedAt.toISOString(),
+      currentOutcomeDigest: currentDigest,
+    })
+  }
+
+  const attemptIds = attempts.map((a) => a.id)
+  const adjudicationRows = attemptIds.length > 0
+    ? await db
+      .select()
+      .from(capabilityAttemptAdjudications)
+      .where(inArray(capabilityAttemptAdjudications.capabilityAttemptId, attemptIds))
+    : []
+
+  const adjudications: CapabilityAdjudicationRecord[] = adjudicationRows.map((row) => ({
+    id: row.id,
+    capabilityAttemptId: row.capabilityAttemptId,
+    sequence: row.sequence,
+    kind: row.kind as CapabilityAdjudicationRecord['kind'],
+    verificationMode: row.verificationMode as CapabilityAdjudicationRecord['verificationMode'],
+    verificationResult: row.verificationResult as CapabilityAdjudicationRecord['verificationResult'],
+    humanDecision: row.humanDecision as CapabilityAdjudicationRecord['humanDecision'],
+    observedAt: row.observedAt.toISOString(),
+  }))
+
+  return computeReliability({ attempts, adjudications, window, now })
+}

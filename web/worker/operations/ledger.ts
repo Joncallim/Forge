@@ -14,6 +14,13 @@ import {
   type OperationVerificationStatus,
 } from '@/lib/operations/contracts'
 import { sanitizeWorkerMessage } from '@/worker/redaction'
+import {
+  buildOperationPolicyInput,
+  buildOperationReliabilityScope,
+  buildOperationRuntimeInput,
+} from '@/worker/reliability/context'
+import { recordCapabilityAttemptsBestEffort } from '@/worker/reliability/ledger'
+import { resolveOperationDefinition } from '@/lib/operations/catalog'
 import type {
   OperationLedger,
   OperationRunEventWrite,
@@ -164,8 +171,9 @@ export function createDatabaseOperationLedger(database: typeof db = db): Operati
     },
 
     async finalize(input: OperationRunFinalization) {
+      let txResult: { executionOutcomeId: string }
       try {
-        return await database.transaction(async (tx) => {
+        txResult = await database.transaction(async (tx) => {
           const outcome = normalizeExecutionOutcome(input.outcome, sanitizeWorkerMessage)
           const [outcomeRow] = await tx
             .insert(executionOutcomes)
@@ -225,7 +233,96 @@ export function createDatabaseOperationLedger(database: typeof db = db): Operati
       } catch (err) {
         unwrapDatabaseError(err)
       }
+      // Ledger write happens after the ADR 0011 transaction has committed --
+      // never inside it -- and is best-effort so it can never affect the
+      // operation run's already-terminal outcome.
+      await recordOperationCapabilityAttemptBestEffort({
+        database,
+        runId: input.runId,
+        executionOutcomeId: txResult.executionOutcomeId,
+      })
+      return txResult
     },
+  }
+}
+
+/**
+ * Reads the immutable identity columns of a terminal operation_runs row and
+ * records the corresponding capability attempt. operationId/operationVersion
+ * are read here rather than threaded through OperationRunFinalization,
+ * keeping the ADR 0011 executor contract unchanged.
+ */
+async function recordOperationCapabilityAttemptBestEffort(input: {
+  database: typeof db
+  runId: string
+  executionOutcomeId: string
+}): Promise<void> {
+  try {
+    const [run] = await input.database
+      .select({
+        taskId: operationRuns.taskId,
+        projectId: operationRuns.projectId,
+        workPackageId: operationRuns.workPackageId,
+        agentRunId: operationRuns.agentRunId,
+        taskAttemptId: operationRuns.taskAttemptId,
+        operationId: operationRuns.operationId,
+        operationVersion: operationRuns.operationVersion,
+        capability: operationRuns.capability,
+        status: operationRuns.status,
+        verificationStatus: operationRuns.verificationStatus,
+        completedAt: operationRuns.completedAt,
+      })
+      .from(operationRuns)
+      .where(eq(operationRuns.id, input.runId))
+      .limit(1)
+    if (!run) return
+    const definition = resolveOperationDefinition({
+      operationId: run.operationId,
+      operationVersion: run.operationVersion,
+    })
+    const scope = await buildOperationReliabilityScope({ projectId: run.projectId, capability: run.capability })
+    if (!scope) return
+    const [outcomeRow] = await input.database
+      .select()
+      .from(executionOutcomes)
+      .where(eq(executionOutcomes.id, input.executionOutcomeId))
+      .limit(1)
+    if (!outcomeRow) return
+    const outcomeCandidate: unknown = {
+      schemaVersion: outcomeRow.schemaVersion,
+      transportStatus: outcomeRow.transportStatus,
+      result: outcomeRow.result,
+      stopReasonCode: outcomeRow.stopReasonCode,
+      stopReasonSummary: outcomeRow.stopReasonSummary,
+      retryable: outcomeRow.retryable,
+      evidenceRefs: outcomeRow.evidenceRefs,
+      verifierRequired: outcomeRow.verifierRequired,
+      verificationStatus: outcomeRow.verificationStatus,
+    }
+    if (!isExecutionOutcome(outcomeCandidate)) return
+    await recordCapabilityAttemptsBestEffort({
+      projectId: run.projectId,
+      taskId: run.taskId,
+      workPackageId: run.workPackageId,
+      agentRunId: run.agentRunId,
+      taskAttemptId: run.taskAttemptId,
+      executionOutcomeId: input.executionOutcomeId,
+      operationRunId: input.runId,
+      outcome: outcomeCandidate,
+      attemptNumber: 1,
+      source: { kind: 'operation', operationId: run.operationId, operationVersion: run.operationVersion },
+      scope,
+      runtime: buildOperationRuntimeInput(definition.adapter),
+      policy: buildOperationPolicyInput(),
+      verificationMode: 'deterministic_adapter',
+      acceptanceCriteriaTotal: 0,
+      validationCommandTotal: 0,
+      validationCommandFailed: 0,
+      observedAt: run.completedAt ?? new Date(),
+    })
+  } catch {
+    // Best-effort: the capability ledger is an interpretation layer over the
+    // already-committed operation run and canonical outcome.
   }
 }
 
