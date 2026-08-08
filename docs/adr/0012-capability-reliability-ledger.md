@@ -2,8 +2,7 @@
 
 ## Status
 
-Proposed. Architecture accepted for implementation; this ADR becomes Accepted
-when issue #186 lands.
+Accepted. Implemented in migration `0031_capability_reliability_ledger.sql`.
 
 Primary design document:
 `docs/architecture/issue-186-capability-reliability-ledger.md`.

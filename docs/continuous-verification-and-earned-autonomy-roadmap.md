@@ -10,7 +10,7 @@ Epic: [#184 — Continuous verification and earned autonomy](https://github.com/
 |---|---|---|
 | Phase 0 — Deterministic operation catalog | #201 | Delivered — ADR 0011, `operation_runs` |
 | Phase 1 — Canonical outcomes | #185 | Delivered — ADR 0010, `execution_outcomes` |
-| Phase 2 — Capability reliability ledger | #186 | Architecture accepted, implementation not started — ADR 0012, `docs/architecture/issue-186-capability-reliability-ledger.md` |
+| Phase 2 — Capability reliability ledger | #186 | Delivered — ADR 0012, `capability_attempts`/`capability_attempt_adjudications` |
 | Phases 3–7 | #187–#191 | Not started |
 
 ## Placement In The Forge Roadmap

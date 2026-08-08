@@ -269,10 +269,13 @@ jobs:
               EXECUTE format('GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.%I TO forge_app_test', table_name);
             END LOOP;
             REVOKE ALL ON TABLE public.execution_outcomes, public.operation_runs,
-              public.operation_run_events FROM forge_app_test;
+              public.operation_run_events, public.capability_attempts,
+              public.capability_attempt_adjudications FROM forge_app_test;
             GRANT SELECT, INSERT, UPDATE ON TABLE public.execution_outcomes,
               public.operation_runs TO forge_app_test;
             GRANT SELECT, INSERT ON TABLE public.operation_run_events TO forge_app_test;
+            GRANT SELECT, INSERT ON TABLE public.capability_attempts,
+              public.capability_attempt_adjudications TO forge_app_test;
             GRANT USAGE, SELECT ON SEQUENCE public.task_logs_sequence_seq TO forge_app_test;
           END;
           $grant_s4_application_acl$;
@@ -512,7 +515,8 @@ jobs:
               'app_settings', 'task_questions'
             ];
             operation_ledger_tables constant text[] := ARRAY[
-              'execution_outcomes', 'operation_runs', 'operation_run_events'
+              'execution_outcomes', 'operation_runs', 'operation_run_events',
+              'capability_attempts', 'capability_attempt_adjudications'
             ];
             protected_tables constant text[] := ARRAY[
               'forge_release_signer_keys', 'forge_release_signer_key_lifecycle_audits',
@@ -559,6 +563,8 @@ jobs:
             GRANT SELECT, INSERT, UPDATE ON TABLE public.execution_outcomes,
               public.operation_runs TO forge_app_test;
             GRANT SELECT, INSERT ON TABLE public.operation_run_events TO forge_app_test;
+            GRANT SELECT, INSERT ON TABLE public.capability_attempts,
+              public.capability_attempt_adjudications TO forge_app_test;
             FOREACH table_name IN ARRAY operation_ledger_tables LOOP
               FOREACH table_privilege IN ARRAY ARRAY[
                 'SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER'
@@ -568,7 +574,7 @@ jobs:
                 ) IS DISTINCT FROM (
                   (table_name IN ('execution_outcomes', 'operation_runs')
                     AND table_privilege IN ('SELECT', 'INSERT', 'UPDATE'))
-                  OR (table_name = 'operation_run_events'
+                  OR (table_name IN ('operation_run_events', 'capability_attempts', 'capability_attempt_adjudications')
                     AND table_privilege IN ('SELECT', 'INSERT'))
                 ) THEN
                   RAISE EXCEPTION 'ordinary app has unexpected % on operation ledger table public.%',

@@ -11,12 +11,12 @@ export async function upsertExecutionOutcome(input: {
   agentRunId?: string | null
   taskAttemptId?: string | null
   outcome: ExecutionOutcome
-}): Promise<void> {
+}): Promise<{ id: string }> {
   if (!input.attemptKey || input.attemptKey.length > 200) {
     throw new Error('Execution outcome attempt key is required and bounded.')
   }
   const outcome = normalizeExecutionOutcome(input.outcome, sanitizeWorkerMessage)
-  await db
+  const [row] = await db
     .insert(executionOutcomes)
     .values({
       taskId: input.taskId,
@@ -44,4 +44,7 @@ export async function upsertExecutionOutcome(input: {
         updatedAt: new Date(),
       },
     })
+    .returning({ id: executionOutcomes.id })
+  if (!row) throw new Error('Execution outcome was not stored.')
+  return row
 }

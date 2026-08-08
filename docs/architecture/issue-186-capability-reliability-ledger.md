@@ -1,6 +1,10 @@
 # Issue #186 Architecture: Capability Reliability Ledger
 
-Status: **Architecture accepted, implementation not started.**
+Status: **Implemented.** Migration `0031_capability_reliability_ledger.sql` and
+the ingest/read paths described below have landed. Rollback and override
+adjudications remain storage-only until #189/#190 add producers, and
+`independent_agent` verification remains refused at ingest until #188 lands
+(§7.5, §15).
 
 | Field | Value |
 |---|---|
