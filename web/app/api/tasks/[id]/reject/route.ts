@@ -16,7 +16,7 @@ import { projectTaskCompatibilityTask, taskCompatibilityError } from '@/lib/mcps
 // ---------------------------------------------------------------------------
 
 const rejectSchema = z.object({
-  reason: z.string().optional(),
+  reason: z.string().max(1_000).optional(),
 })
 
 // ---------------------------------------------------------------------------

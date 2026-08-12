@@ -126,7 +126,7 @@ export type OperationExecutorDependencies = {
 }
 
 export class OperationAdapterExecutionError extends Error {
-  readonly code: 'adapter_failed' | 'cancelled' | 'timeout'
+  readonly code: 'adapter_failed' | 'cancelled' | 'timeout' | 'authority_changed'
   readonly evidenceRefs: string[]
 
   constructor(code: OperationAdapterExecutionError['code'], evidenceRefs: string[] = []) {
@@ -134,7 +134,9 @@ export class OperationAdapterExecutionError extends Error {
       ? 'The deterministic operation timed out.'
       : code === 'cancelled'
         ? 'The deterministic operation was cancelled.'
-        : 'The deterministic operation adapter failed.')
+        : code === 'authority_changed'
+          ? 'The authoritative task, package, grant, or repository scope changed before execution.'
+          : 'The deterministic operation adapter failed.')
     this.name = 'OperationAdapterExecutionError'
     this.code = code
     this.evidenceRefs = normalizedEvidenceRefs(evidenceRefs)
@@ -504,6 +506,7 @@ export async function executeOperation(input: {
   ): Promise<OperationExecutionResult> => {
     const timeout = error instanceof OperationTimeoutError
     const missingRepositoryContext = error instanceof MissingRepositoryContextError
+    const authorityChanged = error instanceof OperationAdapterExecutionError && error.code === 'authority_changed'
     const failureEvidenceRefs = error instanceof OperationAdapterExecutionError
       ? error.evidenceRefs
       : []
@@ -511,8 +514,18 @@ export async function executeOperation(input: {
       runId: run.runId,
       phase,
       status: 'failed',
-      detailCode: timeout ? 'timeout' : phase === 'preflight' ? 'preflight_failed' : 'adapter_failed',
-      detail: { code: timeout ? 'timeout' : missingRepositoryContext ? 'missing_repository_context' : phase === 'preflight' ? 'preflight_failed' : 'adapter_failed' },
+      detailCode: timeout ? 'timeout' : authorityChanged ? 'authority_changed' : phase === 'preflight' ? 'preflight_failed' : 'adapter_failed',
+      detail: {
+        code: timeout
+          ? 'timeout'
+          : authorityChanged
+            ? 'authority_changed'
+            : missingRepositoryContext
+              ? 'missing_repository_context'
+              : phase === 'preflight'
+                ? 'preflight_failed'
+                : 'adapter_failed',
+      },
       evidenceRefs: failureEvidenceRefs,
     }))
     return terminalize({
@@ -527,14 +540,22 @@ export async function executeOperation(input: {
       output: null,
       policyDecision,
       outcome: canonicalOutcome({
-        result: 'failed',
-        code: timeout ? 'timeout' : missingRepositoryContext ? 'missing_repository_context' : 'unknown',
+        result: authorityChanged ? 'blocked' : 'failed',
+        code: timeout
+          ? 'timeout'
+          : authorityChanged
+            ? 'policy_blocked'
+            : missingRepositoryContext
+              ? 'missing_repository_context'
+              : 'unknown',
         evidenceRefs: failureEvidenceRefs,
         summary: timeout
           ? 'The deterministic operation timed out.'
-          : missingRepositoryContext
-            ? 'The trusted project has no valid approved repository root.'
-            : `The deterministic operation ${phase} failed.`,
+          : authorityChanged
+            ? 'The authoritative task, package, grant, or repository scope changed before execution; the operation failed closed.'
+            : missingRepositoryContext
+              ? 'The trusted project has no valid approved repository root.'
+              : `The deterministic operation ${phase} failed.`,
       }),
     })
   }

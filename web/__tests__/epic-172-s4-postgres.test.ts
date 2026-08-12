@@ -981,7 +981,14 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
     // Redis is unavailable and contains forged-looking state. The route must
     // still use only the locked PostgreSQL session decision.
     mockRedisDel.mockResolvedValue(0)
-    mockRedisEval.mockResolvedValue(['{"userId":"forged"}', Date.now() + 60_000, 0, 0])
+    // The password-login rate limiter now drives its counter through one atomic
+    // Redis script; dispatch on the script body so the rate-limit call returns
+    // a counter while the legacy-session authority read still returns the
+    // forged payload the route must ignore.
+    mockRedisEval.mockImplementation((script: string) =>
+      String(script).includes("redis.call('INCR', KEYS[1])")
+        ? 1
+        : ['{"userId":"forged"}', Date.now() + 60_000, 0, 0])
     mockRedisExpire.mockResolvedValue(1)
     mockRedisIncr.mockResolvedValue(1)
     mockRedisSet.mockRejectedValue(new Error('Redis unavailable for route proof'))

@@ -285,6 +285,30 @@ describe('deterministic operation executor', () => {
     ])).toHaveProperty('size', 3)
   })
 
+  it('records a mid-run authority change as a closed policy block, not an adapter failure', async () => {
+    const ledger = new FakeLedger()
+    const result = await executeOperation({
+      request: request(),
+      context: context(),
+      dependencies: {
+        ledger,
+        adapters: adapters({
+          repositoryStatusRead: vi.fn(async () => {
+            throw new OperationAdapterExecutionError('authority_changed')
+          }),
+        }),
+      },
+    })
+    expect(result).toMatchObject({ status: 'failed', output: null })
+    expect(result.outcome).toMatchObject({
+      result: 'blocked',
+      stopReasonCode: 'policy_blocked',
+      stopReasonSummary: expect.stringContaining('scope changed'),
+    })
+    const executionEvent = ledger.events.find((event) => event.phase === 'execution')
+    expect(executionEvent).toMatchObject({ status: 'failed', detailCode: 'authority_changed' })
+  })
+
   it('records trusted-scope failure as preflight, before adapter execution', async () => {
     const ledger = new FakeLedger()
     const fixed = adapters()
