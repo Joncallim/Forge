@@ -8869,6 +8869,27 @@ describe('POST /api/tasks — enqueues to Redis', () => {
     expect(parsed).toHaveProperty('taskId', 'task-new')
   })
 
+  it('rejects an oversized task prompt instead of storing or queueing it', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbSelect.mockReturnValue(chain([{ id: 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11' }]))
+
+    const { POST } = await import('@/app/api/tasks/route')
+    const req = authRequest('/api/tasks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        projectId: 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
+        prompt: 'x'.repeat(65_537),
+      }),
+    })
+
+    const res = await POST(req as never)
+
+    expect(res.status).toBe(400)
+    expect(mockDbInsert).not.toHaveBeenCalled()
+    expect(mockRedisLpush).not.toHaveBeenCalled()
+  })
+
   it('returns 404 and does not enqueue when the project is missing', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     mockDbSelect.mockReturnValue(chain([]))
