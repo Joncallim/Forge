@@ -6,6 +6,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { prepareArchitectArtifact } from '@/worker/architect-artifact'
 import { materializeWorkforceFromArchitectArtifact } from '@/worker/workforce-materializer'
 import { computeReadyWorkPackageIds } from '@/worker/work-package-handoff'
+import type { ProjectMcpOverview } from '@/lib/mcps/types'
 
 const required = process.env.FORGE_WORKFORCE_MATERIALIZER_REQUIRE_POSTGRES_TEST === '1'
 const databaseUrl = process.env.DATABASE_URL?.trim()
@@ -60,7 +61,7 @@ function planText(roles: Array<{ role: string; reviewRequirement: string }>): st
   ].join('\n')
 }
 
-const OVERVIEW = {
+const OVERVIEW: ProjectMcpOverview = {
   projectId: 'project-1',
   config: { profile: 'default', requiredMcps: [], overrides: {} },
   catalog: [],
