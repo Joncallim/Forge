@@ -2447,6 +2447,23 @@ export async function handoffApprovedWorkPackages(
   const handoffArtifact = reviewGates.sourceArtifact
   if (!handoffArtifact) throw new Error('No-op handoff completion did not create a source artifact.')
   const packageStatus = reviewGates.packageStatus
+  await upsertExecutionOutcomeBestEffort({
+    taskId,
+    workPackageId: nextPackage.id,
+    agentRunId: handoff.run.id,
+    attemptKey: `work-package:${nextPackage.id}:run:${handoff.run.id}`,
+    outcome: {
+      schemaVersion: 1,
+      transportStatus: 'ok',
+      result: 'completed',
+      stopReasonCode: null,
+      stopReasonSummary: null,
+      retryable: false,
+      evidenceRefs: [handoffArtifact.id],
+      verifierRequired: (nextPackage.reviewRequirement ?? 'both') !== 'none',
+      verificationStatus: (nextPackage.reviewRequirement ?? 'both') === 'none' ? 'not_required' : 'pending',
+    },
+  })
   assertQueueClaimOwned(options)
   await publishTaskEvent(taskId, 'artifact:created', {
     id: handoffArtifact.id,
