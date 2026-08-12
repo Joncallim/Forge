@@ -79,6 +79,54 @@ describe('computeReliability', () => {
     expect(summary.lastCriticalAt).not.toBeNull()
   })
 
+  it('keeps a critical failure visible when it is older than the age window', () => {
+    const ancient = attempt({
+      result: 'blocked',
+      stopReasonCode: 'security_blocked',
+      severityClass: 'critical',
+      observedAt: new Date(NOW.getTime() - 120 * 24 * 60 * 60 * 1000).toISOString(),
+    })
+    const attempts = [...Array.from({ length: 5 }, () => attempt({ result: 'completed' })), ancient]
+    const summary = computeReliability({ attempts, adjudications: [], window: WINDOW, now: NOW })
+    expect(summary.state).toBe('ready')
+    expect(summary.criticalFailureCount).toBe(1)
+    expect(summary.lastCriticalAt).toBe(ancient.observedAt)
+    expect(summary.sampleCount).toBe(5)
+  })
+
+  it('keeps a critical failure visible when it falls beyond the attempt-count window', () => {
+    const oldest = attempt({
+      result: 'blocked',
+      severityClass: 'critical',
+      observedAt: new Date(NOW.getTime() - 1000).toISOString(),
+    })
+    const attempts = [...Array.from({ length: WINDOW.maxAttempts + 1 }, () => attempt({ result: 'completed' })), oldest]
+    const summary = computeReliability({ attempts, adjudications: [], window: WINDOW, now: NOW })
+    expect(summary.criticalFailureCount).toBe(1)
+    expect(summary.lastCriticalAt).toBe(oldest.observedAt)
+  })
+
+  it('keeps an out-of-window attempt critical when a rollback adjudication marks it', () => {
+    const rolledBack = attempt({
+      result: 'completed',
+      observedAt: new Date(NOW.getTime() - 120 * 24 * 60 * 60 * 1000).toISOString(),
+    })
+    const attempts = [...Array.from({ length: 5 }, () => attempt({ result: 'completed' })), rolledBack]
+    const adjudications = [{
+      id: 'adj-rollback',
+      capabilityAttemptId: rolledBack.id,
+      sequence: 0,
+      kind: 'rollback_recorded' as const,
+      verificationMode: null,
+      verificationResult: null,
+      humanDecision: null,
+      observedAt: NOW.toISOString(),
+    }]
+    const summary = computeReliability({ attempts, adjudications, window: WINDOW, now: NOW })
+    expect(summary.criticalFailureCount).toBe(1)
+    expect(summary.lastCriticalAt).toBe(rolledBack.observedAt)
+  })
+
   it('never counts self_reported or human_review as an independently verified pass', () => {
     const attempts = Array.from({ length: 10 }, () =>
       attempt({ verifierRequired: true, verificationMode: 'human_review', verificationStatus: 'passed' }))

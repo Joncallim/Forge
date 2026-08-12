@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 
-import { and, desc, eq } from 'drizzle-orm'
+import { and, desc, eq, sql } from 'drizzle-orm'
 
 import { db } from '@/db'
 import { capabilityAttemptAdjudications, capabilityAttempts, executionOutcomes } from '@/db/schema'
@@ -14,6 +14,7 @@ import {
   runtimeFingerprint,
   scopeFingerprint,
   unclassifiedCapabilityKey,
+  type AdjudicationKind,
   type CapabilityVerificationResult,
   type HumanDecision,
   type ReliabilityPolicyInput,
@@ -177,16 +178,6 @@ export async function recordCapabilityAttemptsBestEffort(input: RecordCapability
   }
 }
 
-async function nextAdjudicationSequence(capabilityAttemptId: string): Promise<number> {
-  const [last] = await db
-    .select({ sequence: capabilityAttemptAdjudications.sequence })
-    .from(capabilityAttemptAdjudications)
-    .where(eq(capabilityAttemptAdjudications.capabilityAttemptId, capabilityAttemptId))
-    .orderBy(desc(capabilityAttemptAdjudications.sequence))
-    .limit(1)
-  return last ? last.sequence + 1 : 0
-}
-
 async function findAttemptRowsForOutcome(executionOutcomeId: string): Promise<Array<{ id: string }>> {
   return db
     .select({ id: capabilityAttempts.id })
@@ -204,6 +195,48 @@ async function findAttemptRowsForAttemptKey(taskId: string, attemptKey: string):
   return findAttemptRowsForOutcome(outcome.id)
 }
 
+type AdjudicationValues = {
+  kind: AdjudicationKind
+  verificationMode?: VerificationMode | null
+  verificationResult?: CapabilityVerificationResult | null
+  humanDecision?: HumanDecision | null
+  decidedBy?: string | null
+  approvalGateId?: string | null
+  observedAt: Date
+}
+
+/**
+ * Appends one adjudication under a transaction-scoped advisory lock keyed on
+ * the attempt id. Sequence allocation and insertion happen in the same
+ * transaction so concurrent writers (e.g. QA and reviewer gates decided at
+ * the same moment for the same attempt) serialize here instead of both
+ * reading the same maximum sequence and silently dropping the second
+ * decision. The lock is an advisory lock rather than SELECT ... FOR UPDATE
+ * because the ordinary application role deliberately has no UPDATE privilege
+ * on the attempt table; the migration's insert guard takes the same lock and
+ * re-checks gapless order, so the two can never disagree.
+ */
+async function appendAdjudication(capabilityAttemptId: string, values: AdjudicationValues): Promise<void> {
+  await db.transaction(async (tx) => {
+    await tx.execute(sql`
+      select pg_catalog.pg_advisory_xact_lock(
+        pg_catalog.hashtextextended(${capabilityAttemptId}::text, 0)
+      )
+    `)
+    const [last] = await tx
+      .select({ sequence: capabilityAttemptAdjudications.sequence })
+      .from(capabilityAttemptAdjudications)
+      .where(eq(capabilityAttemptAdjudications.capabilityAttemptId, capabilityAttemptId))
+      .orderBy(desc(capabilityAttemptAdjudications.sequence))
+      .limit(1)
+    await tx.insert(capabilityAttemptAdjudications).values({
+      capabilityAttemptId,
+      sequence: last ? last.sequence + 1 : 0,
+      ...values,
+    })
+  })
+}
+
 /** Appends one verification_recorded adjudication per attempt row linked to (taskId, attemptKey). */
 export async function recordVerificationAdjudicationBestEffort(input: {
   taskId: string
@@ -216,10 +249,7 @@ export async function recordVerificationAdjudicationBestEffort(input: {
   try {
     const rows = await findAttemptRowsForAttemptKey(input.taskId, input.attemptKey)
     for (const row of rows) {
-      const sequence = await nextAdjudicationSequence(row.id)
-      await db.insert(capabilityAttemptAdjudications).values({
-        capabilityAttemptId: row.id,
-        sequence,
+      await appendAdjudication(row.id, {
         kind: 'verification_recorded',
         verificationMode: input.verificationMode,
         verificationResult: input.verificationResult,
@@ -229,6 +259,36 @@ export async function recordVerificationAdjudicationBestEffort(input: {
   } catch {
     // Best-effort: a missing attempt (ledger disabled window, or predates
     // this table) is missing evidence, not an error to escalate.
+  }
+}
+
+/**
+ * Appends one deterministic_adapter verification_recorded adjudication per
+ * attempt row of an operation outcome. ADR 0011 canonical outcomes always
+ * carry verifier_required = false, so the schema forbids storing the run's
+ * verdict on the attempt row itself; the adjudication is where the
+ * deterministic verdict belongs. Only called once the run reached a real
+ * verdict ('passed' or 'failed') -- blocked or aborted runs have no verdict
+ * to record.
+ */
+export async function recordDeterministicAdapterVerdictBestEffort(input: {
+  executionOutcomeId: string
+  verificationResult: CapabilityVerificationResult
+  observedAt: Date
+}): Promise<void> {
+  if (!ledgerEnabled()) return
+  try {
+    const rows = await findAttemptRowsForOutcome(input.executionOutcomeId)
+    for (const row of rows) {
+      await appendAdjudication(row.id, {
+        kind: 'verification_recorded',
+        verificationMode: 'deterministic_adapter',
+        verificationResult: input.verificationResult,
+        observedAt: input.observedAt,
+      })
+    }
+  } catch {
+    // Best-effort, same rationale as above.
   }
 }
 
@@ -245,10 +305,7 @@ export async function recordHumanDecisionAdjudicationBestEffort(input: {
   try {
     const rows = await findAttemptRowsForAttemptKey(input.taskId, input.attemptKey)
     for (const row of rows) {
-      const sequence = await nextAdjudicationSequence(row.id)
-      await db.insert(capabilityAttemptAdjudications).values({
-        capabilityAttemptId: row.id,
-        sequence,
+      await appendAdjudication(row.id, {
         kind: 'human_decision',
         humanDecision: input.humanDecision,
         decidedBy: input.decidedBy,
@@ -258,26 +315,5 @@ export async function recordHumanDecisionAdjudicationBestEffort(input: {
     }
   } catch {
     // Best-effort, same rationale as above.
-  }
-}
-
-/** Appends one evidence_drift_detected adjudication for a single attempt row. */
-export async function recordEvidenceDriftAdjudicationBestEffort(input: {
-  capabilityAttemptId: string
-  observedOutcomeDigest: string
-  observedAt: Date
-}): Promise<void> {
-  if (!ledgerEnabled()) return
-  try {
-    const sequence = await nextAdjudicationSequence(input.capabilityAttemptId)
-    await db.insert(capabilityAttemptAdjudications).values({
-      capabilityAttemptId: input.capabilityAttemptId,
-      sequence,
-      kind: 'evidence_drift_detected',
-      observedOutcomeDigest: input.observedOutcomeDigest,
-      observedAt: input.observedAt,
-    })
-  } catch {
-    // Best-effort.
   }
 }

@@ -57,6 +57,15 @@ describe('capability reliability ledger migration', () => {
 
     // Shape closure per adjudication kind.
     expect(sql).toContain('capability_attempt_adjudications_kind_shape_check')
+
+    // Evidence refs are UUID-only, enforced at the database boundary on both
+    // tables (I1): the helper validates a bounded array whose every element
+    // matches the ADR 0010 UUID grammar, so paths, transcripts, and
+    // credentials cannot enter the append-only ledger even by mistake.
+    expect(sql).toContain('forge_is_uuid_evidence_refs_v1')
+    expect(sql).toContain('"capability_attempts_evidence_refs_check" CHECK ("forge_is_uuid_evidence_refs_v1"("evidence_refs"))')
+    expect(sql).toContain('"capability_attempt_adjudications_evidence_refs_check" CHECK ("forge_is_uuid_evidence_refs_v1"("evidence_refs"))')
+    expect(sql).toContain('pg_catalog.jsonb_array_length("value") > 128')
   })
 
   it('grants only SELECT/INSERT to the ordinary application role in the CI ACL gate', async () => {

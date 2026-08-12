@@ -19,7 +19,7 @@ import {
   buildOperationReliabilityScope,
   buildOperationRuntimeInput,
 } from '@/worker/reliability/context'
-import { recordCapabilityAttemptsBestEffort } from '@/worker/reliability/ledger'
+import { recordCapabilityAttemptsBestEffort, recordDeterministicAdapterVerdictBestEffort } from '@/worker/reliability/ledger'
 import { resolveOperationDefinition } from '@/lib/operations/catalog'
 import type {
   OperationLedger,
@@ -314,12 +314,22 @@ async function recordOperationCapabilityAttemptBestEffort(input: {
       scope,
       runtime: buildOperationRuntimeInput(definition.adapter),
       policy: buildOperationPolicyInput(),
-      verificationMode: 'deterministic_adapter',
+      verificationMode: 'none',
       acceptanceCriteriaTotal: 0,
       validationCommandTotal: 0,
       validationCommandFailed: 0,
       observedAt: run.completedAt ?? new Date(),
     })
+    // The canonical outcome always carries verifier_required = false, so the
+    // attempt row cannot hold the deterministic adapter's verdict; append it
+    // as a verification_recorded adjudication once the run reached one.
+    if (run.verificationStatus === 'passed' || run.verificationStatus === 'failed') {
+      await recordDeterministicAdapterVerdictBestEffort({
+        executionOutcomeId: input.executionOutcomeId,
+        verificationResult: run.verificationStatus,
+        observedAt: run.completedAt ?? new Date(),
+      })
+    }
   } catch {
     // Best-effort: the capability ledger is an interpretation layer over the
     // already-committed operation run and canonical outcome.

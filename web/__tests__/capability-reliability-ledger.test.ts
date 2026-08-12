@@ -3,6 +3,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 const mocks = vi.hoisted(() => ({
   insertValues: vi.fn(),
   insertOnConflict: vi.fn(),
+  dbSelect: vi.fn(),
+  txSelect: vi.fn(),
+  txInsert: vi.fn(),
+  operations: [] as string[],
 }))
 
 function chain(rows: unknown[]): Record<string, unknown> {
@@ -13,6 +17,7 @@ function chain(rows: unknown[]): Record<string, unknown> {
   thenable.where = () => thenable
   thenable.orderBy = () => thenable
   thenable.limit = () => thenable
+  thenable.for = () => thenable
   return thenable
 }
 
@@ -30,7 +35,28 @@ vi.mock('@/db', () => ({
         }
       },
     }),
-    select: () => chain([]),
+    select: (...args: unknown[]) => {
+      mocks.operations.push('select')
+      return chain(mocks.dbSelect(...args) ?? [])
+    },
+    transaction: async (callback: (tx: unknown) => unknown) => callback({
+      execute: () => {
+        mocks.operations.push('tx:advisory-lock')
+        return Promise.resolve([])
+      },
+      select: (...args: unknown[]) => {
+        mocks.operations.push('tx:select')
+        return chain(mocks.txSelect(...args) ?? [])
+      },
+      insert: (...args: unknown[]) => {
+        mocks.operations.push('tx:insert')
+        const values: (rows: unknown) => unknown = (rows) => {
+          mocks.txInsert(args[0], rows)
+          return Promise.resolve([])
+        }
+        return { values }
+      },
+    }),
   },
 }))
 
@@ -38,6 +64,7 @@ vi.mock('@/db/schema', () => ({
   capabilityAttempts: {
     executionOutcomeId: 'execution_outcome_id',
     capabilityKey: 'capability_key',
+    id: 'id',
   },
   capabilityAttemptAdjudications: {
     capabilityAttemptId: 'capability_attempt_id',
@@ -53,6 +80,9 @@ vi.mock('@/db/schema', () => ({
 import {
   recordCapabilityAttempts,
   recordCapabilityAttemptsBestEffort,
+  recordDeterministicAdapterVerdictBestEffort,
+  recordHumanDecisionAdjudicationBestEffort,
+  recordVerificationAdjudicationBestEffort,
   type RecordCapabilityAttemptsInput,
 } from '@/worker/reliability/ledger'
 
@@ -200,5 +230,85 @@ describe('recordCapabilityAttemptsBestEffort', () => {
       throw new Error('simulated database failure')
     })
     await expect(recordCapabilityAttemptsBestEffort(baseInput())).resolves.toBeUndefined()
+  })
+})
+
+describe('adjudication appends', () => {
+  beforeEach(() => {
+    mocks.dbSelect.mockReset()
+    mocks.txSelect.mockReset()
+    mocks.txInsert.mockReset()
+    mocks.operations.length = 0
+    delete process.env.FORGE_CAPABILITY_RELIABILITY_LEDGER
+  })
+
+  afterEach(() => {
+    delete process.env.FORGE_CAPABILITY_RELIABILITY_LEDGER
+  })
+
+  it('allocates the adjudication sequence under the attempt advisory lock, then inserts', async () => {
+    mocks.dbSelect
+      .mockReturnValueOnce([{ id: 'outcome-1' }])
+      .mockReturnValueOnce([{ id: 'attempt-1' }])
+    mocks.txSelect.mockReturnValueOnce([{ sequence: 4 }])
+
+    await recordHumanDecisionAdjudicationBestEffort({
+      taskId: 'task-1',
+      attemptKey: 'work-package:wp-1:run:run-1',
+      humanDecision: 'accepted',
+      decidedBy: 'user-1',
+      approvalGateId: 'gate-1',
+      observedAt: new Date('2026-08-01T00:00:00.000Z'),
+    })
+
+    // resolve outcome -> resolve attempt rows -> take the advisory lock ->
+    // read max sequence -> insert, all in that order inside one transaction.
+    expect(mocks.operations).toEqual(['select', 'select', 'tx:advisory-lock', 'tx:select', 'tx:insert'])
+    const [, values] = mocks.txInsert.mock.calls[0] as [unknown, Record<string, unknown>]
+    expect(values).toMatchObject({
+      capabilityAttemptId: 'attempt-1',
+      sequence: 5,
+      kind: 'human_decision',
+      humanDecision: 'accepted',
+      decidedBy: 'user-1',
+      approvalGateId: 'gate-1',
+    })
+  })
+
+  it('records the deterministic adapter verdict as a verification_recorded adjudication', async () => {
+    mocks.dbSelect.mockReturnValueOnce([{ id: 'attempt-1' }])
+    mocks.txSelect.mockReturnValueOnce([])
+
+    await recordDeterministicAdapterVerdictBestEffort({
+      executionOutcomeId: 'outcome-1',
+      verificationResult: 'passed',
+      observedAt: new Date('2026-08-01T00:00:00.000Z'),
+    })
+
+    expect(mocks.operations).toContain('tx:advisory-lock')
+    const [, values] = mocks.txInsert.mock.calls[0] as [unknown, Record<string, unknown>]
+    expect(values).toMatchObject({
+      capabilityAttemptId: 'attempt-1',
+      sequence: 0,
+      kind: 'verification_recorded',
+      verificationMode: 'deterministic_adapter',
+      verificationResult: 'passed',
+    })
+  })
+
+  it('writes no adjudication when the outcome has no attempt rows', async () => {
+    mocks.dbSelect
+      .mockReturnValueOnce([{ id: 'outcome-1' }])
+      .mockReturnValueOnce([])
+
+    await recordVerificationAdjudicationBestEffort({
+      taskId: 'task-1',
+      attemptKey: 'work-package:wp-1:run:run-1',
+      verificationMode: 'human_review',
+      verificationResult: 'passed',
+      observedAt: new Date('2026-08-01T00:00:00.000Z'),
+    })
+
+    expect(mocks.txInsert).not.toHaveBeenCalled()
   })
 })

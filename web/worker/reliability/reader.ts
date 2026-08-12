@@ -1,4 +1,4 @@
-import { and, desc, eq, gte, inArray } from 'drizzle-orm'
+import { and, desc, eq, exists, gte, inArray, or } from 'drizzle-orm'
 
 import { db } from '@/db'
 import { capabilityAttemptAdjudications, capabilityAttempts, executionOutcomes } from '@/db/schema'
@@ -16,7 +16,6 @@ import {
   type ReliabilitySummary,
   type ReliabilityWindow,
 } from '@/lib/reliability/contracts'
-import { recordEvidenceDriftAdjudicationBestEffort } from './ledger'
 import { sanitizeWorkerMessage } from '../redaction'
 
 function storedOutcome(row: typeof executionOutcomes.$inferSelect): ExecutionOutcome | null {
@@ -38,7 +37,16 @@ function storedOutcome(row: typeof executionOutcomes.$inferSelect): ExecutionOut
 /**
  * Reads a cohort's attempts and adjudications, detects drift against the
  * linked execution_outcomes row, and computes the summary with the pure
- * metrics function. Performs no arithmetic itself.
+ * metrics function. Performs no arithmetic itself and performs NO writes:
+ * reading a cohort is side-effect-free (the CLI advertises this). Drift is
+ * reported through the summary state, never appended to the ledger here.
+ *
+ * Two reads: the bounded rate sample (newest `maxAttempts` rows within
+ * `maxAgeMs`) and the unbounded-by-age critical history. Critical rows are
+ * rare, and the safety property (I7) requires them to stay visible whatever
+ * the window, so the ledger's full critical history -- severity-class
+ * critical rows plus rows with a rollback adjudication -- is fetched even
+ * when it predates the sample.
  */
 export async function readCohortReliability(input: {
   cohortFingerprint: string
@@ -49,7 +57,7 @@ export async function readCohortReliability(input: {
   const now = input.now ?? new Date()
   const cutoff = new Date(now.getTime() - window.maxAgeMs)
 
-  const attemptRows = await db
+  const sampleRows = await db
     .select()
     .from(capabilityAttempts)
     .where(and(
@@ -58,6 +66,30 @@ export async function readCohortReliability(input: {
     ))
     .orderBy(desc(capabilityAttempts.observedAt))
     .limit(window.maxAttempts)
+
+  const criticalHistoryRows = await db
+    .select()
+    .from(capabilityAttempts)
+    .where(and(
+      eq(capabilityAttempts.cohortFingerprint, input.cohortFingerprint),
+      or(
+        eq(capabilityAttempts.severityClass, 'critical'),
+        exists(db
+          .select({ id: capabilityAttemptAdjudications.id })
+          .from(capabilityAttemptAdjudications)
+          .where(and(
+            eq(capabilityAttemptAdjudications.capabilityAttemptId, capabilityAttempts.id),
+            eq(capabilityAttemptAdjudications.kind, 'rollback_recorded'),
+          ))),
+      ),
+    ))
+    .orderBy(desc(capabilityAttempts.observedAt))
+
+  const sampleIds = new Set(sampleRows.map((row) => row.id))
+  const attemptRows = [...sampleRows]
+  for (const row of criticalHistoryRows) {
+    if (!sampleIds.has(row.id)) attemptRows.push(row)
+  }
 
   if (attemptRows.length === 0) {
     return computeReliability({ attempts: [], adjudications: [], window, now })
@@ -80,13 +112,6 @@ export async function readCohortReliability(input: {
         const normalized = normalizeExecutionOutcome(outcome, sanitizeWorkerMessage)
         currentDigest = outcomeDigest(normalized)
       }
-    }
-    if (currentDigest && currentDigest !== row.outcomeDigest) {
-      await recordEvidenceDriftAdjudicationBestEffort({
-        capabilityAttemptId: row.id,
-        observedOutcomeDigest: currentDigest,
-        observedAt: now,
-      })
     }
     attempts.push({
       id: row.id,

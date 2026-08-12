@@ -82,10 +82,14 @@ export function computeReliability(input: {
   const cohortFingerprint = input.attempts[0]?.cohortFingerprint ?? ''
   const capabilityKey = input.attempts[0]?.capabilityKey ?? ''
 
-  // Critical failures are reported unconditionally, whatever state we end in.
+  // Critical failures are reported unconditionally, whatever state we end in
+  // (I7). They are computed over the FULL attempt set, not just the bounded
+  // in-window rate sample: the reader supplies critical-history rows that
+  // fall outside maxAgeMs/maxAttempts precisely so an old critical failure
+  // can never scroll out of sight. Rates still use only inWindow below.
   let criticalFailureCount = 0
   let lastCriticalAt: string | null = null
-  for (const attempt of inWindow) {
+  for (const attempt of sorted) {
     const adjs = adjudicationsByAttempt.get(attempt.id) ?? []
     if (isCritical(attempt, adjs)) {
       criticalFailureCount += 1

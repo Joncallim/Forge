@@ -302,7 +302,11 @@ An attempt is `critical` when any of these hold at ingest:
 
 A later `rollback_recorded` adjudication also makes the attempt critical for
 metric purposes; the stored attempt row is not rewritten (I3/I4), the metrics
-function derives it. Critical counts are reported unconditionally (I7).
+function derives it. Critical counts are reported unconditionally (I7) and are
+computed over the cohort's full critical history, not just the rolling rate
+window: the reader supplies the critical rows that fall outside
+`maxAttempts`/`maxAgeMs` precisely so a critical failure can never scroll out
+of sight.
 
 ### 5.7 Summary contract
 
@@ -610,9 +614,14 @@ transaction: ADR 0011 pins its exact transactional contract (outcome + outcome
 event + terminalization commit together), and widening it would invalidate the
 proofs behind that ADR.
 
-Operation attempts use `verification_mode: 'deterministic_adapter'` when the run
-verified, `'none'` when the run was blocked before execution, and
-`operation_run_id` set.
+Operation attempts store `verification_mode: 'none'` on the attempt row: ADR
+0011 canonical outcomes always carry `verifier_required = false`, and the
+schema's consistency check ties `verification_mode = 'none'` to exactly that.
+The run's deterministic adapter verdict (`operation_runs.verification_status`
+`passed`/`failed`) is therefore appended as a `verification_recorded`
+adjudication with mode `deterministic_adapter` right after ingest, and
+`operation_run_id` is set. A run that was blocked or aborted before reaching a
+verdict records no adjudication.
 
 ### 7.4 Ingest algorithm
 
@@ -646,7 +655,8 @@ row and therefore the same conflict target.
 | Producer | Where | Writes |
 |---|---|---|
 | Human review decision | `web/worker/review-gates.ts` → `decideReviewGate` | `human_decision` (`accepted` for `completed`, `rejected` for `needs_rework`) with `decided_by` and `approval_gate_id`; plus `verification_recorded` with mode `human_review` and result `passed`/`failed` |
-| Drift detection | the cohort reader (§8) | `evidence_drift_detected` with the currently observed digest |
+| Deterministic operation verdict | `web/worker/operations/ledger.ts` after `finalize()` commits | `verification_recorded` with mode `deterministic_adapter` and result `passed`/`failed` from the run's verification status |
+| Drift detection | **no producer in v1** | read-only detection (§8): the summary reports `evidence_drift`; the `evidence_drift_detected` kind is contract-only until an explicitly mutating operator command exists |
 | Rollback | **no producer in v1** | contract only |
 | Override | **no producer in v1** | contract only |
 
@@ -691,17 +701,30 @@ export async function readCohortReliability(input: {
 
 The reader:
 
-1. Selects at most `window.maxAttempts` rows for the cohort, newest first.
-2. Selects their adjudications.
-3. Joins the linked `execution_outcomes` rows and recomputes each
-   `outcome_digest`. Any mismatch appends an `evidence_drift_detected`
-   adjudication (best-effort) and marks the attempt drifted.
-4. Calls `computeReliability`.
+1. Selects at most `window.maxAttempts` rows for the cohort, newest first —
+   the bounded rate sample.
+2. Separately selects the cohort's critical history: rows with
+   `severity_class = 'critical'` or with a `rollback_recorded` adjudication,
+   regardless of age. This is what keeps I7 true — an old critical failure
+   stays visible even after the window scrolls past it. Critical rows are
+   rare, so this second read stays small.
+3. Selects the adjudications for the union of both sets.
+4. Joins the linked `execution_outcomes` rows and recomputes each
+   `outcome_digest`, marking drifted attempts. This is detection only: the
+   reader performs no writes, so routine inspection never mutates the audit
+   ledger (and the CLI's "performs no writes" claim stays true).
+5. Calls `computeReliability`, which windows the rate sample itself and
+   computes critical counts over the full set.
 
 Drift semantics (I8): if **any** in-window attempt drifted, `state` is
 `evidence_drift`, every rate is `null`, and `criticalFailureCount` is still
 reported. Forge must not average numbers whose underlying evidence changed
-beneath them.
+beneath them. Drift outside the rate window does not suppress rates; the
+windowed sample is what the rates describe.
+
+`excluded.outside_window` now counts the fetched rows beyond the bounded
+sample — the retained critical history — rather than every row the cohort has
+ever recorded.
 
 Keeping arithmetic in a pure function is what makes "metrics can be recomputed
 deterministically from stored attempts" a testable claim rather than a promise.
@@ -759,6 +782,10 @@ Current state: 31 migrations, newest journal entry `0030_operation_runs` with
      wrong fails the gate loudly, which is the intended behaviour.
    - also extend the `REVOKE ALL ON TABLE …` line near line 271 that seeds the
      ledger-family baseline.
+   - wire `FORGE_RELIABILITY_LEDGER_REQUIRE_POSTGRES_TEST=1` and
+     `FORGE_RELIABILITY_LEDGER_POSTGRES_ADMIN_TEST_URL` into the zero-skip unit
+     step env, so the gated PostgreSQL proof runs in CI on the same database
+     and admin connection as the operation-ledger proof.
 
 `web/scripts/repair-epic-172-legacy-release.ts` was already made tolerant of
 ledgers of 29 rows or more (`a2cc23c`) and should need no change. Verify rather
@@ -812,6 +839,11 @@ repository's existing naming:
 - below `minSamples` → `insufficient_evidence`, all rates null (I9);
 - a cohort of 20 successes plus one `security_blocked` attempt still reports
   `criticalFailureCount: 1` and a non-null `lastCriticalAt` (I7);
+- a critical failure older than `maxAgeMs`, and one beyond `maxAttempts`, both
+  stay visible in `criticalFailureCount`/`lastCriticalAt` while the rate sample
+  stays bounded (I7 critical history);
+- a `rollback_recorded` adjudication on an out-of-window attempt still counts
+  as critical (I7 critical history);
 - `self_reported` and `human_review` verification never raise
   `independentlyVerifiedPass`; a cohort of 10 human-approved completions reports
   `independentlyVerifiedPass: null` (denominator behaviour) and
@@ -829,25 +861,48 @@ repository's existing naming:
 - a ledger write failure does not propagate to the caller (I10);
 - flag off → no writes;
 - missing classification writes exactly one `unclassified` row with
-  `classification_state: 'missing'`; 13 capabilities writes one `overflow` row.
+  `classification_state: 'missing'`; 13 capabilities writes one `overflow` row;
+- adjudication sequence allocation happens inside one transaction that locks
+  the parent attempt row before reading the maximum sequence, then inserts —
+  so concurrent QA/reviewer decisions cannot allocate the same sequence or be
+  silently dropped;
+- the deterministic operation verdict is appended as a
+  `verification_recorded` adjudication with mode `deterministic_adapter`.
 
 **`web/__tests__/capability-reliability-schema.test.ts`** (text assertions on the
 migration, mirroring `operation-ledger-schema.test.ts`)
 - asserts the append-only triggers, the ordering guard, the `CHECK` names, and
   the `REVOKE ALL ON FUNCTION` lines exist;
 - asserts every `text` column in the new tables appears in a `CHECK` — the
-  machine-checkable form of "no free-text column" (I1).
+  machine-checkable form of "no free-text column" (I1);
+- asserts the `forge_is_uuid_evidence_refs_v1` helper backs the
+  `evidence_refs` `CHECK`s on both tables, so only bounded UUID arrays can
+  enter the append-only ledger (I1).
 
 **`web/__tests__/capability-reliability-ledger.postgres.test.ts`** (gated proof,
 modelled exactly on `operation-ledger.postgres.test.ts`)
 - gate: `FORGE_RELIABILITY_LEDGER_REQUIRE_POSTGRES_TEST=1` plus `DATABASE_URL`
   and `FORGE_RELIABILITY_LEDGER_POSTGRES_ADMIN_TEST_URL`; the mandatory suite may
   not skip, and missing variables must throw rather than silently pass;
+- CI runs this proof inside the zero-skip unit step against
+  `forge_epic_172_ci_test` (ordinary app role + `forge_e2e` admin connection),
+  the same wiring as the operation-ledger proof;
 - `UPDATE` and `DELETE` on `capability_attempts` are rejected by the trigger (I3);
 - adjudication sequence gaps and out-of-order inserts are rejected;
 - adjudication `UPDATE`/`DELETE` are rejected (I4);
 - the duplicate-ingest unique index holds under concurrent inserts (I2);
-- each shape `CHECK` rejects its malformed row.
+- each shape `CHECK` rejects its malformed row;
+- non-UUID, non-array, oversized, and null-element `evidence_refs` are
+  rejected at the database boundary on both tables, while a genuine UUID
+  array is accepted (I1);
+- two concurrent adjudication appends both land as the next gapless sequences
+  (no silently dropped decision);
+- a deterministic adapter verdict is persisted as a `verification_recorded`
+  adjudication;
+- the reader keeps an out-of-window severity-critical attempt and an
+  out-of-window rollback-adjudicated attempt visible in
+  `criticalFailureCount`/`lastCriticalAt` while the rate sample stays bounded
+  (I7 critical history).
 
 **Existing suites to extend**
 - `web/__tests__/work-package-handoff-db.test.ts` — assert attempt ingest at all
