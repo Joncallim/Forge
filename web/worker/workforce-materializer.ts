@@ -749,18 +749,40 @@ export async function materializeWorkforceFromArchitectArtifact(
         ),
       )
     input.assertClaimOwned?.()
-    await tx
-      .delete(workPackages)
-      .where(and(
-        eq(workPackages.taskId, input.taskId),
-        or(
-          eq(workPackages.status, 'pending'),
-          and(
-            eq(workPackages.status, 'failed'),
-            sql`${workPackages.metadata}->>'requiresAgentConfiguration' = 'true'`,
-          ),
+    // Replaced packages are superseded, never deleted. Every work package row
+    // has eight immutable local-projection heads (and may have dependency rows)
+    // that reference it with ON DELETE RESTRICT, so deletion is impossible by
+    // design. Superseded packages move to 'cancelled', which every handoff and
+    // review-gate consumer already treats as non-actionable; the new wave of
+    // packages then continues the task's sequence numbering past them.
+    const replacedPackageCondition = and(
+      eq(workPackages.taskId, input.taskId),
+      or(
+        eq(workPackages.status, 'pending'),
+        and(
+          eq(workPackages.status, 'failed'),
+          sql`${workPackages.metadata}->>'requiresAgentConfiguration' = 'true'`,
         ),
-      ))
+      ),
+    )
+    await tx
+      .update(workPackages)
+      .set({
+        blockedReason: 'Superseded by a revised plan.',
+        metadata: sql`coalesce(${workPackages.metadata}, '{}'::jsonb) || ${JSON.stringify({ supersededByPlanRevision: true })}::jsonb`,
+        status: 'cancelled',
+        updatedAt: new Date(),
+      })
+      .where(replacedPackageCondition)
+    input.assertClaimOwned?.()
+    const [sequenceState] = await tx
+      .select({ maxSequence: sql<number | null>`max(${workPackages.sequence})` })
+      .from(workPackages)
+      .where(eq(workPackages.taskId, input.taskId))
+    const maxSequence = typeof sequenceState?.maxSequence === 'number' ? sequenceState.maxSequence : 0
+    rows.workPackages.forEach((pkg, index) => {
+      pkg.sequence = maxSequence + index + 1
+    })
 
     if (rows.harnesses.length > 0) {
       input.assertClaimOwned?.()

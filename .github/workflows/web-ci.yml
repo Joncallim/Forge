@@ -729,6 +729,8 @@ jobs:
           FORGE_EPIC_172_REQUIRE_POSTGRES_TEST: '1'
           FORGE_OPERATION_LEDGER_REQUIRE_POSTGRES_TEST: '1'
           FORGE_OPERATION_LEDGER_POSTGRES_ADMIN_TEST_URL: postgresql://forge_e2e:forge@localhost:5432/forge_epic_172_ci_test
+          FORGE_WORKFORCE_MATERIALIZER_REQUIRE_POSTGRES_TEST: '1'
+          FORGE_WORKFORCE_MATERIALIZER_POSTGRES_ADMIN_TEST_URL: postgresql://forge_e2e:forge@localhost:5432/forge_epic_172_ci_test
           FORGE_EPIC_172_TEST_APP_DATABASE_URL: postgresql://forge_app_test:forge_app_test@localhost:5432/forge_epic_172_ci_test
           FORGE_EPIC_172_TEST_WRITER_DATABASE_URL: postgresql://forge_release_evidence_writer:forge_writer_test@localhost:5432/forge_epic_172_ci_test
           FORGE_EPIC_172_TEST_TRANSITION_DATABASE_URL: postgresql://forge_release_transition:forge_transition_test@localhost:5432/forge_epic_172_ci_test
