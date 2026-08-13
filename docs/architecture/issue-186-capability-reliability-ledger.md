@@ -522,10 +522,13 @@ CONSTRAINT "capability_attempt_adjudications_kind_shape_check" CHECK (
 ```
 
 Ordering guard — a `BEFORE INSERT` trigger requiring
-`NEW.sequence = COALESCE(MAX(sequence), -1) + 1` for that attempt, taking
-`FOR UPDATE` on the parent attempt row exactly as
-`forge_guard_operation_event_insert_v1` does. Plus a second trigger rejecting all
-`UPDATE`/`DELETE` (`capability_attempt_adjudications_append_only`).
+`NEW.sequence = COALESCE(MAX(sequence), -1) + 1` for that attempt, taking a
+transaction-scoped advisory lock keyed on the attempt id (the ordinary
+application role has no `UPDATE` privilege, so `SELECT ... FOR UPDATE` on the
+parent attempt row — the `forge_guard_operation_event_insert_v1` pattern — is
+unavailable here; the application's sequence allocation takes the same
+advisory lock, and the trigger re-checks gapless order). Plus a second trigger
+rejecting all `UPDATE`/`DELETE` (`capability_attempt_adjudications_append_only`).
 
 Indexes: `UNIQUE (capability_attempt_id, sequence)`, and
 `(capability_attempt_id, observed_at)`.
@@ -757,9 +760,8 @@ Adding a migration and public tables trips four pinned gates plus the closed-ACL
 inventory. All were last moved by commits `a2cc23c`, `c64d06b`, `6115707`, and
 `5f06947`; read those diffs before starting.
 
-Current state: 31 migrations, newest journal entry `0030_operation_runs` with
-`when = 1785993600000`. After `0031`, the count is **32** and the max
-`created_at` literal becomes the new migration's journal timestamp.
+Current state: 32 migrations, newest journal entry `0031_capability_reliability_ledger` with
+`when = 1786080000000`.
 
 **Files that must be updated in the same commit as the migration:**
 
@@ -862,8 +864,9 @@ repository's existing naming:
 - flag off → no writes;
 - missing classification writes exactly one `unclassified` row with
   `classification_state: 'missing'`; 13 capabilities writes one `overflow` row;
-- adjudication sequence allocation happens inside one transaction that locks
-  the parent attempt row before reading the maximum sequence, then inserts —
+- adjudication sequence allocation happens inside one transaction that takes
+  a transaction-scoped advisory lock keyed on the attempt id before reading
+  the maximum sequence, then inserts —
   so concurrent QA/reviewer decisions cannot allocate the same sequence or be
   silently dropped;
 - the deterministic operation verdict is appended as a

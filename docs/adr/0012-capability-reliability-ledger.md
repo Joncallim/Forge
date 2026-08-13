@@ -46,8 +46,8 @@ slices rollbacks and overrides — is appended to
 `capability_attempt_adjudications` in gapless sequence order, never written
 back into the attempt. Concurrent writers (for example a QA gate and a
 reviewer gate decided for the same attempt at the same moment) serialize on
-the parent attempt's row lock, so a decision can never be silently dropped by
-a sequence conflict.
+a transaction-scoped advisory lock keyed on the attempt id, so a decision can
+never be silently dropped by a sequence conflict.
 
 Whether an attempt counts as verified is decided by a closed `verification_mode`.
 `self_reported` and `human_review` never contribute to the independently verified

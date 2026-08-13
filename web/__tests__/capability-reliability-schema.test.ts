@@ -66,6 +66,15 @@ describe('capability reliability ledger migration', () => {
     expect(sql).toContain('"capability_attempts_evidence_refs_check" CHECK ("forge_is_uuid_evidence_refs_v1"("evidence_refs"))')
     expect(sql).toContain('"capability_attempt_adjudications_evidence_refs_check" CHECK ("forge_is_uuid_evidence_refs_v1"("evidence_refs"))')
     expect(sql).toContain('pg_catalog.jsonb_array_length("value") > 128')
+
+    // The drizzle schema must declare the same boundary: if it ever drifts
+    // back to a bare jsonb_typeof array check, `npm run db:generate` would
+    // silently emit a migration that reverts the UUID-only guarantee.
+    const schemaSource = await fs.readFile(path.join(process.cwd(), 'db/schema.ts'), 'utf8')
+    expect(schemaSource).toContain("check('capability_attempts_evidence_refs_check', sql`forge_is_uuid_evidence_refs_v1(${t.evidenceRefs})`)")
+    expect(schemaSource).toContain("check('capability_attempt_adjudications_evidence_refs_check', sql`forge_is_uuid_evidence_refs_v1(${t.evidenceRefs})`)")
+    expect(schemaSource).not.toContain("check('capability_attempts_evidence_refs_check', sql`jsonb_typeof(${t.evidenceRefs}) = 'array'`)")
+    expect(schemaSource).not.toContain("check('capability_attempt_adjudications_evidence_refs_check', sql`jsonb_typeof(${t.evidenceRefs}) = 'array'`)")
   })
 
   it('grants only SELECT/INSERT to the ordinary application role in the CI ACL gate', async () => {

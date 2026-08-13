@@ -7,7 +7,15 @@ const mocks = vi.hoisted(() => ({
   txSelect: vi.fn(),
   txInsert: vi.fn(),
   operations: [] as string[],
+  txExecQueries: [] as string[],
 }))
+
+// Flattens a drizzle sql template into its interpolated text so the mock can
+// assert exactly what was executed inside the adjudication transaction.
+function sqlText(query: unknown): string {
+  const chunks = (query as { queryChunks?: unknown[] } | null)?.queryChunks ?? []
+  return chunks.map((chunk) => (typeof chunk === 'string' ? chunk : String((chunk as { value?: unknown }).value))).join('')
+}
 
 function chain(rows: unknown[]): Record<string, unknown> {
   const thenable: Record<string, unknown> = {
@@ -40,8 +48,10 @@ vi.mock('@/db', () => ({
       return chain(mocks.dbSelect(...args) ?? [])
     },
     transaction: async (callback: (tx: unknown) => unknown) => callback({
-      execute: () => {
-        mocks.operations.push('tx:advisory-lock')
+      execute: (query: unknown) => {
+        const text = sqlText(query)
+        mocks.txExecQueries.push(text)
+        mocks.operations.push(text.includes('lock_timeout') ? 'tx:lock-timeout' : 'tx:advisory-lock')
         return Promise.resolve([])
       },
       select: (...args: unknown[]) => {
@@ -85,6 +95,9 @@ import {
   recordVerificationAdjudicationBestEffort,
   type RecordCapabilityAttemptsInput,
 } from '@/worker/reliability/ledger'
+import { outcomeDigest } from '@/lib/reliability/contracts'
+import { normalizeExecutionOutcome } from '@/lib/execution-outcomes'
+import { sanitizeWorkerMessage } from '@/worker/redaction'
 
 function baseInput(overrides: Partial<RecordCapabilityAttemptsInput> = {}): RecordCapabilityAttemptsInput {
   return {
@@ -216,6 +229,32 @@ describe('recordCapabilityAttempts', () => {
     expect(rows[0].attemptGroupId).toBe(rows[1].attemptGroupId)
     expect(rows[0].capabilityMultiplicity).toBe(2)
   })
+
+  it('digests the normalized outcome so redacted or truncated summaries never look drifted', async () => {
+    // The stored execution_outcomes row holds the sanitized and truncated
+    // summary (upsertExecutionOutcome normalizes before writing), and the
+    // reader recomputes the digest from that stored row. The ingest-time
+    // digest must therefore be computed over the same normalized form;
+    // digesting the raw message would mismatch whenever sanitization or the
+    // 1000-char bound changes anything, permanently marking a failed attempt
+    // as evidence_drift and suppressing every rate in its cohort.
+    const outcome: RecordCapabilityAttemptsInput['outcome'] = {
+      schemaVersion: 1,
+      transportStatus: 'ok',
+      result: 'failed',
+      stopReasonCode: 'unknown',
+      stopReasonSummary: 'Failed to connect: postgres://admin:hunter2@localhost:5432/forge',
+      retryable: false,
+      evidenceRefs: [],
+      verifierRequired: false,
+      verificationStatus: 'not_required',
+    }
+    await recordCapabilityAttempts(baseInput({ outcome }))
+    const [, rows] = mocks.insertValues.mock.calls[0] as [unknown, Array<Record<string, unknown>>]
+    const storedDigest = rows[0].outcomeDigest as string
+    expect(storedDigest).toBe(outcomeDigest(normalizeExecutionOutcome(outcome, sanitizeWorkerMessage)))
+    expect(storedDigest).not.toBe(outcomeDigest(outcome))
+  })
 })
 
 describe('recordCapabilityAttemptsBestEffort', () => {
@@ -249,7 +288,7 @@ describe('adjudication appends', () => {
   it('allocates the adjudication sequence under the attempt advisory lock, then inserts', async () => {
     mocks.dbSelect
       .mockReturnValueOnce([{ id: 'outcome-1' }])
-      .mockReturnValueOnce([{ id: 'attempt-1' }])
+      .mockReturnValueOnce([{ id: 'ATTEMPT-1' }])
     mocks.txSelect.mockReturnValueOnce([{ sequence: 4 }])
 
     await recordHumanDecisionAdjudicationBestEffort({
@@ -261,12 +300,19 @@ describe('adjudication appends', () => {
       observedAt: new Date('2026-08-01T00:00:00.000Z'),
     })
 
-    // resolve outcome -> resolve attempt rows -> take the advisory lock ->
-    // read max sequence -> insert, all in that order inside one transaction.
-    expect(mocks.operations).toEqual(['select', 'select', 'tx:advisory-lock', 'tx:select', 'tx:insert'])
+    // Bound the advisory-lock wait, then resolve outcome -> resolve attempt
+    // rows -> take the advisory lock -> read max sequence -> insert, all in
+    // that order inside one transaction.
+    expect(mocks.operations).toEqual([
+      'select', 'select', 'tx:lock-timeout', 'tx:advisory-lock', 'tx:select', 'tx:insert',
+    ])
+    // The lock key must be the canonical lowercase form so it pairs with the
+    // migration guard's uuid::text derivation even for a non-canonical input.
+    expect(mocks.txExecQueries[0]).toContain("lock_timeout = '5s'")
+    expect(mocks.txExecQueries[1]).toContain('hashtextextended(attempt-1::text, 0)')
     const [, values] = mocks.txInsert.mock.calls[0] as [unknown, Record<string, unknown>]
     expect(values).toMatchObject({
-      capabilityAttemptId: 'attempt-1',
+      capabilityAttemptId: 'ATTEMPT-1',
       sequence: 5,
       kind: 'human_decision',
       humanDecision: 'accepted',

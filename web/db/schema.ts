@@ -1666,7 +1666,7 @@ export const capabilityAttempts = pgTable(
     check('capability_attempts_acceptance_criteria_total_check', sql`${t.acceptanceCriteriaTotal} >= 0`),
     check('capability_attempts_validation_command_total_check', sql`${t.validationCommandTotal} >= 0`),
     check('capability_attempts_validation_command_failed_check', sql`${t.validationCommandFailed} >= 0 AND ${t.validationCommandFailed} <= ${t.validationCommandTotal}`),
-    check('capability_attempts_evidence_refs_check', sql`jsonb_typeof(${t.evidenceRefs}) = 'array'`),
+    check('capability_attempts_evidence_refs_check', sql`forge_is_uuid_evidence_refs_v1(${t.evidenceRefs})`),
     check('capability_attempts_verifier_consistency_check', sql`(${t.verifierRequired} AND ${t.verificationStatus} IN ('pending', 'passed', 'failed', 'inconclusive')) OR (NOT ${t.verifierRequired} AND ${t.verificationStatus} = 'not_required')`),
     check('capability_attempts_verification_mode_check', sql`(${t.verificationMode} = 'none') = (NOT ${t.verifierRequired})`),
     check('capability_attempts_unclassified_check', sql`(${t.classificationState} = 'classified') OR ${t.capabilityKey} LIKE 'workpackage:%/unclassified'`),
@@ -1703,7 +1703,7 @@ export const capabilityAttemptAdjudications = pgTable(
     check('capability_attempt_adjudications_verification_result_check', sql`${t.verificationResult} IS NULL OR ${t.verificationResult} IN ('passed', 'failed', 'inconclusive')`),
     check('capability_attempt_adjudications_human_decision_check', sql`${t.humanDecision} IS NULL OR ${t.humanDecision} IN ('accepted', 'rejected', 'cancelled')`),
     check('capability_attempt_adjudications_observed_outcome_digest_check', sql`${t.observedOutcomeDigest} IS NULL OR ${t.observedOutcomeDigest} ~ '^[0-9a-f]{64}$'`),
-    check('capability_attempt_adjudications_evidence_refs_check', sql`jsonb_typeof(${t.evidenceRefs}) = 'array'`),
+    check('capability_attempt_adjudications_evidence_refs_check', sql`forge_is_uuid_evidence_refs_v1(${t.evidenceRefs})`),
     check('capability_attempt_adjudications_kind_shape_check', sql`
       (${t.kind} = 'verification_recorded'
         AND ${t.verificationMode} IS NOT NULL AND ${t.verificationResult} IS NOT NULL

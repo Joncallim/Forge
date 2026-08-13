@@ -418,4 +418,94 @@ describe.skipIf(!enabled)('capability reliability ledger PostgreSQL behavior', (
     })
     expect(summary.excluded).toContainEqual({ reason: 'outside_window', count: 2 })
   })
+
+  it('does not report evidence drift for a redacted or truncated failure summary', async () => {
+    // The production path stores the NORMALIZED outcome (upsertExecutionOutcome
+    // sanitizes and truncates the summary) while the capability attempt used
+    // to be digested from the raw in-memory outcome. Any redacted secret (DB
+    // URL, bearer token, private key) or summary over 1000 chars then made the
+    // read-side digest mismatch the stored digest, permanently marking the
+    // attempt as evidence_drift and suppressing every rate in its cohort.
+    // Prove end-to-end that the stored digest is computed over the normalized
+    // form, so the cohort reads back without drift.
+    const ledgerModule = await import('@/worker/reliability/ledger')
+    const readerModule = await import('@/worker/reliability/reader')
+    const { upsertExecutionOutcome } = await import('@/worker/execution-outcomes')
+    const outcome: ExecutionOutcome = {
+      schemaVersion: 1,
+      transportStatus: 'ok',
+      result: 'failed',
+      stopReasonCode: 'unknown',
+      stopReasonSummary: 'Failed to connect: postgres://admin:hunter2@localhost:5432/forge',
+      retryable: false,
+      evidenceRefs: [],
+      verifierRequired: false,
+      verificationStatus: 'not_required',
+    }
+    const stored = await upsertExecutionOutcome({
+      taskId: ids.task,
+      attemptKey: 'capability-ledger-reader-redaction-proof',
+      outcome,
+    })
+    const observedAt = new Date()
+    await ledgerModule.recordCapabilityAttempts({
+      projectId: ids.project,
+      taskId: ids.task,
+      workPackageId: null,
+      agentRunId: null,
+      taskAttemptId: null,
+      executionOutcomeId: stored.id,
+      operationRunId: null,
+      outcome,
+      attemptNumber: 1,
+      source: { kind: 'work_package', role: 'qa', capabilities: ['redaction-proof'] },
+      scope: {
+        contractVersion: 1,
+        projectId: ids.project,
+        rootRef: null,
+        rootBindingRevision: '1',
+        grantDecisionRevision: '1',
+        repositoryWriteIntent: false,
+        capabilities: ['redaction-proof'],
+        mcpRequirementKeys: [],
+      },
+      runtime: {
+        kind: 'model',
+        providerType: null,
+        modelId: 'redaction-proof-model',
+        providerIsLocal: null,
+        providerConfigUpdatedAt: null,
+        acpExecutionMode: 'proof',
+      },
+      policy: {
+        contractVersion: 1,
+        policyVersion: 'redaction-proof',
+        harnessId: null,
+        harnessUpdatedAt: null,
+        reviewRequirement: 'none',
+        repositoryWritesEnabled: false,
+      },
+      verificationMode: 'none',
+      acceptanceCriteriaTotal: 0,
+      validationCommandTotal: 0,
+      validationCommandFailed: 0,
+      observedAt,
+    })
+    const [storedSummary] = await sql<{ stopReasonSummary: string }[]>`
+      select stop_reason_summary as "stopReasonSummary" from execution_outcomes where id = ${stored.id}::uuid
+    `
+    expect(storedSummary!.stopReasonSummary).toContain('[REDACTED_DATABASE_URL]')
+
+    const [row] = await sql<{ cohortFingerprint: string }[]>`
+      select cohort_fingerprint as "cohortFingerprint" from capability_attempts
+      where execution_outcome_id = ${stored.id}::uuid
+    `
+    const summary = await readerModule.readCohortReliability({
+      cohortFingerprint: row!.cohortFingerprint,
+      now: observedAt,
+    })
+    expect(summary.state).not.toBe('evidence_drift')
+    expect(summary.evidence.driftedAttemptCount).toBe(0)
+    expect(summary.sampleCount).toBe(1)
+  })
 })

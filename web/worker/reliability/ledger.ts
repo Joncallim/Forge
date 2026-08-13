@@ -4,7 +4,7 @@ import { and, desc, eq, sql } from 'drizzle-orm'
 
 import { db } from '@/db'
 import { capabilityAttemptAdjudications, capabilityAttempts, executionOutcomes } from '@/db/schema'
-import type { ExecutionOutcome } from '@/lib/execution-outcomes'
+import { normalizeExecutionOutcome, type ExecutionOutcome } from '@/lib/execution-outcomes'
 import {
   MAX_CAPABILITY_FAN_OUT,
   cohortFingerprint,
@@ -24,6 +24,7 @@ import {
   type VerificationMode,
 } from '@/lib/reliability/contracts'
 import { defaultOnFeatureFlagEnabled } from '../feature-flags'
+import { sanitizeWorkerMessage } from '../redaction'
 
 export type CapabilitySource =
   | { kind: 'work_package'; role: string; capabilities: string[] | null }
@@ -116,7 +117,13 @@ export async function recordCapabilityAttempts(input: RecordCapabilityAttemptsIn
   const scopeFp = scopeFingerprint(input.scope)
   const runtimeFp = runtimeFingerprint(input.runtime)
   const policyFp = policyFingerprint(input.policy)
-  const digest = outcomeDigest(input.outcome)
+  // The digest must be computed over the same canonical, normalized form the
+  // reader recomputes from the linked execution_outcomes row: the stored row
+  // holds the sanitized/truncated summary, so digesting the raw in-memory
+  // outcome here would mismatch the read side for every redacted or truncated
+  // failure message and permanently mark the attempt as drifted. Normalizing
+  // again is idempotent for outcomes already read back from a stored row.
+  const digest = outcomeDigest(normalizeExecutionOutcome(input.outcome, sanitizeWorkerMessage))
   const attemptGroupId = randomUUID()
   const multiplicity = validKeys.length
   const verificationMode = input.outcome.verifierRequired ? input.verificationMode : 'none'
@@ -217,10 +224,19 @@ type AdjudicationValues = {
  * re-checks gapless order, so the two can never disagree.
  */
 async function appendAdjudication(capabilityAttemptId: string, values: AdjudicationValues): Promise<void> {
+  // The migration's insert guard derives its lock key from the canonical
+  // uuid::text form; normalize here so a non-canonical spelling (e.g. an
+  // uppercase id from a future caller) can never derive a different key and
+  // silently disable cross-writer serialization.
+  const lockKey = capabilityAttemptId.toLowerCase()
   await db.transaction(async (tx) => {
+    // Bound the advisory-lock wait: the critical section is milliseconds, so
+    // 5s is generous, but a peer that parks the lock must not be able to pin
+    // this connection (and its worker) indefinitely.
+    await tx.execute(sql`SET LOCAL lock_timeout = '5s'`)
     await tx.execute(sql`
       select pg_catalog.pg_advisory_xact_lock(
-        pg_catalog.hashtextextended(${capabilityAttemptId}::text, 0)
+        pg_catalog.hashtextextended(${lockKey}::text, 0)
       )
     `)
     const [last] = await tx
