@@ -145,6 +145,46 @@ describe('computeReliability', () => {
     expect(summary.rates.unverifiedCompletion).toBe(0)
   })
 
+  // Production shape for ADR 0011 operations: `canonicalOutcome` always sets
+  // verifierRequired false because the run self-verifies, and the verdict
+  // arrives as an adjudication. Keying the denominator on the flag alone
+  // dropped these attempts out of the rate entirely and reported a fully
+  // verified cohort as "no independently verified attempts yet".
+  it('counts an operation attempt whose verdict exists only as an adjudication', () => {
+    const attempts = Array.from({ length: 10 }, () =>
+      attempt({ verifierRequired: false, verificationMode: 'none', verificationStatus: 'not_required' }))
+    const adjudications = attempts.map((a) => verification(a.id, { verificationMode: 'deterministic_adapter', verificationResult: 'passed' }))
+    const summary = computeReliability({ attempts, adjudications, window: WINDOW, now: NOW })
+    expect(summary.rates.independentlyVerifiedPass).toBe(1)
+    expect(summary.rates.unverifiedCompletion).toBe(0)
+    expect(summary.consecutiveVerifiedPasses).toBe(10)
+  })
+
+  it('counts a failed deterministic verdict in the denominator, not the numerator', () => {
+    const passed = Array.from({ length: 8 }, () =>
+      attempt({ verifierRequired: false, verificationMode: 'none', verificationStatus: 'not_required' }))
+    const failed = Array.from({ length: 2 }, () =>
+      attempt({ verifierRequired: false, verificationMode: 'none', verificationStatus: 'not_required' }))
+    const adjudications = [
+      ...passed.map((a) => verification(a.id, { verificationMode: 'deterministic_adapter', verificationResult: 'passed' })),
+      ...failed.map((a) => verification(a.id, { verificationMode: 'deterministic_adapter', verificationResult: 'failed' })),
+    ]
+    const summary = computeReliability({
+      attempts: [...passed, ...failed], adjudications, window: WINDOW, now: NOW,
+    })
+    expect(summary.rates.independentlyVerifiedPass).toBe(0.8)
+  })
+
+  // An attempt nobody verified and nobody required verification for must stay
+  // out of the rate entirely rather than scoring as a failure.
+  it('excludes unverified, verification-not-required attempts from the rate', () => {
+    const attempts = Array.from({ length: 6 }, () =>
+      attempt({ verifierRequired: false, verificationMode: 'none', verificationStatus: 'not_required' }))
+    const summary = computeReliability({ attempts, adjudications: [], window: WINDOW, now: NOW })
+    expect(summary.rates.independentlyVerifiedPass).toBeNull()
+    expect(summary.rates.unverifiedCompletion).toBe(1)
+  })
+
   it('resets consecutiveVerifiedPasses at the first non-verified row from the newest attempt', () => {
     const older = attempt({ observedAt: new Date(NOW.getTime() - 5000).toISOString(), verifierRequired: true, verificationMode: 'deterministic_adapter' })
     const middle = attempt({ observedAt: new Date(NOW.getTime() - 4000).toISOString(), verifierRequired: false, verificationMode: 'none' })

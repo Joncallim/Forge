@@ -2018,6 +2018,7 @@ async function recordAdmissionBlockCapabilityAttemptBestEffort(input: {
       capabilities: source.kind === 'work_package' ? (source.capabilities ?? []) : [],
       mcpRequirementKeys: extractMcpRequirementKeys(input.pkg.mcpRequirements),
     })
+    if (!scope) return
     const policy = await buildWorkPackagePolicyInput({
       harnessId: input.pkg.harnessId,
       reviewRequirement: isReviewRequirement(input.pkg.reviewRequirement) ? input.pkg.reviewRequirement : 'both',
@@ -3750,8 +3751,16 @@ async function executeReadyWorkPackage(
         attemptNumber,
         verificationMode: 'none',
         repositoryAffecting,
-        validationCommandTotal: 0,
-        validationCommandFailed: 0,
+        // `execution` is scoped to the try block and is unavailable once we are
+        // on the failure path, but the validation verdict this severity rule
+        // depends on is not: a repository-affecting package whose validation
+        // commands failed is exactly the `critical` case in ADR 0012, and
+        // reporting zero failed commands here would silently downgrade it to
+        // `normal`. Counts stay coarse (one failing command is enough to make
+        // the attempt critical); the precise per-command tally lives in the
+        // command audits, not in this ledger.
+        validationCommandTotal: validationStatusForPackage === 'failed' ? 1 : 0,
+        validationCommandFailed: validationStatusForPackage === 'failed' ? 1 : 0,
       })
     }
 

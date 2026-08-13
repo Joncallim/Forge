@@ -30,11 +30,29 @@ function latestVerification(adjudications: CapabilityAdjudicationRecord[]): Capa
   return verifications.length > 0 ? verifications[verifications.length - 1] : null
 }
 
+function isIndependentVerificationMode(mode: CapabilityAdjudicationRecord['verificationMode']): boolean {
+  return mode === 'deterministic_adapter' || mode === 'independent_agent'
+}
+
 function isIndependentlyVerifiedPass(adjudications: CapabilityAdjudicationRecord[]): boolean {
   const latest = latestVerification(adjudications)
   if (!latest) return false
-  return (latest.verificationMode === 'deterministic_adapter' || latest.verificationMode === 'independent_agent')
-    && latest.verificationResult === 'passed'
+  return isIndependentVerificationMode(latest.verificationMode) && latest.verificationResult === 'passed'
+}
+
+/**
+ * Whether an independent verifier reached a verdict on this attempt, pass or
+ * fail. This is deliberately separate from the attempt's `verifierRequired`
+ * flag: a deterministic ADR 0011 operation self-verifies, so its canonical
+ * outcome carries `verifierRequired: false` even though a real independent
+ * verdict exists as an adjudication. Keying the verified-pass denominator on
+ * the flag alone would drop every operation attempt out of the rate and
+ * report "no independently verified attempts yet" for a cohort that is in
+ * fact fully verified.
+ */
+function hasIndependentVerdict(adjudications: CapabilityAdjudicationRecord[]): boolean {
+  const latest = latestVerification(adjudications)
+  return latest !== null && isIndependentVerificationMode(latest.verificationMode)
 }
 
 function hasRollback(adjudications: CapabilityAdjudicationRecord[]): boolean {
@@ -171,7 +189,10 @@ export function computeReliability(input: {
       repairRetryTotal += 1
     }
 
-    if (attempt.verifierRequired) {
+    // Denominator: attempts an independent verifier was required for, plus
+    // attempts one actually ruled on. Human review still never reaches the
+    // numerator (I6) -- a human-reviewed package counts here and scores zero.
+    if (attempt.verifierRequired || hasIndependentVerdict(adjs)) {
       verifierRequiredTotal += 1
       if (isIndependentlyVerifiedPass(adjs)) verifiedPassTotal += 1
     }

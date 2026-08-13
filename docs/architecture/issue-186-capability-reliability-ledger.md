@@ -363,7 +363,7 @@ yields `null`, never `0` and never `1`:
 | Rate | Numerator | Denominator |
 |---|---|---|
 | `firstAttemptSuccess` | `attempt_number = 1` and `result = 'completed'` | `attempt_number = 1` |
-| `independentlyVerifiedPass` | latest verification adjudication has mode ∈ {`deterministic_adapter`, `independent_agent`} and result `passed` | attempts with `verifier_required = true` |
+| `independentlyVerifiedPass` | latest verification adjudication has mode ∈ {`deterministic_adapter`, `independent_agent`} and result `passed` | attempts with `verifier_required = true`, **plus** attempts an independent verifier actually ruled on |
 | `humanAccepted` | latest human decision is `accepted` | attempts with at least one human decision |
 | `unverifiedCompletion` | `result = 'completed'` with no independent verification | `result = 'completed'` |
 | `repairRetry` | `attempt_number > 1` | all in-window rows |
@@ -374,6 +374,16 @@ yields `null`, never `0` and never `1`:
 `unverifiedCompletion` exists on purpose. Until #188 lands, Forge's honest answer
 for most cohorts is "completed, but nobody independent checked it" — and that
 number should be visible instead of being quietly folded into a pass rate.
+
+The `independentlyVerifiedPass` denominator deliberately does **not** key on
+`verifier_required` alone. A deterministic ADR 0011 operation self-verifies, so
+its canonical outcome carries `verifier_required: false` even though a real
+independent verdict exists as an adjudication (§7.5). Keying on the flag alone
+dropped every operation attempt out of the rate and reported a fully verified
+cohort as "no independently verified attempts yet". Counting an attempt once a
+verifier has actually ruled on it fixes that without weakening I6: a
+human-reviewed package still enters the denominator and still scores zero,
+because `human_review` never reaches the numerator.
 
 `consecutiveVerifiedPasses` counts backwards from the newest in-window row and
 stops at the first row that is not an independently verified pass. It is `0`
@@ -547,6 +557,16 @@ function (I11), so materializing later is purely additive.
 Revisit when a real measurement shows a cohort read exceeding ~50 ms at p95, or
 when #191 needs cross-cohort listings that would fan out to many cohort queries.
 Record that measurement in the ADR before adding the table.
+
+One read is deliberately *not* bounded: the critical-history query (§8) has no
+`LIMIT`, because I7 requires an old critical failure to stay visible however
+long the window is. Its size is bounded by how many critical attempts a cohort
+has ever accumulated, which is small by construction — criticals are policy or
+security blocks and failed repository validation, not ordinary failures. Capping
+it would silently under-report `criticalFailureCount` and break I7, which is
+strictly worse than the read cost. If a pathological cohort ever makes this
+expensive, replace the row fetch with a SQL aggregate over count and
+`max(observed_at)` rather than adding a cap.
 
 ### 6.4 Schema and privileges
 

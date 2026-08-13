@@ -68,6 +68,17 @@ export async function loadWorkPackageCapabilityContext(pkg: {
  * fingerprint input. One extra indexed read, acceptable per the ingest
  * boundary guidance -- never a live re-read of anything mutable beyond this.
  */
+/**
+ * Scope for an admission block, from an already-locked project snapshot plus
+ * the project's opaque root identity.
+ *
+ * Returns null when the project row cannot be read, rather than defaulting
+ * `rootRef` to null: `projects.root_ref` is legitimately nullable until the
+ * 0027 cutover binds it, so a substituted null would be indistinguishable
+ * from a real project with an unbound root and would silently fold two
+ * different cohorts together. A cohort input that cannot be read is a skipped
+ * ingest, never a guessed fingerprint (design §15, stop condition 1).
+ */
 export async function buildWorkPackageReliabilityScope(input: {
   projectId: string
   rootBindingRevision: bigint
@@ -75,16 +86,17 @@ export async function buildWorkPackageReliabilityScope(input: {
   repositoryWriteIntent: boolean
   capabilities: string[]
   mcpRequirementKeys: string[]
-}): Promise<ReliabilityScopeInput> {
+}): Promise<ReliabilityScopeInput | null> {
   const [project] = await db
     .select({ rootRef: projects.rootRef })
     .from(projects)
     .where(eq(projects.id, input.projectId))
     .limit(1)
+  if (!project) return null
   return {
     contractVersion: 1,
     projectId: input.projectId,
-    rootRef: project?.rootRef ?? null,
+    rootRef: project.rootRef ?? null,
     rootBindingRevision: input.rootBindingRevision.toString(),
     grantDecisionRevision: input.grantDecisionRevision.toString(),
     repositoryWriteIntent: input.repositoryWriteIntent,

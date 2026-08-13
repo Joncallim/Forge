@@ -230,6 +230,50 @@ describe('recordCapabilityAttempts', () => {
     expect(rows[0].capabilityMultiplicity).toBe(2)
   })
 
+  // ADR 0012 severity: a repository-affecting attempt whose validation
+  // commands failed is critical, and I7 requires it to stay visible whatever
+  // the aggregate says. The failure boundary must therefore report the failed
+  // validation rather than a zero count.
+  it('marks a repository-affecting attempt with failed validation as critical', async () => {
+    await recordCapabilityAttempts(baseInput({
+      scope: { ...baseInput().scope, repositoryWriteIntent: true },
+      validationCommandTotal: 1,
+      validationCommandFailed: 1,
+    }))
+    const [, rows] = mocks.insertValues.mock.calls[0] as [unknown, Array<Record<string, unknown>>]
+    expect(rows[0].severityClass).toBe('critical')
+  })
+
+  it('leaves a repository-affecting attempt with passing validation normal', async () => {
+    await recordCapabilityAttempts(baseInput({
+      scope: { ...baseInput().scope, repositoryWriteIntent: true },
+      validationCommandTotal: 3,
+      validationCommandFailed: 0,
+    }))
+    const [, rows] = mocks.insertValues.mock.calls[0] as [unknown, Array<Record<string, unknown>>]
+    expect(rows[0].severityClass).toBe('normal')
+  })
+
+  for (const stopReasonCode of ['security_blocked', 'policy_blocked'] as const) {
+    it(`marks a ${stopReasonCode} attempt as critical regardless of validation counts`, async () => {
+      await recordCapabilityAttempts(baseInput({
+        outcome: {
+          schemaVersion: 1,
+          transportStatus: 'ok',
+          result: 'blocked',
+          stopReasonCode,
+          stopReasonSummary: null,
+          retryable: false,
+          evidenceRefs: [],
+          verifierRequired: false,
+          verificationStatus: 'not_required',
+        },
+      }))
+      const [, rows] = mocks.insertValues.mock.calls[0] as [unknown, Array<Record<string, unknown>>]
+      expect(rows[0].severityClass).toBe('critical')
+    })
+  }
+
   it('digests the normalized outcome so redacted or truncated summaries never look drifted', async () => {
     // The stored execution_outcomes row holds the sanitized and truncated
     // summary (upsertExecutionOutcome normalizes before writing), and the

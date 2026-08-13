@@ -4,7 +4,7 @@ import { pathToFileURL } from 'node:url'
 
 import { and, eq } from 'drizzle-orm'
 
-import { db } from '../db'
+import { closeDb, db } from '../db'
 import { capabilityAttempts } from '../db/schema'
 import { readCohortReliability } from '../worker/reliability/reader'
 import type { ReliabilitySummary } from '../lib/reliability/contracts'
@@ -106,8 +106,12 @@ async function main(): Promise<void> {
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
-  main().catch((err) => {
-    console.error(err instanceof Error ? err.message : String(err))
-    process.exitCode = 1
-  })
+  main()
+    .catch((err) => {
+      console.error(err instanceof Error ? err.message : String(err))
+      process.exitCode = 1
+    })
+    // The postgres pool keeps the event loop alive, so without this the
+    // command prints its report and then hangs instead of exiting.
+    .finally(() => closeDb())
 }
