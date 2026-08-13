@@ -24,12 +24,12 @@ function assertNotAborted(execution: OperationAdapterExecution): void {
 
 async function currentProject(context: TrustedOperationContext): Promise<Project> {
   const [project] = await db.select().from(projects).where(eq(projects.id, context.projectId)).limit(1)
-  if (!project) throw new Error('The trusted operation project no longer exists.')
+  if (!project) throw new OperationAdapterExecutionError('authority_changed')
   if (
     project.rootBindingRevision.toString() !== context.rootBindingRevision
     || project.updatedAt.toISOString() !== context.projectRevision
   ) {
-    throw new Error('The trusted operation project scope changed before adapter execution.')
+    throw new OperationAdapterExecutionError('authority_changed')
   }
   return project
 }
@@ -51,7 +51,7 @@ async function assertCurrentAuthority(context: TrustedOperationContext): Promise
     || fresh.policy.policyCeilings.repository_read !== true
     || !fresh.policy.allowedCapabilities.includes('filesystem.project.read')
   ) {
-    throw new Error('The authoritative operation policy changed before repository execution.')
+    throw new OperationAdapterExecutionError('authority_changed')
   }
 }
 
@@ -65,11 +65,11 @@ async function repositoryRead(
   assertNotAborted(execution)
   const project = await currentProject(context)
   assertNotAborted(execution)
-  if (!context.projectRoot) throw new Error('The trusted project has no approved repository root.')
+  if (!context.projectRoot) throw new OperationAdapterExecutionError('authority_changed')
   const currentRoot = await assertProjectLocalPathForExecution(project)
   assertNotAborted(execution)
   if (currentRoot !== context.projectRoot) {
-    throw new Error('The canonical project root changed before repository execution.')
+    throw new OperationAdapterExecutionError('authority_changed')
   }
   const result = await runScopedRepositoryCommand({
     cwd: context.projectRoot,

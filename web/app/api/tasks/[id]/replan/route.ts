@@ -16,8 +16,13 @@ import { publishTaskEvent } from '@/worker/events'
 // Validation schema
 // ---------------------------------------------------------------------------
 
+// Feedback is appended to the durable task prompt on every revision, so it must
+// stay small: an unbounded reviewer comment would grow the prompt (and the
+// Architect model context) without limit across replan cycles.
+const MAX_REPLAN_FEEDBACK_LENGTH = 4_000
+
 const replanSchema = z.object({
-  feedback: z.string().trim().min(1, 'Feedback is required to change the plan'),
+  feedback: z.string().trim().min(1, 'Feedback is required to change the plan').max(MAX_REPLAN_FEEDBACK_LENGTH, 'Feedback is too large'),
 })
 
 // ---------------------------------------------------------------------------

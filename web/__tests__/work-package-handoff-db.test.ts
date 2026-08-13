@@ -695,6 +695,22 @@ describe('handoffApprovedWorkPackages', () => {
       status: 'awaiting_review',
       workPackageId: 'pkg-1',
     }))
+    expect(mocks.upsertExecutionOutcome).toHaveBeenCalledWith(expect.objectContaining({
+      taskId: 'task-1',
+      workPackageId: 'pkg-1',
+      agentRunId: 'run-1',
+      attemptKey: 'work-package:pkg-1:run:run-1',
+      outcome: expect.objectContaining({
+        schemaVersion: 1,
+        transportStatus: 'ok',
+        result: 'completed',
+        stopReasonCode: null,
+        retryable: false,
+        evidenceRefs: ['artifact-1'],
+        verifierRequired: true,
+        verificationStatus: 'pending',
+      }),
+    }))
     expect(mocks.loadWorkPackageExecutionPreflight).not.toHaveBeenCalled()
     expect(mocks.loadWorkPackageExecutionContext).not.toHaveBeenCalled()
     expect(mocks.activateWorkPackageExecutionContext).not.toHaveBeenCalled()
@@ -853,6 +869,8 @@ describe('handoffApprovedWorkPackages', () => {
       workPackageId: 'pkg-1',
       attemptKey: 'work-package:pkg-1:admission',
       outcome: expect.objectContaining({
+        schemaVersion: 1,
+        transportStatus: 'ok',
         result: 'blocked',
         stopReasonCode: 'admission_denied',
         stopReasonSummary: expect.stringContaining('planning context was not materialized'),

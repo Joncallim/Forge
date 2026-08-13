@@ -905,6 +905,7 @@ describe('login/password', () => {
     vi.clearAllMocks()
     mockRedisSet.mockResolvedValue('OK')
     mockRedisDel.mockResolvedValue(1)
+    mockRedisEval.mockResolvedValue(1)
     mockRedisIncr.mockResolvedValue(1)
     mockRedisExpire.mockResolvedValue(1)
     mockDbInsert.mockReturnValue(createdSessionChain())
@@ -963,11 +964,11 @@ describe('login/password — rate limiting', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     delete process.env.FORGE_TRUST_PROXY
-    mockRedisExpire.mockResolvedValue(1)
+    mockRedisEval.mockResolvedValue(1)
   })
 
   it('returns 429 once the per-IP attempt limit is exceeded', async () => {
-    mockRedisIncr.mockResolvedValue(11)
+    mockRedisEval.mockResolvedValue(11)
 
     const { POST } = await import('@/app/api/auth/login/password/route')
 
@@ -983,7 +984,7 @@ describe('login/password — rate limiting', () => {
   })
 
   it('does not trust forwarded IP headers unless proxy mode is enabled', async () => {
-    mockRedisIncr.mockResolvedValue(11)
+    mockRedisEval.mockResolvedValue(11)
 
     const { POST } = await import('@/app/api/auth/login/password/route')
 
@@ -998,12 +999,17 @@ describe('login/password — rate limiting', () => {
 
     await POST(req as never)
 
-    expect(mockRedisIncr).toHaveBeenCalledWith('ratelimit:login:password:ip:direct')
+    expect(mockRedisEval).toHaveBeenCalledWith(
+      expect.stringContaining("redis.call('INCR', KEYS[1])"),
+      1,
+      'ratelimit:login:password:ip:direct',
+      expect.any(String),
+    )
   })
 
   it('uses forwarded IP headers when trusted proxy mode is enabled', async () => {
     process.env.FORGE_TRUST_PROXY = '1'
-    mockRedisIncr.mockResolvedValue(11)
+    mockRedisEval.mockResolvedValue(11)
 
     const { POST } = await import('@/app/api/auth/login/password/route')
 
@@ -1018,12 +1024,17 @@ describe('login/password — rate limiting', () => {
 
     await POST(req as never)
 
-    expect(mockRedisIncr).toHaveBeenCalledWith('ratelimit:login:password:ip:203.0.113.10')
+    expect(mockRedisEval).toHaveBeenCalledWith(
+      expect.stringContaining("redis.call('INCR', KEYS[1])"),
+      1,
+      'ratelimit:login:password:ip:203.0.113.10',
+      expect.any(String),
+    )
   })
 
   it('does not write malformed trusted proxy headers to the sessions inet column', async () => {
     process.env.FORGE_TRUST_PROXY = '1'
-    mockRedisIncr.mockResolvedValue(1)
+    mockRedisEval.mockResolvedValue(1)
     mockDbSelect.mockReturnValue(
       chain([{ id: 'user-1', displayName: 'Alice', passwordHash: 'stored-hash' }]),
     )

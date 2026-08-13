@@ -159,10 +159,12 @@ describe('production operation adapters', () => {
       ...context,
       policy: { ...context.policy, policyVersion: 'different-policy-version' },
     })
-    await expect(productionOperationAdapters.repositoryStatusRead(context, {
+    const error = await productionOperationAdapters.repositoryStatusRead(context, {
       signal: new AbortController().signal,
       deadline: new Date(Date.now() + 30_000),
-    })).rejects.toThrow('policy changed')
+    }).catch((cause: unknown) => cause)
+    expect(error).toBeInstanceOf(OperationAdapterExecutionError)
+    expect(error).toMatchObject({ code: 'authority_changed' })
     expect(mocks.runScopedRepositoryCommand).not.toHaveBeenCalled()
   })
 })

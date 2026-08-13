@@ -19,10 +19,18 @@ import { projectTaskCompatibilityTask } from '@/lib/mcps/leakage-drain'
 // Validation schema
 // ---------------------------------------------------------------------------
 
+// The prompt is stored, served back in task list/detail responses, and sent to
+// the Architect model, so it must stay bounded: an unbounded prompt would let
+// one task inflate API payloads and the model context without limit.
+const MAX_TASK_PROMPT_BYTES = 65_536
+
 const createTaskSchema = z.object({
   projectId: z.string().uuid(),
   title: z.string().max(500).optional().default(''),
-  prompt: z.string().min(1),
+  prompt: z.string().min(1).refine(
+    (value) => Buffer.byteLength(value, 'utf8') <= MAX_TASK_PROMPT_BYTES,
+    'Prompt is too large',
+  ),
   pmProviderConfigId: z.string().uuid().optional(),
 })
 
