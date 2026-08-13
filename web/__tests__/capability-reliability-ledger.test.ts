@@ -386,6 +386,39 @@ describe('adjudication appends', () => {
     })
   })
 
+  // A package that exercised several capabilities has one attempt row per
+  // capability. One row's append failing (lock timeout, lost sequence race)
+  // must not drop the rest of the group, which would leave the same human
+  // decision recorded for some capabilities of a package and not others.
+  it('keeps appending to the remaining attempt rows when one row fails', async () => {
+    mocks.dbSelect
+      .mockReturnValueOnce([{ id: 'outcome-1' }])
+      .mockReturnValueOnce([{ id: 'attempt-1' }, { id: 'attempt-2' }, { id: 'attempt-3' }])
+    mocks.txSelect.mockReturnValue([])
+    let call = 0
+    mocks.txInsert.mockImplementation(() => {
+      call += 1
+      if (call === 2) throw new Error('simulated lock timeout on the second row')
+      return undefined
+    })
+
+    await recordHumanDecisionAdjudicationBestEffort({
+      taskId: 'task-1',
+      attemptKey: 'work-package:wp-1:run:run-1',
+      humanDecision: 'rejected',
+      decidedBy: 'user-1',
+      approvalGateId: 'gate-1',
+      observedAt: new Date('2026-08-01T00:00:00.000Z'),
+    })
+
+    // All three rows attempted; the third is not skipped by the second's failure.
+    expect(mocks.txInsert).toHaveBeenCalledTimes(3)
+    const attemptedIds = mocks.txInsert.mock.calls.map(
+      ([, values]) => (values as Record<string, unknown>).capabilityAttemptId,
+    )
+    expect(attemptedIds).toEqual(['attempt-1', 'attempt-2', 'attempt-3'])
+  })
+
   it('writes no adjudication when the outcome has no attempt rows', async () => {
     mocks.dbSelect
       .mockReturnValueOnce([{ id: 'outcome-1' }])

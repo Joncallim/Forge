@@ -253,6 +253,35 @@ async function appendAdjudication(capabilityAttemptId: string, values: Adjudicat
   })
 }
 
+/**
+ * Appends the same adjudication to every attempt row of one fan-out group,
+ * isolating each row: one capability's append failing (a lock timeout, a
+ * losing sequence race) must not drop the remaining capabilities of the same
+ * package, which would leave the group partially adjudicated for no reason.
+ * Resolving the rows is the only step whose failure skips the whole group,
+ * because without rows there is nothing to append to.
+ */
+async function appendToEachAttempt(
+  resolveRows: () => Promise<Array<{ id: string }>>,
+  values: AdjudicationValues,
+): Promise<void> {
+  let rows: Array<{ id: string }>
+  try {
+    rows = await resolveRows()
+  } catch {
+    // Best-effort: a missing attempt (ledger disabled window, or predates
+    // this table) is missing evidence, not an error to escalate.
+    return
+  }
+  for (const row of rows) {
+    try {
+      await appendAdjudication(row.id, values)
+    } catch {
+      // Best-effort per row, same rationale.
+    }
+  }
+}
+
 /** Appends one verification_recorded adjudication per attempt row linked to (taskId, attemptKey). */
 export async function recordVerificationAdjudicationBestEffort(input: {
   taskId: string
@@ -262,20 +291,15 @@ export async function recordVerificationAdjudicationBestEffort(input: {
   observedAt: Date
 }): Promise<void> {
   if (!ledgerEnabled()) return
-  try {
-    const rows = await findAttemptRowsForAttemptKey(input.taskId, input.attemptKey)
-    for (const row of rows) {
-      await appendAdjudication(row.id, {
-        kind: 'verification_recorded',
-        verificationMode: input.verificationMode,
-        verificationResult: input.verificationResult,
-        observedAt: input.observedAt,
-      })
-    }
-  } catch {
-    // Best-effort: a missing attempt (ledger disabled window, or predates
-    // this table) is missing evidence, not an error to escalate.
-  }
+  await appendToEachAttempt(
+    () => findAttemptRowsForAttemptKey(input.taskId, input.attemptKey),
+    {
+      kind: 'verification_recorded',
+      verificationMode: input.verificationMode,
+      verificationResult: input.verificationResult,
+      observedAt: input.observedAt,
+    },
+  )
 }
 
 /**
@@ -293,19 +317,15 @@ export async function recordDeterministicAdapterVerdictBestEffort(input: {
   observedAt: Date
 }): Promise<void> {
   if (!ledgerEnabled()) return
-  try {
-    const rows = await findAttemptRowsForOutcome(input.executionOutcomeId)
-    for (const row of rows) {
-      await appendAdjudication(row.id, {
-        kind: 'verification_recorded',
-        verificationMode: 'deterministic_adapter',
-        verificationResult: input.verificationResult,
-        observedAt: input.observedAt,
-      })
-    }
-  } catch {
-    // Best-effort, same rationale as above.
-  }
+  await appendToEachAttempt(
+    () => findAttemptRowsForOutcome(input.executionOutcomeId),
+    {
+      kind: 'verification_recorded',
+      verificationMode: 'deterministic_adapter',
+      verificationResult: input.verificationResult,
+      observedAt: input.observedAt,
+    },
+  )
 }
 
 /** Appends one human_decision adjudication per attempt row linked to (taskId, attemptKey). */
@@ -318,18 +338,14 @@ export async function recordHumanDecisionAdjudicationBestEffort(input: {
   observedAt: Date
 }): Promise<void> {
   if (!ledgerEnabled()) return
-  try {
-    const rows = await findAttemptRowsForAttemptKey(input.taskId, input.attemptKey)
-    for (const row of rows) {
-      await appendAdjudication(row.id, {
-        kind: 'human_decision',
-        humanDecision: input.humanDecision,
-        decidedBy: input.decidedBy,
-        approvalGateId: input.approvalGateId,
-        observedAt: input.observedAt,
-      })
-    }
-  } catch {
-    // Best-effort, same rationale as above.
-  }
+  await appendToEachAttempt(
+    () => findAttemptRowsForAttemptKey(input.taskId, input.attemptKey),
+    {
+      kind: 'human_decision',
+      humanDecision: input.humanDecision,
+      decidedBy: input.decidedBy,
+      approvalGateId: input.approvalGateId,
+      observedAt: input.observedAt,
+    },
+  )
 }
