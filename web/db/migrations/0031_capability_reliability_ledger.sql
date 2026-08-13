@@ -7,26 +7,15 @@
 -- UUIDs only (ADR 0010) and are enforced at the database boundary too: rows
 -- can never be updated or deleted, so an erroneous writer must not be able
 -- to permanently place paths, transcripts, or credentials in the ledger.
--- The helper stays PUBLIC-executable on purpose: CHECK expressions are
--- evaluated with the inserting role's privileges, and the function exposes
--- nothing beyond a boolean over its own argument.
-CREATE FUNCTION "forge_is_uuid_evidence_refs_v1"("value" jsonb) RETURNS boolean
-LANGUAGE sql
-IMMUTABLE
-AS $$
-  SELECT CASE
-    WHEN pg_catalog.jsonb_typeof("value") <> 'array' THEN FALSE
-    WHEN pg_catalog.jsonb_array_length("value") > 128 THEN FALSE
-    ELSE COALESCE((
-      SELECT bool_and(
-        "element" IS NOT NULL
-        AND "element" ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89a-bA-B][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$'
-      )
-      FROM pg_catalog.jsonb_array_elements_text("value") AS "element"
-    ), TRUE)
-  END
-$$;
---> statement-breakpoint
+--
+-- That element-wise check is written inline rather than as a helper routine.
+-- A CHECK expression is evaluated with the *inserting* role's privileges, so
+-- a helper would have to stay PUBLIC-executable to let the ordinary app role
+-- insert -- which in turn lands the routine in every other role's effective
+-- privilege set and breaks the closed routine allowlists proved in CI. The
+-- inline form needs no new routine: jsonb renders its array text canonically
+-- as `[]` or `["<uuid>", "<uuid>"]`, so one anchored regex over that rendering
+-- validates every element without a subquery or set-returning function.
 CREATE TABLE "capability_attempts" (
   "id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
   "attempt_group_id" uuid NOT NULL,
@@ -90,7 +79,11 @@ CREATE TABLE "capability_attempts" (
   CONSTRAINT "capability_attempts_acceptance_criteria_total_check" CHECK ("acceptance_criteria_total" >= 0),
   CONSTRAINT "capability_attempts_validation_command_total_check" CHECK ("validation_command_total" >= 0),
   CONSTRAINT "capability_attempts_validation_command_failed_check" CHECK ("validation_command_failed" >= 0 AND "validation_command_failed" <= "validation_command_total"),
-  CONSTRAINT "capability_attempts_evidence_refs_check" CHECK ("forge_is_uuid_evidence_refs_v1"("evidence_refs")),
+  CONSTRAINT "capability_attempts_evidence_refs_check" CHECK (
+    pg_catalog.jsonb_typeof("evidence_refs") = 'array'
+    AND pg_catalog.jsonb_array_length("evidence_refs") <= 128
+    AND "evidence_refs"::text ~ '^\[\]$|^\["[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89a-bA-B][0-9a-fA-F]{3}-[0-9a-fA-F]{12}"(, "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89a-bA-B][0-9a-fA-F]{3}-[0-9a-fA-F]{12}")*\]$'
+  ),
   CONSTRAINT "capability_attempts_verifier_consistency_check" CHECK (
     ("verifier_required" AND "verification_status" IN ('pending', 'passed', 'failed', 'inconclusive')) OR
     (NOT "verifier_required" AND "verification_status" = 'not_required')
@@ -154,7 +147,11 @@ CREATE TABLE "capability_attempt_adjudications" (
   CONSTRAINT "capability_attempt_adjudications_verification_result_check" CHECK ("verification_result" IS NULL OR "verification_result" IN ('passed', 'failed', 'inconclusive')),
   CONSTRAINT "capability_attempt_adjudications_human_decision_check" CHECK ("human_decision" IS NULL OR "human_decision" IN ('accepted', 'rejected', 'cancelled')),
   CONSTRAINT "capability_attempt_adjudications_observed_outcome_digest_check" CHECK ("observed_outcome_digest" IS NULL OR "observed_outcome_digest" ~ '^[0-9a-f]{64}$'),
-  CONSTRAINT "capability_attempt_adjudications_evidence_refs_check" CHECK ("forge_is_uuid_evidence_refs_v1"("evidence_refs")),
+  CONSTRAINT "capability_attempt_adjudications_evidence_refs_check" CHECK (
+    pg_catalog.jsonb_typeof("evidence_refs") = 'array'
+    AND pg_catalog.jsonb_array_length("evidence_refs") <= 128
+    AND "evidence_refs"::text ~ '^\[\]$|^\["[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89a-bA-B][0-9a-fA-F]{3}-[0-9a-fA-F]{12}"(, "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89a-bA-B][0-9a-fA-F]{3}-[0-9a-fA-F]{12}")*\]$'
+  ),
   CONSTRAINT "capability_attempt_adjudications_kind_shape_check" CHECK (
     ("kind" = 'verification_recorded'
       AND "verification_mode" IS NOT NULL AND "verification_result" IS NOT NULL

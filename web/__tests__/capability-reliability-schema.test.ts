@@ -59,22 +59,38 @@ describe('capability reliability ledger migration', () => {
     expect(sql).toContain('capability_attempt_adjudications_kind_shape_check')
 
     // Evidence refs are UUID-only, enforced at the database boundary on both
-    // tables (I1): the helper validates a bounded array whose every element
-    // matches the ADR 0010 UUID grammar, so paths, transcripts, and
-    // credentials cannot enter the append-only ledger even by mistake.
-    expect(sql).toContain('forge_is_uuid_evidence_refs_v1')
-    expect(sql).toContain('"capability_attempts_evidence_refs_check" CHECK ("forge_is_uuid_evidence_refs_v1"("evidence_refs"))')
-    expect(sql).toContain('"capability_attempt_adjudications_evidence_refs_check" CHECK ("forge_is_uuid_evidence_refs_v1"("evidence_refs"))')
-    expect(sql).toContain('pg_catalog.jsonb_array_length("value") > 128')
+    // tables (I1): a bounded array whose every element matches the ADR 0010
+    // UUID grammar, so paths, transcripts, and credentials cannot enter the
+    // append-only ledger even by mistake.
+    const uuidElement = '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89a-bA-B][0-9a-fA-F]{3}-[0-9a-fA-F]{12}'
+    for (const constraint of [
+      'capability_attempts_evidence_refs_check',
+      'capability_attempt_adjudications_evidence_refs_check',
+    ]) {
+      expect(sql).toContain(constraint)
+    }
+    expect(sql).toContain(`^\\[\\]$|^\\["${uuidElement}"(, "${uuidElement}")*\\]$`)
+    expect(sql).toContain('pg_catalog.jsonb_array_length("evidence_refs") <= 128')
+
+    // The element-wise validation must stay inline. A helper routine would
+    // have to be PUBLIC-executable (CHECK runs as the inserting role), which
+    // puts it in every role's effective privilege set and breaks the closed
+    // routine allowlists proved elsewhere in CI.
+    expect(sql).not.toContain('CREATE FUNCTION "forge_is_uuid_evidence_refs_v1"')
 
     // The drizzle schema must declare the same boundary: if it ever drifts
     // back to a bare jsonb_typeof array check, `npm run db:generate` would
     // silently emit a migration that reverts the UUID-only guarantee.
     const schemaSource = await fs.readFile(path.join(process.cwd(), 'db/schema.ts'), 'utf8')
-    expect(schemaSource).toContain("check('capability_attempts_evidence_refs_check', sql`forge_is_uuid_evidence_refs_v1(${t.evidenceRefs})`)")
-    expect(schemaSource).toContain("check('capability_attempt_adjudications_evidence_refs_check', sql`forge_is_uuid_evidence_refs_v1(${t.evidenceRefs})`)")
+    for (const constraint of [
+      'capability_attempts_evidence_refs_check',
+      'capability_attempt_adjudications_evidence_refs_check',
+    ]) {
+      expect(schemaSource).toContain(constraint)
+    }
     expect(schemaSource).not.toContain("check('capability_attempts_evidence_refs_check', sql`jsonb_typeof(${t.evidenceRefs}) = 'array'`)")
     expect(schemaSource).not.toContain("check('capability_attempt_adjudications_evidence_refs_check', sql`jsonb_typeof(${t.evidenceRefs}) = 'array'`)")
+    expect(schemaSource).not.toContain('forge_is_uuid_evidence_refs_v1')
   })
 
   it('grants only SELECT/INSERT to the ordinary application role in the CI ACL gate', async () => {
