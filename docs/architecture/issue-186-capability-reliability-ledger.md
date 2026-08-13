@@ -1007,6 +1007,44 @@ Stop and escalate to the Architect rather than improvising if any of these occur
 8. The pinned migration gates in §10 cannot be satisfied without weakening an
    assertion.
 
+### 15.1 Known limitations carried into v1
+
+Two gaps were identified in review and deliberately left for a follow-up slice,
+because closing either one requires changing a contract outside this ledger.
+
+**(a) Reused attempt keys can raise a false `evidence_drift`.** Two of the §7.3
+boundaries write their canonical outcome under an attempt key that is not unique
+per observation: the admission block reuses `work-package:<id>:admission` on
+every handoff pass, and completion and failure share
+`work-package:<id>:run:<runId>`. `upsertExecutionOutcome` is
+`ON CONFLICT DO UPDATE`, so a second observation overwrites the row, while the
+attempt row's `outcome_digest` still pins the first. When the two observations
+differ — a package re-blocked for a different reason, or a broker failure whose
+error text changes between passes — the read path sees a digest mismatch and
+reports `evidence_drift`, suppressing every rate in that cohort and naming
+tampering as the cause of an ordinary retry. Ingest is correct in isolation; the
+digest simply assumes an immutability that the reused key does not provide.
+Closing it means giving those boundaries an attempt key unique per observation,
+which is a change to the `execution_outcomes` write contract (ADR 0011 / #185),
+not to this ledger. Until then the failure is conservative in direction — rates
+are suppressed, never inflated — and criticals stay visible (I7).
+
+**(b) A later `human_review` verdict can mask an earlier independent one.**
+`latestVerification` takes the newest `verification_recorded` adjudication
+whatever its mode, and `decideReviewGate` appends one in `human_review` mode. If
+an attempt ever carries both an independent verdict and a human decision, the
+human one lands last and `isIndependentlyVerifiedPass` goes false: the attempt
+leaves the `independentlyVerifiedPass` denominator (or scores zero), counts as an
+unverified completion, and breaks the consecutive-pass streak — so a human
+approving a machine-verified package makes the cohort read *worse*. This is
+unreachable in v1: the only independent producer is
+`recordDeterministicAdapterVerdictBestEffort`, which fires on `operation:`
+attempts, and those never pass through a review gate. It becomes live the moment
+#188 introduces `independent_agent` verification on work packages, and the fix
+belongs there — take the latest verification *among independent modes* — because
+picking that semantics now would change published rate meanings ahead of the
+producer that motivates it.
+
 ---
 
 ## 16. Considered and deferred

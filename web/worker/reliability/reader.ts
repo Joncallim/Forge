@@ -18,6 +18,20 @@ import {
 } from '@/lib/reliability/contracts'
 import { sanitizeWorkerMessage } from '../redaction'
 
+/**
+ * Stand-in digest for a linked outcome that cannot be re-digested at read
+ * time: the row is unreachable, or its columns no longer parse as a schema-v1
+ * outcome. Drift detection has to fail CLOSED here. `execution_outcomes` is
+ * insert-only by convention but carries no update-reject trigger, and its
+ * `evidence_refs` column has no CHECK at all (0029 declined to validate array
+ * elements in SQL), so an out-of-band write can leave a row that satisfies
+ * every table constraint yet fails `isExecutionOutcome`. Treating that as
+ * "not checked" would let exactly the tampering this digest exists to catch
+ * pass as clean evidence, while a tamper that kept the row valid was caught.
+ * Never a real digest (those are 64 hex chars), so it always mismatches.
+ */
+const UNREADABLE_OUTCOME_DIGEST = 'unreadable'
+
 function storedOutcome(row: typeof executionOutcomes.$inferSelect): ExecutionOutcome | null {
   const candidate: unknown = {
     schemaVersion: row.schemaVersion,
@@ -105,14 +119,10 @@ export async function readCohortReliability(input: {
   const attempts: CapabilityAttemptRecord[] = []
   for (const row of attemptRows) {
     const outcomeRow = outcomesById.get(row.executionOutcomeId)
-    let currentDigest: string | undefined
-    if (outcomeRow) {
-      const outcome = storedOutcome(outcomeRow)
-      if (outcome) {
-        const normalized = normalizeExecutionOutcome(outcome, sanitizeWorkerMessage)
-        currentDigest = outcomeDigest(normalized)
-      }
-    }
+    const outcome = outcomeRow ? storedOutcome(outcomeRow) : null
+    const currentDigest = outcome
+      ? outcomeDigest(normalizeExecutionOutcome(outcome, sanitizeWorkerMessage))
+      : UNREADABLE_OUTCOME_DIGEST
     attempts.push({
       id: row.id,
       attemptGroupId: row.attemptGroupId,

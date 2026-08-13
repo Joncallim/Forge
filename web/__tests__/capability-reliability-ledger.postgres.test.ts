@@ -508,4 +508,100 @@ describe.skipIf(!enabled)('capability reliability ledger PostgreSQL behavior', (
     expect(summary.evidence.driftedAttemptCount).toBe(0)
     expect(summary.sampleCount).toBe(1)
   })
+
+  it('reports evidence drift when the linked outcome no longer parses as a v1 outcome', async () => {
+    // Drift detection must fail CLOSED. `execution_outcomes.evidence_refs`
+    // carries no CHECK (0029 declined to validate array elements in SQL), so
+    // an out-of-band write can leave a row that still satisfies every table
+    // constraint yet fails `isExecutionOutcome`. If that read as "not
+    // checked", the one tamper the digest cannot see would be the one that
+    // breaks the row -- while a tamper that kept it valid was caught.
+    const ledgerModule = await import('@/worker/reliability/ledger')
+    const readerModule = await import('@/worker/reliability/reader')
+    const { upsertExecutionOutcome } = await import('@/worker/execution-outcomes')
+    const outcome: ExecutionOutcome = {
+      schemaVersion: 1,
+      transportStatus: 'ok',
+      result: 'completed',
+      stopReasonCode: null,
+      stopReasonSummary: null,
+      retryable: false,
+      evidenceRefs: [],
+      verifierRequired: false,
+      verificationStatus: 'not_required',
+    }
+    const stored = await upsertExecutionOutcome({
+      taskId: ids.task,
+      attemptKey: 'capability-ledger-unparseable-outcome-proof',
+      outcome,
+    })
+    const observedAt = new Date()
+    await ledgerModule.recordCapabilityAttempts({
+      projectId: ids.project,
+      taskId: ids.task,
+      workPackageId: null,
+      agentRunId: null,
+      taskAttemptId: null,
+      executionOutcomeId: stored.id,
+      operationRunId: null,
+      outcome,
+      attemptNumber: 1,
+      source: { kind: 'work_package', role: 'qa', capabilities: ['tamper-proof'] },
+      scope: {
+        contractVersion: 1,
+        projectId: ids.project,
+        rootRef: null,
+        rootBindingRevision: '1',
+        grantDecisionRevision: '1',
+        repositoryWriteIntent: false,
+        capabilities: ['tamper-proof'],
+        mcpRequirementKeys: [],
+      },
+      runtime: {
+        kind: 'model',
+        providerType: null,
+        modelId: 'tamper-proof-model',
+        providerIsLocal: null,
+        providerConfigUpdatedAt: null,
+        acpExecutionMode: 'proof',
+      },
+      policy: {
+        contractVersion: 1,
+        policyVersion: 'tamper-proof',
+        harnessId: null,
+        harnessUpdatedAt: null,
+        reviewRequirement: 'none',
+        repositoryWritesEnabled: false,
+      },
+      verificationMode: 'none',
+      acceptanceCriteriaTotal: 0,
+      validationCommandTotal: 0,
+      validationCommandFailed: 0,
+      observedAt,
+    })
+    const [row] = await sql<{ cohortFingerprint: string }[]>`
+      select cohort_fingerprint as "cohortFingerprint" from capability_attempts
+      where execution_outcome_id = ${stored.id}::uuid
+    `
+
+    const clean = await readerModule.readCohortReliability({
+      cohortFingerprint: row!.cohortFingerprint,
+      now: observedAt,
+    })
+    expect(clean.state).not.toBe('evidence_drift')
+
+    // The table accepts this: `evidence_refs` is jsonb with no constraint.
+    await sql`
+      update execution_outcomes set evidence_refs = '["not-a-uuid"]'::jsonb
+      where id = ${stored.id}::uuid
+    `
+
+    const tampered = await readerModule.readCohortReliability({
+      cohortFingerprint: row!.cohortFingerprint,
+      now: observedAt,
+    })
+    expect(tampered.state).toBe('evidence_drift')
+    expect(tampered.evidence.driftedAttemptCount).toBe(1)
+    expect(tampered.rates.firstAttemptSuccess).toBeNull()
+  })
 })
