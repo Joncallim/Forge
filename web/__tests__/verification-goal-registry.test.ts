@@ -1,9 +1,10 @@
-import { mkdtemp, mkdir, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, realpath, rename, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { OPERATION_CATALOG } from '@/lib/operations/catalog'
+import type { ProjectExecutionRootBinding } from '@/lib/projects/local-path'
 import {
   MAX_VERIFICATION_GOAL_FILE_BYTES,
   VERIFICATION_GOAL_REGISTRY_PATH,
@@ -25,6 +26,11 @@ async function projectRoot(): Promise<string> {
   const root = await realpath(created)
   roots.push(root)
   return root
+}
+
+async function projectBinding(root: string): Promise<ProjectExecutionRootBinding> {
+  const identity = await stat(root, { bigint: true })
+  return { path: root, dev: identity.dev, ino: identity.ino }
 }
 
 function definition(goalId: string, definitionVersion = 1) {
@@ -58,7 +64,7 @@ describe('verification goal repository registry', () => {
     await writeFile(path.join(directory, 'zeta.json'), JSON.stringify(definition('zeta-goal')))
     await writeFile(path.join(directory, 'alpha.json'), JSON.stringify(definition('alpha-goal')))
 
-    const loaded = await loadVerificationGoalRegistry(root)
+    const loaded = await loadVerificationGoalRegistry(await projectBinding(root))
     expect(loaded.map((goal) => goal.definition.goalId)).toEqual(['alpha-goal', 'zeta-goal'])
     expect(loaded.map((goal) => goal.sourcePath)).toEqual([
       '.forge/verification-goals/alpha.json',
@@ -68,12 +74,17 @@ describe('verification goal repository registry', () => {
   })
 
   it('treats a missing registry as an empty declarative registry', async () => {
-    await expect(loadVerificationGoalRegistry(await projectRoot())).resolves.toEqual([])
+    const root = await projectRoot()
+    await expect(loadVerificationGoalRegistry(await projectBinding(root))).resolves.toEqual([])
   })
 
   it('does not disclose a trusted host path when the project cannot be read', async () => {
     const root = path.join(await projectRoot(), 'missing-project')
-    await expect(loadVerificationGoalRegistry(root)).rejects.toMatchObject({
+    await expect(loadVerificationGoalRegistry({
+      path: root,
+      dev: BigInt(0),
+      ino: BigInt(0),
+    })).rejects.toMatchObject({
       message: expect.not.stringContaining(root),
     })
   })
@@ -91,7 +102,7 @@ describe('verification goal repository registry', () => {
 
     await expect(importVerificationGoalRegistryForTest({ projectId }, {
       loadProject: async () => ({ id: projectId, localPath: root }),
-      canonicalizeProjectRoot: async () => root,
+      bindProjectRoot: async () => projectBinding(root),
       store,
     }))
       .rejects.toThrow(/exactly the v1 definition keys/i)
@@ -107,7 +118,7 @@ describe('verification goal repository registry', () => {
     const importSnapshots = vi.fn()
 
     const importWithAdversarialReplacement = async () => {
-      const goals = await loadVerificationGoalRegistryForTest(root, OPERATION_CATALOG, {
+      const goals = await loadVerificationGoalRegistryForTest(await projectBinding(root), OPERATION_CATALOG, {
         afterRegistryDirectoryAnchored: async () => {
           await rename(directory, movedDirectory)
           await symlink(movedDirectory, directory, 'dir')
@@ -123,20 +134,20 @@ describe('verification goal repository registry', () => {
   it('fails closed for unknown projects and projects without a local path', async () => {
     const root = await projectRoot()
     const importSnapshots = vi.fn()
-    const canonicalizeProjectRoot = vi.fn(async () => root)
+    const bindProjectRoot = vi.fn(async () => projectBinding(root))
     const store: VerificationGoalSnapshotStore = { importSnapshots }
 
     await expect(importVerificationGoalRegistryForTest({ projectId }, {
       loadProject: async () => null,
-      canonicalizeProjectRoot,
+      bindProjectRoot,
       store,
     })).rejects.toThrow(/could not be resolved/i)
     await expect(importVerificationGoalRegistryForTest({ projectId }, {
       loadProject: async () => ({ id: projectId, localPath: null }),
-      canonicalizeProjectRoot,
+      bindProjectRoot,
       store,
     })).rejects.toThrow(/authoritative project localPath/i)
-    expect(canonicalizeProjectRoot).not.toHaveBeenCalled()
+    expect(bindProjectRoot).not.toHaveBeenCalled()
     expect(importSnapshots).not.toHaveBeenCalled()
   })
 
@@ -169,7 +180,7 @@ describe('verification goal repository registry', () => {
     }
     const result = await importVerificationGoalRegistryForTest(inputWithUntrustedExtra, {
       loadProject: async () => ({ id: projectId, localPath: authoritativeRoot }),
-      canonicalizeProjectRoot: async (project) => project.localPath!,
+      bindProjectRoot: async (project) => projectBinding(project.localPath!),
       store: { importSnapshots },
     })
 
@@ -192,14 +203,39 @@ describe('verification goal repository registry', () => {
 
     await expect(importVerificationGoalRegistryForTest({ projectId }, {
       loadProject: async () => ({ id: projectId, localPath: root }),
-      canonicalizeProjectRoot: async () => {
-        const validatedRoot = await realpath(root)
+      bindProjectRoot: async () => {
+        const validatedRoot = await projectBinding(await realpath(root))
         await rename(root, movedProject)
         await symlink(movedProject, root, 'dir')
         return validatedRoot
       },
       store: { importSnapshots },
     })).rejects.toThrow(/symlink|safely|fixed location/i)
+    expect(importSnapshots).not.toHaveBeenCalled()
+  })
+
+  it('fails before storage when the bound project root is replaced by another real directory', async () => {
+    const root = await projectRoot()
+    const outsideRoot = await projectRoot()
+    const replacementRoot = await projectRoot()
+    const movedProject = path.join(outsideRoot, 'moved-project')
+    const replacementDirectory = await registry(replacementRoot)
+    await writeFile(
+      path.join(replacementDirectory, 'outside.json'),
+      JSON.stringify(definition('outside-goal')),
+    )
+    const importSnapshots = vi.fn()
+
+    await expect(importVerificationGoalRegistryForTest({ projectId }, {
+      loadProject: async () => ({ id: projectId, localPath: root }),
+      bindProjectRoot: async () => {
+        const binding = await projectBinding(root)
+        await rename(root, movedProject)
+        await rename(replacementRoot, root)
+        return binding
+      },
+      store: { importSnapshots },
+    })).rejects.toThrow(/changed|replaced|safely/i)
     expect(importSnapshots).not.toHaveBeenCalled()
   })
 
@@ -211,7 +247,7 @@ describe('verification goal repository registry', () => {
 
     await expect(importVerificationGoalRegistryForTest({ projectId }, {
       loadProject: async () => ({ id: projectId, localPath: root }),
-      canonicalizeProjectRoot: async () => root,
+      bindProjectRoot: async () => projectBinding(root),
       loadRegistry: (projectRoot) => loadVerificationGoalRegistryForTest(projectRoot, OPERATION_CATALOG, {
         afterAnchoredEnumeration: async () => {
           await writeFile(path.join(directory, 'unexpected.txt'), 'not a goal')
@@ -232,7 +268,7 @@ describe('verification goal repository registry', () => {
 
     await expect(importVerificationGoalRegistryForTest({ projectId }, {
       loadProject: async () => ({ id: projectId, localPath: root }),
-      canonicalizeProjectRoot: async () => root,
+      bindProjectRoot: async () => projectBinding(root),
       loadRegistry: (projectRoot) => loadVerificationGoalRegistryForTest(projectRoot, OPERATION_CATALOG, {
         afterAnchoredEnumeration: async () => {
           await rename(duplicateCandidate, path.join(directory, 'duplicate.json'))
@@ -255,7 +291,7 @@ describe('verification goal repository registry', () => {
 
     await expect(importVerificationGoalRegistryForTest({ projectId }, {
       loadProject: async () => ({ id: projectId, localPath: root }),
-      canonicalizeProjectRoot: async () => root,
+      bindProjectRoot: async () => projectBinding(root),
       loadRegistry: (projectRoot) => loadVerificationGoalRegistryForTest(projectRoot, OPERATION_CATALOG, {
         afterFirstAnchoredEntryRead: async () => {
           await rename(readPath, movedReadPath)
@@ -272,7 +308,7 @@ describe('verification goal repository registry', () => {
     const directory = await registry(root)
     await writeFile(path.join(directory, 'one.json'), JSON.stringify(definition('same-goal', 1)))
     await writeFile(path.join(directory, 'two.json'), JSON.stringify(definition('same-goal', 2)))
-    await expect(loadVerificationGoalRegistry(root)).rejects.toThrow(/appears more than once/i)
+    await expect(loadVerificationGoalRegistry(await projectBinding(root))).rejects.toThrow(/appears more than once/i)
   })
 
   it('rejects symlinks, nested entries, unsafe names, excessive bytes, depth, and malformed JSON', async () => {
@@ -299,7 +335,7 @@ describe('verification goal repository registry', () => {
       const root = await projectRoot()
       const directory = await registry(root)
       await arrange(root, directory)
-      await expect(loadVerificationGoalRegistry(root)).rejects.toThrow()
+      await expect(loadVerificationGoalRegistry(await projectBinding(root))).rejects.toThrow()
     }
   })
 })

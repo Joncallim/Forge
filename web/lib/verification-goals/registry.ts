@@ -14,6 +14,7 @@ import { promisify } from 'node:util'
 
 import type { OperationDefinition } from '@/lib/operations/contracts'
 import { OPERATION_CATALOG } from '@/lib/operations/catalog'
+import type { ProjectExecutionRootBinding } from '@/lib/projects/local-path'
 import {
   compareVerificationGoalStrings,
   parseVerificationGoalDefinition,
@@ -118,7 +119,11 @@ function assertJsonDepth(source: string, sourcePath: string): void {
   }
 }
 
-async function openDirectoryLease(directoryPath: string, expectedRealPath: string): Promise<DirectoryLease> {
+async function openDirectoryLease(
+  directoryPath: string,
+  expectedRealPath: string,
+  expectedIdentity?: Pick<ProjectExecutionRootBinding, 'dev' | 'ino'>,
+): Promise<DirectoryLease> {
   const before = await lstat(directoryPath, { bigint: true })
   if (before.isSymbolicLink() || !before.isDirectory()) {
     throw new VerificationGoalRegistryError(
@@ -140,7 +145,12 @@ async function openDirectoryLease(directoryPath: string, expectedRealPath: strin
   }
   try {
     const opened = await handle.stat({ bigint: true })
-    if (!opened.isDirectory() || !sameDirectorySnapshot(before, opened)) {
+    if (
+      !opened.isDirectory()
+      || !sameDirectorySnapshot(before, opened)
+      || (expectedIdentity !== undefined
+        && (opened.dev !== expectedIdentity.dev || opened.ino !== expectedIdentity.ino))
+    ) {
       throw new VerificationGoalRegistryError(
         'invalid_registry',
         'A verification goal registry directory changed while it was being anchored.',
@@ -531,7 +541,7 @@ async function parseRegistrySnapshot(
 }
 
 async function loadVerificationGoalRegistryInternal(
-  projectRoot: string,
+  projectRoot: ProjectExecutionRootBinding,
   catalog: ReadonlyMap<string, OperationDefinition>,
   hooks: VerificationGoalRegistryTestHooks = {},
 ): Promise<LoadedVerificationGoal[]> {
@@ -542,11 +552,15 @@ async function loadVerificationGoalRegistryInternal(
     )
   }
 
-  // The importer already returned a canonical, workspace-contained root.
-  // Resolve syntax only: re-running realpath here would follow a symlink that
-  // replaced the validated root during the handoff into this loader.
-  const trustedProjectRoot = path.resolve(projectRoot)
-  const projectLease = await openDirectoryLease(trustedProjectRoot, trustedProjectRoot)
+  // The importer already returned a canonical, workspace-contained root and
+  // the directory identity observed by that guard. Resolve syntax only:
+  // re-running realpath here would follow a replacement during the handoff.
+  const trustedProjectRoot = path.resolve(projectRoot.path)
+  const projectLease = await openDirectoryLease(
+    trustedProjectRoot,
+    trustedProjectRoot,
+    projectRoot,
+  )
   let forgeLease: DirectoryLease | null = null
   let registryLease: DirectoryLease | null = null
   try {
@@ -594,7 +608,7 @@ async function loadVerificationGoalRegistryInternal(
 }
 
 async function loadWithSafeErrorBoundary(
-  projectRoot: string,
+  projectRoot: ProjectExecutionRootBinding,
   catalog: ReadonlyMap<string, OperationDefinition>,
   hooks?: VerificationGoalRegistryTestHooks,
 ): Promise<LoadedVerificationGoal[]> {
@@ -618,7 +632,7 @@ async function loadWithSafeErrorBoundary(
 }
 
 export function loadVerificationGoalRegistry(
-  projectRoot: string,
+  projectRoot: ProjectExecutionRootBinding,
   catalog: ReadonlyMap<string, OperationDefinition> = OPERATION_CATALOG,
 ): Promise<LoadedVerificationGoal[]> {
   return loadWithSafeErrorBoundary(projectRoot, catalog)
@@ -626,7 +640,7 @@ export function loadVerificationGoalRegistry(
 
 /** Test-only seam for deterministic directory replacement races. */
 export function loadVerificationGoalRegistryForTest(
-  projectRoot: string,
+  projectRoot: ProjectExecutionRootBinding,
   catalog: ReadonlyMap<string, OperationDefinition>,
   hooks: VerificationGoalRegistryTestHooks,
 ): Promise<LoadedVerificationGoal[]> {

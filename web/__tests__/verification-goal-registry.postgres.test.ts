@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { mkdtemp, mkdir, rm, unlink, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, realpath, rm, stat, unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import postgres from 'postgres'
@@ -43,6 +43,12 @@ describe.skipIf(!enabled)('verification goal registry PostgreSQL behavior', () =
     await writeFile(path.join(directory, fileName), JSON.stringify(value))
   }
 
+  async function bindProjectRoot() {
+    const canonicalRoot = await realpath(root)
+    const identity = await stat(canonicalRoot, { bigint: true })
+    return { path: canonicalRoot, dev: identity.dev, ino: identity.ino }
+  }
+
   beforeAll(async () => {
     root = await mkdtemp(path.join(tmpdir(), 'forge-verification-goals-postgres-'))
     directory = path.join(root, ...VERIFICATION_GOAL_REGISTRY_PATH.split('/'))
@@ -74,7 +80,7 @@ describe.skipIf(!enabled)('verification goal registry PostgreSQL behavior', () =
     const { databaseVerificationGoalSnapshotStore } = await import('@/worker/verification-goals/snapshots')
     const dependencies = {
       loadProject: async () => ({ id: ids.project, localPath: root }),
-      canonicalizeProjectRoot: async () => root,
+      bindProjectRoot,
       store: databaseVerificationGoalSnapshotStore,
     }
     await writeGoal('z-proof.json', goal('z-proof', 1))
@@ -100,7 +106,7 @@ describe.skipIf(!enabled)('verification goal registry PostgreSQL behavior', () =
     await writeGoal('a-new.json', goal('a-new', 1))
     await expect(importVerificationGoalRegistryForTest({ projectId: ids.project }, {
       loadProject: async () => ({ id: ids.project, localPath: root }),
-      canonicalizeProjectRoot: async () => root,
+      bindProjectRoot,
       store: databaseVerificationGoalSnapshotStore,
     }))
       .rejects.toThrow(/different content/i)
@@ -116,7 +122,7 @@ describe.skipIf(!enabled)('verification goal registry PostgreSQL behavior', () =
     const { databaseVerificationGoalSnapshotStore } = await import('@/worker/verification-goals/snapshots')
     const dependencies = {
       loadProject: async () => ({ id: ids.project, localPath: root }),
-      canonicalizeProjectRoot: async () => root,
+      bindProjectRoot,
       store: databaseVerificationGoalSnapshotStore,
     }
     await unlink(path.join(directory, 'a-new.json'))

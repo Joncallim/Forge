@@ -1,4 +1,5 @@
-import fs from 'node:fs/promises'
+import { constants as fsConstants } from 'node:fs'
+import fs, { type FileHandle } from 'node:fs/promises'
 import path from 'node:path'
 import { db } from '@/db'
 import { projects } from '@/db/schema'
@@ -8,6 +9,12 @@ type ProjectLocalPath = {
   id: string
   localPath: string | null
 }
+
+export type ProjectExecutionRootBinding = Readonly<{
+  path: string
+  dev: bigint
+  ino: bigint
+}>
 
 function pathsOverlap(a: string, b: string): boolean {
   return isWithinPath(a, b) || isWithinPath(b, a)
@@ -182,13 +189,60 @@ export async function assertProjectLocalPathAllowed(input: {
   return projectRoot
 }
 
-export async function assertProjectLocalPathForExecution(project: ProjectLocalPath): Promise<string> {
+async function bindProjectExecutionRoot(projectRoot: string): Promise<ProjectExecutionRootBinding> {
+  const before = await fs.lstat(projectRoot, { bigint: true })
+  if (before.isSymbolicLink() || !before.isDirectory()) {
+    throw new Error('Project localPath is not a real directory.')
+  }
+
+  let handle: FileHandle
+  try {
+    handle = await fs.open(
+      projectRoot,
+      fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
+    )
+  } catch {
+    throw new Error('Project localPath could not be opened safely for execution.')
+  }
+
+  try {
+    const opened = await handle.stat({ bigint: true })
+    const [current, currentRealPath] = await Promise.all([
+      fs.lstat(projectRoot, { bigint: true }),
+      fs.realpath(projectRoot),
+    ])
+    if (
+      !opened.isDirectory()
+      || current.isSymbolicLink()
+      || !current.isDirectory()
+      || before.dev !== opened.dev
+      || before.ino !== opened.ino
+      || current.dev !== opened.dev
+      || current.ino !== opened.ino
+      || currentRealPath !== projectRoot
+    ) {
+      throw new Error('Project localPath moved or was replaced while it was being bound for execution.')
+    }
+    return { path: projectRoot, dev: opened.dev, ino: opened.ino }
+  } finally {
+    await handle.close()
+  }
+}
+
+export async function assertProjectLocalPathForExecutionBinding(
+  project: ProjectLocalPath,
+): Promise<ProjectExecutionRootBinding> {
   if (!project.localPath?.trim()) {
     throw new Error('Project localPath is required before Forge can execute this task.')
   }
 
-  return assertProjectLocalPathAllowed({
+  const projectRoot = await assertProjectLocalPathAllowed({
     localPath: project.localPath,
     projectId: project.id,
   })
+  return bindProjectExecutionRoot(projectRoot)
+}
+
+export async function assertProjectLocalPathForExecution(project: ProjectLocalPath): Promise<string> {
+  return (await assertProjectLocalPathForExecutionBinding(project)).path
 }
