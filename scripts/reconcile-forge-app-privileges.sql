@@ -23,6 +23,9 @@ INSERT INTO forge_expected_protected_owner_inventory (relation_name, owner_name)
   ('forge_epic_172_s3_release_state', 'forge_release_routines_owner'),
   ('work_package_local_projection_sources', 'forge_release_routines_owner'),
   ('work_package_local_projection_heads', 'forge_release_routines_owner'),
+  ('verification_goal_registry_revisions', 'forge_s4_routines_owner'),
+  ('verification_goal_registry_entries', 'forge_s4_routines_owner'),
+  ('verification_goal_registry_heads', 'forge_s4_routines_owner'),
   ('architect_plan_versions', 'forge_s4_routines_owner'),
   ('architect_plan_entries', 'forge_s4_routines_owner'),
   ('architect_plan_execution_references', 'forge_s4_routines_owner'),
@@ -77,11 +80,34 @@ BEGIN
   ) THEN
     RAISE EXCEPTION 'forge app role has membership edges';
   END IF;
-  IF (SELECT count(*) FROM pg_catalog.pg_roles
-      WHERE rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner')) <> 2 THEN
-    RAISE EXCEPTION 'protected owner roles are missing';
+  IF (
+    SELECT count(*)
+    FROM pg_catalog.pg_authid role_row
+    WHERE role_row.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner')
+      AND NOT role_row.rolcanlogin
+      AND NOT role_row.rolinherit
+      AND NOT role_row.rolsuper
+      AND NOT role_row.rolcreatedb
+      AND NOT role_row.rolcreaterole
+      AND NOT role_row.rolreplication
+      AND NOT role_row.rolbypassrls
+      AND role_row.rolconnlimit = -1
+      AND role_row.rolpassword IS NULL
+      AND role_row.rolvaliduntil IS NULL
+  ) <> 2 OR EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_auth_members membership
+    WHERE membership.roleid IN (
+      'forge_release_routines_owner'::pg_catalog.regrole,
+      'forge_s4_routines_owner'::pg_catalog.regrole
+    ) OR membership.member IN (
+      'forge_release_routines_owner'::pg_catalog.regrole,
+      'forge_s4_routines_owner'::pg_catalog.regrole
+    )
+  ) THEN
+    RAISE EXCEPTION 'protected owner roles are outside the exact safe boundary';
   END IF;
-  IF (SELECT count(*) FROM forge_expected_protected_owner_inventory) <> 37 OR EXISTS (
+  IF (SELECT count(*) FROM forge_expected_protected_owner_inventory) <> 40 OR EXISTS (
     SELECT 1
     FROM forge_expected_protected_owner_inventory expected
     LEFT JOIN pg_catalog.pg_class relation
@@ -100,7 +126,7 @@ BEGIN
   WHERE namespace_row.nspname = 'public'
     AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
     AND owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner');
-  IF protected_count < 37 THEN
+  IF protected_count < 40 THEN
     RAISE EXCEPTION 'protected ownership boundary is incomplete';
   END IF;
 END;
@@ -138,6 +164,16 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public
   GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO forge;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public
   GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO forge;
+
+-- Snapshots remain application-appended. Protected registry construction is
+-- available only through its fixed SECURITY DEFINER routine.
+REVOKE ALL PRIVILEGES ON TABLE
+  public.verification_goal_snapshots,
+  public.verification_goal_registry_revisions,
+  public.verification_goal_registry_entries,
+  public.verification_goal_registry_heads
+FROM forge;
+GRANT SELECT, INSERT ON TABLE public.verification_goal_snapshots TO forge;
 
 DO $reconcile$
 DECLARE
@@ -182,14 +218,23 @@ $reconcile$;
 
 GRANT SELECT ON TABLE
   public.work_package_local_projection_sources,
-  public.work_package_local_projection_heads
+  public.work_package_local_projection_heads,
+  public.verification_goal_registry_revisions,
+  public.verification_goal_registry_entries,
+  public.verification_goal_registry_heads
 TO forge;
+REVOKE ALL ON FUNCTION public.forge_commit_verification_goal_registry_revision_v1(
+  uuid,uuid,uuid,uuid,timestamptz,text,uuid,bigint,bigint,timestamptz,text,jsonb
+) FROM PUBLIC, forge;
+GRANT EXECUTE ON FUNCTION public.forge_commit_verification_goal_registry_revision_v1(
+  uuid,uuid,uuid,uuid,timestamptz,text,uuid,bigint,bigint,timestamptz,text,jsonb
+) TO forge;
 
 DO $verify$
 DECLARE
   projection_name text;
 BEGIN
-  IF (SELECT count(*) FROM forge_expected_protected_owner_inventory) <> 37 OR EXISTS (
+  IF (SELECT count(*) FROM forge_expected_protected_owner_inventory) <> 40 OR EXISTS (
     SELECT 1
     FROM forge_expected_protected_owner_inventory expected
     LEFT JOIN pg_catalog.pg_class relation
@@ -220,6 +265,77 @@ BEGIN
   ) THEN
     RAISE EXCEPTION 'forge app role is outside the exact safe boundary';
   END IF;
+  IF (
+    SELECT count(*)
+    FROM pg_catalog.pg_authid role_row
+    WHERE role_row.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner')
+      AND NOT role_row.rolcanlogin
+      AND NOT role_row.rolinherit
+      AND NOT role_row.rolsuper
+      AND NOT role_row.rolcreatedb
+      AND NOT role_row.rolcreaterole
+      AND NOT role_row.rolreplication
+      AND NOT role_row.rolbypassrls
+      AND role_row.rolconnlimit = -1
+      AND role_row.rolpassword IS NULL
+      AND role_row.rolvaliduntil IS NULL
+  ) <> 2 OR EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_auth_members membership
+    WHERE membership.roleid IN (
+      'forge_release_routines_owner'::pg_catalog.regrole,
+      'forge_s4_routines_owner'::pg_catalog.regrole
+    ) OR membership.member IN (
+      'forge_release_routines_owner'::pg_catalog.regrole,
+      'forge_s4_routines_owner'::pg_catalog.regrole
+    )
+  ) THEN
+    RAISE EXCEPTION 'protected owner roles changed during reconciliation';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_proc routine
+    WHERE routine.oid = 'public.forge_commit_verification_goal_registry_revision_v1(uuid,uuid,uuid,uuid,timestamp with time zone,text,uuid,bigint,bigint,timestamp with time zone,text,jsonb)'::pg_catalog.regprocedure
+      AND routine.proowner = 'forge_s4_routines_owner'::pg_catalog.regrole
+      AND routine.prosecdef
+      AND routine.proconfig = ARRAY['search_path=pg_catalog']
+      AND pg_catalog.has_function_privilege('forge', routine.oid, 'EXECUTE')
+      AND NOT EXISTS (
+        SELECT 1
+        FROM pg_catalog.aclexplode(
+          COALESCE(routine.proacl, pg_catalog.acldefault('f', routine.proowner))
+        ) privilege
+        WHERE privilege.privilege_type = 'EXECUTE'
+          AND privilege.grantee NOT IN (
+            'forge'::pg_catalog.regrole,
+            'forge_s4_routines_owner'::pg_catalog.regrole
+          )
+      )
+  ) THEN
+    RAISE EXCEPTION 'verification goal registry commit routine owner or execute boundary is invalid';
+  END IF;
+  IF EXISTS (
+    SELECT 1
+    FROM unnest(ARRAY[
+      'verification_goal_snapshots',
+      'verification_goal_registry_revisions',
+      'verification_goal_registry_entries',
+      'verification_goal_registry_heads'
+    ]) registry_table
+    CROSS JOIN unnest(ARRAY[
+      'SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER'
+    ]) registry_privilege
+    WHERE pg_catalog.has_table_privilege(
+      'forge',
+      pg_catalog.format('public.%I', registry_table),
+      registry_privilege
+    ) IS DISTINCT FROM (
+      registry_privilege = 'SELECT'
+      OR (registry_table = 'verification_goal_snapshots' AND registry_privilege = 'INSERT')
+    )
+  ) THEN
+    RAISE EXCEPTION 'forge verification goal registry privileges are outside the exact append-only matrix';
+  END IF;
   IF EXISTS (
     SELECT 1
     FROM pg_catalog.pg_class relation
@@ -235,7 +351,10 @@ BEGIN
       AND (
         relation.relname NOT IN (
           'work_package_local_projection_sources',
-          'work_package_local_projection_heads'
+          'work_package_local_projection_heads',
+          'verification_goal_registry_revisions',
+          'verification_goal_registry_entries',
+          'verification_goal_registry_heads'
         )
         OR privilege.privilege_type <> 'SELECT'
         OR privilege.is_grantable
@@ -315,7 +434,10 @@ BEGIN
           relation.relname NOT IN (
             'forge_epic_172_s3_release_state',
             'work_package_local_projection_sources',
-            'work_package_local_projection_heads'
+            'work_package_local_projection_heads',
+            'verification_goal_registry_revisions',
+            'verification_goal_registry_entries',
+            'verification_goal_registry_heads'
           )
           AND (
             pg_catalog.has_table_privilege(forge_role.oid, relation.oid, 'SELECT')
@@ -328,7 +450,10 @@ BEGIN
   END IF;
   FOREACH projection_name IN ARRAY ARRAY[
     'work_package_local_projection_sources',
-    'work_package_local_projection_heads'
+    'work_package_local_projection_heads',
+    'verification_goal_registry_revisions',
+    'verification_goal_registry_entries',
+    'verification_goal_registry_heads'
   ]
   LOOP
     IF (

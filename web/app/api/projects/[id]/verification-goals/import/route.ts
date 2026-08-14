@@ -108,17 +108,23 @@ export async function POST(
       )
     }
 
-    const results = await importVerificationGoalRegistry({ projectId })
-    const snapshots = [...results].sort(compareImportResults).map((result) => ({
-      snapshotId: result.snapshotId,
-      goalId: result.goalId,
-      definitionVersion: result.definitionVersion,
-      state: result.kind,
+    const result = await importVerificationGoalRegistry({
+      projectId,
+      actorUserId: session.userId.toLowerCase(),
+    })
+    const snapshots = [...result.snapshots].sort(compareImportResults).map((snapshot) => ({
+      snapshotId: snapshot.snapshotId,
+      goalId: snapshot.goalId,
+      definitionVersion: snapshot.definitionVersion,
+      state: snapshot.kind,
     }))
 
     return NextResponse.json({
-      schemaVersion: 1,
+      schemaVersion: 2,
       projectId,
+      registryRevisionId: result.registryRevisionId,
+      manifestDigest: result.manifestDigest,
+      headState: result.headState,
       snapshots,
       summary: {
         total: snapshots.length,
@@ -148,6 +154,22 @@ export async function POST(
           return projectContextUnavailableResponse()
         case 'project_repository_unavailable':
           return projectRepositoryUnavailableResponse()
+        case 'project_authority_changed':
+          return NextResponse.json(
+            {
+              error: 'The project authority changed during verification goal import.',
+              code: 'project_authority_changed',
+            },
+            { status: 409 },
+          )
+        case 'registry_head_changed':
+          return NextResponse.json(
+            {
+              error: 'The verification goal registry changed during import. Retry the request.',
+              code: 'registry_head_changed',
+            },
+            { status: 409 },
+          )
       }
     }
 

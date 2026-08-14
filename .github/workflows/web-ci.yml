@@ -101,6 +101,9 @@ jobs:
           CREATE ROLE forge_app_test
             LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
             PASSWORD 'forge_app_test';
+          CREATE ROLE forge
+            LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
+            PASSWORD 'forge_registry_test';
           -- CI-only observer. PostgreSQL's default PUBLIC CONNECT/TEMPORARY
           -- privileges can still cover other disposable runner databases; this
           -- role is constrained by its direct attributes, memberships, and the
@@ -213,8 +216,16 @@ jobs:
           FORGE_S5_FORCE_HANDOFF_FAILURE=1 bash scripts/ci/apply-epic-172-s5-recovery-migration.sh
           failed=$?
           set -e
-          psql "$FORGE_DATABASE_ADMIN_URL" --set ON_ERROR_STOP=1 --command "do \$\$ begin if pg_catalog.has_function_privilege('forge_migration_test', 'public.forge_begin_epic_172_s4_owner_bootstrap_v1()', 'execute') or pg_catalog.pg_has_role('forge_migration_test', 'forge_s4_routines_owner', 'member') or pg_catalog.has_schema_privilege('forge_migration_test', 'forge', 'create') then raise exception 'S5 cleanup proof retained migration authority'; end if; end \$\$;"
+          psql "$FORGE_DATABASE_ADMIN_URL" --set ON_ERROR_STOP=1 --command "do \$\$ begin if pg_catalog.has_function_privilege('forge_migration_test', 'public.forge_begin_epic_172_s4_owner_bootstrap_v1()', 'execute') or pg_catalog.has_function_privilege('forge_migration_test', 'public.forge_finalize_epic_172_s4_owner_bootstrap_v1()', 'execute') or pg_catalog.pg_has_role('forge_migration_test', 'forge_s4_routines_owner', 'member') or pg_catalog.has_schema_privilege('forge_migration_test', 'forge', 'create') or pg_catalog.has_schema_privilege('forge_s4_routines_owner', 'public', 'create') or pg_catalog.has_schema_privilege('forge_s4_routines_owner', 'forge', 'create') or not pg_catalog.has_schema_privilege('forge_s4_routines_owner', 'forge', 'usage') then raise exception 'protected-owner cleanup proof retained or removed authority'; end if; end \$\$;"
           test "$failed" -ne 0
+          bash scripts/ci/apply-epic-172-s5-recovery-migration.sh
+          set +e
+          FORGE_REGISTRY_FORCE_HANDOFF_FAILURE=1 bash scripts/ci/apply-verification-goal-registry-migration.sh
+          registry_failed=$?
+          set -e
+          psql "$FORGE_DATABASE_ADMIN_URL" --set ON_ERROR_STOP=1 --command "do \$\$ begin if pg_catalog.has_function_privilege('forge_migration_test', 'public.forge_begin_epic_172_s4_owner_bootstrap_v1()', 'execute') or pg_catalog.has_function_privilege('forge_migration_test', 'public.forge_finalize_epic_172_s4_owner_bootstrap_v1()', 'execute') or pg_catalog.pg_has_role('forge_migration_test', 'forge_s4_routines_owner', 'member') or pg_catalog.has_schema_privilege('forge_migration_test', 'forge', 'create') or pg_catalog.has_schema_privilege('forge_s4_routines_owner', 'public', 'create') or pg_catalog.has_schema_privilege('forge_s4_routines_owner', 'forge', 'create') or not pg_catalog.has_schema_privilege('forge_s4_routines_owner', 'forge', 'usage') then raise exception 'registry cleanup proof retained or removed authority'; end if; end \$\$;"
+          test "$registry_failed" -ne 0
+          bash scripts/ci/apply-verification-goal-registry-migration.sh
       - name: Create the freshly migrated isolated S4 PostgreSQL proof database
         run: |
           npm run protocol:bootstrap-epic-172-release-roles
@@ -224,6 +235,7 @@ jobs:
           npm run protocol:bootstrap-epic-172-s4-roles
           npx tsx scripts/ci/migrate-through-0027.ts
           bash scripts/ci/apply-epic-172-s5-recovery-migration.sh
+          bash scripts/ci/apply-verification-goal-registry-migration.sh
         env:
           DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_s4_ci_test
           FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_s4_ci_test
@@ -271,13 +283,19 @@ jobs:
             REVOKE ALL ON TABLE public.execution_outcomes, public.operation_runs,
               public.operation_run_events, public.capability_attempts,
               public.capability_attempt_adjudications,
-              public.verification_goal_snapshots FROM forge_app_test;
+              public.verification_goal_snapshots,
+              public.verification_goal_registry_revisions,
+              public.verification_goal_registry_entries,
+              public.verification_goal_registry_heads FROM forge_app_test;
             GRANT SELECT, INSERT, UPDATE ON TABLE public.execution_outcomes,
               public.operation_runs TO forge_app_test;
             GRANT SELECT, INSERT ON TABLE public.operation_run_events TO forge_app_test;
             GRANT SELECT, INSERT ON TABLE public.capability_attempts,
               public.capability_attempt_adjudications TO forge_app_test;
             GRANT SELECT, INSERT ON TABLE public.verification_goal_snapshots TO forge_app_test;
+            GRANT SELECT ON TABLE public.verification_goal_registry_revisions,
+              public.verification_goal_registry_entries,
+              public.verification_goal_registry_heads TO forge_app_test;
             GRANT USAGE, SELECT ON SEQUENCE public.task_logs_sequence_seq TO forge_app_test;
           END;
           $grant_s4_application_acl$;
@@ -317,6 +335,11 @@ jobs:
           DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_epic_172_ci_test
       - name: Apply migration-0028 with failure-safe S5 recovery ownership
         run: bash scripts/ci/apply-epic-172-s5-recovery-migration.sh
+        env:
+          DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_epic_172_ci_test
+          FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_epic_172_ci_test
+      - name: Apply verification-goal registry migration with failure-safe ownership
+        run: bash scripts/ci/apply-verification-goal-registry-migration.sh
         env:
           DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_epic_172_ci_test
           FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_epic_172_ci_test
@@ -519,7 +542,8 @@ jobs:
             operation_ledger_tables constant text[] := ARRAY[
               'execution_outcomes', 'operation_runs', 'operation_run_events',
               'capability_attempts', 'capability_attempt_adjudications',
-              'verification_goal_snapshots'
+              'verification_goal_snapshots', 'verification_goal_registry_revisions',
+              'verification_goal_registry_entries', 'verification_goal_registry_heads'
             ];
             protected_tables constant text[] := ARRAY[
               'forge_release_signer_keys', 'forge_release_signer_key_lifecycle_audits',
@@ -569,6 +593,9 @@ jobs:
             GRANT SELECT, INSERT ON TABLE public.capability_attempts,
               public.capability_attempt_adjudications TO forge_app_test;
             GRANT SELECT, INSERT ON TABLE public.verification_goal_snapshots TO forge_app_test;
+            GRANT SELECT ON TABLE public.verification_goal_registry_revisions,
+              public.verification_goal_registry_entries,
+              public.verification_goal_registry_heads TO forge_app_test;
             FOREACH table_name IN ARRAY operation_ledger_tables LOOP
               FOREACH table_privilege IN ARRAY ARRAY[
                 'SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER'
@@ -580,6 +607,8 @@ jobs:
                     AND table_privilege IN ('SELECT', 'INSERT', 'UPDATE'))
                   OR (table_name IN ('operation_run_events', 'capability_attempts', 'capability_attempt_adjudications', 'verification_goal_snapshots')
                     AND table_privilege IN ('SELECT', 'INSERT'))
+                  OR (table_name IN ('verification_goal_registry_revisions', 'verification_goal_registry_entries', 'verification_goal_registry_heads')
+                    AND table_privilege = 'SELECT')
                 ) THEN
                   RAISE EXCEPTION 'ordinary app has unexpected % on operation ledger table public.%',
                     table_privilege, table_name;
@@ -603,6 +632,9 @@ jobs:
             GRANT USAGE, SELECT ON SEQUENCE public.task_logs_sequence_seq TO forge_app_test;
           END;
           $grant_application_acl$;
+          GRANT CONNECT ON DATABASE forge_epic_172_ci_test TO forge;
+          GRANT USAGE ON SCHEMA public TO forge;
+          GRANT SELECT ON TABLE public.projects TO forge;
           SQL
           PGPASSWORD=forge_app_test psql \
             --host localhost \
@@ -743,6 +775,7 @@ jobs:
           FORGE_RELIABILITY_LEDGER_POSTGRES_ADMIN_TEST_URL: postgresql://forge_e2e:forge@localhost:5432/forge_epic_172_ci_test
           FORGE_VERIFICATION_GOAL_REGISTRY_REQUIRE_POSTGRES_TEST: '1'
           FORGE_VERIFICATION_GOAL_REGISTRY_POSTGRES_ADMIN_TEST_URL: postgresql://forge_e2e:forge@localhost:5432/forge_epic_172_ci_test
+          FORGE_VERIFICATION_GOAL_REGISTRY_POSTGRES_APP_TEST_URL: postgresql://forge:forge_registry_test@localhost:5432/forge_epic_172_ci_test
           FORGE_WORKFORCE_MATERIALIZER_REQUIRE_POSTGRES_TEST: '1'
           FORGE_WORKFORCE_MATERIALIZER_POSTGRES_ADMIN_TEST_URL: postgresql://forge_e2e:forge@localhost:5432/forge_epic_172_ci_test
           FORGE_EPIC_172_TEST_APP_DATABASE_URL: postgresql://forge_app_test:forge_app_test@localhost:5432/forge_epic_172_ci_test

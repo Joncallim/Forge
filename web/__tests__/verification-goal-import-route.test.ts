@@ -26,7 +26,9 @@ vi.mock('@/worker/verification-goals/importer', async (importOriginal) => ({
 import { POST, runtime } from '@/app/api/projects/[id]/verification-goals/import/route'
 
 const PROJECT_ID = '11111111-1111-4111-8111-111111111111'
-const USER_ID = 'user-1'
+const USER_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+const REGISTRY_REVISION_ID = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+const MANIFEST_DIGEST = 'c'.repeat(64)
 const ROUTE_CONTEXT = { params: Promise.resolve({ id: PROJECT_ID }) }
 
 function request(body?: string): NextRequest {
@@ -42,12 +44,17 @@ describe('POST /api/projects/:id/verification-goals/import', () => {
     mocks.getSession.mockResolvedValue({ userId: USER_ID })
     mocks.guardIngress.mockResolvedValue(null)
     mocks.getAccessibleProject.mockResolvedValue({ id: PROJECT_ID, archivedAt: null })
-    mocks.importRegistry.mockResolvedValue([{
-      snapshotId: '22222222-2222-4222-8222-222222222222',
-      goalId: 'goal-one',
-      definitionVersion: 1,
-      kind: 'inserted',
-    }])
+    mocks.importRegistry.mockResolvedValue({
+      registryRevisionId: REGISTRY_REVISION_ID,
+      manifestDigest: MANIFEST_DIGEST,
+      headState: 'advanced',
+      snapshots: [{
+        snapshotId: '22222222-2222-4222-8222-222222222222',
+        goalId: 'goal-one',
+        definitionVersion: 1,
+        kind: 'inserted',
+      }],
+    })
   })
 
   it('uses the Node runtime', () => {
@@ -135,11 +142,17 @@ describe('POST /api/projects/:id/verification-goals/import', () => {
 
     expect(response.status).toBe(200)
     await expect(response.json()).resolves.toMatchObject({
-      schemaVersion: 1,
+      schemaVersion: 2,
       projectId: canonicalProjectId,
+      registryRevisionId: REGISTRY_REVISION_ID,
+      manifestDigest: MANIFEST_DIGEST,
+      headState: 'advanced',
     })
     expect(mocks.getAccessibleProject).toHaveBeenCalledWith(canonicalProjectId, USER_ID)
-    expect(mocks.importRegistry).toHaveBeenCalledWith({ projectId: canonicalProjectId })
+    expect(mocks.importRegistry).toHaveBeenCalledWith({
+      projectId: canonicalProjectId,
+      actorUserId: USER_ID,
+    })
   })
 
   it('rejects any caller body without consuming it or passing caller data to the importer', async () => {
@@ -162,27 +175,35 @@ describe('POST /api/projects/:id/verification-goals/import', () => {
   })
 
   it('returns only deterministic inserted and existing snapshot results', async () => {
-    mocks.importRegistry.mockResolvedValue([
-      {
-        snapshotId: '33333333-3333-4333-8333-333333333333',
-        goalId: 'z-goal',
-        definitionVersion: 2,
-        kind: 'existing',
-      },
-      {
-        snapshotId: '22222222-2222-4222-8222-222222222222',
-        goalId: 'a-goal',
-        definitionVersion: 1,
-        kind: 'inserted',
-      },
-    ])
+    mocks.importRegistry.mockResolvedValue({
+      registryRevisionId: REGISTRY_REVISION_ID,
+      manifestDigest: MANIFEST_DIGEST,
+      headState: 'advanced',
+      snapshots: [
+        {
+          snapshotId: '33333333-3333-4333-8333-333333333333',
+          goalId: 'z-goal',
+          definitionVersion: 2,
+          kind: 'existing',
+        },
+        {
+          snapshotId: '22222222-2222-4222-8222-222222222222',
+          goalId: 'a-goal',
+          definitionVersion: 1,
+          kind: 'inserted',
+        },
+      ],
+    })
 
     const response = await POST(request(), ROUTE_CONTEXT)
 
     expect(response.status).toBe(200)
     await expect(response.json()).resolves.toEqual({
-      schemaVersion: 1,
+      schemaVersion: 2,
       projectId: PROJECT_ID,
+      registryRevisionId: REGISTRY_REVISION_ID,
+      manifestDigest: MANIFEST_DIGEST,
+      headState: 'advanced',
       snapshots: [
         {
           snapshotId: '22222222-2222-4222-8222-222222222222',
@@ -200,7 +221,10 @@ describe('POST /api/projects/:id/verification-goals/import', () => {
       summary: { total: 2, inserted: 1, existing: 1 },
     })
     expect(mocks.importRegistry).toHaveBeenCalledOnce()
-    expect(mocks.importRegistry).toHaveBeenCalledWith({ projectId: PROJECT_ID })
+    expect(mocks.importRegistry).toHaveBeenCalledWith({
+      projectId: PROJECT_ID,
+      actorUserId: USER_ID,
+    })
   })
 
   it('keeps repeated existing imports idempotent and caller-input free', async () => {
@@ -210,7 +234,12 @@ describe('POST /api/projects/:id/verification-goals/import', () => {
       definitionVersion: 1,
       kind: 'existing',
     }]
-    mocks.importRegistry.mockResolvedValue(existing)
+    mocks.importRegistry.mockResolvedValue({
+      registryRevisionId: REGISTRY_REVISION_ID,
+      manifestDigest: MANIFEST_DIGEST,
+      headState: 'existing',
+      snapshots: existing,
+    })
 
     const first = await POST(request(), ROUTE_CONTEXT)
     const second = await POST(request(), ROUTE_CONTEXT)
@@ -218,8 +247,11 @@ describe('POST /api/projects/:id/verification-goals/import', () => {
     expect(first.status).toBe(200)
     expect(second.status).toBe(200)
     const expectedResponse = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       projectId: PROJECT_ID,
+      registryRevisionId: REGISTRY_REVISION_ID,
+      manifestDigest: MANIFEST_DIGEST,
+      headState: 'existing',
       snapshots: [{
         snapshotId: '22222222-2222-4222-8222-222222222222',
         goalId: 'goal-one',
@@ -231,19 +263,33 @@ describe('POST /api/projects/:id/verification-goals/import', () => {
     expect(await first.json()).toEqual(expectedResponse)
     expect(await second.json()).toEqual(expectedResponse)
     expect(mocks.importRegistry).toHaveBeenCalledTimes(2)
-    expect(mocks.importRegistry).toHaveBeenNthCalledWith(1, { projectId: PROJECT_ID })
-    expect(mocks.importRegistry).toHaveBeenNthCalledWith(2, { projectId: PROJECT_ID })
+    expect(mocks.importRegistry).toHaveBeenNthCalledWith(1, {
+      projectId: PROJECT_ID,
+      actorUserId: USER_ID,
+    })
+    expect(mocks.importRegistry).toHaveBeenNthCalledWith(2, {
+      projectId: PROJECT_ID,
+      actorUserId: USER_ID,
+    })
   })
 
-  it('returns a successful no-op when the project registry is absent or empty', async () => {
-    mocks.importRegistry.mockResolvedValue([])
+  it('returns a successful empty authoritative import when the project registry is absent or empty', async () => {
+    mocks.importRegistry.mockResolvedValue({
+      registryRevisionId: REGISTRY_REVISION_ID,
+      manifestDigest: MANIFEST_DIGEST,
+      headState: 'advanced',
+      snapshots: [],
+    })
 
     const response = await POST(request(), ROUTE_CONTEXT)
 
     expect(response.status).toBe(200)
     await expect(response.json()).resolves.toEqual({
-      schemaVersion: 1,
+      schemaVersion: 2,
       projectId: PROJECT_ID,
+      registryRevisionId: REGISTRY_REVISION_ID,
+      manifestDigest: MANIFEST_DIGEST,
+      headState: 'advanced',
       snapshots: [],
       summary: { total: 0, inserted: 0, existing: 0 },
     })
@@ -322,6 +368,18 @@ describe('POST /api/projects/:id/verification-goals/import', () => {
     })
   })
 
+  it.each([
+    ['project_authority_changed', 'The project authority changed during verification goal import.'],
+    ['registry_head_changed', 'The verification goal registry changed during import. Retry the request.'],
+  ] as const)('returns a fixed 409 for typed %s conflicts', async (code, error) => {
+    mocks.importRegistry.mockRejectedValue(new VerificationGoalImportError(code))
+
+    const response = await POST(request(), ROUTE_CONTEXT)
+
+    expect(response.status).toBe(409)
+    await expect(response.json()).resolves.toEqual({ error, code })
+  })
+
   it('returns a fixed 400 for a typed importer project-id rejection', async () => {
     mocks.importRegistry.mockRejectedValue(
       new VerificationGoalImportError('invalid_project_id'),
@@ -336,11 +394,12 @@ describe('POST /api/projects/:id/verification-goals/import', () => {
     })
   })
 
-  it('returns a generic correlated 500 and does not expose or log an unexpected error message', async () => {
+  it.each([
+    Object.assign(new Error('filesystem failed at /private/secret-project'), { code: 'EIO' }),
+    new Error('database failed with password TOP SECRET at /private/secret-project'),
+  ])('returns a generic correlated 500 for unexpected filesystem or database failures', async (failure) => {
     const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
-    mocks.importRegistry.mockRejectedValue(new Error(
-      'database failed with password TOP SECRET at /private/secret-project',
-    ))
+    mocks.importRegistry.mockRejectedValue(failure)
 
     try {
       const response = await POST(request(), ROUTE_CONTEXT)
@@ -354,11 +413,11 @@ describe('POST /api/projects/:id/verification-goals/import', () => {
       expect(text).not.toContain('/private/secret-project')
       expect(consoleError).toHaveBeenCalledWith(
         '[POST /api/projects/:id/verification-goals/import] Unexpected error',
-        {
+        expect.objectContaining({
           route: 'POST /api/projects/:id/verification-goals/import',
           errorClass: 'Error',
           correlationId: body.correlationId,
-        },
+        }),
       )
     } finally {
       consoleError.mockRestore()

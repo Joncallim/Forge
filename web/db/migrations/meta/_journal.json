@@ -232,6 +232,13 @@
       "when": 1786665600000,
       "tag": "0032_verification_goal_snapshots",
       "breakpoints": true
+    },
+    {
+      "idx": 33,
+      "version": "7",
+      "when": 1786752000000,
+      "tag": "0033_verification_goal_registry_revisions",
+      "breakpoints": true
     }
   ]
 }

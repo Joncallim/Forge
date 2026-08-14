@@ -12,55 +12,68 @@ function identifier(value: string): string {
 
 async function main(): Promise<void> {
   const adminUrl = process.env.FORGE_DATABASE_ADMIN_URL?.trim()
-  if (!adminUrl) throw new Error('FORGE_DATABASE_ADMIN_URL is required for the one-shot S5 owner handoff.')
+  if (!adminUrl) throw new Error('FORGE_DATABASE_ADMIN_URL is required for the one-shot protected-owner handoff.')
   const migration = postgres(getRequiredEnv('DATABASE_URL'), { max: 1, onnotice: () => {} })
   const [{ migrationRole }] = await migration<{ migrationRole: string }[]>`select current_user as "migrationRole"`
   await migration.end({ timeout: 5 })
   const admin = postgres(adminUrl, { max: 1, onnotice: () => {} })
   try {
     if (process.argv.includes('--cleanup')) {
-      // This is deliberately idempotent. A failed 0028 transaction can leave
-      // the migration login holding the owner edge opened by BEGIN; CI invokes
-      // this path unconditionally so a failed cutover never becomes a durable
-      // privilege escalation.
+      // This is deliberately idempotent. A failed protected migration can
+      // leave the migration login or owner holding authority opened by BEGIN;
+      // every wrapper invokes this path unconditionally.
       await admin.unsafe(`revoke execute on function ${BEGIN}, ${FINALIZE} from ${identifier(migrationRole)};`)
       await admin.unsafe(`revoke forge_s4_routines_owner from ${identifier(migrationRole)};`)
       await admin.unsafe(`revoke create on schema forge from ${identifier(migrationRole)};`)
-      const [{ executeGrants, ownerMembership, schemaCreate }] = await admin<{
+      await admin.unsafe('revoke create on schema public, forge from forge_s4_routines_owner;')
+      await admin.unsafe('grant usage on schema forge to forge_s4_routines_owner;')
+      const [{ executeGrants, ownerMembership, migrationSchemaCreate,
+        ownerPublicCreate, ownerForgeCreate, ownerForgeUsage }] = await admin<{
         executeGrants: number
         ownerMembership: boolean
-        schemaCreate: boolean
+        migrationSchemaCreate: boolean
+        ownerPublicCreate: boolean
+        ownerForgeCreate: boolean
+        ownerForgeUsage: boolean
       }[]>`
         select
           (select count(*)::integer
-           from pg_catalog.aclexplode(coalesce(
-             (select proacl from pg_catalog.pg_proc where oid = ${BEGIN}::regprocedure),
-             pg_catalog.acldefault('f', (select proowner from pg_catalog.pg_proc where oid = ${BEGIN}::regprocedure))
+           from pg_catalog.pg_proc routine
+           cross join lateral pg_catalog.aclexplode(coalesce(
+             routine.proacl, pg_catalog.acldefault('f', routine.proowner)
            )) acl
-           where acl.grantee = ${migrationRole}::regrole and acl.privilege_type = 'EXECUTE') as "executeGrants",
+           where routine.oid = any(array[${BEGIN}::regprocedure, ${FINALIZE}::regprocedure])
+             and acl.grantee = ${migrationRole}::regrole
+             and acl.privilege_type = 'EXECUTE') as "executeGrants",
           pg_catalog.pg_has_role(${migrationRole}::name, 'forge_s4_routines_owner', 'MEMBER') as "ownerMembership",
-          pg_catalog.has_schema_privilege(${migrationRole}::name, 'forge', 'CREATE') as "schemaCreate"
+          pg_catalog.has_schema_privilege(${migrationRole}::name, 'forge', 'CREATE') as "migrationSchemaCreate",
+          pg_catalog.has_schema_privilege('forge_s4_routines_owner', 'public', 'CREATE') as "ownerPublicCreate",
+          pg_catalog.has_schema_privilege('forge_s4_routines_owner', 'forge', 'CREATE') as "ownerForgeCreate",
+          pg_catalog.has_schema_privilege('forge_s4_routines_owner', 'forge', 'USAGE') as "ownerForgeUsage"
       `
-      if (executeGrants !== 0 || ownerMembership || schemaCreate) {
-        throw new Error('The S5 recovery owner cleanup did not remove every temporary authority edge.')
+      if (executeGrants !== 0 || ownerMembership || migrationSchemaCreate
+        || ownerPublicCreate || ownerForgeCreate || !ownerForgeUsage) {
+        throw new Error('The protected-owner cleanup did not restore the exact authority boundary.')
       }
-      console.log('✓ Removed and verified every temporary S5 recovery owner handoff edge.')
+      console.log('✓ Removed and verified every temporary protected-owner handoff edge.')
       return
     }
     await admin.unsafe(`grant execute on function ${BEGIN}, ${FINALIZE} to ${identifier(migrationRole)};`)
     const [{ grants }] = await admin<{ grants: number }[]>`
       select count(*)::integer as "grants"
-      from pg_catalog.aclexplode(coalesce(
-        (select proacl from pg_catalog.pg_proc where oid = ${BEGIN}::regprocedure),
-        pg_catalog.acldefault('f', (select proowner from pg_catalog.pg_proc where oid = ${BEGIN}::regprocedure))
+      from pg_catalog.pg_proc routine
+      cross join lateral pg_catalog.aclexplode(coalesce(
+        routine.proacl, pg_catalog.acldefault('f', routine.proowner)
       )) acl
-      where acl.grantee = ${migrationRole}::regrole and acl.privilege_type = 'EXECUTE'
+      where routine.oid = any(array[${BEGIN}::regprocedure, ${FINALIZE}::regprocedure])
+        and acl.grantee = ${migrationRole}::regrole
+        and acl.privilege_type = 'EXECUTE'
     `
-    if (grants !== 1) throw new Error('The S5 recovery migration did not receive one exact bootstrap execute grant.')
+    if (grants !== 2) throw new Error('The protected migration did not receive both exact handoff execute grants.')
   } finally {
     await admin.end({ timeout: 5 })
   }
-  console.log('✓ Granted the migration login one transaction-scoped S5 recovery owner handoff.')
+  console.log('✓ Granted the migration login the bounded protected-owner handoff routines.')
 }
 
 main().catch((error) => { console.error(`✗ ${error instanceof Error ? error.message : String(error)}`); process.exit(1) })

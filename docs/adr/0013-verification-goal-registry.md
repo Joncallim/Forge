@@ -102,11 +102,51 @@ operation argument.
 
 An import returns the snapshots seen during that request and counts how many
 were newly inserted or already existed. A project with no registry files gets a
-successful no-op. An archived or inaccessible project stays hidden. An
+successful import with zero snapshots; Forge still records that empty registry
+as the project's current authoritative revision. An archived or inaccessible
+project stays hidden. An
 unavailable project repository is reported without exposing its path, and
 invalid registry details are replaced with fixed safe wording. This endpoint
 stores definitions only. It does not run a goal, queue work, or claim that a
 goal passed.
+
+## Authoritative registry revisions
+
+Each successful import now records one complete view of the registry, including
+an empty registry. Forge hashes a sorted list containing each goal's identifier,
+definition version, definition digest, and repository-relative source path. The
+hash never includes a database row identifier or an absolute filesystem path.
+Moving an unchanged goal file therefore creates a different registry manifest,
+while reading the same files in a different filesystem order does not.
+
+Before reading, Forge captures the project's owner, archive state, repository
+path and root identity, filesystem binding and grant revisions, project update
+time, and current registry head. After reading, one database transaction locks
+the project and head and checks that every captured value is unchanged. If the
+project authority changed, the import writes nothing. If another import advanced
+the head, Forge returns that revision only when its authority and exact manifest
+membership match the fresh read; otherwise the caller must retry.
+
+Registry revisions and their membership entries are append-only. A project's
+revision sequence starts at one and only increases. The sole mutable row is the
+project's current-head pointer. Its database guard permits only the next linked
+revision, exactly one sequence higher; an idempotent import leaves the pointer
+untouched. The ordinary application login can read this protected history but
+cannot write it directly. Instead, it calls one fixed database routine owned by
+a non-login role. That routine checks the project authority, the ordered
+membership, and the manifest hash before it constructs a revision or advances
+the head. Definition snapshots, the registry revision, its entries, and the
+head advance commit in one transaction. A conflict rolls all of them back.
+
+The revision's application-asserted actor identifier comes from the authenticated
+web session. The database routine verifies that this value matches the project's
+recorded owner, but PostgreSQL does not authenticate that web session itself.
+This field is useful application context, not non-repudiable proof of who acted.
+
+The import response uses schema version 2. It reports the registry revision,
+manifest digest, whether the head advanced or already existed, and snapshot
+counts. These records describe repository configuration only. They do not grant
+permission, run a goal, queue work, or state that verification passed.
 
 ## Migration proof
 

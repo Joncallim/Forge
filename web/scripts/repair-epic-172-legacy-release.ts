@@ -14,6 +14,7 @@ const migration0025At = 1784263200000
 const migration0026At = 1784266800000
 const migration0027At = 1784270400000
 const migration0028At = 1784274000000
+const migration0033At = 1786752000000
 const current0026 = '3434290ee6253c1cfe2b26e482228fceeba017417d0f4449aabcefa900d2d207'
 const current0027 = '8cf249d0ba7f10dca9ac1721677a5c6f4c5080d3f9f478156f72e0ac21c5ebd8'
 const current0028 = '7b6019d9d2a3a069c51e26a729e071982ddbbd20726727107c2b8c0ad08ee78a'
@@ -97,6 +98,9 @@ const protectedInstallerRelations = [
   { name: 'forge_epic_172_s3_release_state', owner: releaseOwner, scope: 's3' },
   { name: 'work_package_local_projection_sources', owner: releaseOwner, scope: 'projection' },
   { name: 'work_package_local_projection_heads', owner: releaseOwner, scope: 'projection' },
+  { name: 'verification_goal_registry_revisions', owner: s4Owner, scope: 'current-read-only' },
+  { name: 'verification_goal_registry_entries', owner: s4Owner, scope: 'current-read-only' },
+  { name: 'verification_goal_registry_heads', owner: s4Owner, scope: 'current-read-only' },
   { name: 'architect_plan_versions', owner: s4Owner, scope: 's4' },
   { name: 'architect_plan_entries', owner: s4Owner, scope: 's4' },
   { name: 'architect_plan_execution_references', owner: s4Owner, scope: 's4' },
@@ -130,21 +134,27 @@ const protectedReleaseTables = protectedInstallerRelations
   .filter((relation) => relation.scope === 'release')
   .map((relation) => relation.name)
 const protectedInstallerGrantTables = protectedInstallerRelations.map((relation) => relation.name)
+const historicalProtectedInstallerGrantTables = protectedInstallerRelations
+  .filter((relation) => relation.scope !== 'current-read-only')
+  .map((relation) => relation.name)
 const exact0026ProtectedInstallerTables = protectedInstallerRelations
   .filter((relation) => relation.scope === 'release' || relation.scope === 's3' || relation.scope === 'projection')
   .map((relation) => relation.name)
 const exact0026ProjectionTables = protectedInstallerRelations
   .filter((relation) => relation.scope === 'projection')
   .map((relation) => relation.name)
-const protectedProjectionTables = new Set<string>(protectedInstallerRelations
-  .filter((relation) => relation.scope === 'projection')
-  .map((relation) => relation.name))
-const protectedEffectiveSelectTables = protectedInstallerRelations
-  .filter((relation) => relation.scope === 's3' || relation.scope === 'projection')
+const currentReadOnlyProtectedTables = protectedInstallerRelations
+  .filter((relation) => relation.scope === 'current-read-only')
   .map((relation) => relation.name)
-const protectedInstallerGrantTableSql = protectedInstallerGrantTables
-  .map((table) => `public.${table}`)
-  .join(', ')
+const protectedDirectReadTables = new Set<string>([
+  ...exact0026ProjectionTables,
+  ...currentReadOnlyProtectedTables,
+])
+const protectedEffectiveSelectTables = protectedInstallerRelations
+  .filter((relation) => relation.scope === 's3'
+    || relation.scope === 'projection'
+    || relation.scope === 'current-read-only')
+  .map((relation) => relation.name)
 const forgeContaminationPrivileges = ['DELETE', 'INSERT', 'SELECT', 'UPDATE'] as const
 const releaseRoutineNames = [
   'activate_epic_172_release_signer_v1', 'assert_epic_172_transition_authorization_live_v1',
@@ -942,6 +952,7 @@ async function exactProtectedInstallerColumnAcls(
 
 async function exactEffectiveForgeProtectedInstallerPrivileges(
   sql: postgres.Sql | postgres.TransactionSql,
+  relationNames: readonly string[],
 ): Promise<boolean> {
   const [boundary] = await sql<readonly {
     roles: number; relations: number; violations: number; publicViolations: number
@@ -954,7 +965,7 @@ async function exactEffectiveForgeProtectedInstallerPrivileges(
       JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = relation.relnamespace
       WHERE namespace_row.nspname = 'public'
         AND relation.relkind IN ('r', 'p')
-        AND relation.relname = ANY(${sql.array([...protectedInstallerGrantTables])}::text[])
+        AND relation.relname = ANY(${sql.array([...relationNames])}::text[])
     )
     SELECT
       (SELECT pg_catalog.count(*)::integer FROM forge_role) AS roles,
@@ -1004,7 +1015,7 @@ async function exactEffectiveForgeProtectedInstallerPrivileges(
   return boundary?.publicViolations === 0
     && (boundary.roles === 0
       || (boundary.roles === 1
-        && boundary.relations === protectedInstallerRelations.length
+        && boundary.relations === relationNames.length
         && boundary.violations === 0))
 }
 
@@ -1013,6 +1024,7 @@ type ProtectedInstallerAclMode = 'pre-0028-clean' | 'canonical' | 'legacy-dirty'
 async function exactProtectedInstallerBoundary(
   sql: postgres.Sql | postgres.TransactionSql,
   mode: ProtectedInstallerAclMode,
+  relationNames: readonly string[],
 ): Promise<boolean> {
   const relations = await sql<readonly { name: string; owner: string; kind: string }[]>`
     SELECT relation.relname AS name, owner_role.rolname AS owner, relation.relkind AS kind
@@ -1020,16 +1032,16 @@ async function exactProtectedInstallerBoundary(
     JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = relation.relnamespace
     JOIN pg_catalog.pg_roles owner_role ON owner_role.oid = relation.relowner
     WHERE namespace_row.nspname = 'public'
-      AND relation.relname = ANY(${sql.array([...protectedInstallerGrantTables])}::text[])
+      AND relation.relname = ANY(${sql.array([...relationNames])}::text[])
     ORDER BY relation.relname
   `
   const expectedByName = new Map<string, string>(protectedInstallerRelations
     .map((relation) => [relation.name, relation.owner] as const))
-  if (relations.length !== protectedInstallerRelations.length || relations.some((relation) => (
+  if (relations.length !== relationNames.length || relations.some((relation) => (
     relation.kind !== 'r' && relation.kind !== 'p'
   ) || expectedByName.get(relation.name) !== relation.owner)) return false
 
-  if (!await exactProtectedInstallerColumnAcls(sql, protectedInstallerGrantTables)) return false
+  if (!await exactProtectedInstallerColumnAcls(sql, relationNames)) return false
 
   const grants = await sql<readonly { entry: string }[]>`
     SELECT relation.relname || '|' || privilege.privilege_type || '|'
@@ -1042,19 +1054,19 @@ async function exactProtectedInstallerBoundary(
     JOIN pg_catalog.pg_roles grantee ON grantee.oid = privilege.grantee
     JOIN pg_catalog.pg_roles grantor ON grantor.oid = privilege.grantor
     WHERE namespace_row.nspname = 'public'
-      AND relation.relname = ANY(${sql.array([...protectedInstallerGrantTables])}::text[])
+      AND relation.relname = ANY(${sql.array([...relationNames])}::text[])
       AND grantee.rolname = 'forge'
     ORDER BY 1
   `
   const expected: string[] = []
   if (mode === 'canonical') {
-    for (const relation of protectedInstallerRelations) {
-      if (protectedProjectionTables.has(relation.name)) {
+    for (const relation of protectedInstallerRelations.filter(({ name }) => relationNames.includes(name))) {
+      if (protectedDirectReadTables.has(relation.name)) {
         expected.push(`${relation.name}|SELECT|false|${relation.owner}`)
       }
     }
   } else if (mode === 'legacy-dirty') {
-    for (const relation of protectedInstallerRelations) {
+    for (const relation of protectedInstallerRelations.filter(({ name }) => relationNames.includes(name))) {
       for (const privilege of forgeContaminationPrivileges) {
         expected.push(`${relation.name}|${privilege}|false|${relation.owner}`)
       }
@@ -1065,7 +1077,7 @@ async function exactProtectedInstallerBoundary(
   if (actual.length !== expected.length
     || !actual.every((entry, index) => entry === expected[index])) return false
   return mode === 'legacy-dirty'
-    || await exactEffectiveForgeProtectedInstallerPrivileges(sql)
+    || await exactEffectiveForgeProtectedInstallerPrivileges(sql, relationNames)
 }
 
 async function exactOptionalForgeAppRoleBoundary(
@@ -1376,6 +1388,7 @@ async function current0026Fingerprint(sql: postgres.Sql | postgres.TransactionSq
 async function durableRepairedFingerprint(
   sql: postgres.Sql | postgres.TransactionSql,
   protectedAclMode: ProtectedInstallerAclMode,
+  protectedRelationNames: readonly string[],
 ): Promise<boolean> {
   // Later migrations legitimately add S4/S5 objects and may populate release
   // state.  The stable repair receipt is therefore the complete protected S3
@@ -1384,7 +1397,7 @@ async function durableRepairedFingerprint(
   return await exactReleaseCatalog(sql, true, 'durable-s4-no-public')
     && await exactS3CompletionBoundary(sql, expectForgeContamination)
     && await exactProtectedTableAcls(sql, true, expectForgeContamination)
-    && await exactProtectedInstallerBoundary(sql, protectedAclMode)
+    && await exactProtectedInstallerBoundary(sql, protectedAclMode, protectedRelationNames)
     && await exactLegacyConsumerLocalAuthority(sql, true)
     && await exactRoutines(sql, repairedRoutineDigests, false, true, null)
     && await exactReleaseRoleBoundary(sql, true)
@@ -1443,6 +1456,10 @@ async function main(): Promise<void> {
               : expected[1]
           return row.hash === expectedHash
         })
+      const currentReadOnlyScopePresent = lockedHashes.has(migration0033At)
+      const durableProtectedRelations = currentReadOnlyScopePresent
+        ? protectedInstallerGrantTables
+        : historicalProtectedInstallerGrantTables
       if (!exactLedger || !position) {
         throw new Error('Refusing legacy release repair: locked migration ledger is not an exact supported 0026, 0027, or 0028-or-later position.')
       }
@@ -1461,9 +1478,13 @@ async function main(): Promise<void> {
       }
 
       if (position !== '0026') {
-        await lockProtectedInstallerAclCatalog(sql)
+        await lockProtectedInstallerAclCatalog(sql, durableProtectedRelations)
         const cleanAclMode = position === '0027' ? 'pre-0028-clean' : 'canonical'
-        if (await durableRepairedFingerprint(sql, cleanAclMode)) return 'later-repaired' as const
+        if (await durableRepairedFingerprint(
+          sql,
+          cleanAclMode,
+          durableProtectedRelations,
+        )) return 'later-repaired' as const
         if (position !== '0028') {
           throw new Error('Refusing legacy release repair: protected installer grants are normalizable only at the exact 0028 ledger position.')
         }
@@ -1472,11 +1493,24 @@ async function main(): Promise<void> {
         // public table after migrations. The exact protected relation and
         // column catalog tuples are already locked, so concurrent table- or
         // column-level GRANT/REVOKE changes serialize before classification.
-        if (!await durableRepairedFingerprint(sql, 'legacy-dirty')) {
+        if (!await durableRepairedFingerprint(sql, 'legacy-dirty', durableProtectedRelations)) {
           throw new Error('Refusing legacy release repair: a later legacy-hash ledger lacks the durable repaired catalog fingerprint.')
         }
-        await sql.unsafe(`REVOKE ALL ON TABLE ${protectedInstallerGrantTableSql} FROM forge`)
-        await sql.unsafe(`GRANT SELECT ON TABLE public.work_package_local_projection_sources, public.work_package_local_projection_heads TO forge`)
+        const protectedRelationSql = durableProtectedRelations
+          .map((table) => `public.${table}`)
+          .join(', ')
+        await sql.unsafe(`REVOKE ALL ON TABLE ${protectedRelationSql} FROM forge`)
+        const directReadTables = [
+          ...exact0026ProjectionTables,
+          ...(currentReadOnlyScopePresent ? currentReadOnlyProtectedTables : []),
+        ].map((table) => `public.${table}`).join(', ')
+        await sql.unsafe(`GRANT SELECT ON TABLE ${directReadTables} TO forge`)
+        if (currentReadOnlyScopePresent) {
+          await sql.unsafe(`REVOKE ALL ON TABLE public.verification_goal_snapshots FROM forge`)
+          await sql.unsafe(`GRANT SELECT, INSERT ON TABLE public.verification_goal_snapshots TO forge`)
+          await sql.unsafe(`REVOKE ALL ON FUNCTION public.forge_commit_verification_goal_registry_revision_v1(uuid,uuid,uuid,uuid,timestamptz,text,uuid,bigint,bigint,timestamptz,text,jsonb) FROM PUBLIC, forge`)
+          await sql.unsafe(`GRANT EXECUTE ON FUNCTION public.forge_commit_verification_goal_registry_revision_v1(uuid,uuid,uuid,uuid,timestamptz,text,uuid,bigint,bigint,timestamptz,text,jsonb) TO forge`)
+        }
         const ledgerAfterNormalization = await sql<readonly { hash: string; created_at: number }[]>`
           SELECT hash, created_at
           FROM drizzle.__drizzle_migrations
@@ -1489,7 +1523,7 @@ async function main(): Promise<void> {
           ))) {
           throw new Error('Legacy release protected-grant normalization unexpectedly altered the immutable migration ledger.')
         }
-        if (!await durableRepairedFingerprint(sql, 'canonical')) {
+        if (!await durableRepairedFingerprint(sql, 'canonical', durableProtectedRelations)) {
           throw new Error('Legacy release protected-grant normalization did not restore the exact durable catalog fingerprint.')
         }
         return 'later-normalized' as const

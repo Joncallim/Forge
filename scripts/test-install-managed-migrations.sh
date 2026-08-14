@@ -6,6 +6,12 @@ SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALLER="$SCRIPT_DIR/install.sh"
 REPAIR="$SCRIPT_DIR/repair.sh"
 PRIVILEGE_SQL="$SCRIPT_DIR/reconcile-forge-app-privileges.sql"
+LEGACY_REPAIR_PROOF="$SCRIPT_DIR/../web/scripts/ci/prove-installer-legacy-migration-repair.sh"
+S5_MIGRATION_WRAPPER="$SCRIPT_DIR/../web/scripts/ci/apply-epic-172-s5-recovery-migration.sh"
+REGISTRY_MIGRATION_WRAPPER="$SCRIPT_DIR/../web/scripts/ci/apply-verification-goal-registry-migration.sh"
+PROTECTED_OWNER_BOOTSTRAP="$SCRIPT_DIR/../web/scripts/bootstrap-epic-172-s5-recovery-owner.ts"
+MIGRATE_THROUGH_0028="$SCRIPT_DIR/../web/scripts/ci/migrate-through-0028.ts"
+MIGRATE_THROUGH_0033="$SCRIPT_DIR/../web/scripts/ci/migrate-through-0033.ts"
 TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/forge-managed-migrations.XXXXXX")"
 trap 'rm -rf "$TEST_ROOT"' EXIT
 TEST_SECRET='TEST_APP_DATABASE_URL_MUST_NOT_APPEAR'
@@ -91,6 +97,70 @@ case "$service_transition_text" in
 esac
 assert_contains 'GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO forge;' "$PRIVILEGE_SQL"
 assert_contains 'GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO forge;' "$PRIVILEGE_SQL"
+assert_contains 'public.verification_goal_registry_revisions,' "$PRIVILEGE_SQL"
+assert_contains 'public.verification_goal_registry_entries,' "$PRIVILEGE_SQL"
+assert_contains 'public.verification_goal_registry_heads' "$PRIVILEGE_SQL"
+assert_contains "RAISE EXCEPTION 'forge verification goal registry privileges are outside the exact append-only matrix'" "$PRIVILEGE_SQL"
+assert_contains "RAISE EXCEPTION 'verification goal registry commit routine owner or execute boundary is invalid'" "$PRIVILEGE_SQL"
+assert_contains "RAISE EXCEPTION 'protected owner roles are outside the exact safe boundary'" "$PRIVILEGE_SQL"
+assert_contains "RAISE EXCEPTION 'protected owner roles changed during reconciliation'" "$PRIVILEGE_SQL"
+assert_contains 'role_row.rolpassword IS NULL' "$PRIVILEGE_SQL"
+assert_contains "membership.member IN (" "$PRIVILEGE_SQL"
+assert_contains "routine.proconfig = ARRAY['search_path=pg_catalog']" "$PRIVILEGE_SQL"
+assert_contains 'GRANT EXECUTE ON FUNCTION public.forge_commit_verification_goal_registry_revision_v1(' "$PRIVILEGE_SQL"
+registry_current_read_scope_count="$(grep -c "scope: 'current-read-only'" \
+  "$SCRIPT_DIR/../web/scripts/repair-epic-172-legacy-release.ts")"
+[ "$registry_current_read_scope_count" = 3 ] \
+  || fail 'legacy repair must classify the three registry tables in the current-only read scope'
+assert_contains 'const currentReadOnlyProtectedTables = protectedInstallerRelations' \
+  "$SCRIPT_DIR/../web/scripts/repair-epic-172-legacy-release.ts"
+assert_contains '...currentReadOnlyProtectedTables,' \
+  "$SCRIPT_DIR/../web/scripts/repair-epic-172-legacy-release.ts"
+assert_contains 'if (protectedDirectReadTables.has(relation.name))' \
+  "$SCRIPT_DIR/../web/scripts/repair-epic-172-legacy-release.ts"
+assert_contains 'snapshot managed-latest-once' "$LEGACY_REPAIR_PROOF"
+assert_contains 'snapshot managed-latest-twice' "$LEGACY_REPAIR_PROOF"
+assert_contains "assert_unchanged managed-latest-once managed-latest-twice 'Managed latest rerun'" \
+  "$LEGACY_REPAIR_PROOF"
+assert_contains 'CANONICAL_PROTECTED_DIRECT_READ_COUNT=5' "$LEGACY_REPAIR_PROOF"
+assert_contains 'assert_protected_forge_acl_count "$CANONICAL_PROTECTED_DIRECT_READ_COUNT"' \
+  "$LEGACY_REPAIR_PROOF"
+assert_contains "direct_read_tables constant text[] := ARRAY[" "$LEGACY_REPAIR_PROOF"
+canonical_direct_read_count="$(sed -n 's/^CANONICAL_PROTECTED_DIRECT_READ_COUNT=//p' \
+  "$LEGACY_REPAIR_PROOF")"
+declared_direct_read_count="$(sed -n \
+  '/direct_read_tables constant text\[\] := ARRAY\[/,/^  \];/p' "$LEGACY_REPAIR_PROOF" \
+  | grep -c "^    '[^']*'[,]*$")"
+[ "$declared_direct_read_count" = "$canonical_direct_read_count" ] \
+  || fail 'legacy proof canonical direct-read count must match its exact table set'
+for direct_read_table in \
+  work_package_local_projection_sources \
+  work_package_local_projection_heads \
+  verification_goal_registry_revisions \
+  verification_goal_registry_entries \
+  verification_goal_registry_heads; do
+  assert_contains "'$direct_read_table'" "$LEGACY_REPAIR_PROOF"
+done
+assert_contains 'relation.relname <> ALL(direct_read_tables)' "$LEGACY_REPAIR_PROOF"
+assert_contains 'FOREACH direct_read_table IN ARRAY direct_read_tables' "$LEGACY_REPAIR_PROOF"
+assert_not_contains "relation.relname NOT IN ('work_package_local_projection_sources', 'work_package_local_projection_heads')" "$LEGACY_REPAIR_PROOF"
+assert_contains ") <> current_setting('forge.proof_canonical_protected_direct_read_count')::integer + 1 OR (" \
+  "$LEGACY_REPAIR_PROOF"
+assert_contains ") <> current_setting('forge.proof_canonical_protected_direct_read_count')::integer OR (" \
+  "$LEGACY_REPAIR_PROOF"
+assert_not_contains ') <> 3 OR (' "$LEGACY_REPAIR_PROOF"
+assert_not_contains ') <> 2 OR (' "$LEGACY_REPAIR_PROOF"
+assert_contains 'npx tsx scripts/ci/migrate-through-0028.ts' "$S5_MIGRATION_WRAPPER"
+assert_not_contains 'npm run db:migrate' "$S5_MIGRATION_WRAPPER"
+assert_contains 'FORGE_REGISTRY_FORCE_HANDOFF_FAILURE' "$REGISTRY_MIGRATION_WRAPPER"
+assert_contains 'npx tsx scripts/ci/migrate-through-0033.ts' "$REGISTRY_MIGRATION_WRAPPER"
+assert_contains "const PREDECESSOR_MIGRATION = '0027_epic_172_s4_packet_context'" "$MIGRATE_THROUGH_0028"
+assert_contains "const TARGET_MIGRATION = '0028_epic_172_s5_recovery_actions'" "$MIGRATE_THROUGH_0028"
+assert_contains "const PREDECESSOR_MIGRATION = '0032_verification_goal_snapshots'" "$MIGRATE_THROUGH_0033"
+assert_contains "const TARGET_MIGRATION = '0033_verification_goal_registry_revisions'" "$MIGRATE_THROUGH_0033"
+assert_contains 'routine.oid = any(array[${BEGIN}::regprocedure, ${FINALIZE}::regprocedure])' "$PROTECTED_OWNER_BOOTSTRAP"
+assert_contains "revoke create on schema public, forge from forge_s4_routines_owner" "$PROTECTED_OWNER_BOOTSTRAP"
+assert_contains "grant usage on schema forge to forge_s4_routines_owner" "$PROTECTED_OWNER_BOOTSTRAP"
 assert_contains "owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner')" "$PRIVILEGE_SQL"
 assert_contains 'FOR UPDATE OF relation;' "$PRIVILEGE_SQL"
 assert_contains 'FOR UPDATE OF attribute;' "$PRIVILEGE_SQL"
@@ -127,8 +197,8 @@ sed -n '/canonical-protected-owner-map-begin/,/canonical-protected-owner-map-end
   | sed -n "s/^  { name: '\([^']*\)', owner: \([^,]*\),.*/\1|\2/p" \
   | sed 's/|releaseOwner$/|forge_release_routines_owner/; s/|s4Owner$/|forge_s4_routines_owner/' \
   | sort > "$ts_owner_map"
-[ "$(wc -l < "$sql_owner_map" | tr -d '[:space:]')" = 37 ] \
-  || fail 'shared SQL must define the exact 37-table protected owner map'
+[ "$(wc -l < "$sql_owner_map" | tr -d '[:space:]')" = 40 ] \
+  || fail 'shared SQL must define the exact 40-table protected owner map'
 cmp -s "$sql_owner_map" "$ts_owner_map" \
   || fail 'shared SQL and legacy normalizer protected owner maps drifted'
 
@@ -914,7 +984,7 @@ run_managed_case() {
   CASE_DIR="$case_dir"
 }
 
-expected_stages=(release migrate-0025 s3 migrate-0026 legacy-repair s4 migrate-0027 s5 latest)
+expected_stages=(release migrate-0025 s3 migrate-0026 legacy-repair s4 migrate-0027 s5 registry latest)
 
 run_managed_case current current
 [ "$CASE_STATUS" -eq 0 ] || fail 'current-user managed migration should succeed'
@@ -947,6 +1017,12 @@ run_managed_case s5-failure current 0 s5
 assert_contains 's5-cleanup-attempted' "$CASE_DIR/stages"
 assert_not_contains 'latest' "$CASE_DIR/stages"
 assert_contains 'its cleanup wrapper preserves the original migration failure' "$CASE_DIR/stderr"
+
+run_managed_case registry-failure current 0 registry
+[ "$CASE_STATUS" -ne 0 ] || fail 'registry migration failure must fail the orchestration'
+assert_contains 'registry-cleanup-attempted' "$CASE_DIR/stages"
+assert_not_contains 'latest' "$CASE_DIR/stages"
+assert_contains 'verification-goal registry; its cleanup wrapper preserves the original migration failure' "$CASE_DIR/stderr"
 
 run_managed_case legacy-repair-failure current 0 legacy-repair
 [ "$CASE_STATUS" -ne 0 ] || fail 'legacy repair failure must fail the orchestration'

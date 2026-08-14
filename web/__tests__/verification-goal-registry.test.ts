@@ -4,23 +4,73 @@ import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { OPERATION_CATALOG } from '@/lib/operations/catalog'
-import type { ProjectExecutionRootBinding } from '@/lib/projects/local-path'
+import {
+  ProjectRootBindingError,
+  type ProjectExecutionRootBinding,
+} from '@/lib/projects/local-path'
 import {
   MAX_VERIFICATION_GOAL_FILE_BYTES,
   VERIFICATION_GOAL_REGISTRY_PATH,
   loadVerificationGoalRegistry,
   loadVerificationGoalRegistryForTest,
-  type LoadedVerificationGoal,
 } from '@/lib/verification-goals/registry'
 import {
   importVerificationGoalRegistryForTest,
   type ImportVerificationGoalRegistryInput,
   VerificationGoalImportError,
 } from '@/worker/verification-goals/importer'
-import type { VerificationGoalSnapshotStore } from '@/worker/verification-goals/snapshots'
+import type {
+  VerificationGoalRegistryCommitInput,
+  VerificationGoalRegistryStore,
+} from '@/worker/verification-goals/registry-store'
 
 const roots: string[] = []
 const projectId = '11111111-1111-4111-8111-111111111111'
+const actorUserId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+const rootRef = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+const projectRevision = '2026-08-15T00:00:00.000000Z'
+const importInput = { projectId, actorUserId }
+
+function projectAuthority(
+  localPath: string | null,
+  overrides: Partial<{
+    id: string
+    submittedBy: string | null
+    archivedAt: Date | null
+    rootRef: string | null
+    rootBindingRevision: bigint
+    grantDecisionRevision: bigint
+    updatedAt: string
+    priorHeadRevisionId: string | null
+  }> = {},
+) {
+  return {
+    id: projectId,
+    submittedBy: actorUserId,
+    archivedAt: null,
+    localPath,
+    rootRef,
+    rootBindingRevision: BigInt(1),
+    grantDecisionRevision: BigInt(1),
+    updatedAt: projectRevision,
+    priorHeadRevisionId: null,
+    ...overrides,
+  }
+}
+
+function registryStore(commitRegistry = vi.fn(async (input: VerificationGoalRegistryCommitInput) => ({
+  registryRevisionId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+  manifestDigest: input.manifest.digest,
+  headState: 'advanced' as const,
+  snapshots: input.goals.map((goal) => ({
+    snapshotId: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
+    goalId: goal.definition.goalId,
+    definitionVersion: goal.definition.definitionVersion,
+    kind: 'inserted' as const,
+  })),
+}))) {
+  return { commitRegistry, store: { commitRegistry } satisfies VerificationGoalRegistryStore }
+}
 
 async function projectRoot(): Promise<string> {
   const created = await mkdtemp(path.join(tmpdir(), 'forge-verification-goals-'))
@@ -98,16 +148,15 @@ describe('verification goal repository registry', () => {
       ...definition('invalid-goal'),
       argv: ['npm', 'test'],
     }))
-    const importSnapshots = vi.fn()
-    const store: VerificationGoalSnapshotStore = { importSnapshots }
+    const { commitRegistry, store } = registryStore()
 
-    await expect(importVerificationGoalRegistryForTest({ projectId }, {
-      loadProject: async () => ({ id: projectId, localPath: root }),
+    await expect(importVerificationGoalRegistryForTest(importInput, {
+      loadProject: async () => projectAuthority(root),
       bindProjectRoot: async () => projectBinding(root),
       store,
     }))
       .rejects.toThrow(/exactly the v1 definition keys/i)
-    expect(importSnapshots).not.toHaveBeenCalled()
+    expect(commitRegistry).not.toHaveBeenCalled()
   })
 
   it('fails before storage when the anchored registry is moved outside and its path symlinks to that inode', async () => {
@@ -134,11 +183,11 @@ describe('verification goal repository registry', () => {
 
   it('fails closed for unknown projects and projects without a local path', async () => {
     const root = await projectRoot()
-    const importSnapshots = vi.fn()
+    const commitRegistry = vi.fn()
     const bindProjectRoot = vi.fn(async () => projectBinding(root))
-    const store: VerificationGoalSnapshotStore = { importSnapshots }
+    const store: VerificationGoalRegistryStore = { commitRegistry }
 
-    await expect(importVerificationGoalRegistryForTest({ projectId }, {
+    await expect(importVerificationGoalRegistryForTest(importInput, {
       loadProject: async () => null,
       bindProjectRoot,
       store,
@@ -146,8 +195,8 @@ describe('verification goal repository registry', () => {
       name: 'VerificationGoalImportError',
       code: 'project_context_unavailable',
     })
-    await expect(importVerificationGoalRegistryForTest({ projectId }, {
-      loadProject: async () => ({ id: projectId, localPath: null }),
+    await expect(importVerificationGoalRegistryForTest(importInput, {
+      loadProject: async () => projectAuthority(null),
       bindProjectRoot,
       store,
     })).rejects.toMatchObject({
@@ -155,38 +204,52 @@ describe('verification goal repository registry', () => {
       code: 'project_repository_unavailable',
     })
     expect(bindProjectRoot).not.toHaveBeenCalled()
-    expect(importSnapshots).not.toHaveBeenCalled()
+    expect(commitRegistry).not.toHaveBeenCalled()
   })
 
   it('canonicalizes an uppercase project id before project resolution and storage', async () => {
     const root = await projectRoot()
     const uppercaseProjectId = 'AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA'
     const canonicalProjectId = uppercaseProjectId.toLowerCase()
-    const loadProject = vi.fn(async () => ({ id: canonicalProjectId, localPath: root }))
+    const canonicalActorUserId = actorUserId.toUpperCase()
+    const loadProject = vi.fn(async () => projectAuthority(root, { id: canonicalProjectId }))
     const bindProjectRoot = vi.fn(async () => projectBinding(root))
-    const importSnapshots = vi.fn(async () => [])
+    const { commitRegistry, store } = registryStore()
 
-    await expect(importVerificationGoalRegistryForTest({ projectId: uppercaseProjectId }, {
+    await expect(importVerificationGoalRegistryForTest({
+      projectId: uppercaseProjectId,
+      actorUserId: canonicalActorUserId,
+    }, {
       loadProject,
       bindProjectRoot,
-      store: { importSnapshots },
-    })).resolves.toEqual([])
+      store,
+    })).resolves.toMatchObject({ headState: 'advanced' })
 
     expect(loadProject).toHaveBeenCalledWith(canonicalProjectId)
-    expect(bindProjectRoot).toHaveBeenCalledWith({ id: canonicalProjectId, localPath: root })
-    expect(importSnapshots).toHaveBeenCalledWith(canonicalProjectId, [])
+    expect(bindProjectRoot).toHaveBeenCalledWith(projectAuthority(root, { id: canonicalProjectId }))
+    expect(commitRegistry).toHaveBeenCalledWith(expect.objectContaining({
+      authority: expect.objectContaining({
+        projectId: canonicalProjectId,
+        applicationAssertedActorUserId: actorUserId,
+        submittedBy: actorUserId,
+      }),
+      goals: [],
+    }))
   })
 
   it('uses typed errors for invalid or mismatched project identity', async () => {
     const root = await projectRoot()
     const loadProject = vi.fn(async () => ({
+      ...projectAuthority(root),
       id: '22222222-2222-4222-8222-222222222222',
-      localPath: root,
     }))
     const bindProjectRoot = vi.fn(async () => projectBinding(root))
-    const store: VerificationGoalSnapshotStore = { importSnapshots: vi.fn() }
+    const { store } = registryStore()
 
-    await expect(importVerificationGoalRegistryForTest({ projectId: 'not-a-uuid' }, {
+    await expect(importVerificationGoalRegistryForTest({
+      projectId: 'not-a-uuid',
+      actorUserId,
+    }, {
       loadProject,
       bindProjectRoot,
       store,
@@ -196,7 +259,7 @@ describe('verification goal repository registry', () => {
     })
     expect(loadProject).not.toHaveBeenCalled()
 
-    await expect(importVerificationGoalRegistryForTest({ projectId }, {
+    await expect(importVerificationGoalRegistryForTest(importInput, {
       loadProject,
       bindProjectRoot,
       store,
@@ -209,16 +272,19 @@ describe('verification goal repository registry', () => {
 
   it('wraps project-root binding failures without retaining filesystem details', async () => {
     const root = await projectRoot()
-    const importSnapshots = vi.fn()
+    const { commitRegistry, store } = registryStore()
     let failure: unknown
 
     try {
-      await importVerificationGoalRegistryForTest({ projectId }, {
-        loadProject: async () => ({ id: projectId, localPath: root }),
+      await importVerificationGoalRegistryForTest(importInput, {
+        loadProject: async () => projectAuthority(root),
         bindProjectRoot: async () => {
-          throw new Error('Unsafe path /private/secret-project and parser text TOP SECRET')
+          throw new ProjectRootBindingError(
+            'project_root_unavailable',
+            'Unsafe path /private/secret-project and parser text TOP SECRET',
+          )
         },
-        store: { importSnapshots },
+        store,
       })
     } catch (error) {
       failure = error
@@ -229,7 +295,26 @@ describe('verification goal repository registry', () => {
     expect(failure).not.toHaveProperty('cause')
     expect((failure as Error).message).not.toContain('/private/secret-project')
     expect((failure as Error).message).not.toContain('TOP SECRET')
-    expect(importSnapshots).not.toHaveBeenCalled()
+    expect(commitRegistry).not.toHaveBeenCalled()
+  })
+
+  it('does not disguise unexpected filesystem or database failures as expected root errors', async () => {
+    const root = await projectRoot()
+    const { store } = registryStore()
+    const filesystemFailure = Object.assign(new Error('unexpected filesystem failure'), { code: 'EIO' })
+    const databaseFailure = new Error('unexpected database failure')
+
+    await expect(importVerificationGoalRegistryForTest(importInput, {
+      loadProject: async () => projectAuthority(root),
+      bindProjectRoot: async () => { throw filesystemFailure },
+      store,
+    })).rejects.toBe(filesystemFailure)
+
+    await expect(importVerificationGoalRegistryForTest(importInput, {
+      loadProject: async () => { throw databaseFailure },
+      bindProjectRoot: async () => projectBinding(root),
+      store,
+    })).rejects.toBe(databaseFailure)
   })
 
   it('cannot use a caller-supplied root in place of the authoritative project root', async () => {
@@ -245,33 +330,39 @@ describe('verification goal repository registry', () => {
       path.join(callerDirectory, 'caller.json'),
       JSON.stringify(definition('caller-goal')),
     )
-    const importSnapshots = vi.fn(async (
-      _projectId: string,
-      goals: readonly LoadedVerificationGoal[],
-    ) => goals.map((goal) => ({
-      snapshotId: '22222222-2222-4222-8222-222222222222',
-      goalId: goal.definition.goalId,
-      definitionVersion: goal.definition.definitionVersion,
-      kind: 'inserted' as const,
-    })))
+    const commitRegistry = vi.fn(async (input: VerificationGoalRegistryCommitInput) => ({
+      registryRevisionId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+      manifestDigest: input.manifest.digest,
+      headState: 'advanced' as const,
+      snapshots: input.goals.map((goal) => ({
+        snapshotId: '22222222-2222-4222-8222-222222222222',
+        goalId: goal.definition.goalId,
+        definitionVersion: goal.definition.definitionVersion,
+        kind: 'inserted' as const,
+      })),
+    }))
     const inputWithUntrustedExtra: ImportVerificationGoalRegistryInput = {
       projectId,
+      actorUserId,
       // @ts-expect-error Production callers cannot provide or override the root.
       projectRoot: callerRoot,
     }
     const result = await importVerificationGoalRegistryForTest(inputWithUntrustedExtra, {
-      loadProject: async () => ({ id: projectId, localPath: authoritativeRoot }),
+      loadProject: async () => projectAuthority(authoritativeRoot),
       bindProjectRoot: async (project) => projectBinding(project.localPath!),
-      store: { importSnapshots },
+      store: { commitRegistry },
     })
 
-    expect(result.map((row) => row.goalId)).toEqual(['authoritative-goal'])
-    expect(importSnapshots).toHaveBeenCalledWith(
-      projectId,
-      [expect.objectContaining({
+    expect(result.snapshots.map((row) => row.goalId)).toEqual(['authoritative-goal'])
+    expect(commitRegistry).toHaveBeenCalledWith(expect.objectContaining({
+      authority: expect.objectContaining({
+        projectId,
+        applicationAssertedActorUserId: actorUserId,
+      }),
+      goals: [expect.objectContaining({
         definition: expect.objectContaining({ goalId: 'authoritative-goal' }),
       })],
-    )
+    }))
   })
 
   it('fails before storage when the validated project root is rebound to an outside symlink', async () => {
@@ -280,19 +371,19 @@ describe('verification goal repository registry', () => {
     const movedProject = path.join(outsideRoot, 'moved-project')
     const directory = await registry(root)
     await writeFile(path.join(directory, 'trusted.json'), JSON.stringify(definition('trusted-goal')))
-    const importSnapshots = vi.fn()
+    const { commitRegistry, store } = registryStore()
 
-    await expect(importVerificationGoalRegistryForTest({ projectId }, {
-      loadProject: async () => ({ id: projectId, localPath: root }),
+    await expect(importVerificationGoalRegistryForTest(importInput, {
+      loadProject: async () => projectAuthority(root),
       bindProjectRoot: async () => {
         const validatedRoot = await projectBinding(await realpath(root))
         await rename(root, movedProject)
         await symlink(movedProject, root, 'dir')
         return validatedRoot
       },
-      store: { importSnapshots },
+      store,
     })).rejects.toThrow(/symlink|safely|fixed location/i)
-    expect(importSnapshots).not.toHaveBeenCalled()
+    expect(commitRegistry).not.toHaveBeenCalled()
   })
 
   it('fails before storage when the bound project root is replaced by another real directory', async () => {
@@ -305,38 +396,38 @@ describe('verification goal repository registry', () => {
       path.join(replacementDirectory, 'outside.json'),
       JSON.stringify(definition('outside-goal')),
     )
-    const importSnapshots = vi.fn()
+    const { commitRegistry, store } = registryStore()
 
-    await expect(importVerificationGoalRegistryForTest({ projectId }, {
-      loadProject: async () => ({ id: projectId, localPath: root }),
+    await expect(importVerificationGoalRegistryForTest(importInput, {
+      loadProject: async () => projectAuthority(root),
       bindProjectRoot: async () => {
         const binding = await projectBinding(root)
         await rename(root, movedProject)
         await rename(replacementRoot, root)
         return binding
       },
-      store: { importSnapshots },
+      store,
     })).rejects.toThrow(/changed|replaced|safely/i)
-    expect(importSnapshots).not.toHaveBeenCalled()
+    expect(commitRegistry).not.toHaveBeenCalled()
   })
 
   it('fails before storage when an invalid file is added after registry enumeration', async () => {
     const root = await projectRoot()
     const directory = await registry(root)
     await writeFile(path.join(directory, 'current.json'), JSON.stringify(definition('current-goal')))
-    const importSnapshots = vi.fn()
+    const { commitRegistry, store } = registryStore()
 
-    await expect(importVerificationGoalRegistryForTest({ projectId }, {
-      loadProject: async () => ({ id: projectId, localPath: root }),
+    await expect(importVerificationGoalRegistryForTest(importInput, {
+      loadProject: async () => projectAuthority(root),
       bindProjectRoot: async () => projectBinding(root),
       loadRegistry: (projectRoot) => loadVerificationGoalRegistryForTest(projectRoot, OPERATION_CATALOG, {
         afterAnchoredEnumeration: async () => {
           await writeFile(path.join(directory, 'unexpected.txt'), 'not a goal')
         },
       }),
-      store: { importSnapshots },
+      store,
     })).rejects.toThrow(/unsafe|membership|changed/i)
-    expect(importSnapshots).not.toHaveBeenCalled()
+    expect(commitRegistry).not.toHaveBeenCalled()
   })
 
   it('fails before storage when a rename adds a duplicate goal after enumeration', async () => {
@@ -345,19 +436,19 @@ describe('verification goal repository registry', () => {
     const duplicateCandidate = path.join(root, '.forge', 'duplicate-candidate.json')
     await writeFile(path.join(directory, 'current.json'), JSON.stringify(definition('same-goal')))
     await writeFile(duplicateCandidate, JSON.stringify(definition('same-goal')))
-    const importSnapshots = vi.fn()
+    const { commitRegistry, store } = registryStore()
 
-    await expect(importVerificationGoalRegistryForTest({ projectId }, {
-      loadProject: async () => ({ id: projectId, localPath: root }),
+    await expect(importVerificationGoalRegistryForTest(importInput, {
+      loadProject: async () => projectAuthority(root),
       bindProjectRoot: async () => projectBinding(root),
       loadRegistry: (projectRoot) => loadVerificationGoalRegistryForTest(projectRoot, OPERATION_CATALOG, {
         afterAnchoredEnumeration: async () => {
           await rename(duplicateCandidate, path.join(directory, 'duplicate.json'))
         },
       }),
-      store: { importSnapshots },
+      store,
     })).rejects.toThrow(/unsafe|membership|changed/i)
-    expect(importSnapshots).not.toHaveBeenCalled()
+    expect(commitRegistry).not.toHaveBeenCalled()
   })
 
   it('fails before storage when an already-read file is removed and replaced', async () => {
@@ -368,10 +459,10 @@ describe('verification goal repository registry', () => {
     const replacementPath = path.join(root, '.forge', 'replacement.json')
     await writeFile(readPath, JSON.stringify(definition('original-goal')))
     await writeFile(replacementPath, JSON.stringify(definition('replacement-goal')))
-    const importSnapshots = vi.fn()
+    const { commitRegistry, store } = registryStore()
 
-    await expect(importVerificationGoalRegistryForTest({ projectId }, {
-      loadProject: async () => ({ id: projectId, localPath: root }),
+    await expect(importVerificationGoalRegistryForTest(importInput, {
+      loadProject: async () => projectAuthority(root),
       bindProjectRoot: async () => projectBinding(root),
       loadRegistry: (projectRoot) => loadVerificationGoalRegistryForTest(projectRoot, OPERATION_CATALOG, {
         afterFirstAnchoredEntryRead: async () => {
@@ -379,9 +470,9 @@ describe('verification goal repository registry', () => {
           await rename(replacementPath, readPath)
         },
       }),
-      store: { importSnapshots },
+      store,
     })).rejects.toThrow(/unsafe|membership|changed/i)
-    expect(importSnapshots).not.toHaveBeenCalled()
+    expect(commitRegistry).not.toHaveBeenCalled()
   })
 
   it('rejects duplicate goal ids even when the source files use different versions', async () => {

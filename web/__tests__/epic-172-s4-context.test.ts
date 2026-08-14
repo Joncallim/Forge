@@ -62,6 +62,10 @@ const s5RecoveryMigrationWrapper = readFileSync(
   fileURLToPath(new URL('../scripts/ci/apply-epic-172-s5-recovery-migration.sh', import.meta.url)),
   'utf8',
 )
+const verificationGoalRegistryMigrationWrapper = readFileSync(
+  fileURLToPath(new URL('../scripts/ci/apply-verification-goal-registry-migration.sh', import.meta.url)),
+  'utf8',
+)
 const sessionReconciliation = readFileSync(
   fileURLToPath(new URL('../scripts/reconcile-session-credentials.ts', import.meta.url)),
   'utf8',
@@ -133,10 +137,24 @@ describe('Epic 172 S4 PostgreSQL CI contract', () => {
     expect(stage0027).toBeLessThan(handoff0028)
     expect(webCiWorkflow).toContain('run: bash scripts/ci/apply-epic-172-s5-recovery-migration.sh')
     expect(s5RecoveryMigrationWrapper).toContain('npx tsx scripts/bootstrap-epic-172-s5-recovery-owner.ts')
-    expect(s5RecoveryMigrationWrapper).toContain('npm run db:migrate')
+    expect(s5RecoveryMigrationWrapper).toContain('npx tsx scripts/ci/migrate-through-0028.ts')
+    expect(s5RecoveryMigrationWrapper).not.toContain('npm run db:migrate')
     expect(s5RecoveryMigrationWrapper).toContain('trap cleanup EXIT')
     expect(s5RecoveryMigrationWrapper).toContain('bootstrap-epic-172-s5-recovery-owner.ts --cleanup')
-    expect(handoff0028).toBeLessThan(webCiWorkflow.indexOf('name: Configure disposable release and S4 principal passwords'))
+    const registryHandoff0033 = webCiWorkflow.indexOf(
+      'name: Apply verification-goal registry migration with failure-safe ownership',
+    )
+    expect(registryHandoff0033).toBeGreaterThan(handoff0028)
+    expect(webCiWorkflow).toContain(
+      'run: bash scripts/ci/apply-verification-goal-registry-migration.sh',
+    )
+    expect(verificationGoalRegistryMigrationWrapper).toContain(
+      'npx tsx scripts/ci/migrate-through-0033.ts',
+    )
+    expect(verificationGoalRegistryMigrationWrapper).not.toContain('npm run db:migrate')
+    expect(registryHandoff0033).toBeLessThan(
+      webCiWorkflow.indexOf('name: Configure disposable release and S4 principal passwords'),
+    )
     expect(webCiWorkflow).toContain('npm run test:mcp:s4-postgres -- --reporter=default | tee "$report"')
     expect(webCiWorkflow).toContain('run: npm run test:unit:zero-skip')
     const zeroSkipStep = webCiWorkflow.slice(
