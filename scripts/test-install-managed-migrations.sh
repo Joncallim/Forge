@@ -122,8 +122,17 @@ assert_contains 'snapshot managed-latest-once' "$LEGACY_REPAIR_PROOF"
 assert_contains 'snapshot managed-latest-twice' "$LEGACY_REPAIR_PROOF"
 assert_contains "assert_unchanged managed-latest-once managed-latest-twice 'Managed latest rerun'" \
   "$LEGACY_REPAIR_PROOF"
-assert_contains 'assert_protected_forge_acl_count 5' "$LEGACY_REPAIR_PROOF"
+assert_contains 'CANONICAL_PROTECTED_DIRECT_READ_COUNT=5' "$LEGACY_REPAIR_PROOF"
+assert_contains 'assert_protected_forge_acl_count "$CANONICAL_PROTECTED_DIRECT_READ_COUNT"' \
+  "$LEGACY_REPAIR_PROOF"
 assert_contains "direct_read_tables constant text[] := ARRAY[" "$LEGACY_REPAIR_PROOF"
+canonical_direct_read_count="$(sed -n 's/^CANONICAL_PROTECTED_DIRECT_READ_COUNT=//p' \
+  "$LEGACY_REPAIR_PROOF")"
+declared_direct_read_count="$(sed -n \
+  '/direct_read_tables constant text\[\] := ARRAY\[/,/^  \];/p' "$LEGACY_REPAIR_PROOF" \
+  | grep -c "^    '[^']*'[,]*$")"
+[ "$declared_direct_read_count" = "$canonical_direct_read_count" ] \
+  || fail 'legacy proof canonical direct-read count must match its exact table set'
 for direct_read_table in \
   work_package_local_projection_sources \
   work_package_local_projection_heads \
@@ -135,6 +144,12 @@ done
 assert_contains 'relation.relname <> ALL(direct_read_tables)' "$LEGACY_REPAIR_PROOF"
 assert_contains 'FOREACH direct_read_table IN ARRAY direct_read_tables' "$LEGACY_REPAIR_PROOF"
 assert_not_contains "relation.relname NOT IN ('work_package_local_projection_sources', 'work_package_local_projection_heads')" "$LEGACY_REPAIR_PROOF"
+assert_contains ") <> current_setting('forge.proof_canonical_protected_direct_read_count')::integer + 1 OR (" \
+  "$LEGACY_REPAIR_PROOF"
+assert_contains ") <> current_setting('forge.proof_canonical_protected_direct_read_count')::integer OR (" \
+  "$LEGACY_REPAIR_PROOF"
+assert_not_contains ') <> 3 OR (' "$LEGACY_REPAIR_PROOF"
+assert_not_contains ') <> 2 OR (' "$LEGACY_REPAIR_PROOF"
 assert_contains 'npx tsx scripts/ci/migrate-through-0028.ts' "$S5_MIGRATION_WRAPPER"
 assert_not_contains 'npm run db:migrate' "$S5_MIGRATION_WRAPPER"
 assert_contains 'FORGE_REGISTRY_FORCE_HANDOFF_FAILURE' "$REGISTRY_MIGRATION_WRAPPER"

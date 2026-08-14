@@ -19,6 +19,7 @@ WEB_ROOT="$(cd -P "$SCRIPT_DIR/../.." && pwd)"
 REPO_ROOT="$(cd -P "$WEB_ROOT/.." && pwd)"
 FIXTURE="$SCRIPT_DIR/sql/installer-legacy-0023-0025-fixture.sql"
 CONSUMER_OTHER_DATABASE=forge_installer_legacy_consumer_other_test
+CANONICAL_PROTECTED_DIRECT_READ_COUNT=5
 TEMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/forge-legacy-repair-dbr1.XXXXXX")"
 trap 'rm -rf "$TEMP_ROOT"' EXIT
 source "$REPO_ROOT/scripts/ci/current-migration-ledger.sh"
@@ -1331,7 +1332,7 @@ grant_exact_forge_contamination
 assert_protected_forge_acl_count 160
 run_managed_sequence
 snapshot managed-latest-once
-assert_protected_forge_acl_count 5
+assert_protected_forge_acl_count "$CANONICAL_PROTECTED_DIRECT_READ_COUNT"
 run_managed_sequence
 snapshot managed-latest-twice
 assert_unchanged managed-latest-once managed-latest-twice 'Managed latest rerun'
@@ -1379,7 +1380,7 @@ cmp -s "$TEMP_ROOT/exact-installer-contamination-before.ledger" "$TEMP_ROOT/exac
   echo 'Installer-grant normalization changed the immutable migration ledger.' >&2
   exit 1
 }
-assert_protected_forge_acl_count 5
+assert_protected_forge_acl_count "$CANONICAL_PROTECTED_DIRECT_READ_COUNT"
 admin_psql <<'SQL'
 DO $proof$
 BEGIN
@@ -1544,14 +1545,19 @@ assert_unchanged extra-installer-contamination-before extra-installer-contaminat
 restore_canonical_forge_boundary
 
 echo 'Proving concurrent table and column ACL changes serialize across the full protected inventory.'
-assert_protected_forge_acl_count 5
+assert_protected_forge_acl_count "$CANONICAL_PROTECTED_DIRECT_READ_COUNT"
 snapshot table-acl-race-before
 prove_acl_grant_race_refusal table "SET ROLE forge_s4_routines_owner;
 GRANT INSERT ON TABLE public.architect_plan_versions TO forge;
 RESET ROLE;"
 snapshot table-acl-race-after
 assert_only_external_acl_changed table-acl-race-before table-acl-race-after 'Concurrent protected S4 table grant'
-admin_psql <<'SQL'
+admin_psql --set canonical_protected_direct_read_count="$CANONICAL_PROTECTED_DIRECT_READ_COUNT" <<'SQL'
+SELECT pg_catalog.set_config(
+  'forge.proof_canonical_protected_direct_read_count',
+  :'canonical_protected_direct_read_count',
+  false
+);
 DO $proof$
 BEGIN
   IF (
@@ -1565,7 +1571,7 @@ BEGIN
     WHERE namespace_row.nspname = 'public'
       AND owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner')
       AND privilege.grantee = 'forge'::pg_catalog.regrole
-  ) <> 3 OR (
+  ) <> current_setting('forge.proof_canonical_protected_direct_read_count')::integer + 1 OR (
     SELECT count(*)
     FROM pg_catalog.pg_class relation
     JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = relation.relnamespace
@@ -1592,7 +1598,7 @@ SET ROLE forge_s4_routines_owner;
 REVOKE INSERT ON TABLE public.architect_plan_versions FROM forge;
 RESET ROLE;
 SQL
-assert_protected_forge_acl_count 5
+assert_protected_forge_acl_count "$CANONICAL_PROTECTED_DIRECT_READ_COUNT"
 
 snapshot column-acl-race-before
 prove_acl_grant_race_refusal column "SET ROLE forge_s4_routines_owner;
@@ -1600,7 +1606,12 @@ GRANT SELECT (task_id) ON TABLE public.architect_plan_versions TO forge;
 RESET ROLE;"
 snapshot column-acl-race-after
 assert_only_external_acl_changed column-acl-race-before column-acl-race-after 'Concurrent protected S4 column grant'
-admin_psql <<'SQL'
+admin_psql --set canonical_protected_direct_read_count="$CANONICAL_PROTECTED_DIRECT_READ_COUNT" <<'SQL'
+SELECT pg_catalog.set_config(
+  'forge.proof_canonical_protected_direct_read_count',
+  :'canonical_protected_direct_read_count',
+  false
+);
 DO $proof$
 BEGIN
   IF (
@@ -1614,7 +1625,7 @@ BEGIN
     WHERE namespace_row.nspname = 'public'
       AND owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner')
       AND privilege.grantee = 'forge'::pg_catalog.regrole
-  ) <> 2 OR (
+  ) <> current_setting('forge.proof_canonical_protected_direct_read_count')::integer OR (
     SELECT count(*)
     FROM pg_catalog.pg_attribute attribute
     JOIN pg_catalog.pg_class relation ON relation.oid = attribute.attrelid
@@ -1648,7 +1659,7 @@ SET ROLE forge_s4_routines_owner;
 REVOKE SELECT (task_id) ON TABLE public.architect_plan_versions FROM forge;
 RESET ROLE;
 SQL
-assert_protected_forge_acl_count 5
+assert_protected_forge_acl_count "$CANONICAL_PROTECTED_DIRECT_READ_COUNT"
 
 echo 'Proving the real installer and repair app-grant transaction against disposable PostgreSQL.'
 admin_psql <<'SQL'
@@ -1658,7 +1669,7 @@ CREATE TABLE public.forge_installer_privilege_probe (
 );
 SQL
 run_installer_grant_privileges installer-grant-success
-assert_protected_forge_acl_count 5
+assert_protected_forge_acl_count "$CANONICAL_PROTECTED_DIRECT_READ_COUNT"
 assert_owner_driven_forge_boundary
 run_repair_grant_privileges repair-grant-success
 grep -Fq 'Ensured the forge role can read ordinary forge tables without protected-table DML access.' \
@@ -1667,7 +1678,7 @@ grep -Fq 'Ensured the forge role can read ordinary forge tables without protecte
   echo 'Repair did not execute the shared privilege reconciliation successfully.' >&2
   exit 1
 }
-assert_protected_forge_acl_count 5
+assert_protected_forge_acl_count "$CANONICAL_PROTECTED_DIRECT_READ_COUNT"
 assert_owner_driven_forge_boundary
 
 echo 'Proving shared reconciliation role races block, then refuse the committed unsafe boundary.'
@@ -1711,7 +1722,7 @@ grep -Fq 'Could not transactionally refresh forge app privileges (non-fatal).' \
 }
 admin_server_psql --command 'ALTER ROLE forge_release_routines_owner NOLOGIN;'
 run_repair_grant_privileges repair-after-protected-owner-restore
-assert_protected_forge_acl_count 5
+assert_protected_forge_acl_count "$CANONICAL_PROTECTED_DIRECT_READ_COUNT"
 assert_owner_driven_forge_boundary
 
 echo 'Proving installer provisioning role races block, then refuse the committed unsafe boundary.'
@@ -1744,7 +1755,7 @@ grep -Fq 'Could not transactionally refresh forge app privileges (non-fatal).' \
   exit 1
 }
 admin_psql --command 'REVOKE SELECT (task_id), UPDATE (task_id) ON TABLE public.architect_plan_versions FROM PUBLIC;'
-assert_protected_forge_acl_count 5
+assert_protected_forge_acl_count "$CANONICAL_PROTECTED_DIRECT_READ_COUNT"
 
 admin_psql --command 'GRANT SELECT ON TABLE public.work_package_local_projection_sources TO PUBLIC;'
 snapshot shared-public-projection-authority-before
@@ -1757,7 +1768,7 @@ grep -Fq 'Could not transactionally refresh forge app privileges (non-fatal).' \
   exit 1
 }
 admin_psql --command 'REVOKE SELECT ON TABLE public.work_package_local_projection_sources FROM PUBLIC;'
-assert_protected_forge_acl_count 5
+assert_protected_forge_acl_count "$CANONICAL_PROTECTED_DIRECT_READ_COUNT"
 
 admin_psql --command 'GRANT SELECT (task_id) ON TABLE public.architect_plan_versions TO forge_architect_plan_history_reader;'
 snapshot shared-unrelated-column-acl-before
@@ -1770,7 +1781,7 @@ grep -Fq 'Ensured the forge role can read ordinary forge tables without protecte
   exit 1
 }
 admin_psql --command 'REVOKE SELECT (task_id) ON TABLE public.architect_plan_versions FROM forge_architect_plan_history_reader;'
-assert_protected_forge_acl_count 5
+assert_protected_forge_acl_count "$CANONICAL_PROTECTED_DIRECT_READ_COUNT"
 
 admin_server_psql --command 'ALTER ROLE forge INHERIT;'
 run_repair_grant_privileges repair-legacy-inherit
@@ -1787,7 +1798,7 @@ BEGIN
 END;
 $proof$;
 SQL
-assert_protected_forge_acl_count 5
+assert_protected_forge_acl_count "$CANONICAL_PROTECTED_DIRECT_READ_COUNT"
 
 admin_server_psql --command 'ALTER ROLE forge CREATEROLE;'
 snapshot shared-unsafe-role-before
@@ -1831,7 +1842,7 @@ admin_psql <<'SQL'
 ALTER TABLE public.architect_plan_versions OWNER TO forge_s4_routines_owner;
 SQL
 run_repair_grant_privileges repair-after-owner-restore
-assert_protected_forge_acl_count 5
+assert_protected_forge_acl_count "$CANONICAL_PROTECTED_DIRECT_READ_COUNT"
 assert_owner_driven_forge_boundary
 admin_psql <<'SQL'
 DO $proof$
