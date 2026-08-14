@@ -15,6 +15,7 @@ import {
 import {
   importVerificationGoalRegistryForTest,
   type ImportVerificationGoalRegistryInput,
+  VerificationGoalImportError,
 } from '@/worker/verification-goals/importer'
 import type { VerificationGoalSnapshotStore } from '@/worker/verification-goals/snapshots'
 
@@ -141,13 +142,93 @@ describe('verification goal repository registry', () => {
       loadProject: async () => null,
       bindProjectRoot,
       store,
-    })).rejects.toThrow(/could not be resolved/i)
+    })).rejects.toMatchObject({
+      name: 'VerificationGoalImportError',
+      code: 'project_context_unavailable',
+    })
     await expect(importVerificationGoalRegistryForTest({ projectId }, {
       loadProject: async () => ({ id: projectId, localPath: null }),
       bindProjectRoot,
       store,
-    })).rejects.toThrow(/authoritative project localPath/i)
+    })).rejects.toMatchObject({
+      name: 'VerificationGoalImportError',
+      code: 'project_repository_unavailable',
+    })
     expect(bindProjectRoot).not.toHaveBeenCalled()
+    expect(importSnapshots).not.toHaveBeenCalled()
+  })
+
+  it('canonicalizes an uppercase project id before project resolution and storage', async () => {
+    const root = await projectRoot()
+    const uppercaseProjectId = 'AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA'
+    const canonicalProjectId = uppercaseProjectId.toLowerCase()
+    const loadProject = vi.fn(async () => ({ id: canonicalProjectId, localPath: root }))
+    const bindProjectRoot = vi.fn(async () => projectBinding(root))
+    const importSnapshots = vi.fn(async () => [])
+
+    await expect(importVerificationGoalRegistryForTest({ projectId: uppercaseProjectId }, {
+      loadProject,
+      bindProjectRoot,
+      store: { importSnapshots },
+    })).resolves.toEqual([])
+
+    expect(loadProject).toHaveBeenCalledWith(canonicalProjectId)
+    expect(bindProjectRoot).toHaveBeenCalledWith({ id: canonicalProjectId, localPath: root })
+    expect(importSnapshots).toHaveBeenCalledWith(canonicalProjectId, [])
+  })
+
+  it('uses typed errors for invalid or mismatched project identity', async () => {
+    const root = await projectRoot()
+    const loadProject = vi.fn(async () => ({
+      id: '22222222-2222-4222-8222-222222222222',
+      localPath: root,
+    }))
+    const bindProjectRoot = vi.fn(async () => projectBinding(root))
+    const store: VerificationGoalSnapshotStore = { importSnapshots: vi.fn() }
+
+    await expect(importVerificationGoalRegistryForTest({ projectId: 'not-a-uuid' }, {
+      loadProject,
+      bindProjectRoot,
+      store,
+    })).rejects.toMatchObject({
+      name: 'VerificationGoalImportError',
+      code: 'invalid_project_id',
+    })
+    expect(loadProject).not.toHaveBeenCalled()
+
+    await expect(importVerificationGoalRegistryForTest({ projectId }, {
+      loadProject,
+      bindProjectRoot,
+      store,
+    })).rejects.toMatchObject({
+      name: 'VerificationGoalImportError',
+      code: 'project_context_unavailable',
+    })
+    expect(bindProjectRoot).not.toHaveBeenCalled()
+  })
+
+  it('wraps project-root binding failures without retaining filesystem details', async () => {
+    const root = await projectRoot()
+    const importSnapshots = vi.fn()
+    let failure: unknown
+
+    try {
+      await importVerificationGoalRegistryForTest({ projectId }, {
+        loadProject: async () => ({ id: projectId, localPath: root }),
+        bindProjectRoot: async () => {
+          throw new Error('Unsafe path /private/secret-project and parser text TOP SECRET')
+        },
+        store: { importSnapshots },
+      })
+    } catch (error) {
+      failure = error
+    }
+
+    expect(failure).toBeInstanceOf(VerificationGoalImportError)
+    expect(failure).toMatchObject({ code: 'project_repository_unavailable' })
+    expect(failure).not.toHaveProperty('cause')
+    expect((failure as Error).message).not.toContain('/private/secret-project')
+    expect((failure as Error).message).not.toContain('TOP SECRET')
     expect(importSnapshots).not.toHaveBeenCalled()
   })
 

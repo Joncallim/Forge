@@ -91,6 +91,23 @@ digest, the bounded repository-relative source path, and the creation time. It
 does not store a source revision because this slice does not yet have a safely
 bound revision at import time.
 
+## Manual registry import boundary
+
+An authenticated project owner may ask Forge to import the current registry by
+calling the project's verification-goal import endpoint. The request has no
+body: callers provide only the project identifier in the URL. Forge resolves
+the project's repository from its own database after checking project access,
+so a caller cannot provide a different path, goal definition, operation, or
+operation argument.
+
+An import returns the snapshots seen during that request and counts how many
+were newly inserted or already existed. A project with no registry files gets a
+successful no-op. An archived or inaccessible project stays hidden. An
+unavailable project repository is reported without exposing its path, and
+invalid registry details are replaced with fixed safe wording. This endpoint
+stores definitions only. It does not run a goal, queue work, or claim that a
+goal passed.
+
 ## Migration proof
 
 The shared `scripts/ci/current-migration-ledger.sh` helper reads the authoritative

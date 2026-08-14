@@ -27,6 +27,27 @@ export type ImportVerificationGoalRegistryInput = {
   projectId: string
 }
 
+export type VerificationGoalImportErrorCode =
+  | 'invalid_project_id'
+  | 'project_context_unavailable'
+  | 'project_repository_unavailable'
+
+const IMPORT_ERROR_MESSAGES: Record<VerificationGoalImportErrorCode, string> = {
+  invalid_project_id: 'Verification goal import requires a valid project id.',
+  project_context_unavailable: 'Verification goal project context could not be resolved.',
+  project_repository_unavailable: 'Verification goal project repository is unavailable.',
+}
+
+export class VerificationGoalImportError extends Error {
+  readonly code: VerificationGoalImportErrorCode
+
+  constructor(code: VerificationGoalImportErrorCode) {
+    super(IMPORT_ERROR_MESSAGES[code])
+    this.name = 'VerificationGoalImportError'
+    this.code = code
+  }
+}
+
 export type VerificationGoalRegistryImporterDependencies = {
   loadProject: (projectId: string) => Promise<VerificationGoalProject | null>
   bindProjectRoot: (project: VerificationGoalProject) => Promise<ProjectExecutionRootBinding>
@@ -58,18 +79,24 @@ async function importVerificationGoalRegistryWithDependencies(
   dependencies: VerificationGoalRegistryImporterDependencies,
 ): Promise<VerificationGoalSnapshotImportResult[]> {
   if (!UUID.test(input.projectId)) {
-    throw new Error('Verification goal import requires a valid project id.')
+    throw new VerificationGoalImportError('invalid_project_id')
   }
-  const project = await dependencies.loadProject(input.projectId)
-  if (!project || project.id !== input.projectId) {
-    throw new Error('Verification goal project context could not be resolved.')
+  const projectId = input.projectId.toLowerCase()
+  const project = await dependencies.loadProject(projectId)
+  if (!project || project.id !== projectId) {
+    throw new VerificationGoalImportError('project_context_unavailable')
   }
   if (!project.localPath?.trim()) {
-    throw new Error('Verification goal import requires an authoritative project localPath.')
+    throw new VerificationGoalImportError('project_repository_unavailable')
   }
-  const projectRoot = await dependencies.bindProjectRoot(project)
+  let projectRoot: ProjectExecutionRootBinding
+  try {
+    projectRoot = await dependencies.bindProjectRoot(project)
+  } catch {
+    throw new VerificationGoalImportError('project_repository_unavailable')
+  }
   const goals = await (dependencies.loadRegistry ?? loadVerificationGoalRegistry)(projectRoot)
-  return dependencies.store.importSnapshots(project.id, goals)
+  return dependencies.store.importSnapshots(projectId, goals)
 }
 
 export function importVerificationGoalRegistry(
