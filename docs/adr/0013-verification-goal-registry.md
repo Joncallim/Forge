@@ -93,11 +93,16 @@ bound revision at import time.
 
 ## Migration proof
 
-The authoritative Drizzle journal, `web/db/migrations/meta/_journal.json`, determines
-the exact installed migration count and latest migration timestamp. Installer
-proof derives both expectations from that journal and compares them with the
-installer-managed PostgreSQL ledger. Tests and scripts must not copy those
-values into separate numeric pins that become stale when a migration is added.
+The shared `scripts/ci/current-migration-ledger.sh` helper reads the authoritative
+Drizzle journal at `web/db/migrations/meta/_journal.json`. It validates the journal
+order, then derives the exact migration count and latest timestamp. The managed
+installer, legacy-repair, and populated 0026/0027 upgrade proofs all compare their
+PostgreSQL ledgers with those shared expectations. They pass the derived decimal
+values through quoted `psql` variables and copy them into session settings before
+entering dollar-quoted PostgreSQL blocks. This keeps variable binding safe and
+avoids numeric tip pins that become stale when a migration is added. Literal 0027
+and 0028 timestamps remain in the upgrade proof because they verify fixed historical
+boundaries rather than the moving journal tip.
 
 Hosted PostgreSQL proof of the full installer and repair sequence is mandatory
 for this slice. Passing local checks is useful, but it does not replace that

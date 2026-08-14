@@ -3,7 +3,10 @@ import { eq } from 'drizzle-orm'
 import { db } from '@/db'
 import { projects } from '@/db/schema'
 import { assertProjectLocalPathForExecution } from '@/lib/projects/local-path'
-import { loadVerificationGoalRegistry } from '@/lib/verification-goals/registry'
+import {
+  loadVerificationGoalRegistry,
+  type LoadedVerificationGoal,
+} from '@/lib/verification-goals/registry'
 import {
   databaseVerificationGoalSnapshotStore,
   type VerificationGoalSnapshotImportResult,
@@ -24,6 +27,7 @@ export type ImportVerificationGoalRegistryInput = {
 export type VerificationGoalRegistryImporterDependencies = {
   loadProject: (projectId: string) => Promise<VerificationGoalProject | null>
   canonicalizeProjectRoot: (project: VerificationGoalProject) => Promise<string>
+  loadRegistry?: (projectRoot: string) => Promise<LoadedVerificationGoal[]>
   store: VerificationGoalSnapshotStore
 }
 
@@ -61,7 +65,7 @@ async function importVerificationGoalRegistryWithDependencies(
     throw new Error('Verification goal import requires an authoritative project localPath.')
   }
   const projectRoot = await dependencies.canonicalizeProjectRoot(project)
-  const goals = await loadVerificationGoalRegistry(projectRoot)
+  const goals = await (dependencies.loadRegistry ?? loadVerificationGoalRegistry)(projectRoot)
   return dependencies.store.importSnapshots(project.id, goals)
 }
 

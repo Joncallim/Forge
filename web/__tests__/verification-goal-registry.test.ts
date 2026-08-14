@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, rename, rm, symlink, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -21,7 +21,8 @@ const roots: string[] = []
 const projectId = '11111111-1111-4111-8111-111111111111'
 
 async function projectRoot(): Promise<string> {
-  const root = await mkdtemp(path.join(tmpdir(), 'forge-verification-goals-'))
+  const created = await mkdtemp(path.join(tmpdir(), 'forge-verification-goals-'))
+  const root = await realpath(created)
   roots.push(root)
   return root
 }
@@ -179,6 +180,91 @@ describe('verification goal repository registry', () => {
         definition: expect.objectContaining({ goalId: 'authoritative-goal' }),
       })],
     )
+  })
+
+  it('fails before storage when the validated project root is rebound to an outside symlink', async () => {
+    const root = await projectRoot()
+    const outsideRoot = await projectRoot()
+    const movedProject = path.join(outsideRoot, 'moved-project')
+    const directory = await registry(root)
+    await writeFile(path.join(directory, 'trusted.json'), JSON.stringify(definition('trusted-goal')))
+    const importSnapshots = vi.fn()
+
+    await expect(importVerificationGoalRegistryForTest({ projectId }, {
+      loadProject: async () => ({ id: projectId, localPath: root }),
+      canonicalizeProjectRoot: async () => {
+        const validatedRoot = await realpath(root)
+        await rename(root, movedProject)
+        await symlink(movedProject, root, 'dir')
+        return validatedRoot
+      },
+      store: { importSnapshots },
+    })).rejects.toThrow(/symlink|safely|fixed location/i)
+    expect(importSnapshots).not.toHaveBeenCalled()
+  })
+
+  it('fails before storage when an invalid file is added after registry enumeration', async () => {
+    const root = await projectRoot()
+    const directory = await registry(root)
+    await writeFile(path.join(directory, 'current.json'), JSON.stringify(definition('current-goal')))
+    const importSnapshots = vi.fn()
+
+    await expect(importVerificationGoalRegistryForTest({ projectId }, {
+      loadProject: async () => ({ id: projectId, localPath: root }),
+      canonicalizeProjectRoot: async () => root,
+      loadRegistry: (projectRoot) => loadVerificationGoalRegistryForTest(projectRoot, OPERATION_CATALOG, {
+        afterAnchoredEnumeration: async () => {
+          await writeFile(path.join(directory, 'unexpected.txt'), 'not a goal')
+        },
+      }),
+      store: { importSnapshots },
+    })).rejects.toThrow(/unsafe|membership|changed/i)
+    expect(importSnapshots).not.toHaveBeenCalled()
+  })
+
+  it('fails before storage when a rename adds a duplicate goal after enumeration', async () => {
+    const root = await projectRoot()
+    const directory = await registry(root)
+    const duplicateCandidate = path.join(root, '.forge', 'duplicate-candidate.json')
+    await writeFile(path.join(directory, 'current.json'), JSON.stringify(definition('same-goal')))
+    await writeFile(duplicateCandidate, JSON.stringify(definition('same-goal')))
+    const importSnapshots = vi.fn()
+
+    await expect(importVerificationGoalRegistryForTest({ projectId }, {
+      loadProject: async () => ({ id: projectId, localPath: root }),
+      canonicalizeProjectRoot: async () => root,
+      loadRegistry: (projectRoot) => loadVerificationGoalRegistryForTest(projectRoot, OPERATION_CATALOG, {
+        afterAnchoredEnumeration: async () => {
+          await rename(duplicateCandidate, path.join(directory, 'duplicate.json'))
+        },
+      }),
+      store: { importSnapshots },
+    })).rejects.toThrow(/unsafe|membership|changed/i)
+    expect(importSnapshots).not.toHaveBeenCalled()
+  })
+
+  it('fails before storage when an already-read file is removed and replaced', async () => {
+    const root = await projectRoot()
+    const directory = await registry(root)
+    const readPath = path.join(directory, 'a-read.json')
+    const movedReadPath = path.join(root, '.forge', 'original-read.json')
+    const replacementPath = path.join(root, '.forge', 'replacement.json')
+    await writeFile(readPath, JSON.stringify(definition('original-goal')))
+    await writeFile(replacementPath, JSON.stringify(definition('replacement-goal')))
+    const importSnapshots = vi.fn()
+
+    await expect(importVerificationGoalRegistryForTest({ projectId }, {
+      loadProject: async () => ({ id: projectId, localPath: root }),
+      canonicalizeProjectRoot: async () => root,
+      loadRegistry: (projectRoot) => loadVerificationGoalRegistryForTest(projectRoot, OPERATION_CATALOG, {
+        afterFirstAnchoredEntryRead: async () => {
+          await rename(readPath, movedReadPath)
+          await rename(replacementPath, readPath)
+        },
+      }),
+      store: { importSnapshots },
+    })).rejects.toThrow(/unsafe|membership|changed/i)
+    expect(importSnapshots).not.toHaveBeenCalled()
   })
 
   it('rejects duplicate goal ids even when the source files use different versions', async () => {

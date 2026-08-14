@@ -1,4 +1,6 @@
 SELECT pg_catalog.set_config('forge.fixture_migration_principal', :'migration_principal', false);
+SELECT pg_catalog.set_config('forge.proof_expected_migration_count', :'expected_migration_count', false);
+SELECT pg_catalog.set_config('forge.proof_expected_latest_migration_at', :'expected_latest_migration_at', false);
 
 DO $assertions$
 DECLARE
@@ -13,11 +15,14 @@ BEGIN
   -- role.rolpassword IS NULL is verified by the administrator-only S4
   -- bootstrap; pg_roles intentionally masks it from this ordinary migration
   -- proof. This block verifies every attribute visible to the ordinary login.
-  IF (SELECT count(*) FROM drizzle.__drizzle_migrations) <> 33
-     OR (SELECT count(DISTINCT created_at) FROM drizzle.__drizzle_migrations) <> 33
+  IF (SELECT count(*) FROM drizzle.__drizzle_migrations)
+       <> current_setting('forge.proof_expected_migration_count')::bigint
+     OR (SELECT count(DISTINCT created_at) FROM drizzle.__drizzle_migrations)
+       <> current_setting('forge.proof_expected_migration_count')::bigint
      OR NOT EXISTS (SELECT 1 FROM drizzle.__drizzle_migrations WHERE created_at = 1784270400000)
      OR NOT EXISTS (SELECT 1 FROM drizzle.__drizzle_migrations WHERE created_at = 1784274000000)
-     OR (SELECT max(created_at) FROM drizzle.__drizzle_migrations) <> 1786665600000 THEN
+     OR (SELECT max(created_at) FROM drizzle.__drizzle_migrations)
+       <> current_setting('forge.proof_expected_latest_migration_at')::bigint THEN
     RAISE EXCEPTION 'The normal migrator did not retain the immutable 0027/0028 release boundary while reaching the exact latest ledger';
   END IF;
 

@@ -2,7 +2,7 @@ import {
   constants as fsConstants,
   type BigIntStats,
 } from 'node:fs'
-import { execFile } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
 import {
   lstat,
   open,
@@ -77,10 +77,20 @@ type RegistrySnapshot = {
 export type VerificationGoalRegistryTestHooks = {
   /** Runs after directory handles are pinned and before the anchored reader starts. */
   afterRegistryDirectoryAnchored?: () => Promise<void>
+  /** Read-only child pauses after its initial sorted enumeration. */
+  afterAnchoredEnumeration?: () => Promise<void>
+  /** Read-only child pauses after the first captured file has been read. */
+  afterFirstAnchoredEntryRead?: () => Promise<void>
 }
 
 function sameIdentity(left: BigIntStats, right: BigIntStats): boolean {
   return left.dev === right.dev && left.ino === right.ino
+}
+
+function sameDirectorySnapshot(left: BigIntStats, right: BigIntStats): boolean {
+  return sameIdentity(left, right)
+    && left.mtimeNs === right.mtimeNs
+    && left.ctimeNs === right.ctimeNs
 }
 
 function assertJsonDepth(source: string, sourcePath: string): void {
@@ -116,14 +126,6 @@ async function openDirectoryLease(directoryPath: string, expectedRealPath: strin
       'Verification goal registry path components must be real directories, not symlinks or special files.',
     )
   }
-  const observedRealPath = await realpath(directoryPath)
-  if (observedRealPath !== expectedRealPath) {
-    throw new VerificationGoalRegistryError(
-      'registry_escape',
-      'A verification goal registry path component resolves outside its fixed location.',
-    )
-  }
-
   let handle: FileHandle
   try {
     handle = await open(
@@ -138,10 +140,17 @@ async function openDirectoryLease(directoryPath: string, expectedRealPath: strin
   }
   try {
     const opened = await handle.stat({ bigint: true })
-    if (!opened.isDirectory() || !sameIdentity(before, opened)) {
+    if (!opened.isDirectory() || !sameDirectorySnapshot(before, opened)) {
       throw new VerificationGoalRegistryError(
         'invalid_registry',
         'A verification goal registry directory changed while it was being anchored.',
+      )
+    }
+    const observedRealPath = await realpath(directoryPath)
+    if (observedRealPath !== expectedRealPath) {
+      throw new VerificationGoalRegistryError(
+        'registry_escape',
+        'A verification goal registry path component resolves outside its fixed location.',
       )
     }
     return { handle, path: directoryPath, realPath: observedRealPath, stat: opened }
@@ -172,6 +181,17 @@ async function assertDirectoryLeaseStillFixed(lease: DirectoryLease): Promise<vo
   }
 }
 
+async function assertRegistryLeaseStillFixed(lease: DirectoryLease): Promise<void> {
+  await assertDirectoryLeaseStillFixed(lease)
+  const opened = await lease.handle.stat({ bigint: true })
+  if (!sameDirectorySnapshot(lease.stat, opened)) {
+    throw new VerificationGoalRegistryError(
+      'invalid_registry',
+      'Verification goal registry membership changed while it was being read.',
+    )
+  }
+}
+
 // Node does not expose openat(2), and Darwin's /dev/fd directory descriptors
 // cannot be traversed. This helper uses a child process whose cwd is a kernel
 // reference after spawn resolves lease.path. The child verifies that cwd's
@@ -188,6 +208,7 @@ const [
   maxFilesRaw,
   maxFileBytesRaw,
   maxTotalBytesRaw,
+  checkpointPhase,
 ] = process.argv.slice(1)
 const maxFiles = Number(maxFilesRaw)
 const maxFileBytes = Number(maxFileBytesRaw)
@@ -202,6 +223,13 @@ function sameIdentity(stat) {
   return stat.dev.toString() === expectedDev && stat.ino.toString() === expectedIno
 }
 
+function sameDirectorySnapshot(left, right) {
+  return left.dev === right.dev
+    && left.ino === right.ino
+    && left.mtimeNs === right.mtimeNs
+    && left.ctimeNs === right.ctimeNs
+}
+
 function sameFileSnapshot(left, right) {
   return left.dev === right.dev
     && left.ino === right.ino
@@ -210,7 +238,23 @@ function sameFileSnapshot(left, right) {
     && left.ctimeNs === right.ctimeNs
 }
 
-async function readEntry(name) {
+async function checkpoint(phase) {
+  if (checkpointPhase !== phase) return
+  process.stderr.write('FORGE_REGISTRY_CHECKPOINT:' + phase + '\n')
+  await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error('checkpoint_timeout')), 10000)
+    process.stdin.once('data', () => {
+      clearTimeout(timeout)
+      resolve()
+    })
+    process.stdin.once('end', () => {
+      clearTimeout(timeout)
+      reject(new Error('checkpoint_closed'))
+    })
+  })
+}
+
+async function captureEntry(name) {
   const beforePath = await fsp.lstat(name, { bigint: true })
   if (beforePath.isSymbolicLink() || !beforePath.isFile()) throw new Error('invalid_entry')
   let handle
@@ -237,10 +281,18 @@ async function readEntry(name) {
     if (!sameFileSnapshot(before, after) || after.size !== BigInt(offset)) {
       throw new Error('entry_changed')
     }
-    return buffer.subarray(0, offset)
-  } finally {
+    return { before, bytes: buffer.subarray(0, offset), handle, name }
+  } catch (error) {
     await handle.close()
+    throw error
   }
+}
+
+function entrySet(entries) {
+  return entries.map((entry) => {
+    const kind = entry.isFile() ? 'file' : entry.isDirectory() ? 'directory' : entry.isSymbolicLink() ? 'symlink' : 'other'
+    return kind + ':' + entry.name
+  })
 }
 
 async function main() {
@@ -249,46 +301,148 @@ async function main() {
   const entries = await fsp.readdir('.', { withFileTypes: true })
   if (entries.length > maxFiles) return fail('registry_limit')
   entries.sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0)
+  const initialEntrySet = entrySet(entries)
+  await checkpoint('after_enumeration')
 
   let totalBytes = 0
-  const snapshot = []
-  for (const entry of entries) {
-    if (!entry.isFile() || entry.isSymbolicLink() || !safeName.test(entry.name)) return fail('invalid_entry')
-    const bytes = await readEntry(entry.name)
-    totalBytes += bytes.length
-    if (totalBytes > maxTotalBytes) return fail('registry_limit')
-    snapshot.push({ name: entry.name, bytesBase64: bytes.toString('base64') })
+  const captured = []
+  try {
+    for (const entry of entries) {
+      if (!entry.isFile() || entry.isSymbolicLink() || !safeName.test(entry.name)) return fail('invalid_entry')
+      const capture = await captureEntry(entry.name)
+      captured.push(capture)
+      totalBytes += capture.bytes.length
+      if (totalBytes > maxTotalBytes) return fail('registry_limit')
+      if (captured.length === 1) await checkpoint('after_first_read')
+    }
+
+    const entriesAfter = await fsp.readdir('.', { withFileTypes: true })
+    entriesAfter.sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0)
+    if (JSON.stringify(entrySet(entriesAfter)) !== JSON.stringify(initialEntrySet)) return fail('membership_changed')
+    const directoryAfter = await fsp.stat('.', { bigint: true })
+    if (!sameDirectorySnapshot(directory, directoryAfter)) return fail('membership_changed')
+
+    for (const capture of captured) {
+      const [openedAfter, pathAfter] = await Promise.all([
+        capture.handle.stat({ bigint: true }),
+        fsp.lstat(capture.name, { bigint: true }),
+      ])
+      if (!sameFileSnapshot(capture.before, openedAfter) || !sameFileSnapshot(capture.before, pathAfter)) {
+        return fail('entry_changed')
+      }
+    }
+    const snapshot = captured.map((capture) => ({
+      name: capture.name,
+      bytesBase64: capture.bytes.toString('base64'),
+    }))
+    process.stdout.write(JSON.stringify({ ok: true, entries: snapshot }))
+  } finally {
+    await Promise.allSettled(captured.map((capture) => capture.handle.close()))
   }
-  const after = await fsp.stat('.', { bigint: true })
-  if (!sameIdentity(after)) return fail('directory_identity')
-  process.stdout.write(JSON.stringify({ ok: true, entries: snapshot }))
 }
 
 main().catch((error) => fail(error && typeof error.message === 'string' ? error.message : 'filesystem_error'))
 `
 
+function anchoredReaderArguments(lease: DirectoryLease, checkpointPhase = ''): string[] {
+  return [
+    '-e',
+    ANCHORED_REGISTRY_READER,
+    lease.stat.dev.toString(),
+    lease.stat.ino.toString(),
+    MAX_VERIFICATION_GOAL_REGISTRY_FILES.toString(),
+    MAX_VERIFICATION_GOAL_FILE_BYTES.toString(),
+    MAX_VERIFICATION_GOAL_REGISTRY_BYTES.toString(),
+    checkpointPhase,
+  ]
+}
+
+async function readWithCheckpoint(
+  lease: DirectoryLease,
+  phase: 'after_enumeration' | 'after_first_read',
+  hook: () => Promise<void>,
+): Promise<string> {
+  const child = spawn(process.execPath, anchoredReaderArguments(lease, phase), {
+    cwd: lease.path,
+    env: { NODE_ENV: 'production' },
+    stdio: ['pipe', 'pipe', 'pipe'],
+    windowsHide: true,
+  })
+  const stdout: Buffer[] = []
+  let stdoutBytes = 0
+  let stderr = ''
+  let checkpointSeen = false
+  let hookError: unknown
+  let hookPromise: Promise<void> = Promise.resolve()
+  let timedOut = false
+  const timeout = setTimeout(() => {
+    timedOut = true
+    child.kill('SIGKILL')
+  }, 30_000)
+
+  child.stdout.on('data', (chunk: Buffer) => {
+    stdoutBytes += chunk.length
+    if (stdoutBytes > 2 * 1024 * 1024) child.kill('SIGKILL')
+    else stdout.push(chunk)
+  })
+  child.stderr.on('data', (chunk: Buffer) => {
+    stderr += chunk.toString('utf8')
+    if (stderr.length > 1_024) {
+      child.kill('SIGKILL')
+      return
+    }
+    if (!checkpointSeen && stderr.includes(`FORGE_REGISTRY_CHECKPOINT:${phase}\n`)) {
+      checkpointSeen = true
+      hookPromise = hook()
+        .then(() => { child.stdin.end('continue\n') })
+        .catch((error: unknown) => {
+          hookError = error
+          child.kill('SIGKILL')
+        })
+    }
+  })
+
+  let code: number | null
+  try {
+    code = await new Promise<number | null>((resolve, reject) => {
+      child.once('error', reject)
+      child.once('close', resolve)
+    })
+    await hookPromise
+  } finally {
+    clearTimeout(timeout)
+  }
+  if (hookError) throw hookError
+  if (timedOut || code !== 0 || !checkpointSeen || stdoutBytes > 2 * 1024 * 1024) {
+    throw new Error('Anchored registry checkpoint reader failed.')
+  }
+  return Buffer.concat(stdout).toString('utf8')
+}
+
 async function readAnchoredRegistrySnapshot(
   lease: DirectoryLease,
+  hooks: VerificationGoalRegistryTestHooks,
 ): Promise<RegistrySnapshotEntry[]> {
   let stdout: string | Buffer
   try {
-    const result = await execFileAsync(process.execPath, [
-      '-e',
-      ANCHORED_REGISTRY_READER,
-      lease.stat.dev.toString(),
-      lease.stat.ino.toString(),
-      MAX_VERIFICATION_GOAL_REGISTRY_FILES.toString(),
-      MAX_VERIFICATION_GOAL_FILE_BYTES.toString(),
-      MAX_VERIFICATION_GOAL_REGISTRY_BYTES.toString(),
-    ], {
-      cwd: lease.path,
-      encoding: 'utf8',
-      env: { NODE_ENV: 'production' },
-      maxBuffer: 2 * 1024 * 1024,
-      timeout: 30_000,
-      windowsHide: true,
-    })
-    stdout = result.stdout
+    if (hooks.afterAnchoredEnumeration && hooks.afterFirstAnchoredEntryRead) {
+      throw new Error('Only one anchored registry checkpoint may be used per test read.')
+    }
+    if (hooks.afterAnchoredEnumeration) {
+      stdout = await readWithCheckpoint(lease, 'after_enumeration', hooks.afterAnchoredEnumeration)
+    } else if (hooks.afterFirstAnchoredEntryRead) {
+      stdout = await readWithCheckpoint(lease, 'after_first_read', hooks.afterFirstAnchoredEntryRead)
+    } else {
+      const result = await execFileAsync(process.execPath, anchoredReaderArguments(lease), {
+        cwd: lease.path,
+        encoding: 'utf8',
+        env: { NODE_ENV: 'production' },
+        maxBuffer: 2 * 1024 * 1024,
+        timeout: 30_000,
+        windowsHide: true,
+      })
+      stdout = result.stdout
+    }
   } catch {
     throw new VerificationGoalRegistryError(
       'invalid_registry',
@@ -388,7 +542,10 @@ async function loadVerificationGoalRegistryInternal(
     )
   }
 
-  const trustedProjectRoot = await realpath(projectRoot)
+  // The importer already returned a canonical, workspace-contained root.
+  // Resolve syntax only: re-running realpath here would follow a symlink that
+  // replaced the validated root during the handoff into this loader.
+  const trustedProjectRoot = path.resolve(projectRoot)
   const projectLease = await openDirectoryLease(trustedProjectRoot, trustedProjectRoot)
   let forgeLease: DirectoryLease | null = null
   let registryLease: DirectoryLease | null = null
@@ -419,12 +576,12 @@ async function loadVerificationGoalRegistryInternal(
     }
 
     await hooks.afterRegistryDirectoryAnchored?.()
-    const snapshot = await readAnchoredRegistrySnapshot(registryLease)
+    const snapshot = await readAnchoredRegistrySnapshot(registryLease, hooks)
     const loaded = await parseRegistrySnapshot(snapshot, catalog)
     await Promise.all([
       assertDirectoryLeaseStillFixed(projectLease),
       assertDirectoryLeaseStillFixed(forgeLease),
-      assertDirectoryLeaseStillFixed(registryLease),
+      assertRegistryLeaseStillFixed(registryLease),
     ])
     return loaded
   } finally {

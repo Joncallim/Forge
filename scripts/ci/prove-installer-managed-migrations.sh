@@ -15,30 +15,9 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -P "$SCRIPT_DIR/../.." && pwd)"
 INSTALLER="$REPO_ROOT/scripts/install.sh"
-MIGRATION_JOURNAL="$REPO_ROOT/web/db/migrations/meta/_journal.json"
 TEMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/forge-installer-managed-proof.XXXXXX")"
 trap 'rm -rf "$TEMP_ROOT"' EXIT
-
-read -r EXPECTED_MIGRATION_COUNT EXPECTED_LATEST_MIGRATION_AT < <(
-  node -e '
-    const { readFileSync } = require("node:fs");
-    const journalPath = process.argv[1];
-    const journal = JSON.parse(readFileSync(journalPath, "utf8"));
-    const entries = journal.entries;
-    if (!Array.isArray(entries) || entries.length === 0) {
-      throw new Error("The migration journal must contain at least one entry");
-    }
-    for (const [index, entry] of entries.entries()) {
-      if (entry.idx !== index || !Number.isSafeInteger(entry.when) || entry.when <= 0) {
-        throw new Error(`Invalid migration journal entry at index ${index}`);
-      }
-      if (index > 0 && entry.when <= entries[index - 1].when) {
-        throw new Error(`Migration timestamps are not strictly increasing at index ${index}`);
-      }
-    }
-    process.stdout.write(`${entries.length} ${entries.at(-1).when}\n`);
-  ' "$MIGRATION_JOURNAL"
-)
+source "$REPO_ROOT/scripts/ci/current-migration-ledger.sh"
 
 prepare_0025_baseline() {
   local database_url="$1" admin_url="$2"
@@ -70,8 +49,8 @@ assert_latest_and_clean() {
   local database_name="$1"
   PGPASSWORD="$FORGE_INSTALLER_MANAGED_ADMIN_PASSWORD" PGHOST="$FORGE_INSTALLER_MANAGED_ADMIN_HOST" PGUSER="$FORGE_INSTALLER_MANAGED_ADMIN_USER" PGDATABASE="$database_name" psql \
     --set ON_ERROR_STOP=1 \
-    --set expected_migration_count="$EXPECTED_MIGRATION_COUNT" \
-    --set expected_latest_migration_at="$EXPECTED_LATEST_MIGRATION_AT" <<'SQL'
+    --set expected_migration_count="$FORGE_CURRENT_MIGRATION_COUNT" \
+    --set expected_latest_migration_at="$FORGE_CURRENT_LATEST_MIGRATION_AT" <<'SQL'
 SELECT pg_catalog.set_config('forge.proof_expected_migration_count', :'expected_migration_count', false);
 SELECT pg_catalog.set_config('forge.proof_expected_latest_migration_at', :'expected_latest_migration_at', false);
 
