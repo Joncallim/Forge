@@ -1,11 +1,16 @@
-import { constants as fsConstants, type Stats } from 'node:fs'
+import {
+  constants as fsConstants,
+  type BigIntStats,
+} from 'node:fs'
+import { execFile } from 'node:child_process'
 import {
   lstat,
   open,
-  readdir,
   realpath,
+  type FileHandle,
 } from 'node:fs/promises'
 import path from 'node:path'
+import { promisify } from 'node:util'
 
 import type { OperationDefinition } from '@/lib/operations/contracts'
 import { OPERATION_CATALOG } from '@/lib/operations/catalog'
@@ -25,6 +30,8 @@ export const MAX_VERIFICATION_GOAL_JSON_DEPTH = 4
 export const MAX_VERIFICATION_GOAL_SOURCE_PATH_LENGTH = 256
 
 const SAFE_REGISTRY_FILE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,126}\.json$/
+const SUPPORTED_DIRECTORY_ANCHOR_PLATFORMS = new Set<NodeJS.Platform>(['darwin', 'linux'])
+const execFileAsync = promisify(execFile)
 
 export type LoadedVerificationGoal = {
   definition: VerificationGoalDefinition
@@ -47,9 +54,33 @@ export class VerificationGoalRegistryError extends Error {
   }
 }
 
-function isInside(parent: string, child: string): boolean {
-  const relative = path.relative(parent, child)
-  return relative.length > 0 && !relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative)
+type DirectoryLease = {
+  handle: FileHandle
+  path: string
+  realPath: string
+  stat: BigIntStats
+}
+
+type RegistrySnapshotEntry = {
+  name: string
+  bytesBase64: string
+}
+
+type RegistrySnapshot = {
+  ok: true
+  entries: RegistrySnapshotEntry[]
+} | {
+  ok: false
+  reason: string
+}
+
+export type VerificationGoalRegistryTestHooks = {
+  /** Runs after directory handles are pinned and before the anchored reader starts. */
+  afterRegistryDirectoryAnchored?: () => Promise<void>
+}
+
+function sameIdentity(left: BigIntStats, right: BigIntStats): boolean {
+  return left.dev === right.dev && left.ino === right.ino
 }
 
 function assertJsonDepth(source: string, sourcePath: string): void {
@@ -77,54 +108,134 @@ function assertJsonDepth(source: string, sourcePath: string): void {
   }
 }
 
-async function readBoundedRegularFile(
-  filePath: string,
-  sourcePath: string,
-  expectedStat: Stats,
-): Promise<Buffer> {
-  let handle
+async function openDirectoryLease(directoryPath: string, expectedRealPath: string): Promise<DirectoryLease> {
+  const before = await lstat(directoryPath, { bigint: true })
+  if (before.isSymbolicLink() || !before.isDirectory()) {
+    throw new VerificationGoalRegistryError(
+      'invalid_registry',
+      'Verification goal registry path components must be real directories, not symlinks or special files.',
+    )
+  }
+  const observedRealPath = await realpath(directoryPath)
+  if (observedRealPath !== expectedRealPath) {
+    throw new VerificationGoalRegistryError(
+      'registry_escape',
+      'A verification goal registry path component resolves outside its fixed location.',
+    )
+  }
+
+  let handle: FileHandle
   try {
-    handle = await open(filePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW)
+    handle = await open(
+      directoryPath,
+      fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
+    )
   } catch {
     throw new VerificationGoalRegistryError(
-      'invalid_file',
-      `${sourcePath} could not be opened as a non-symlink registry file.`,
+      'invalid_registry',
+      'A verification goal registry path component could not be opened safely.',
     )
   }
   try {
-    const before = await handle.stat()
-    if (!before.isFile()) {
-      throw new VerificationGoalRegistryError('invalid_file', `${sourcePath} must be a regular file.`)
+    const opened = await handle.stat({ bigint: true })
+    if (!opened.isDirectory() || !sameIdentity(before, opened)) {
+      throw new VerificationGoalRegistryError(
+        'invalid_registry',
+        'A verification goal registry directory changed while it was being anchored.',
+      )
     }
-    if (
-      expectedStat.dev !== before.dev
-      || expectedStat.ino !== before.ino
-      || expectedStat.size !== before.size
-    ) {
-      throw new VerificationGoalRegistryError('invalid_file', `${sourcePath} changed before it could be opened safely.`)
-    }
-    if (before.size > MAX_VERIFICATION_GOAL_FILE_BYTES) {
-      throw new VerificationGoalRegistryError('registry_limit', `${sourcePath} exceeds the per-file byte limit.`)
-    }
+    return { handle, path: directoryPath, realPath: observedRealPath, stat: opened }
+  } catch (error) {
+    await handle.close()
+    throw error
+  }
+}
 
-    const buffer = Buffer.alloc(MAX_VERIFICATION_GOAL_FILE_BYTES + 1)
+async function assertDirectoryLeaseStillFixed(lease: DirectoryLease): Promise<void> {
+  const [opened, current, currentRealPath] = await Promise.all([
+    lease.handle.stat({ bigint: true }),
+    lstat(lease.path, { bigint: true }),
+    realpath(lease.path),
+  ])
+  if (
+    !opened.isDirectory()
+    || current.isSymbolicLink()
+    || !current.isDirectory()
+    || !sameIdentity(lease.stat, opened)
+    || !sameIdentity(lease.stat, current)
+    || currentRealPath !== lease.realPath
+  ) {
+    throw new VerificationGoalRegistryError(
+      'registry_escape',
+      'The verification goal registry moved or was replaced while it was being read.',
+    )
+  }
+}
+
+// Node does not expose openat(2), and Darwin's /dev/fd directory descriptors
+// cannot be traversed. This helper uses a child process whose cwd is a kernel
+// reference after spawn resolves lease.path. The child verifies that cwd's
+// dev/ino against the parent-held directory handle before any relative lookup,
+// then opens only direct children with O_NOFOLLOW. Renaming or replacing the
+// pathname cannot redirect those relative opens after the child has anchored.
+const ANCHORED_REGISTRY_READER = String.raw`
+const fs = require('node:fs')
+const fsp = require('node:fs/promises')
+
+const [
+  expectedDev,
+  expectedIno,
+  maxFilesRaw,
+  maxFileBytesRaw,
+  maxTotalBytesRaw,
+] = process.argv.slice(1)
+const maxFiles = Number(maxFilesRaw)
+const maxFileBytes = Number(maxFileBytesRaw)
+const maxTotalBytes = Number(maxTotalBytesRaw)
+const safeName = /^[A-Za-z0-9][A-Za-z0-9._-]{0,126}\.json$/
+
+function fail(reason) {
+  process.stdout.write(JSON.stringify({ ok: false, reason }))
+}
+
+function sameIdentity(stat) {
+  return stat.dev.toString() === expectedDev && stat.ino.toString() === expectedIno
+}
+
+function sameFileSnapshot(left, right) {
+  return left.dev === right.dev
+    && left.ino === right.ino
+    && left.size === right.size
+    && left.mtimeNs === right.mtimeNs
+    && left.ctimeNs === right.ctimeNs
+}
+
+async function readEntry(name) {
+  const beforePath = await fsp.lstat(name, { bigint: true })
+  if (beforePath.isSymbolicLink() || !beforePath.isFile()) throw new Error('invalid_entry')
+  let handle
+  try {
+    handle = await fsp.open(name, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW)
+  } catch {
+    throw new Error('invalid_entry')
+  }
+  try {
+    const before = await handle.stat({ bigint: true })
+    if (!before.isFile() || !sameFileSnapshot(beforePath, before)) {
+      throw new Error('entry_changed')
+    }
+    if (before.size > BigInt(maxFileBytes)) throw new Error('file_limit')
+    const buffer = Buffer.alloc(maxFileBytes + 1)
     let offset = 0
     while (offset < buffer.length) {
-      const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, offset)
-      if (bytesRead === 0) break
-      offset += bytesRead
+      const result = await handle.read(buffer, offset, buffer.length - offset, offset)
+      if (result.bytesRead === 0) break
+      offset += result.bytesRead
     }
-    if (offset > MAX_VERIFICATION_GOAL_FILE_BYTES) {
-      throw new VerificationGoalRegistryError('registry_limit', `${sourcePath} grew beyond the per-file byte limit while being read.`)
-    }
-    const after = await handle.stat()
-    if (
-      before.dev !== after.dev
-      || before.ino !== after.ino
-      || before.size !== after.size
-      || after.size !== offset
-    ) {
-      throw new VerificationGoalRegistryError('invalid_file', `${sourcePath} changed while the registry was being read.`)
+    if (offset > maxFileBytes) throw new Error('file_limit')
+    const after = await handle.stat({ bigint: true })
+    if (!sameFileSnapshot(before, after) || after.size !== BigInt(offset)) {
+      throw new Error('entry_changed')
     }
     return buffer.subarray(0, offset)
   } finally {
@@ -132,65 +243,105 @@ async function readBoundedRegularFile(
   }
 }
 
-/**
- * Reads the fixed, direct-child JSON registry. It returns no partial result:
- * every path and definition is validated before the sorted array is exposed.
- */
-async function loadVerificationGoalRegistryInternal(
-  projectRoot: string,
-  catalog: ReadonlyMap<string, OperationDefinition> = OPERATION_CATALOG,
-): Promise<LoadedVerificationGoal[]> {
-  const trustedProjectRoot = await realpath(projectRoot)
-  const registryPath = path.join(projectRoot, ...VERIFICATION_GOAL_REGISTRY_PATH.split('/'))
+async function main() {
+  const directory = await fsp.stat('.', { bigint: true })
+  if (!directory.isDirectory() || !sameIdentity(directory)) return fail('directory_identity')
+  const entries = await fsp.readdir('.', { withFileTypes: true })
+  if (entries.length > maxFiles) return fail('registry_limit')
+  entries.sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0)
 
-  let registryStat
+  let totalBytes = 0
+  const snapshot = []
+  for (const entry of entries) {
+    if (!entry.isFile() || entry.isSymbolicLink() || !safeName.test(entry.name)) return fail('invalid_entry')
+    const bytes = await readEntry(entry.name)
+    totalBytes += bytes.length
+    if (totalBytes > maxTotalBytes) return fail('registry_limit')
+    snapshot.push({ name: entry.name, bytesBase64: bytes.toString('base64') })
+  }
+  const after = await fsp.stat('.', { bigint: true })
+  if (!sameIdentity(after)) return fail('directory_identity')
+  process.stdout.write(JSON.stringify({ ok: true, entries: snapshot }))
+}
+
+main().catch((error) => fail(error && typeof error.message === 'string' ? error.message : 'filesystem_error'))
+`
+
+async function readAnchoredRegistrySnapshot(
+  lease: DirectoryLease,
+): Promise<RegistrySnapshotEntry[]> {
+  let stdout: string | Buffer
   try {
-    registryStat = await lstat(registryPath)
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []
-    throw error
-  }
-  if (registryStat.isSymbolicLink() || !registryStat.isDirectory()) {
-    throw new VerificationGoalRegistryError('invalid_registry', 'The verification goal registry must be a real directory, not a symlink or special file.')
-  }
-  const trustedRegistryRoot = await realpath(registryPath)
-  if (!isInside(trustedProjectRoot, trustedRegistryRoot)) {
-    throw new VerificationGoalRegistryError('registry_escape', 'The verification goal registry resolves outside the trusted project root.')
+    const result = await execFileAsync(process.execPath, [
+      '-e',
+      ANCHORED_REGISTRY_READER,
+      lease.stat.dev.toString(),
+      lease.stat.ino.toString(),
+      MAX_VERIFICATION_GOAL_REGISTRY_FILES.toString(),
+      MAX_VERIFICATION_GOAL_FILE_BYTES.toString(),
+      MAX_VERIFICATION_GOAL_REGISTRY_BYTES.toString(),
+    ], {
+      cwd: lease.path,
+      encoding: 'utf8',
+      env: { NODE_ENV: 'production' },
+      maxBuffer: 2 * 1024 * 1024,
+      timeout: 30_000,
+      windowsHide: true,
+    })
+    stdout = result.stdout
+  } catch {
+    throw new VerificationGoalRegistryError(
+      'invalid_registry',
+      'The verification goal registry could not be read through its directory anchor.',
+    )
   }
 
-  const entries = await readdir(registryPath, { withFileTypes: true })
-  if (entries.length > MAX_VERIFICATION_GOAL_REGISTRY_FILES) {
-    throw new VerificationGoalRegistryError('registry_limit', 'The verification goal registry contains too many entries.')
+  let payload: RegistrySnapshot
+  try {
+    payload = JSON.parse(stdout.toString()) as RegistrySnapshot
+  } catch {
+    throw new VerificationGoalRegistryError('invalid_registry', 'The anchored registry reader returned an invalid result.')
   }
+  if (!payload.ok) {
+    throw new VerificationGoalRegistryError(
+      payload.reason === 'registry_limit' || payload.reason === 'file_limit'
+        ? 'registry_limit'
+        : 'invalid_file',
+      payload.reason === 'directory_identity'
+        ? 'The verification goal registry moved or was replaced before its anchored read.'
+        : 'The verification goal registry contains an unsafe or changed entry.',
+    )
+  }
+  if (!Array.isArray(payload.entries) || payload.entries.length > MAX_VERIFICATION_GOAL_REGISTRY_FILES) {
+    throw new VerificationGoalRegistryError('invalid_registry', 'The anchored registry reader returned invalid entries.')
+  }
+  return payload.entries
+}
 
-  const sortedEntries = entries.sort((left, right) => compareVerificationGoalStrings(left.name, right.name))
+async function parseRegistrySnapshot(
+  snapshot: readonly RegistrySnapshotEntry[],
+  catalog: ReadonlyMap<string, OperationDefinition>,
+): Promise<LoadedVerificationGoal[]> {
   const loaded: LoadedVerificationGoal[] = []
   const goalIds = new Set<string>()
   let totalBytes = 0
 
-  for (const entry of sortedEntries) {
-    if (!entry.isFile() || entry.isSymbolicLink()) {
-      throw new VerificationGoalRegistryError('invalid_file', 'Verification goal registry entries must be direct-child regular JSON files.')
+  for (const entry of snapshot) {
+    if (
+      typeof entry.name !== 'string'
+      || !SAFE_REGISTRY_FILE_NAME.test(entry.name)
+      || typeof entry.bytesBase64 !== 'string'
+    ) {
+      throw new VerificationGoalRegistryError('invalid_registry', 'The anchored registry reader returned an invalid entry.')
     }
-    if (!SAFE_REGISTRY_FILE_NAME.test(entry.name)) {
-      throw new VerificationGoalRegistryError('invalid_file', 'Verification goal registry filenames must be bounded safe direct-child .json names.')
-    }
-
     const sourcePath = `${VERIFICATION_GOAL_REGISTRY_PATH}/${entry.name}`
     if (sourcePath.length > MAX_VERIFICATION_GOAL_SOURCE_PATH_LENGTH) {
       throw new VerificationGoalRegistryError('registry_limit', 'Verification goal source path exceeds the storage limit.')
     }
-    const absoluteFilePath = path.join(registryPath, entry.name)
-    const fileStat = await lstat(absoluteFilePath)
-    if (fileStat.isSymbolicLink() || !fileStat.isFile()) {
-      throw new VerificationGoalRegistryError('invalid_file', `${sourcePath} must be a regular file and may not be a symlink.`)
+    const bytes = Buffer.from(entry.bytesBase64, 'base64')
+    if (bytes.toString('base64') !== entry.bytesBase64 || bytes.length > MAX_VERIFICATION_GOAL_FILE_BYTES) {
+      throw new VerificationGoalRegistryError('invalid_registry', 'The anchored registry reader returned invalid bytes.')
     }
-    const trustedFilePath = await realpath(absoluteFilePath)
-    if (path.dirname(trustedFilePath) !== trustedRegistryRoot || !isInside(trustedRegistryRoot, trustedFilePath)) {
-      throw new VerificationGoalRegistryError('registry_escape', `${sourcePath} resolves outside the fixed registry root.`)
-    }
-
-    const bytes = await readBoundedRegularFile(absoluteFilePath, sourcePath, fileStat)
     totalBytes += bytes.length
     if (totalBytes > MAX_VERIFICATION_GOAL_REGISTRY_BYTES) {
       throw new VerificationGoalRegistryError('registry_limit', 'The verification goal registry exceeds the total byte limit.')
@@ -225,12 +376,73 @@ async function loadVerificationGoalRegistryInternal(
   ))
 }
 
-export async function loadVerificationGoalRegistry(
+async function loadVerificationGoalRegistryInternal(
   projectRoot: string,
-  catalog: ReadonlyMap<string, OperationDefinition> = OPERATION_CATALOG,
+  catalog: ReadonlyMap<string, OperationDefinition>,
+  hooks: VerificationGoalRegistryTestHooks = {},
+): Promise<LoadedVerificationGoal[]> {
+  if (!SUPPORTED_DIRECTORY_ANCHOR_PLATFORMS.has(process.platform)) {
+    throw new VerificationGoalRegistryError(
+      'invalid_registry',
+      'Verification goal registry loading is unavailable on this platform because a safe directory anchor is not supported.',
+    )
+  }
+
+  const trustedProjectRoot = await realpath(projectRoot)
+  const projectLease = await openDirectoryLease(trustedProjectRoot, trustedProjectRoot)
+  let forgeLease: DirectoryLease | null = null
+  let registryLease: DirectoryLease | null = null
+  try {
+    const forgePath = path.join(trustedProjectRoot, '.forge')
+    try {
+      forgeLease = await openDirectoryLease(forgePath, forgePath)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        await assertDirectoryLeaseStillFixed(projectLease)
+        return []
+      }
+      throw error
+    }
+
+    const registryPath = path.join(forgePath, 'verification-goals')
+    try {
+      registryLease = await openDirectoryLease(registryPath, registryPath)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        await Promise.all([
+          assertDirectoryLeaseStillFixed(projectLease),
+          assertDirectoryLeaseStillFixed(forgeLease),
+        ])
+        return []
+      }
+      throw error
+    }
+
+    await hooks.afterRegistryDirectoryAnchored?.()
+    const snapshot = await readAnchoredRegistrySnapshot(registryLease)
+    const loaded = await parseRegistrySnapshot(snapshot, catalog)
+    await Promise.all([
+      assertDirectoryLeaseStillFixed(projectLease),
+      assertDirectoryLeaseStillFixed(forgeLease),
+      assertDirectoryLeaseStillFixed(registryLease),
+    ])
+    return loaded
+  } finally {
+    await Promise.allSettled([
+      registryLease?.handle.close(),
+      forgeLease?.handle.close(),
+      projectLease.handle.close(),
+    ])
+  }
+}
+
+async function loadWithSafeErrorBoundary(
+  projectRoot: string,
+  catalog: ReadonlyMap<string, OperationDefinition>,
+  hooks?: VerificationGoalRegistryTestHooks,
 ): Promise<LoadedVerificationGoal[]> {
   try {
-    return await loadVerificationGoalRegistryInternal(projectRoot, catalog)
+    return await loadVerificationGoalRegistryInternal(projectRoot, catalog, hooks)
   } catch (error) {
     if (
       error instanceof VerificationGoalRegistryError
@@ -246,4 +458,20 @@ export async function loadVerificationGoalRegistry(
       `The verification goal registry could not be read safely${code}.`,
     )
   }
+}
+
+export function loadVerificationGoalRegistry(
+  projectRoot: string,
+  catalog: ReadonlyMap<string, OperationDefinition> = OPERATION_CATALOG,
+): Promise<LoadedVerificationGoal[]> {
+  return loadWithSafeErrorBoundary(projectRoot, catalog)
+}
+
+/** Test-only seam for deterministic directory replacement races. */
+export function loadVerificationGoalRegistryForTest(
+  projectRoot: string,
+  catalog: ReadonlyMap<string, OperationDefinition>,
+  hooks: VerificationGoalRegistryTestHooks,
+): Promise<LoadedVerificationGoal[]> {
+  return loadWithSafeErrorBoundary(projectRoot, catalog, hooks)
 }

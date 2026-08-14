@@ -1,12 +1,14 @@
-import { mkdtemp, mkdir, rm, symlink, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import { OPERATION_CATALOG } from '@/lib/operations/catalog'
 import {
   MAX_VERIFICATION_GOAL_FILE_BYTES,
   VERIFICATION_GOAL_REGISTRY_PATH,
   loadVerificationGoalRegistry,
+  loadVerificationGoalRegistryForTest,
   type LoadedVerificationGoal,
 } from '@/lib/verification-goals/registry'
 import {
@@ -92,6 +94,28 @@ describe('verification goal repository registry', () => {
       store,
     }))
       .rejects.toThrow(/exactly the v1 definition keys/i)
+    expect(importSnapshots).not.toHaveBeenCalled()
+  })
+
+  it('fails before storage when the anchored registry is moved outside and its path symlinks to that inode', async () => {
+    const root = await projectRoot()
+    const outsideRoot = await projectRoot()
+    const directory = await registry(root)
+    const movedDirectory = path.join(outsideRoot, 'moved-registry')
+    await writeFile(path.join(directory, 'trusted.json'), JSON.stringify(definition('trusted-goal')))
+    const importSnapshots = vi.fn()
+
+    const importWithAdversarialReplacement = async () => {
+      const goals = await loadVerificationGoalRegistryForTest(root, OPERATION_CATALOG, {
+        afterRegistryDirectoryAnchored: async () => {
+          await rename(directory, movedDirectory)
+          await symlink(movedDirectory, directory, 'dir')
+        },
+      })
+      return importSnapshots(projectId, goals)
+    }
+
+    await expect(importWithAdversarialReplacement()).rejects.toThrow(/moved or was replaced|unsafe/i)
     expect(importSnapshots).not.toHaveBeenCalled()
   })
 

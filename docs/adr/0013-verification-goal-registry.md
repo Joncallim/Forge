@@ -17,6 +17,26 @@ File count, file size, total size, and JSON nesting are bounded. Forge validates
 the whole registry before writing any snapshots, so one invalid file means no
 database changes.
 
+## Filesystem boundary
+
+Reading the registry must stay tied to the identity of one validated directory,
+not just to the text `.forge/verification-goals`. Forge enumerates that directory
+and opens each direct child through the same trusted directory identity. If the
+directory is renamed or replaced while an import is in progress, Forge must
+either continue reading the directory it already validated or stop the import;
+it must never silently switch to the replacement.
+
+The final file opened for each definition must be a regular file, not a symbolic
+link. Immediately before persistence, Forge re-attests that the original
+project-relative registry path still names the same directory it validated. A
+rename, replacement, or failed re-attestation aborts the whole transaction. If
+the host platform cannot provide the required directory-anchored and no-follow
+filesystem guarantees, registry import fails closed.
+
+The trusted filesystem helper only enumerates and reads bounded definition
+files. Repository-provided commands, scripts, adapters, tools, callbacks, and
+other executable material never enter that helper.
+
 ## Version 1 format
 
 Every definition has exactly these fields:
@@ -70,6 +90,19 @@ The table stores only identity fields, the validated canonical definition, its
 digest, the bounded repository-relative source path, and the creation time. It
 does not store a source revision because this slice does not yet have a safely
 bound revision at import time.
+
+## Migration proof
+
+The authoritative Drizzle journal, `web/db/migrations/meta/_journal.json`, determines
+the exact installed migration count and latest migration timestamp. Installer
+proof derives both expectations from that journal and compares them with the
+installer-managed PostgreSQL ledger. Tests and scripts must not copy those
+values into separate numeric pins that become stale when a migration is added.
+
+Hosted PostgreSQL proof of the full installer and repair sequence is mandatory
+for this slice. Passing local checks is useful, but it does not replace that
+hosted proof. This decision record does not claim the proof has passed until the
+corresponding hosted continuous integration job reports success.
 
 ## Deferred work
 
