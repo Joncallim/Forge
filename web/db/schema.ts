@@ -1598,6 +1598,134 @@ export type OperationRunEvent = InferSelectModel<typeof operationRunEvents>
 export type NewOperationRunEvent = InferInsertModel<typeof operationRunEvents>
 
 // ---------------------------------------------------------------------------
+// capabilityAttempts and capabilityAttemptAdjudications
+// ---------------------------------------------------------------------------
+// Immutable, append-only capability reliability ledger (ADR 0012, issue #186).
+// Attempts are one row per (execution_outcome_id, capability_key); later
+// evidence (verification, human decisions, rollback, override, drift) is
+// appended to the adjudications table rather than rewriting the attempt.
+export const capabilityAttempts = pgTable(
+  'capability_attempts',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    attemptGroupId: uuid('attempt_group_id').notNull(),
+    projectId: uuid('project_id').notNull().references(() => projects.id, { onDelete: 'restrict' }),
+    taskId: uuid('task_id').notNull().references(() => tasks.id, { onDelete: 'restrict' }),
+    workPackageId: uuid('work_package_id').references(() => workPackages.id, { onDelete: 'set null' }),
+    agentRunId: uuid('agent_run_id').references(() => agentRuns.id, { onDelete: 'set null' }),
+    taskAttemptId: uuid('task_attempt_id').references(() => taskAttempts.id, { onDelete: 'set null' }),
+    executionOutcomeId: uuid('execution_outcome_id').notNull().references(() => executionOutcomes.id, { onDelete: 'restrict' }),
+    operationRunId: uuid('operation_run_id').references(() => operationRuns.id, { onDelete: 'set null' }),
+    contractVersion: integer('contract_version').notNull().default(1),
+    capabilityKey: text('capability_key').notNull(),
+    classificationState: text('classification_state').notNull(),
+    capabilityMultiplicity: integer('capability_multiplicity').notNull(),
+    cohortFingerprint: text('cohort_fingerprint').notNull(),
+    scopeFingerprint: text('scope_fingerprint').notNull(),
+    runtimeFingerprint: text('runtime_fingerprint').notNull(),
+    policyFingerprint: text('policy_fingerprint').notNull(),
+    outcomeDigest: text('outcome_digest').notNull(),
+    transportStatus: text('transport_status').notNull(),
+    result: text('result').notNull(),
+    stopReasonCode: text('stop_reason_code'),
+    retryable: boolean('retryable').notNull(),
+    attemptNumber: integer('attempt_number').notNull().default(1),
+    severityClass: text('severity_class').notNull(),
+    verifierRequired: boolean('verifier_required').notNull(),
+    verificationMode: text('verification_mode').notNull(),
+    verificationStatus: text('verification_status').notNull(),
+    acceptanceCriteriaTotal: integer('acceptance_criteria_total').notNull().default(0),
+    validationCommandTotal: integer('validation_command_total').notNull().default(0),
+    validationCommandFailed: integer('validation_command_failed').notNull().default(0),
+    evidenceRefs: jsonb('evidence_refs').$type<string[]>().notNull().default(sql`'[]'::jsonb`),
+    observedAt: timestamp('observed_at', tsOpts).notNull(),
+    createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [
+    uniqueIndex('capability_attempts_outcome_capability_idx').on(t.executionOutcomeId, t.capabilityKey),
+    index('capability_attempts_cohort_observed_at_idx').on(t.cohortFingerprint, t.observedAt),
+    index('capability_attempts_project_capability_idx').on(t.projectId, t.capabilityKey),
+    index('capability_attempts_attempt_group_idx').on(t.attemptGroupId),
+    index('capability_attempts_execution_outcome_idx').on(t.executionOutcomeId),
+    check('capability_attempts_contract_version_check', sql`${t.contractVersion} = 1`),
+    check('capability_attempts_capability_key_check', sql`length(${t.capabilityKey}) <= 120 AND ${t.capabilityKey} ~ '^(workpackage:[a-z][a-z0-9-]{0,39}/[a-z][a-z0-9-]{0,39}|operation:[a-z][a-z0-9]*([._-][a-z0-9]+)+@[1-9][0-9]{0,3})$'`),
+    check('capability_attempts_classification_state_check', sql`${t.classificationState} IN ('classified', 'missing', 'overflow')`),
+    check('capability_attempts_capability_multiplicity_check', sql`${t.capabilityMultiplicity} BETWEEN 1 AND 12`),
+    check('capability_attempts_cohort_fingerprint_check', sql`${t.cohortFingerprint} ~ '^[0-9a-f]{64}$'`),
+    check('capability_attempts_scope_fingerprint_check', sql`${t.scopeFingerprint} ~ '^[0-9a-f]{64}$'`),
+    check('capability_attempts_runtime_fingerprint_check', sql`${t.runtimeFingerprint} ~ '^[0-9a-f]{64}$'`),
+    check('capability_attempts_policy_fingerprint_check', sql`${t.policyFingerprint} ~ '^[0-9a-f]{64}$'`),
+    check('capability_attempts_outcome_digest_check', sql`${t.outcomeDigest} ~ '^[0-9a-f]{64}$'`),
+    check('capability_attempts_transport_status_check', sql`${t.transportStatus} IN ('ok', 'error')`),
+    check('capability_attempts_result_check', sql`${t.result} IN ('completed', 'partial', 'refused', 'blocked', 'needs_attention', 'failed', 'cancelled')`),
+    check('capability_attempts_stop_reason_code_check', sql`${t.stopReasonCode} IS NULL OR ${t.stopReasonCode} IN ('provider_transport_failure', 'model_refusal', 'invalid_output', 'validation_failed', 'missing_capability', 'admission_denied', 'policy_blocked', 'security_blocked', 'missing_repository_context', 'timeout', 'context_limit', 'output_limit', 'retry_exhausted', 'human_cancelled', 'unknown')`),
+    check('capability_attempts_attempt_number_check', sql`${t.attemptNumber} >= 1`),
+    check('capability_attempts_severity_class_check', sql`${t.severityClass} IN ('normal', 'critical')`),
+    check('capability_attempts_verification_mode_value_check', sql`${t.verificationMode} IN ('none', 'self_reported', 'human_review', 'deterministic_adapter', 'independent_agent')`),
+    check('capability_attempts_verification_status_check', sql`${t.verificationStatus} IN ('not_required', 'pending', 'passed', 'failed', 'inconclusive')`),
+    check('capability_attempts_acceptance_criteria_total_check', sql`${t.acceptanceCriteriaTotal} >= 0`),
+    check('capability_attempts_validation_command_total_check', sql`${t.validationCommandTotal} >= 0`),
+    check('capability_attempts_validation_command_failed_check', sql`${t.validationCommandFailed} >= 0 AND ${t.validationCommandFailed} <= ${t.validationCommandTotal}`),
+    check('capability_attempts_evidence_refs_check', sql`pg_catalog.jsonb_typeof(${t.evidenceRefs}) = 'array' AND pg_catalog.jsonb_array_length(${t.evidenceRefs}) <= 128 AND ${t.evidenceRefs}::text ~ '^\\[\\]$|^\\["[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89a-bA-B][0-9a-fA-F]{3}-[0-9a-fA-F]{12}"(, "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89a-bA-B][0-9a-fA-F]{3}-[0-9a-fA-F]{12}")*\\]$'`),
+    check('capability_attempts_verifier_consistency_check', sql`(${t.verifierRequired} AND ${t.verificationStatus} IN ('pending', 'passed', 'failed', 'inconclusive')) OR (NOT ${t.verifierRequired} AND ${t.verificationStatus} = 'not_required')`),
+    check('capability_attempts_verification_mode_check', sql`(${t.verificationMode} = 'none') = (NOT ${t.verifierRequired})`),
+    check('capability_attempts_unclassified_check', sql`(${t.classificationState} = 'classified') OR ${t.capabilityKey} LIKE 'workpackage:%/unclassified'`),
+    check('capability_attempts_operation_runtime_check', sql`${t.operationRunId} IS NULL OR ${t.verificationMode} IN ('none', 'deterministic_adapter')`),
+  ],
+)
+
+export type CapabilityAttempt = InferSelectModel<typeof capabilityAttempts>
+export type NewCapabilityAttempt = InferInsertModel<typeof capabilityAttempts>
+
+export const capabilityAttemptAdjudications = pgTable(
+  'capability_attempt_adjudications',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    capabilityAttemptId: uuid('capability_attempt_id').notNull().references(() => capabilityAttempts.id, { onDelete: 'restrict' }),
+    sequence: integer('sequence').notNull(),
+    kind: text('kind').notNull(),
+    verificationMode: text('verification_mode'),
+    verificationResult: text('verification_result'),
+    humanDecision: text('human_decision'),
+    decidedBy: uuid('decided_by').references(() => users.id, { onDelete: 'set null' }),
+    approvalGateId: uuid('approval_gate_id').references(() => approvalGates.id, { onDelete: 'set null' }),
+    observedOutcomeDigest: text('observed_outcome_digest'),
+    evidenceRefs: jsonb('evidence_refs').$type<string[]>().notNull().default(sql`'[]'::jsonb`),
+    observedAt: timestamp('observed_at', tsOpts).notNull(),
+    createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [
+    uniqueIndex('capability_attempt_adjudications_attempt_sequence_idx').on(t.capabilityAttemptId, t.sequence),
+    index('capability_attempt_adjudications_attempt_observed_at_idx').on(t.capabilityAttemptId, t.observedAt),
+    check('capability_attempt_adjudications_sequence_check', sql`${t.sequence} >= 0`),
+    check('capability_attempt_adjudications_kind_check', sql`${t.kind} IN ('verification_recorded', 'human_decision', 'rollback_recorded', 'override_recorded', 'evidence_drift_detected')`),
+    check('capability_attempt_adjudications_verification_mode_check', sql`${t.verificationMode} IS NULL OR ${t.verificationMode} IN ('none', 'self_reported', 'human_review', 'deterministic_adapter', 'independent_agent')`),
+    check('capability_attempt_adjudications_verification_result_check', sql`${t.verificationResult} IS NULL OR ${t.verificationResult} IN ('passed', 'failed', 'inconclusive')`),
+    check('capability_attempt_adjudications_human_decision_check', sql`${t.humanDecision} IS NULL OR ${t.humanDecision} IN ('accepted', 'rejected', 'cancelled')`),
+    check('capability_attempt_adjudications_observed_outcome_digest_check', sql`${t.observedOutcomeDigest} IS NULL OR ${t.observedOutcomeDigest} ~ '^[0-9a-f]{64}$'`),
+    check('capability_attempt_adjudications_evidence_refs_check', sql`pg_catalog.jsonb_typeof(${t.evidenceRefs}) = 'array' AND pg_catalog.jsonb_array_length(${t.evidenceRefs}) <= 128 AND ${t.evidenceRefs}::text ~ '^\\[\\]$|^\\["[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89a-bA-B][0-9a-fA-F]{3}-[0-9a-fA-F]{12}"(, "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89a-bA-B][0-9a-fA-F]{3}-[0-9a-fA-F]{12}")*\\]$'`),
+    check('capability_attempt_adjudications_kind_shape_check', sql`
+      (${t.kind} = 'verification_recorded'
+        AND ${t.verificationMode} IS NOT NULL AND ${t.verificationResult} IS NOT NULL
+        AND ${t.humanDecision} IS NULL AND ${t.observedOutcomeDigest} IS NULL)
+      OR (${t.kind} = 'human_decision'
+        AND ${t.humanDecision} IS NOT NULL
+        AND ${t.verificationMode} IS NULL AND ${t.verificationResult} IS NULL
+        AND ${t.observedOutcomeDigest} IS NULL)
+      OR (${t.kind} IN ('rollback_recorded', 'override_recorded')
+        AND ${t.verificationMode} IS NULL AND ${t.verificationResult} IS NULL
+        AND ${t.humanDecision} IS NULL AND ${t.observedOutcomeDigest} IS NULL)
+      OR (${t.kind} = 'evidence_drift_detected'
+        AND ${t.observedOutcomeDigest} IS NOT NULL
+        AND ${t.verificationMode} IS NULL AND ${t.verificationResult} IS NULL AND ${t.humanDecision} IS NULL)
+    `),
+  ],
+)
+
+export type CapabilityAttemptAdjudication = InferSelectModel<typeof capabilityAttemptAdjudications>
+export type NewCapabilityAttemptAdjudication = InferInsertModel<typeof capabilityAttemptAdjudications>
+
+// ---------------------------------------------------------------------------
 // artifacts
 // ---------------------------------------------------------------------------
 export const artifacts = pgTable(

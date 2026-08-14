@@ -1027,11 +1027,14 @@ describe('review gate contract', () => {
     })
 
     expect(result).toMatchObject({ status: 'decided', decision: 'completed' })
-    // dbSelect is called 6 times: gate, reviewRequirement, sourceArtifact,
+    // dbSelect is called 8 times: gate, reviewRequirement, sourceArtifact,
     // latest package artifact, then
-    // completeTaskIfReviewGatesSatisfied's package list + gate list. No QA-blocks-
+    // completeTaskIfReviewGatesSatisfied's package list + gate list, then the
+    // two capability-reliability-ledger adjudication lookups (human decision,
+    // verification) that resolve their execution_outcomes row and find no
+    // linked capability attempts in this mocked environment. No QA-blocks-
     // reviewer lookup happens for reviewer_only.
-    expect(mocks.dbSelect).toHaveBeenCalledTimes(6)
+    expect(mocks.dbSelect).toHaveBeenCalledTimes(8)
   })
 
   it('completes a both-review package only after QA approves first and then Reviewer approves', async () => {

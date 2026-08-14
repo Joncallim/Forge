@@ -6,6 +6,10 @@ import { sanitizeWorkerMessage } from './redaction'
 import { updateTaskStatusIfCurrent } from './task-state'
 import { convergeRecognizedOperatorHoldTask } from '../lib/mcps/filesystem-grant-reconciliation'
 import { resolveS4ReviewSourceV1 } from '../lib/mcps/review-source-resolver'
+import {
+  recordHumanDecisionAdjudicationBestEffort,
+  recordVerificationAdjudicationBestEffort,
+} from './reliability/ledger'
 
 export const REVIEW_GATE_TYPES = ['qa_review', 'reviewer_review', 'security_review'] as const
 export type ReviewGateType = typeof REVIEW_GATE_TYPES[number]
@@ -1145,6 +1149,26 @@ export async function decideReviewGate(input: {
   const completion = decided.packageStatus === 'completed'
     ? await completeTaskIfReviewGatesSatisfied(input.taskId)
     : { status: 'blocked' as const }
+
+  if (sourceAgentRunId) {
+    const attemptKey = `work-package:${workPackageId}:run:${sourceAgentRunId}`
+    const humanDecision = input.decision === 'completed' ? 'accepted' : 'rejected'
+    await recordHumanDecisionAdjudicationBestEffort({
+      taskId: input.taskId,
+      attemptKey,
+      humanDecision,
+      decidedBy: input.userId,
+      approvalGateId: gate.id,
+      observedAt: now,
+    })
+    await recordVerificationAdjudicationBestEffort({
+      taskId: input.taskId,
+      attemptKey,
+      verificationMode: 'human_review',
+      verificationResult: humanDecision === 'accepted' ? 'passed' : 'failed',
+      observedAt: now,
+    })
+  }
 
   // A review barrier may have been the last reason a running task could not
   // return to its durable operator hold. Recheck after every existing

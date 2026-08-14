@@ -30,6 +30,7 @@
     "protocol:scrub-legacy-leakage": "tsx scripts/scrub-legacy-leakage.ts",
     "protocol:inspect-local-projection-overlimit": "tsx scripts/inspect-local-projection-overlimit.ts",
     "protocol:archive-local-projection-overlimit": "tsx scripts/archive-local-projection-overlimit.ts",
+    "protocol:inspect-capability-reliability": "tsx scripts/inspect-capability-reliability.ts",
     "session-credentials:reconcile": "tsx scripts/reconcile-session-credentials.ts",
     "project-roots:reconcile-expansion": "tsx scripts/reconcile-project-root-expansion.ts",
     "project-roots:build-concurrent-index": "tsx scripts/build-project-root-ref-index.ts",

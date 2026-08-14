@@ -71,7 +71,22 @@ import {
 import { explicitOptInFeatureFlagEnabled } from './feature-flags'
 import { sanitizeWorkerMessage } from './redaction'
 import { upsertExecutionOutcome } from './execution-outcomes'
-import { executionFailureOutcome, outcomeEvidenceRefsFromArtifact } from '../lib/execution-outcomes'
+import {
+  executionFailureOutcome,
+  outcomeEvidenceRefsFromArtifact,
+  type ExecutionOutcome,
+} from '../lib/execution-outcomes'
+import {
+  buildExecutedRuntimeInputFromRunId,
+  buildIntendedRuntimeInputFromHarness,
+  buildWorkPackagePolicyInput,
+  buildWorkPackageReliabilityScope,
+  buildWorkPackageReliabilityScopeForTask,
+  extractMcpRequirementKeys,
+  loadWorkPackageCapabilityContext,
+  loadWorkPackageCapabilitySource,
+} from './reliability/context'
+import { recordCapabilityAttemptsBestEffort } from './reliability/ledger'
 import { recordTaskLogBestEffort } from './task-logs'
 import { packetCandidateGuard } from '../lib/mcps/packet-issuance-v2'
 import { localEffectCandidateGuard } from '../lib/mcps/local-run-evidence-v2'
@@ -428,12 +443,13 @@ async function publishTaskEventBestEffort(
  */
 async function upsertExecutionOutcomeBestEffort(
   input: Parameters<typeof upsertExecutionOutcome>[0],
-): Promise<void> {
+): Promise<{ id: string } | null> {
   try {
-    await upsertExecutionOutcome(input)
+    return await upsertExecutionOutcome(input)
   } catch (err) {
     const message = sanitizeWorkerMessage(err instanceof Error ? err.message : String(err))
     console.warn(`Failed to record execution outcome for ${input.attemptKey}: ${message}`)
+    return null
   }
 }
 
@@ -1949,28 +1965,153 @@ async function persistWorkPackageHandoffBlock(input: {
       break
   }
   if (result.status === 'blocked') {
-    await upsertExecutionOutcomeBestEffort({
+    const admissionOutcome: ExecutionOutcome = {
+      schemaVersion: 1,
+      transportStatus: 'ok',
+      result: 'blocked',
+      stopReasonCode: input.decision.kind === 'reserved_role'
+        ? 'policy_blocked'
+        : input.decision.kind === 'broker'
+          ? 'admission_denied'
+          : 'missing_capability',
+      stopReasonSummary: result.blockedReason,
+      retryable: !result.terminalBlock,
+      evidenceRefs: [],
+      verifierRequired: false,
+      verificationStatus: 'not_required',
+    }
+    const storedOutcome = await upsertExecutionOutcomeBestEffort({
       taskId: input.taskId,
       workPackageId: input.pkg.id,
       attemptKey: `work-package:${input.pkg.id}:admission`,
-      outcome: {
-        schemaVersion: 1,
-        transportStatus: 'ok',
-        result: 'blocked',
-        stopReasonCode: input.decision.kind === 'reserved_role'
-          ? 'policy_blocked'
-          : input.decision.kind === 'broker'
-            ? 'admission_denied'
-            : 'missing_capability',
-        stopReasonSummary: result.blockedReason,
-        retryable: !result.terminalBlock,
-        evidenceRefs: [],
-        verifierRequired: false,
-        verificationStatus: 'not_required',
-      },
+      outcome: admissionOutcome,
     })
+    if (storedOutcome) {
+      await recordAdmissionBlockCapabilityAttemptBestEffort({
+        pkg: input.pkg,
+        project: input.project,
+        taskId: input.taskId,
+        executionOutcomeId: storedOutcome.id,
+        outcome: admissionOutcome,
+      })
+    }
   }
   return result
+}
+
+async function recordAdmissionBlockCapabilityAttemptBestEffort(input: {
+  pkg: HandoffPackage
+  project: McpProjectFreshnessSnapshot
+  taskId: string
+  executionOutcomeId: string
+  outcome: ExecutionOutcome
+}): Promise<void> {
+  try {
+    const runtime = await buildIntendedRuntimeInputFromHarness(input.pkg.harnessId)
+    if (!runtime) return
+    const source = await loadWorkPackageCapabilitySource(input.pkg)
+    const scope = await buildWorkPackageReliabilityScope({
+      projectId: input.project.id,
+      rootBindingRevision: input.project.rootBindingRevision,
+      grantDecisionRevision: input.project.grantDecisionRevision,
+      repositoryWriteIntent: false,
+      capabilities: source.kind === 'work_package' ? (source.capabilities ?? []) : [],
+      mcpRequirementKeys: extractMcpRequirementKeys(input.pkg.mcpRequirements),
+    })
+    if (!scope) return
+    const policy = await buildWorkPackagePolicyInput({
+      harnessId: input.pkg.harnessId,
+      reviewRequirement: isReviewRequirement(input.pkg.reviewRequirement) ? input.pkg.reviewRequirement : 'both',
+      repositoryWritesEnabled: false,
+    })
+    await recordCapabilityAttemptsBestEffort({
+      projectId: input.project.id,
+      taskId: input.taskId,
+      workPackageId: input.pkg.id,
+      agentRunId: null,
+      taskAttemptId: null,
+      executionOutcomeId: input.executionOutcomeId,
+      operationRunId: null,
+      outcome: input.outcome,
+      attemptNumber: 1,
+      source,
+      scope,
+      runtime,
+      policy,
+      verificationMode: 'none',
+      acceptanceCriteriaTotal: 0,
+      validationCommandTotal: 0,
+      validationCommandFailed: 0,
+      observedAt: new Date(),
+    })
+  } catch (err) {
+    const message = sanitizeWorkerMessage(err instanceof Error ? err.message : String(err))
+    console.warn(`Failed to record capability attempt for admission block on work package ${input.pkg.id}: ${message}`)
+  }
+}
+
+function isReviewRequirement(value: string | undefined): value is 'none' | 'qa_only' | 'reviewer_only' | 'both' {
+  return value === 'none' || value === 'qa_only' || value === 'reviewer_only' || value === 'both'
+}
+
+/**
+ * Shared ingest for the completion and failure boundaries of a run. Loads
+ * the agent-run snapshot fresh by id (never trusting a possibly-partial
+ * `run` object already in scope) and skips ingest entirely when that
+ * runtime identity is unavailable, per the ledger's fail-closed contract.
+ */
+async function recordWorkPackageRunCapabilityAttemptBestEffort(input: {
+  taskId: string
+  pkg: HandoffPackage
+  runId: string
+  executionOutcomeId: string
+  outcome: ExecutionOutcome
+  attemptNumber: number
+  verificationMode: 'none' | 'human_review'
+  repositoryAffecting: boolean
+  validationCommandTotal: number
+  validationCommandFailed: number
+}): Promise<void> {
+  try {
+    const runtime = await buildExecutedRuntimeInputFromRunId(input.runId)
+    if (!runtime) return
+    const { source, acceptanceCriteriaTotal } = await loadWorkPackageCapabilityContext(input.pkg)
+    const scope = await buildWorkPackageReliabilityScopeForTask({
+      taskId: input.taskId,
+      repositoryWriteIntent: input.repositoryAffecting,
+      capabilities: source.kind === 'work_package' ? (source.capabilities ?? []) : [],
+      mcpRequirementKeys: extractMcpRequirementKeys(input.pkg.mcpRequirements),
+    })
+    if (!scope) return
+    const policy = await buildWorkPackagePolicyInput({
+      harnessId: input.pkg.harnessId,
+      reviewRequirement: isReviewRequirement(input.pkg.reviewRequirement) ? input.pkg.reviewRequirement : 'both',
+      repositoryWritesEnabled: input.repositoryAffecting,
+    })
+    await recordCapabilityAttemptsBestEffort({
+      projectId: scope.projectId,
+      taskId: input.taskId,
+      workPackageId: input.pkg.id,
+      agentRunId: input.runId,
+      taskAttemptId: null,
+      executionOutcomeId: input.executionOutcomeId,
+      operationRunId: null,
+      outcome: input.outcome,
+      attemptNumber: input.attemptNumber,
+      source,
+      scope,
+      runtime,
+      policy,
+      verificationMode: input.verificationMode,
+      acceptanceCriteriaTotal,
+      validationCommandTotal: input.validationCommandTotal,
+      validationCommandFailed: input.validationCommandFailed,
+      observedAt: new Date(),
+    })
+  } catch (err) {
+    const message = sanitizeWorkerMessage(err instanceof Error ? err.message : String(err))
+    console.warn(`Failed to record capability attempt for run ${input.runId} on work package ${input.pkg.id}: ${message}`)
+  }
 }
 
 /**
@@ -3325,23 +3466,38 @@ async function executeReadyWorkPackage(
       artifact = protectedArtifact ?? null
     }
     if (!artifact) throw new Error('Work package completion did not create a source artifact.')
-    await upsertExecutionOutcomeBestEffort({
+    const completionOutcome: ExecutionOutcome = {
+      schemaVersion: 1,
+      transportStatus: 'ok',
+      result: 'completed',
+      stopReasonCode: null,
+      stopReasonSummary: null,
+      retryable: false,
+      evidenceRefs: [artifact.id],
+      verifierRequired: (nextPackage.reviewRequirement ?? 'both') !== 'none',
+      verificationStatus: (nextPackage.reviewRequirement ?? 'both') === 'none' ? 'not_required' : 'pending',
+    }
+    const completionStoredOutcome = await upsertExecutionOutcomeBestEffort({
       taskId,
       workPackageId: nextPackage.id,
       agentRunId: run.id,
       attemptKey: `work-package:${nextPackage.id}:run:${run.id}`,
-      outcome: {
-        schemaVersion: 1,
-        transportStatus: 'ok',
-        result: 'completed',
-        stopReasonCode: null,
-        stopReasonSummary: null,
-        retryable: false,
-        evidenceRefs: [artifact.id],
-        verifierRequired: (nextPackage.reviewRequirement ?? 'both') !== 'none',
-        verificationStatus: (nextPackage.reviewRequirement ?? 'both') === 'none' ? 'not_required' : 'pending',
-      },
+      outcome: completionOutcome,
     })
+    if (completionStoredOutcome) {
+      await recordWorkPackageRunCapabilityAttemptBestEffort({
+        taskId,
+        pkg: nextPackage,
+        runId: run.id,
+        executionOutcomeId: completionStoredOutcome.id,
+        outcome: completionOutcome,
+        attemptNumber,
+        verificationMode: completionOutcome.verifierRequired ? 'human_review' : 'none',
+        repositoryAffecting,
+        validationCommandTotal: execution.commandResults.length,
+        validationCommandFailed: execution.commandResults.filter((result) => result.exitCode !== 0).length,
+      })
+    }
     const packageStatus = reviewGates.packageStatus === 'awaiting_review' || reviewGates.packageStatus === 'completed'
       ? reviewGates.packageStatus
       : null
@@ -3569,21 +3725,44 @@ async function executeReadyWorkPackage(
     // A failure outcome is authoritative even when the artifact write did not
     // return a row. Keep evidence empty in that case rather than losing the
     // outcome record or inventing an evidence reference.
-    await upsertExecutionOutcomeBestEffort({
+    const failureOutcome: ExecutionOutcome = {
+      ...executionFailureOutcome({
+        message,
+        retryable: !finalAttempt,
+        validationFailed: validationStatusForPackage === 'failed',
+        repositoryContextMissing: repositoryEvidenceBlocked,
+      }),
+      evidenceRefs: outcomeEvidenceRefsFromArtifact(artifact),
+    }
+    const failureStoredOutcome = await upsertExecutionOutcomeBestEffort({
       taskId,
       workPackageId: nextPackage.id,
       agentRunId: run.id,
       attemptKey: `work-package:${nextPackage.id}:run:${run.id}`,
-      outcome: {
-        ...executionFailureOutcome({
-          message,
-          retryable: !finalAttempt,
-          validationFailed: validationStatusForPackage === 'failed',
-          repositoryContextMissing: repositoryEvidenceBlocked,
-        }),
-        evidenceRefs: outcomeEvidenceRefsFromArtifact(artifact),
-      },
+      outcome: failureOutcome,
     })
+    if (failureStoredOutcome) {
+      await recordWorkPackageRunCapabilityAttemptBestEffort({
+        taskId,
+        pkg: nextPackage,
+        runId: run.id,
+        executionOutcomeId: failureStoredOutcome.id,
+        outcome: failureOutcome,
+        attemptNumber,
+        verificationMode: 'none',
+        repositoryAffecting,
+        // `execution` is scoped to the try block and is unavailable once we are
+        // on the failure path, but the validation verdict this severity rule
+        // depends on is not: a repository-affecting package whose validation
+        // commands failed is exactly the `critical` case in ADR 0012, and
+        // reporting zero failed commands here would silently downgrade it to
+        // `normal`. Counts stay coarse (one failing command is enough to make
+        // the attempt critical); the precise per-command tally lives in the
+        // command audits, not in this ledger.
+        validationCommandTotal: validationStatusForPackage === 'failed' ? 1 : 0,
+        validationCommandFailed: validationStatusForPackage === 'failed' ? 1 : 0,
+      })
+    }
 
     assertQueueClaimOwned(options)
     await publishTaskEventBestEffort(taskId, 'run:failed', {
