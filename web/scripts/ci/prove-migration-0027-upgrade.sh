@@ -38,6 +38,7 @@ echo "Bootstrapping the exact S4 owner handoff and applying pending migrations f
 npm run protocol:bootstrap-epic-172-s4-roles
 npx tsx scripts/ci/migrate-through-0027.ts
 bash scripts/ci/apply-epic-172-s5-recovery-migration.sh
+bash scripts/ci/apply-verification-goal-registry-migration.sh
 psql "${FORGE_DATABASE_ADMIN_URL}" --set ON_ERROR_STOP=1 \
   --set migration_principal="${migration_principal}" \
   --set expected_migration_count="$FORGE_CURRENT_MIGRATION_COUNT" \

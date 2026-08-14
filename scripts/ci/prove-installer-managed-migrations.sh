@@ -76,7 +76,7 @@ $proof$;
 SQL
 }
 
-assert_s5_cleanup() {
+assert_protected_owner_cleanup() {
   local database_name="$1"
   PGPASSWORD="$FORGE_INSTALLER_MANAGED_ADMIN_PASSWORD" PGHOST="$FORGE_INSTALLER_MANAGED_ADMIN_HOST" PGUSER="$FORGE_INSTALLER_MANAGED_ADMIN_USER" PGDATABASE="$database_name" psql --set ON_ERROR_STOP=1 <<'SQL'
 DO $proof$
@@ -87,9 +87,16 @@ BEGIN
     migration_login,
     'public.forge_begin_epic_172_s4_owner_bootstrap_v1()'::regprocedure,
     'EXECUTE'
+  ) OR pg_catalog.has_function_privilege(
+    migration_login,
+    'public.forge_finalize_epic_172_s4_owner_bootstrap_v1()'::regprocedure,
+    'EXECUTE'
   ) OR pg_catalog.pg_has_role(migration_login, 'forge_s4_routines_owner', 'member')
-    OR pg_catalog.has_schema_privilege(migration_login, 'forge', 'CREATE') THEN
-    RAISE EXCEPTION 'S5 cleanup retained temporary migration authority';
+    OR pg_catalog.has_schema_privilege(migration_login, 'forge', 'CREATE')
+    OR pg_catalog.has_schema_privilege('forge_s4_routines_owner', 'public', 'CREATE')
+    OR pg_catalog.has_schema_privilege('forge_s4_routines_owner', 'forge', 'CREATE')
+    OR NOT pg_catalog.has_schema_privilege('forge_s4_routines_owner', 'forge', 'USAGE') THEN
+    RAISE EXCEPTION 'Protected-owner cleanup did not restore the exact authority boundary';
   END IF;
 END;
 $proof$;
@@ -119,6 +126,36 @@ if [ "$failure_status" -eq 0 ]; then
   echo 'The induced S5 failure unexpectedly succeeded.' >&2
   exit 1
 fi
-assert_s5_cleanup "$FORGE_INSTALLER_MANAGED_FAILURE_ADMIN_DATABASE"
+assert_protected_owner_cleanup "$FORGE_INSTALLER_MANAGED_FAILURE_ADMIN_DATABASE"
 
-echo 'Installer-managed migration sequence, rerun, and S5 failure-cleanup proof passed.'
+echo 'Retrying S5, then proving the registry handoff fails from 0028 and cleans up.'
+(
+  cd "$REPO_ROOT/web"
+  DATABASE_URL="$FORGE_INSTALLER_MANAGED_FAILURE_DATABASE_URL" \
+    FORGE_DATABASE_ADMIN_URL="$FORGE_INSTALLER_MANAGED_FAILURE_ADMIN_URL" \
+    bash scripts/ci/apply-epic-172-s5-recovery-migration.sh
+)
+set +e
+(
+  cd "$REPO_ROOT/web"
+  DATABASE_URL="$FORGE_INSTALLER_MANAGED_FAILURE_DATABASE_URL" \
+    FORGE_DATABASE_ADMIN_URL="$FORGE_INSTALLER_MANAGED_FAILURE_ADMIN_URL" \
+    FORGE_REGISTRY_FORCE_HANDOFF_FAILURE=1 \
+    bash scripts/ci/apply-verification-goal-registry-migration.sh
+)
+registry_failure_status=$?
+set -e
+if [ "$registry_failure_status" -eq 0 ]; then
+  echo 'The induced registry handoff failure unexpectedly succeeded.' >&2
+  exit 1
+fi
+assert_protected_owner_cleanup "$FORGE_INSTALLER_MANAGED_FAILURE_ADMIN_DATABASE"
+(
+  cd "$REPO_ROOT/web"
+  DATABASE_URL="$FORGE_INSTALLER_MANAGED_FAILURE_DATABASE_URL" \
+    FORGE_DATABASE_ADMIN_URL="$FORGE_INSTALLER_MANAGED_FAILURE_ADMIN_URL" \
+    bash scripts/ci/apply-verification-goal-registry-migration.sh
+)
+assert_latest_and_clean "$FORGE_INSTALLER_MANAGED_FAILURE_ADMIN_DATABASE"
+
+echo 'Installer-managed migration sequence, rerun, and both failure-cleanup proofs passed.'

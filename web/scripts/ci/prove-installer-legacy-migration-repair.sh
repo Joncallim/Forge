@@ -324,7 +324,10 @@ restore_canonical_forge_boundary() {
   admin_psql <<'SQL'
 GRANT SELECT ON TABLE
   public.work_package_local_projection_sources,
-  public.work_package_local_projection_heads
+  public.work_package_local_projection_heads,
+  public.verification_goal_registry_revisions,
+  public.verification_goal_registry_entries,
+  public.verification_goal_registry_heads
 TO forge;
 SQL
 }
@@ -349,7 +352,7 @@ assert_protected_forge_acl_count() {
     echo "Expected $expected_count protected forge ACL rows, found $actual_count." >&2
     exit 1
   }
-  if [ "$expected_count" = 148 ]; then
+  if [ "$expected_count" = 148 ] || [ "$expected_count" = 160 ]; then
     exact_live_count="$(admin_psql --no-align --tuples-only --quiet --command "
     SELECT count(*)
     FROM pg_catalog.pg_class relation
@@ -366,8 +369,8 @@ assert_protected_forge_acl_count() {
       AND privilege.privilege_type IN ('DELETE', 'INSERT', 'SELECT', 'UPDATE')
       AND NOT privilege.is_grantable
       AND privilege.grantor = relation.relowner;")"
-    [ "$exact_live_count" = 148 ] || {
-      echo "Exact installer contamination expected 148 owner-granted ACL rows, found $exact_live_count." >&2
+    [ "$exact_live_count" = "$expected_count" ] || {
+      echo "Exact installer contamination expected $expected_count owner-granted ACL rows, found $exact_live_count." >&2
       exit 1
     }
   elif [ "$expected_count" = 2 ]; then
@@ -387,6 +390,29 @@ assert_protected_forge_acl_count() {
       AND privilege.grantor = relation.relowner;")"
     [ "$exact_live_count" = 2 ] || {
       echo "Canonical projection boundary expected two exact SELECT grants, found $exact_live_count." >&2
+      exit 1
+    }
+  elif [ "$expected_count" = 5 ]; then
+    exact_live_count="$(admin_psql --no-align --tuples-only --quiet --command "
+    SELECT count(*)
+    FROM pg_catalog.pg_class relation
+    JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = relation.relnamespace
+    CROSS JOIN LATERAL pg_catalog.aclexplode(
+      COALESCE(relation.relacl, pg_catalog.acldefault('r', relation.relowner))
+    ) privilege
+    JOIN pg_catalog.pg_roles grantee ON grantee.oid = privilege.grantee
+    WHERE namespace_row.nspname = 'public'
+      AND relation.relname IN (
+        'work_package_local_projection_sources', 'work_package_local_projection_heads',
+        'verification_goal_registry_revisions', 'verification_goal_registry_entries',
+        'verification_goal_registry_heads'
+      )
+      AND grantee.rolname = 'forge'
+      AND privilege.privilege_type = 'SELECT'
+      AND NOT privilege.is_grantable
+      AND privilege.grantor = relation.relowner;")"
+    [ "$exact_live_count" = 5 ] || {
+      echo "Canonical latest boundary expected five exact SELECT grants, found $exact_live_count." >&2
       exit 1
     }
   fi
@@ -566,7 +592,14 @@ assert_owner_driven_forge_boundary() {
   admin_psql <<'SQL'
 DO $proof$
 DECLARE
-  projection_name text;
+  direct_read_table text;
+  direct_read_tables constant text[] := ARRAY[
+    'work_package_local_projection_sources',
+    'work_package_local_projection_heads',
+    'verification_goal_registry_revisions',
+    'verification_goal_registry_entries',
+    'verification_goal_registry_heads'
+  ];
 BEGIN
   IF EXISTS (
     SELECT 1
@@ -581,7 +614,7 @@ BEGIN
       AND owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner')
       AND privilege.grantee = 'forge'::pg_catalog.regrole
       AND (
-        relation.relname NOT IN ('work_package_local_projection_sources', 'work_package_local_projection_heads')
+        relation.relname <> ALL(direct_read_tables)
         OR privilege.privilege_type <> 'SELECT'
         OR privilege.is_grantable
         OR privilege.grantor <> relation.relowner
@@ -601,10 +634,7 @@ BEGIN
   ) THEN
     RAISE EXCEPTION 'Owner-driven installer boundary retained unexpected forge authority';
   END IF;
-  FOREACH projection_name IN ARRAY ARRAY[
-    'work_package_local_projection_sources',
-    'work_package_local_projection_heads'
-  ]
+  FOREACH direct_read_table IN ARRAY direct_read_tables
   LOOP
     IF (
       SELECT count(*)
@@ -614,13 +644,13 @@ BEGIN
         COALESCE(relation.relacl, pg_catalog.acldefault('r', relation.relowner))
       ) privilege
       WHERE namespace_row.nspname = 'public'
-        AND relation.relname = projection_name
+        AND relation.relname = direct_read_table
         AND privilege.grantee = 'forge'::pg_catalog.regrole
         AND privilege.privilege_type = 'SELECT'
         AND NOT privilege.is_grantable
         AND privilege.grantor = relation.relowner
     ) <> 1 THEN
-      RAISE EXCEPTION 'Projection % lacks exact forge SELECT authority', projection_name;
+      RAISE EXCEPTION 'Direct-read table % lacks exact owner-granted forge SELECT authority', direct_read_table;
     END IF;
   END LOOP;
   IF (
@@ -1298,10 +1328,10 @@ run_managed_sequence
 # A real legacy install ran the broad app grant after reaching latest. Recreate
 # that state before the next upgrade so the 0028 normalizer sees a real shape.
 grant_exact_forge_contamination
-assert_protected_forge_acl_count 148
+assert_protected_forge_acl_count 160
 run_managed_sequence
 snapshot managed-latest-once
-assert_protected_forge_acl_count 2
+assert_protected_forge_acl_count 5
 run_managed_sequence
 snapshot managed-latest-twice
 assert_unchanged managed-latest-once managed-latest-twice 'Managed latest rerun'
@@ -1338,7 +1368,7 @@ CREATE TABLE public.forge_legacy_ordinary_acl_probe (
 );
 SQL
 grant_exact_forge_contamination
-assert_protected_forge_acl_count 148
+assert_protected_forge_acl_count 160
 echo 'Proving legacy normalizer role races block, then refuse the committed unsafe boundary.'
 prove_role_boundary_race_refusal legacy attribute
 prove_role_boundary_race_refusal legacy membership
@@ -1349,7 +1379,7 @@ cmp -s "$TEMP_ROOT/exact-installer-contamination-before.ledger" "$TEMP_ROOT/exac
   echo 'Installer-grant normalization changed the immutable migration ledger.' >&2
   exit 1
 }
-assert_protected_forge_acl_count 2
+assert_protected_forge_acl_count 5
 admin_psql <<'SQL'
 DO $proof$
 BEGIN
@@ -1514,7 +1544,7 @@ assert_unchanged extra-installer-contamination-before extra-installer-contaminat
 restore_canonical_forge_boundary
 
 echo 'Proving concurrent table and column ACL changes serialize across the full protected inventory.'
-assert_protected_forge_acl_count 2
+assert_protected_forge_acl_count 5
 snapshot table-acl-race-before
 prove_acl_grant_race_refusal table "SET ROLE forge_s4_routines_owner;
 GRANT INSERT ON TABLE public.architect_plan_versions TO forge;
@@ -1562,7 +1592,7 @@ SET ROLE forge_s4_routines_owner;
 REVOKE INSERT ON TABLE public.architect_plan_versions FROM forge;
 RESET ROLE;
 SQL
-assert_protected_forge_acl_count 2
+assert_protected_forge_acl_count 5
 
 snapshot column-acl-race-before
 prove_acl_grant_race_refusal column "SET ROLE forge_s4_routines_owner;
@@ -1618,7 +1648,7 @@ SET ROLE forge_s4_routines_owner;
 REVOKE SELECT (task_id) ON TABLE public.architect_plan_versions FROM forge;
 RESET ROLE;
 SQL
-assert_protected_forge_acl_count 2
+assert_protected_forge_acl_count 5
 
 echo 'Proving the real installer and repair app-grant transaction against disposable PostgreSQL.'
 admin_psql <<'SQL'
@@ -1628,7 +1658,7 @@ CREATE TABLE public.forge_installer_privilege_probe (
 );
 SQL
 run_installer_grant_privileges installer-grant-success
-assert_protected_forge_acl_count 2
+assert_protected_forge_acl_count 5
 assert_owner_driven_forge_boundary
 run_repair_grant_privileges repair-grant-success
 grep -Fq 'Ensured the forge role can read ordinary forge tables without protected-table DML access.' \
@@ -1637,12 +1667,52 @@ grep -Fq 'Ensured the forge role can read ordinary forge tables without protecte
   echo 'Repair did not execute the shared privilege reconciliation successfully.' >&2
   exit 1
 }
-assert_protected_forge_acl_count 2
+assert_protected_forge_acl_count 5
 assert_owner_driven_forge_boundary
 
 echo 'Proving shared reconciliation role races block, then refuse the committed unsafe boundary.'
 prove_role_boundary_race_refusal shared attribute
 prove_role_boundary_race_refusal shared membership
+
+echo 'Proving shared reconciliation refuses protected-owner membership and LOGIN drift.'
+admin_server_psql <<'SQL'
+DO $setup$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'forge_protected_owner_foreign_probe') THEN
+    CREATE ROLE forge_protected_owner_foreign_probe
+      NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+  END IF;
+END;
+$setup$;
+GRANT forge_s4_routines_owner TO forge_protected_owner_foreign_probe;
+SQL
+snapshot shared-protected-owner-membership-before
+run_repair_grant_privileges repair-protected-owner-membership
+snapshot shared-protected-owner-membership-after
+assert_unchanged shared-protected-owner-membership-before shared-protected-owner-membership-after 'Shared SQL protected-owner membership refusal'
+grep -Fq 'Could not transactionally refresh forge app privileges (non-fatal).' \
+  "$TEMP_ROOT/repair-protected-owner-membership.log" || {
+  echo 'Repair did not report the protected-owner membership refusal.' >&2
+  exit 1
+}
+admin_server_psql <<'SQL'
+REVOKE forge_s4_routines_owner FROM forge_protected_owner_foreign_probe;
+DROP ROLE forge_protected_owner_foreign_probe;
+ALTER ROLE forge_release_routines_owner LOGIN;
+SQL
+snapshot shared-protected-owner-login-before
+run_repair_grant_privileges repair-protected-owner-login
+snapshot shared-protected-owner-login-after
+assert_unchanged shared-protected-owner-login-before shared-protected-owner-login-after 'Shared SQL protected-owner LOGIN refusal'
+grep -Fq 'Could not transactionally refresh forge app privileges (non-fatal).' \
+  "$TEMP_ROOT/repair-protected-owner-login.log" || {
+  echo 'Repair did not report the protected-owner LOGIN refusal.' >&2
+  exit 1
+}
+admin_server_psql --command 'ALTER ROLE forge_release_routines_owner NOLOGIN;'
+run_repair_grant_privileges repair-after-protected-owner-restore
+assert_protected_forge_acl_count 5
+assert_owner_driven_forge_boundary
 
 echo 'Proving installer provisioning role races block, then refuse the committed unsafe boundary.'
 prove_role_boundary_race_refusal installer attribute
@@ -1674,7 +1744,7 @@ grep -Fq 'Could not transactionally refresh forge app privileges (non-fatal).' \
   exit 1
 }
 admin_psql --command 'REVOKE SELECT (task_id), UPDATE (task_id) ON TABLE public.architect_plan_versions FROM PUBLIC;'
-assert_protected_forge_acl_count 2
+assert_protected_forge_acl_count 5
 
 admin_psql --command 'GRANT SELECT ON TABLE public.work_package_local_projection_sources TO PUBLIC;'
 snapshot shared-public-projection-authority-before
@@ -1687,7 +1757,7 @@ grep -Fq 'Could not transactionally refresh forge app privileges (non-fatal).' \
   exit 1
 }
 admin_psql --command 'REVOKE SELECT ON TABLE public.work_package_local_projection_sources FROM PUBLIC;'
-assert_protected_forge_acl_count 2
+assert_protected_forge_acl_count 5
 
 admin_psql --command 'GRANT SELECT (task_id) ON TABLE public.architect_plan_versions TO forge_architect_plan_history_reader;'
 snapshot shared-unrelated-column-acl-before
@@ -1700,7 +1770,7 @@ grep -Fq 'Ensured the forge role can read ordinary forge tables without protecte
   exit 1
 }
 admin_psql --command 'REVOKE SELECT (task_id) ON TABLE public.architect_plan_versions FROM forge_architect_plan_history_reader;'
-assert_protected_forge_acl_count 2
+assert_protected_forge_acl_count 5
 
 admin_server_psql --command 'ALTER ROLE forge INHERIT;'
 run_repair_grant_privileges repair-legacy-inherit
@@ -1717,7 +1787,7 @@ BEGIN
 END;
 $proof$;
 SQL
-assert_protected_forge_acl_count 2
+assert_protected_forge_acl_count 5
 
 admin_server_psql --command 'ALTER ROLE forge CREATEROLE;'
 snapshot shared-unsafe-role-before
@@ -1761,7 +1831,7 @@ admin_psql <<'SQL'
 ALTER TABLE public.architect_plan_versions OWNER TO forge_s4_routines_owner;
 SQL
 run_repair_grant_privileges repair-after-owner-restore
-assert_protected_forge_acl_count 2
+assert_protected_forge_acl_count 5
 assert_owner_driven_forge_boundary
 admin_psql <<'SQL'
 DO $proof$

@@ -4,7 +4,7 @@ import { db } from '@/db'
 import { verificationGoalSnapshots } from '@/db/schema'
 import type { LoadedVerificationGoal } from '@/lib/verification-goals/registry'
 
-type SnapshotTransaction = Parameters<Parameters<typeof db.transaction>[0]>[0]
+export type VerificationGoalSnapshotTransaction = Parameters<Parameters<typeof db.transaction>[0]>[0]
 
 export type VerificationGoalSnapshotImportResult = {
   snapshotId: string
@@ -50,7 +50,7 @@ function canonicalDefinitionValue(goal: LoadedVerificationGoal): Record<string, 
 }
 
 async function insertOrResolveSnapshot(
-  tx: SnapshotTransaction,
+  tx: VerificationGoalSnapshotTransaction,
   projectId: string,
   goal: LoadedVerificationGoal,
 ): Promise<VerificationGoalSnapshotImportResult> {
@@ -116,6 +116,8 @@ async function insertOrResolveSnapshot(
     kind: 'existing',
   }
 }
+
+export { insertOrResolveSnapshot as insertOrResolveVerificationGoalSnapshot }
 
 /**
  * Imports the already-validated registry in one transaction. A divergent

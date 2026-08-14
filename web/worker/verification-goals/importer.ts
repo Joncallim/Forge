@@ -1,64 +1,76 @@
-import { eq } from 'drizzle-orm'
+import { eq, sql } from 'drizzle-orm'
 
 import { db } from '@/db'
-import { projects } from '@/db/schema'
+import { projects, verificationGoalRegistryHeads } from '@/db/schema'
 import {
   assertProjectLocalPathForExecutionBinding,
+  ProjectRootBindingError,
   type ProjectExecutionRootBinding,
 } from '@/lib/projects/local-path'
+import { verificationGoalRegistryManifest } from '@/lib/verification-goals/manifest'
 import {
   loadVerificationGoalRegistry,
   type LoadedVerificationGoal,
 } from '@/lib/verification-goals/registry'
 import {
-  databaseVerificationGoalSnapshotStore,
-  type VerificationGoalSnapshotImportResult,
-  type VerificationGoalSnapshotStore,
-} from './snapshots'
+  databaseVerificationGoalRegistryStore,
+  type VerificationGoalRegistryCommitResult,
+  type VerificationGoalRegistryStore,
+} from './registry-store'
+import { VerificationGoalImportError } from './errors'
+
+export {
+  VerificationGoalImportError,
+  type VerificationGoalImportErrorCode,
+} from './errors'
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 
 type VerificationGoalProject = {
   id: string
+  submittedBy: string | null
+  archivedAt: Date | null
   localPath: string | null
+  rootRef: string | null
+  rootBindingRevision: bigint
+  grantDecisionRevision: bigint
+  updatedAt: string
+  priorHeadRevisionId: string | null
 }
 
 export type ImportVerificationGoalRegistryInput = {
   projectId: string
-}
-
-export type VerificationGoalImportErrorCode =
-  | 'invalid_project_id'
-  | 'project_context_unavailable'
-  | 'project_repository_unavailable'
-
-const IMPORT_ERROR_MESSAGES: Record<VerificationGoalImportErrorCode, string> = {
-  invalid_project_id: 'Verification goal import requires a valid project id.',
-  project_context_unavailable: 'Verification goal project context could not be resolved.',
-  project_repository_unavailable: 'Verification goal project repository is unavailable.',
-}
-
-export class VerificationGoalImportError extends Error {
-  readonly code: VerificationGoalImportErrorCode
-
-  constructor(code: VerificationGoalImportErrorCode) {
-    super(IMPORT_ERROR_MESSAGES[code])
-    this.name = 'VerificationGoalImportError'
-    this.code = code
-  }
+  actorUserId: string
 }
 
 export type VerificationGoalRegistryImporterDependencies = {
   loadProject: (projectId: string) => Promise<VerificationGoalProject | null>
   bindProjectRoot: (project: VerificationGoalProject) => Promise<ProjectExecutionRootBinding>
   loadRegistry?: (projectRoot: ProjectExecutionRootBinding) => Promise<LoadedVerificationGoal[]>
-  store: VerificationGoalSnapshotStore
+  store: VerificationGoalRegistryStore
 }
 
 async function loadProjectFromDatabase(projectId: string): Promise<VerificationGoalProject | null> {
   const [project] = await db
-    .select({ id: projects.id, localPath: projects.localPath })
+    .select({
+      id: projects.id,
+      submittedBy: projects.submittedBy,
+      archivedAt: projects.archivedAt,
+      localPath: projects.localPath,
+      rootRef: projects.rootRef,
+      rootBindingRevision: projects.rootBindingRevision,
+      grantDecisionRevision: projects.grantDecisionRevision,
+      updatedAt: sql<string>`to_char(
+        ${projects.updatedAt} AT TIME ZONE 'UTC',
+        'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+      )`,
+      priorHeadRevisionId: verificationGoalRegistryHeads.registryRevisionId,
+    })
     .from(projects)
+    .leftJoin(
+      verificationGoalRegistryHeads,
+      eq(verificationGoalRegistryHeads.projectId, projects.id),
+    )
     .where(eq(projects.id, projectId))
     .limit(1)
   return project ?? null
@@ -67,7 +79,7 @@ async function loadProjectFromDatabase(projectId: string): Promise<VerificationG
 const productionDependencies: VerificationGoalRegistryImporterDependencies = {
   loadProject: loadProjectFromDatabase,
   bindProjectRoot: assertProjectLocalPathForExecutionBinding,
-  store: databaseVerificationGoalSnapshotStore,
+  store: databaseVerificationGoalRegistryStore,
 }
 
 /**
@@ -77,31 +89,59 @@ const productionDependencies: VerificationGoalRegistryImporterDependencies = {
 async function importVerificationGoalRegistryWithDependencies(
   input: ImportVerificationGoalRegistryInput,
   dependencies: VerificationGoalRegistryImporterDependencies,
-): Promise<VerificationGoalSnapshotImportResult[]> {
+): Promise<VerificationGoalRegistryCommitResult> {
   if (!UUID.test(input.projectId)) {
     throw new VerificationGoalImportError('invalid_project_id')
   }
   const projectId = input.projectId.toLowerCase()
-  const project = await dependencies.loadProject(projectId)
-  if (!project || project.id !== projectId) {
+  if (!UUID.test(input.actorUserId)) {
     throw new VerificationGoalImportError('project_context_unavailable')
   }
-  if (!project.localPath?.trim()) {
+  const actorUserId = input.actorUserId.toLowerCase()
+  const project = await dependencies.loadProject(projectId)
+  if (
+    !project
+    || project.id !== projectId
+    || project.submittedBy !== actorUserId
+    || project.archivedAt !== null
+  ) {
+    throw new VerificationGoalImportError('project_context_unavailable')
+  }
+  if (!project.localPath?.trim() || !project.rootRef) {
     throw new VerificationGoalImportError('project_repository_unavailable')
   }
   let projectRoot: ProjectExecutionRootBinding
   try {
     projectRoot = await dependencies.bindProjectRoot(project)
-  } catch {
-    throw new VerificationGoalImportError('project_repository_unavailable')
+  } catch (error) {
+    if (error instanceof ProjectRootBindingError) {
+      throw new VerificationGoalImportError('project_repository_unavailable')
+    }
+    throw error
   }
   const goals = await (dependencies.loadRegistry ?? loadVerificationGoalRegistry)(projectRoot)
-  return dependencies.store.importSnapshots(projectId, goals)
+  const manifest = verificationGoalRegistryManifest(goals)
+  return dependencies.store.commitRegistry({
+    authority: {
+      projectId,
+      applicationAssertedActorUserId: actorUserId,
+      submittedBy: project.submittedBy,
+      archivedAt: project.archivedAt,
+      localPath: project.localPath,
+      rootRef: project.rootRef,
+      rootBindingRevision: project.rootBindingRevision,
+      grantDecisionRevision: project.grantDecisionRevision,
+      projectRevision: project.updatedAt,
+      priorHeadRevisionId: project.priorHeadRevisionId,
+    },
+    goals,
+    manifest,
+  })
 }
 
 export function importVerificationGoalRegistry(
   input: ImportVerificationGoalRegistryInput,
-): Promise<VerificationGoalSnapshotImportResult[]> {
+): Promise<VerificationGoalRegistryCommitResult> {
   return importVerificationGoalRegistryWithDependencies(input, productionDependencies)
 }
 
@@ -109,6 +149,6 @@ export function importVerificationGoalRegistry(
 export function importVerificationGoalRegistryForTest(
   input: ImportVerificationGoalRegistryInput,
   dependencies: VerificationGoalRegistryImporterDependencies,
-): Promise<VerificationGoalSnapshotImportResult[]> {
+): Promise<VerificationGoalRegistryCommitResult> {
   return importVerificationGoalRegistryWithDependencies(input, dependencies)
 }

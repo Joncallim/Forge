@@ -16,6 +16,39 @@ export type ProjectExecutionRootBinding = Readonly<{
   ino: bigint
 }>
 
+export type ProjectRootBindingErrorCode =
+  | 'missing_local_path'
+  | 'unsafe_project_root'
+  | 'project_root_unavailable'
+  | 'project_root_changed'
+
+export class ProjectRootBindingError extends Error {
+  readonly code: ProjectRootBindingErrorCode
+
+  constructor(code: ProjectRootBindingErrorCode, message: string) {
+    super(message)
+    this.name = 'ProjectRootBindingError'
+    this.code = code
+  }
+}
+
+const EXPECTED_PROJECT_ROOT_FILESYSTEM_CODES = new Set([
+  'EACCES',
+  'ELOOP',
+  'ENOENT',
+  'ENOTDIR',
+  'EPERM',
+])
+
+function rootError(code: ProjectRootBindingErrorCode, message: string): ProjectRootBindingError {
+  return new ProjectRootBindingError(code, message)
+}
+
+function isExpectedProjectRootFilesystemError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException | null)?.code
+  return typeof code === 'string' && EXPECTED_PROJECT_ROOT_FILESYSTEM_CODES.has(code)
+}
+
 function pathsOverlap(a: string, b: string): boolean {
   return isWithinPath(a, b) || isWithinPath(b, a)
 }
@@ -47,18 +80,18 @@ export function assertProjectPathNotProtected(
 ): void {
   const candidate = path.resolve(/*turbopackIgnore: true*/ localPath)
   if (samePath(candidate, workspace.workspaceRoot)) {
-    throw new Error('Project localPath cannot be the active Forge workspace root.')
+    throw rootError('unsafe_project_root', 'Project localPath cannot be the active Forge workspace root.')
   }
   // Reject the projects root itself and any ancestor that would enclose it: a
   // project rooted above the projects root could reach every other project's
   // files. Children under the projects root remain allowed.
   if (typeof workspace.projectsRoot === 'string' && isWithinPath(candidate, workspace.projectsRoot)) {
-    throw new Error('Project localPath must be a child directory under the workspace projects root, not the projects root itself or an ancestor of it.')
+    throw rootError('unsafe_project_root', 'Project localPath must be a child directory under the workspace projects root, not the projects root itself or an ancestor of it.')
   }
 
   for (const protectedDirectory of protectedWorkspaceDirectories(workspace)) {
     if (pathsOverlap(candidate, protectedDirectory.path)) {
-      throw new Error(`Project localPath cannot overlap the ${protectedDirectory.label}.`)
+      throw rootError('unsafe_project_root', `Project localPath cannot overlap the ${protectedDirectory.label}.`)
     }
   }
 }
@@ -67,7 +100,7 @@ async function realDirectory(rawPath: string): Promise<string> {
   const realPath = await fs.realpath(path.resolve(/*turbopackIgnore: true*/ rawPath))
   const stat = await fs.stat(realPath)
   if (!stat.isDirectory()) {
-    throw new Error('Project localPath is not a directory.')
+    throw rootError('unsafe_project_root', 'Project localPath is not a directory.')
   }
   return realPath
 }
@@ -87,7 +120,9 @@ async function realProjectPathCandidate(rawPath: string): Promise<string> {
     current = parent
     try {
       const stat = await fs.stat(current)
-      if (!stat.isDirectory()) throw new Error('Project localPath ancestor is not a directory.')
+      if (!stat.isDirectory()) {
+        throw rootError('unsafe_project_root', 'Project localPath ancestor is not a directory.')
+      }
       const realAncestor = await fs.realpath(current)
       return path.resolve(/*turbopackIgnore: true*/ realAncestor, path.relative(current, resolved))
     } catch (err) {
@@ -95,7 +130,7 @@ async function realProjectPathCandidate(rawPath: string): Promise<string> {
     }
   }
 
-  throw new Error('Project localPath must have an existing directory ancestor.')
+  throw rootError('project_root_unavailable', 'Project localPath must have an existing directory ancestor.')
 }
 
 async function canonicalizeExistingPath(rawPath: string): Promise<string> {
@@ -152,7 +187,7 @@ export async function assertProjectLocalPathPreflightAllowed(input: {
   ])
 
   if (!isWithinPath(workspaceRoot, projectRoot)) {
-    throw new Error('Project localPath resolved outside the active Forge workspace.')
+    throw rootError('unsafe_project_root', 'Project localPath resolved outside the active Forge workspace.')
   }
   assertProjectPathNotProtected(projectRoot, await canonicalizeWorkspacePaths(workspace))
 
@@ -169,7 +204,7 @@ export async function assertProjectLocalPathPreflightAllowed(input: {
       continue
     }
     if (pathsOverlap(projectRoot, otherRoot)) {
-      throw new Error('Project localPath overlaps another registered Forge project.')
+      throw rootError('unsafe_project_root', 'Project localPath overlaps another registered Forge project.')
     }
   }
 
@@ -184,7 +219,7 @@ export async function assertProjectLocalPathAllowed(input: {
   const projectRoot = await assertProjectLocalPathPreflightAllowed(input)
   const stat = await fs.stat(projectRoot)
   if (!stat.isDirectory()) {
-    throw new Error('Project localPath is not a directory.')
+    throw rootError('unsafe_project_root', 'Project localPath is not a directory.')
   }
   return projectRoot
 }
@@ -192,7 +227,7 @@ export async function assertProjectLocalPathAllowed(input: {
 async function bindProjectExecutionRoot(projectRoot: string): Promise<ProjectExecutionRootBinding> {
   const before = await fs.lstat(projectRoot, { bigint: true })
   if (before.isSymbolicLink() || !before.isDirectory()) {
-    throw new Error('Project localPath is not a real directory.')
+    throw rootError('unsafe_project_root', 'Project localPath is not a real directory.')
   }
 
   let handle: FileHandle
@@ -201,8 +236,9 @@ async function bindProjectExecutionRoot(projectRoot: string): Promise<ProjectExe
       projectRoot,
       fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
     )
-  } catch {
-    throw new Error('Project localPath could not be opened safely for execution.')
+  } catch (error) {
+    if (!isExpectedProjectRootFilesystemError(error)) throw error
+    throw rootError('project_root_unavailable', 'Project localPath could not be opened safely for execution.')
   }
 
   try {
@@ -221,7 +257,7 @@ async function bindProjectExecutionRoot(projectRoot: string): Promise<ProjectExe
       || current.ino !== opened.ino
       || currentRealPath !== projectRoot
     ) {
-      throw new Error('Project localPath moved or was replaced while it was being bound for execution.')
+      throw rootError('project_root_changed', 'Project localPath moved or was replaced while it was being bound for execution.')
     }
     return { path: projectRoot, dev: opened.dev, ino: opened.ino }
   } finally {
@@ -233,14 +269,22 @@ export async function assertProjectLocalPathForExecutionBinding(
   project: ProjectLocalPath,
 ): Promise<ProjectExecutionRootBinding> {
   if (!project.localPath?.trim()) {
-    throw new Error('Project localPath is required before Forge can execute this task.')
+    throw rootError('missing_local_path', 'Project localPath is required before Forge can execute this task.')
   }
 
-  const projectRoot = await assertProjectLocalPathAllowed({
-    localPath: project.localPath,
-    projectId: project.id,
-  })
-  return bindProjectExecutionRoot(projectRoot)
+  try {
+    const projectRoot = await assertProjectLocalPathAllowed({
+      localPath: project.localPath,
+      projectId: project.id,
+    })
+    return await bindProjectExecutionRoot(projectRoot)
+  } catch (error) {
+    if (error instanceof ProjectRootBindingError) throw error
+    if (isExpectedProjectRootFilesystemError(error)) {
+      throw rootError('project_root_unavailable', 'Project localPath is unavailable for execution.')
+    }
+    throw error
+  }
 }
 
 export async function assertProjectLocalPathForExecution(project: ProjectLocalPath): Promise<string> {

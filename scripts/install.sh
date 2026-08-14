@@ -1771,7 +1771,9 @@ run_managed_local_migration_stage() {
   if [ "${FORGE_INSTALL_TEST_HOOK:-}" = "managed-local-migrations" ]; then
     printf '%s\n' "$stage" >> "${FORGE_INSTALL_TEST_STAGE_LOG:?}"
     if [ "${FORGE_INSTALL_TEST_FAIL_STAGE:-}" = "$stage" ]; then
-      [ "$stage" != "s5" ] || printf 's5-cleanup-attempted\n' >> "${FORGE_INSTALL_TEST_STAGE_LOG:?}"
+      case "$stage" in
+        s5|registry) printf '%s-cleanup-attempted\n' "$stage" >> "${FORGE_INSTALL_TEST_STAGE_LOG:?}" ;;
+      esac
       return 1
     fi
     return 0
@@ -1788,6 +1790,7 @@ run_managed_local_migration_stage() {
         s4) npm run protocol:bootstrap-epic-172-s4-roles ;;
         migrate-0027) npx tsx scripts/ci/migrate-through-0027.ts ;;
         s5) bash scripts/ci/apply-epic-172-s5-recovery-migration.sh ;;
+        registry) bash scripts/ci/apply-verification-goal-registry-migration.sh ;;
         latest) npm run db:migrate ;;
         *) exit 64 ;;
       esac' _ "$REPO_ROOT/web" "$stage"
@@ -1896,6 +1899,7 @@ run_managed_local_migration_as_runuser() {
       s4) npm run protocol:bootstrap-epic-172-s4-roles ;;
       migrate-0027) npx tsx scripts/ci/migrate-through-0027.ts ;;
       s5) bash scripts/ci/apply-epic-172-s5-recovery-migration.sh ;;
+      registry) bash scripts/ci/apply-verification-goal-registry-migration.sh ;;
       latest) npm run db:migrate ;;
       *) exit 64 ;;
     esac' _ "$REPO_ROOT/web" "$stage"
@@ -1919,6 +1923,7 @@ run_managed_local_migration_as_sudo() {
       s4) npm run protocol:bootstrap-epic-172-s4-roles ;;
       migrate-0027) npx tsx scripts/ci/migrate-through-0027.ts ;;
       s5) bash scripts/ci/apply-epic-172-s5-recovery-migration.sh ;;
+      registry) bash scripts/ci/apply-verification-goal-registry-migration.sh ;;
       latest) npm run db:migrate ;;
       *) exit 64 ;;
     esac' _ "$REPO_ROOT/web" "$stage"
@@ -1928,7 +1933,7 @@ run_managed_local_migration_as_sudo() {
 run_managed_local_migrations() {
   step "Applying managed local database migrations"
   if [ "$DRY_RUN" = "1" ]; then
-    info "[dry-run] Bootstrap release roles, migrate through 0025, bootstrap S3, migrate through 0026, repair an exact known legacy release catalog if needed, bootstrap S4, migrate through 0027, apply S5 with cleanup, then run the latest migrator."
+    info "[dry-run] Bootstrap release roles, migrate through 0025, bootstrap S3, migrate through 0026, repair an exact known legacy release catalog if needed, bootstrap S4, migrate through 0027, apply S5 through 0028 with cleanup, apply the verification-goal registry through 0033 with cleanup, then run the latest migrator."
     return 0
   fi
 
@@ -1959,6 +1964,7 @@ run_managed_local_migration_sequence() {
   run_managed_local_migration_stage "Bootstrap S4 owner handoff for managed local migration" s4 || die "Managed local migration failed while bootstrapping the S4 owner handoff."
   run_managed_local_migration_stage "Migrate managed local database through 0027" migrate-0027 || die "Managed local migration failed while applying migrations through 0027."
   run_managed_local_migration_stage "Apply S5 managed local migration with mandatory cleanup" s5 || die "Managed local migration failed while applying S5; its cleanup wrapper preserves the original migration failure."
+  run_managed_local_migration_stage "Apply verification-goal registry migration with mandatory cleanup" registry || die "Managed local migration failed while applying the verification-goal registry; its cleanup wrapper preserves the original migration failure."
   run_managed_local_migration_stage "Run the latest managed local migrator" latest || die "Managed local migration failed while applying the latest migration set."
 }
 

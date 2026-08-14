@@ -1746,6 +1746,10 @@ export const verificationGoalSnapshots = pgTable(
   (t) => [
     uniqueIndex('verification_goal_snapshots_project_goal_version_idx')
       .on(t.projectId, t.goalId, t.definitionVersion),
+    uniqueIndex('verification_goal_snapshots_id_project_idx')
+      .on(t.id, t.projectId),
+    uniqueIndex('verification_goal_snapshots_registry_entry_identity_idx')
+      .on(t.id, t.projectId, t.goalId, t.definitionVersion, t.definitionDigest),
     index('verification_goal_snapshots_project_goal_created_at_idx')
       .on(t.projectId, t.goalId, t.createdAt),
     check('verification_goal_snapshots_goal_id_check', sql`
@@ -1788,6 +1792,174 @@ export const verificationGoalSnapshots = pgTable(
 
 export type VerificationGoalSnapshot = InferSelectModel<typeof verificationGoalSnapshots>
 export type NewVerificationGoalSnapshot = InferInsertModel<typeof verificationGoalSnapshots>
+
+// ---------------------------------------------------------------------------
+// verificationGoalRegistryRevisions / Entries / Heads
+// ---------------------------------------------------------------------------
+// Revisions and entries are immutable descriptions of one complete repository
+// registry. The head is the sole mutable projection and only moves to a higher
+// per-project sequence. None of these rows authorizes execution.
+export const verificationGoalRegistryRevisions = pgTable(
+  'verification_goal_registry_revisions',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    projectId: uuid('project_id').notNull().references(() => projects.id, {
+      onDelete: 'restrict',
+      onUpdate: 'restrict',
+    }),
+    revisionSequence: bigint('revision_sequence', { mode: 'bigint' }).notNull(),
+    manifestDigest: text('manifest_digest').notNull(),
+    applicationAssertedActorUserId: uuid('application_asserted_actor_user_id').notNull().references(() => users.id, {
+      onDelete: 'restrict',
+      onUpdate: 'restrict',
+    }),
+    projectSubmittedBy: uuid('project_submitted_by').notNull().references(() => users.id, {
+      onDelete: 'restrict',
+      onUpdate: 'restrict',
+    }),
+    projectArchivedAt: timestamp('project_archived_at', tsOpts),
+    projectLocalPath: text('project_local_path').notNull(),
+    rootRef: uuid('root_ref').notNull(),
+    rootBindingRevision: bigint('root_binding_revision', { mode: 'bigint' }).notNull(),
+    grantDecisionRevision: bigint('grant_decision_revision', { mode: 'bigint' }).notNull(),
+    projectRevision: timestamp('project_revision', tsOpts).notNull(),
+    predecessorRevisionId: uuid('predecessor_revision_id'),
+    createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [
+    uniqueIndex('verification_goal_registry_revisions_project_sequence_idx')
+      .on(t.projectId, t.revisionSequence),
+    uniqueIndex('verification_goal_registry_revisions_id_project_idx')
+      .on(t.id, t.projectId),
+    uniqueIndex('verification_goal_registry_revisions_id_project_sequence_idx')
+      .on(t.id, t.projectId, t.revisionSequence),
+    unique('verification_goal_registry_revisions_transition_identity_unique').on(
+      t.projectId,
+      t.predecessorRevisionId,
+      t.rootRef,
+      t.rootBindingRevision,
+      t.grantDecisionRevision,
+      t.projectRevision,
+      t.manifestDigest,
+    ).nullsNotDistinct(),
+    foreignKey({
+      columns: [t.predecessorRevisionId, t.projectId],
+      foreignColumns: [t.id, t.projectId],
+      name: 'verification_goal_registry_revisions_predecessor_fk',
+    }).onDelete('restrict').onUpdate('restrict'),
+    check('verification_goal_registry_revisions_sequence_check', sql`${t.revisionSequence} > 0`),
+    check('verification_goal_registry_revisions_manifest_digest_check', sql`
+      ${t.manifestDigest} ~ '^[0-9a-f]{64}$'
+    `),
+    check('verification_goal_registry_revisions_asserted_actor_check', sql`
+      ${t.applicationAssertedActorUserId} = ${t.projectSubmittedBy}
+    `),
+    check('verification_goal_registry_revisions_archived_check', sql`
+      ${t.projectArchivedAt} is null
+    `),
+    check('verification_goal_registry_revisions_local_path_check', sql`
+      length(${t.projectLocalPath}) between 1 and 4096
+    `),
+    check('verification_goal_registry_revisions_authority_revision_check', sql`
+      ${t.rootBindingRevision} >= 0 and ${t.grantDecisionRevision} >= 0
+    `),
+  ],
+)
+
+export const verificationGoalRegistryEntries = pgTable(
+  'verification_goal_registry_entries',
+  {
+    registryRevisionId: uuid('registry_revision_id').notNull(),
+    projectId: uuid('project_id').notNull(),
+    ordinal: integer('ordinal').notNull(),
+    snapshotId: uuid('snapshot_id').notNull(),
+    goalId: text('goal_id').notNull(),
+    definitionVersion: integer('definition_version').notNull(),
+    definitionDigest: text('definition_digest').notNull(),
+    sourcePath: text('source_path').notNull(),
+    createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [
+    primaryKey({
+      columns: [t.registryRevisionId, t.ordinal],
+      name: 'verification_goal_registry_entries_pk',
+    }),
+    uniqueIndex('verification_goal_registry_entries_revision_goal_idx')
+      .on(t.registryRevisionId, t.goalId),
+    index('verification_goal_registry_entries_project_goal_idx')
+      .on(t.projectId, t.goalId),
+    foreignKey({
+      columns: [t.registryRevisionId, t.projectId],
+      foreignColumns: [verificationGoalRegistryRevisions.id, verificationGoalRegistryRevisions.projectId],
+      name: 'verification_goal_registry_entries_revision_project_fk',
+    }).onDelete('restrict').onUpdate('restrict'),
+    foreignKey({
+      columns: [
+        t.snapshotId,
+        t.projectId,
+        t.goalId,
+        t.definitionVersion,
+        t.definitionDigest,
+      ],
+      foreignColumns: [
+        verificationGoalSnapshots.id,
+        verificationGoalSnapshots.projectId,
+        verificationGoalSnapshots.goalId,
+        verificationGoalSnapshots.definitionVersion,
+        verificationGoalSnapshots.definitionDigest,
+      ],
+      name: 'verification_goal_registry_entries_snapshot_project_fk',
+    }).onDelete('restrict').onUpdate('restrict'),
+    check('verification_goal_registry_entries_ordinal_check', sql`${t.ordinal} >= 0`),
+    check('verification_goal_registry_entries_goal_id_check', sql`
+      length(${t.goalId}) between 1 and 64
+      and ${t.goalId} ~ '^[a-z][a-z0-9]*(-[a-z0-9]+)*$'
+    `),
+    check('verification_goal_registry_entries_definition_version_check', sql`
+      ${t.definitionVersion} between 1 and 1000000
+    `),
+    check('verification_goal_registry_entries_definition_digest_check', sql`
+      ${t.definitionDigest} ~ '^[0-9a-f]{64}$'
+    `),
+    check('verification_goal_registry_entries_source_path_check', sql`
+      length(${t.sourcePath}) <= 256
+      and ${t.sourcePath} ~ '^\\.forge/verification-goals/[A-Za-z0-9][A-Za-z0-9._-]{0,126}\\.json$'
+    `),
+  ],
+)
+
+export const verificationGoalRegistryHeads = pgTable(
+  'verification_goal_registry_heads',
+  {
+    projectId: uuid('project_id').primaryKey().references(() => projects.id, {
+      onDelete: 'restrict',
+      onUpdate: 'restrict',
+    }),
+    registryRevisionId: uuid('registry_revision_id').notNull(),
+    revisionSequence: bigint('revision_sequence', { mode: 'bigint' }).notNull(),
+    updatedAt: timestamp('updated_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [
+    uniqueIndex('verification_goal_registry_heads_revision_idx').on(t.registryRevisionId),
+    foreignKey({
+      columns: [t.registryRevisionId, t.projectId, t.revisionSequence],
+      foreignColumns: [
+        verificationGoalRegistryRevisions.id,
+        verificationGoalRegistryRevisions.projectId,
+        verificationGoalRegistryRevisions.revisionSequence,
+      ],
+      name: 'verification_goal_registry_heads_revision_project_sequence_fk',
+    }).onDelete('restrict').onUpdate('restrict'),
+    check('verification_goal_registry_heads_sequence_check', sql`${t.revisionSequence} > 0`),
+  ],
+)
+
+export type VerificationGoalRegistryRevision = InferSelectModel<typeof verificationGoalRegistryRevisions>
+export type NewVerificationGoalRegistryRevision = InferInsertModel<typeof verificationGoalRegistryRevisions>
+export type VerificationGoalRegistryEntry = InferSelectModel<typeof verificationGoalRegistryEntries>
+export type NewVerificationGoalRegistryEntry = InferInsertModel<typeof verificationGoalRegistryEntries>
+export type VerificationGoalRegistryHead = InferSelectModel<typeof verificationGoalRegistryHeads>
+export type NewVerificationGoalRegistryHead = InferInsertModel<typeof verificationGoalRegistryHeads>
 
 // ---------------------------------------------------------------------------
 // artifacts
