@@ -23,6 +23,7 @@ vi.mock('@/lib/workspace', async () => {
 import type { WorkspaceSettings } from '@/lib/workspace'
 import {
   assertProjectLocalPathForExecution,
+  assertProjectLocalPathForExecutionBinding,
   assertProjectLocalPathPreflightAllowed,
   assertProjectPathNotProtected,
 } from '@/lib/projects/local-path'
@@ -71,6 +72,20 @@ describe('assertProjectLocalPathForExecution', () => {
     const realProjectRoot = await fs.realpath(projectRoot)
     await expect(assertProjectLocalPathForExecution({ id: 'project-1', localPath: projectRoot }))
       .resolves.toBe(realProjectRoot)
+  })
+
+  it('binds the canonical execution root to its opened directory identity', async () => {
+    const realProjectRoot = await fs.realpath(projectRoot)
+    const identity = await fs.lstat(realProjectRoot, { bigint: true })
+
+    await expect(assertProjectLocalPathForExecutionBinding({
+      id: 'project-1',
+      localPath: projectRoot,
+    })).resolves.toEqual({
+      path: realProjectRoot,
+      dev: identity.dev,
+      ino: identity.ino,
+    })
   })
 
   it('rejects symlinks that resolve outside the active workspace', async () => {

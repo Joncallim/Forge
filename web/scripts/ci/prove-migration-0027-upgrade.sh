@@ -3,6 +3,11 @@ set -euo pipefail
 
 : "${FORGE_MIGRATION_0027_DATABASE_URL:?Set the disposable PostgreSQL 0027 upgrade database URL.}"
 : "${FORGE_DATABASE_ADMIN_URL:?Set the short-lived PostgreSQL administrator URL.}"
+SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WEB_ROOT="$(cd -P "$SCRIPT_DIR/../.." && pwd)"
+REPO_ROOT="$(cd -P "$WEB_ROOT/.." && pwd)"
+source "$REPO_ROOT/scripts/ci/current-migration-ledger.sh"
+
 upgrade_baseline="${FORGE_MIGRATION_RECOVERY_BASELINE:-0026}"
 if [[ "${upgrade_baseline}" != '0026' && "${upgrade_baseline}" != '0027' ]]; then
   echo 'FORGE_MIGRATION_RECOVERY_BASELINE must be 0026 or 0027.' >&2
@@ -35,6 +40,8 @@ npx tsx scripts/ci/migrate-through-0027.ts
 bash scripts/ci/apply-epic-172-s5-recovery-migration.sh
 psql "${FORGE_DATABASE_ADMIN_URL}" --set ON_ERROR_STOP=1 \
   --set migration_principal="${migration_principal}" \
+  --set expected_migration_count="$FORGE_CURRENT_MIGRATION_COUNT" \
+  --set expected_latest_migration_at="$FORGE_CURRENT_LATEST_MIGRATION_AT" \
   --file scripts/ci/sql/migration-0027-expansion-assertions.sql
 psql "${FORGE_DATABASE_ADMIN_URL}" --set ON_ERROR_STOP=1 \
   --file scripts/ci/sql/migration-0027-archive-assertions.sql

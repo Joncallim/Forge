@@ -17,6 +17,7 @@ REPO_ROOT="$(cd -P "$SCRIPT_DIR/../.." && pwd)"
 INSTALLER="$REPO_ROOT/scripts/install.sh"
 TEMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/forge-installer-managed-proof.XXXXXX")"
 trap 'rm -rf "$TEMP_ROOT"' EXIT
+source "$REPO_ROOT/scripts/ci/current-migration-ledger.sh"
 
 prepare_0025_baseline() {
   local database_url="$1" admin_url="$2"
@@ -46,11 +47,19 @@ run_real_managed_sequence() {
 
 assert_latest_and_clean() {
   local database_name="$1"
-  PGPASSWORD="$FORGE_INSTALLER_MANAGED_ADMIN_PASSWORD" PGHOST="$FORGE_INSTALLER_MANAGED_ADMIN_HOST" PGUSER="$FORGE_INSTALLER_MANAGED_ADMIN_USER" PGDATABASE="$database_name" psql --set ON_ERROR_STOP=1 <<'SQL'
+  PGPASSWORD="$FORGE_INSTALLER_MANAGED_ADMIN_PASSWORD" PGHOST="$FORGE_INSTALLER_MANAGED_ADMIN_HOST" PGUSER="$FORGE_INSTALLER_MANAGED_ADMIN_USER" PGDATABASE="$database_name" psql \
+    --set ON_ERROR_STOP=1 \
+    --set expected_migration_count="$FORGE_CURRENT_MIGRATION_COUNT" \
+    --set expected_latest_migration_at="$FORGE_CURRENT_LATEST_MIGRATION_AT" <<'SQL'
+SELECT pg_catalog.set_config('forge.proof_expected_migration_count', :'expected_migration_count', false);
+SELECT pg_catalog.set_config('forge.proof_expected_latest_migration_at', :'expected_latest_migration_at', false);
+
 DO $proof$
 BEGIN
-  IF (SELECT count(*) FROM drizzle.__drizzle_migrations) <> 32
-     OR (SELECT max(created_at) FROM drizzle.__drizzle_migrations) <> 1786080000000 THEN
+  IF (SELECT count(*) FROM drizzle.__drizzle_migrations)
+       <> current_setting('forge.proof_expected_migration_count')::bigint
+     OR (SELECT max(created_at) FROM drizzle.__drizzle_migrations)
+       <> current_setting('forge.proof_expected_latest_migration_at')::bigint THEN
     RAISE EXCEPTION 'Managed installer did not apply the exact latest migration ledger';
   END IF;
   IF pg_catalog.to_regclass('public.forge_epic_172_s3_release_state') IS NULL THEN

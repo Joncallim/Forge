@@ -21,6 +21,7 @@ FIXTURE="$SCRIPT_DIR/sql/installer-legacy-0023-0025-fixture.sql"
 CONSUMER_OTHER_DATABASE=forge_installer_legacy_consumer_other_test
 TEMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/forge-legacy-repair-dbr1.XXXXXX")"
 trap 'rm -rf "$TEMP_ROOT"' EXIT
+source "$REPO_ROOT/scripts/ci/current-migration-ledger.sh"
 
 case "$FORGE_LEGACY_REPAIR_ADMIN_DATABASE" in
   ''|*[!A-Za-z0-9_]* ) echo 'Unsafe disposable database name.' >&2; exit 64 ;;
@@ -1304,11 +1305,18 @@ assert_protected_forge_acl_count 2
 run_managed_sequence
 snapshot managed-latest-twice
 assert_unchanged managed-latest-once managed-latest-twice 'Managed latest rerun'
-admin_psql <<'SQL'
+admin_psql \
+  --set expected_migration_count="$FORGE_CURRENT_MIGRATION_COUNT" \
+  --set expected_latest_migration_at="$FORGE_CURRENT_LATEST_MIGRATION_AT" <<'SQL'
+SELECT pg_catalog.set_config('forge.proof_expected_migration_count', :'expected_migration_count', false);
+SELECT pg_catalog.set_config('forge.proof_expected_latest_migration_at', :'expected_latest_migration_at', false);
+
 DO $proof$
 BEGIN
-  IF (SELECT count(*) FROM drizzle.__drizzle_migrations) <> 32
-     OR (SELECT max(created_at) FROM drizzle.__drizzle_migrations) <> 1786080000000 THEN
+  IF (SELECT count(*) FROM drizzle.__drizzle_migrations)
+       <> current_setting('forge.proof_expected_migration_count')::bigint
+     OR (SELECT max(created_at) FROM drizzle.__drizzle_migrations)
+       <> current_setting('forge.proof_expected_latest_migration_at')::bigint THEN
     RAISE EXCEPTION 'Managed sequence did not reach the exact latest ledger';
   END IF;
   IF EXISTS (

@@ -1726,6 +1726,70 @@ export type CapabilityAttemptAdjudication = InferSelectModel<typeof capabilityAt
 export type NewCapabilityAttemptAdjudication = InferInsertModel<typeof capabilityAttemptAdjudications>
 
 // ---------------------------------------------------------------------------
+// verificationGoalSnapshots
+// ---------------------------------------------------------------------------
+// Repository-backed verification goals are imported as immutable snapshots.
+// This table records definitions only; a row does not mean a goal ran, passed,
+// or produced evidence.
+export const verificationGoalSnapshots = pgTable(
+  'verification_goal_snapshots',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    projectId: uuid('project_id').notNull().references(() => projects.id, { onDelete: 'restrict' }),
+    goalId: text('goal_id').notNull(),
+    definitionVersion: integer('definition_version').notNull(),
+    canonicalDefinition: jsonb('canonical_definition').$type<Record<string, unknown>>().notNull(),
+    definitionDigest: text('definition_digest').notNull(),
+    sourcePath: text('source_path').notNull(),
+    createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [
+    uniqueIndex('verification_goal_snapshots_project_goal_version_idx')
+      .on(t.projectId, t.goalId, t.definitionVersion),
+    index('verification_goal_snapshots_project_goal_created_at_idx')
+      .on(t.projectId, t.goalId, t.createdAt),
+    check('verification_goal_snapshots_goal_id_check', sql`
+      length(${t.goalId}) BETWEEN 1 AND 64
+      AND ${t.goalId} ~ '^[a-z][a-z0-9]*(-[a-z0-9]+)*$'
+    `),
+    check('verification_goal_snapshots_definition_version_check', sql`
+      ${t.definitionVersion} BETWEEN 1 AND 1000000
+    `),
+    check('verification_goal_snapshots_definition_digest_check', sql`
+      ${t.definitionDigest} ~ '^[0-9a-f]{64}$'
+    `),
+    check('verification_goal_snapshots_source_path_check', sql`
+      length(${t.sourcePath}) <= 256
+      AND ${t.sourcePath} ~ '^\\.forge/verification-goals/[A-Za-z0-9][A-Za-z0-9._-]{0,126}\\.json$'
+    `),
+    check('verification_goal_snapshots_canonical_definition_check', sql`
+      pg_catalog.jsonb_typeof(${t.canonicalDefinition}) = 'object'
+      AND pg_catalog.octet_length(${t.canonicalDefinition}::text) <= 32768
+      AND ${t.canonicalDefinition} ?& ARRAY[
+        'schemaVersion', 'goalId', 'definitionVersion', 'title', 'description',
+        'capability', 'severity', 'enabled', 'operations'
+      ]
+      AND (${t.canonicalDefinition} - ARRAY[
+        'schemaVersion', 'goalId', 'definitionVersion', 'title', 'description',
+        'capability', 'severity', 'enabled', 'operations'
+      ]) = '{}'::jsonb
+      AND ${t.canonicalDefinition} @> pg_catalog.jsonb_build_object(
+        'schemaVersion', 1,
+        'goalId', ${t.goalId},
+        'definitionVersion', ${t.definitionVersion}
+      )
+      AND pg_catalog.jsonb_typeof(${t.canonicalDefinition} -> 'enabled') = 'boolean'
+      AND (${t.canonicalDefinition} ->> 'severity') IN ('low', 'medium', 'high', 'critical')
+      AND pg_catalog.jsonb_typeof(${t.canonicalDefinition} -> 'operations') = 'array'
+      AND pg_catalog.jsonb_array_length(${t.canonicalDefinition} -> 'operations') BETWEEN 1 AND 16
+    `),
+  ],
+)
+
+export type VerificationGoalSnapshot = InferSelectModel<typeof verificationGoalSnapshots>
+export type NewVerificationGoalSnapshot = InferInsertModel<typeof verificationGoalSnapshots>
+
+// ---------------------------------------------------------------------------
 // artifacts
 // ---------------------------------------------------------------------------
 export const artifacts = pgTable(
