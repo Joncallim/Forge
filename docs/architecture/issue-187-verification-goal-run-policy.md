@@ -1,291 +1,189 @@
 # Issue #187 Architecture: Verification Goal Run Policy and Goal-Owned Execution
 
-Status: **Architecture draft — Round 1 findings incorporated. No runtime execution is authorized by this document.**
+Status: **Consolidated architecture after orthogonal review rounds 1–4. Implementation is not authorized until fresh post-consolidation review finds no material blockers in scope.**
 
 | Field | Value |
 |---|---|
 | Issue | [#187 — Add project verification goals and scheduled proof runs](https://github.com/Joncallim/Forge/issues/187) |
 | Parent Epic | [#184 — Continuous verification and earned autonomy](https://github.com/Joncallim/Forge/issues/184) |
-| Existing foundation | ADR 0013 + authoritative registry revisions; ADR 0011 Operation Catalog; ADR 0010 canonical outcomes; ADR 0012 reliability ledger |
+| Foundation | ADR 0013 registry, ADR 0011 Operation Catalog, ADR 0010 canonical outcomes, ADR 0012 reliability ledger |
 | Downstream | #188 independent verification, #189 earned autonomy, #190 Project Sentinel, #191 reporting |
-| This PR | Architecture only: executable-goal contract, policy/authority model, goal-owned run/evidence model, manual execution, history, scheduling, recovery, migration/ACL plan |
+| Scope | Complete #187 architecture: executable goal definitions, run policy/authority, manual proof runs, evidence/history, reliability integration, bounded scheduling, migration/recovery/release boundaries |
 
 ---
 
-## 1. Plain-language summary
+## 1. Outcome
 
-Forge can already import a strict repository-backed verification-goal registry and identify which complete registry revision is authoritative. It still cannot safely **run** those goals.
+Forge can already import a strict repository-backed verification-goal registry and identify the authoritative complete registry revision. It cannot safely execute those goals yet.
 
-The missing boundary is larger than a `Run` button. The production deterministic-operation path, canonical outcome rows, command audits, and reliability attempts are currently anchored to a Forge **task**. A project proof is not an implementation task and must never manufacture a fake task or work package to borrow task authority.
+Issue #187 is complete only when Forge can:
 
-This architecture makes a **verification goal run** a first-class execution subject. It keeps repository files declarative, places execution ceilings in operator-owned database policy, binds a run to the exact imported goal membership and import-time Operation Catalog definitions, binds decisive evidence to one clean repository commit, and reuses Forge's deterministic operation executor only after the shared ledgers can represent a non-task subject without weakening existing task guarantees.
+1. prove that the **live repository goal registry still matches the explicitly imported authoritative registry**;
+2. select only explicitly reviewed deterministic Operation Catalog entries;
+3. resolve operator/system execution ceilings without allowing repository text to grant authority;
+4. create a first-class **verification goal run**, not a synthetic implementation task;
+5. bind decisive proof evidence to one clean repository commit and a bounded execution environment;
+6. execute operations sequentially through the existing deterministic executor under database-owned lease fencing;
+7. distinguish functional proof failure from authority, infrastructure, evidence, timeout, and recovery uncertainty;
+8. emit one overall #185-compatible canonical outcome for the goal run plus child operation outcomes;
+9. calculate last-green / first-observed-failure history from decisive evidence;
+10. feed comparable child-operation evidence into #186 without sample inflation;
+11. support manual runs first, then a bounded deterministic scheduler;
+12. preserve explicit human/project authority and fail closed on every version/authority mismatch.
 
-The first executable version is deliberately narrow:
-
-- current schema-v1 goals remain definition-only forever;
-- executable goals use explicit schema v2;
-- v2 still references only code-owned, enabled, non-deprecated, zero-input deterministic operations;
-- repository configuration may request proof work but can never increase permission, rate, concurrency, deadline, evidence authority, or autonomy;
-- project verification execution is disabled by default until the operator opts in;
-- project proof reads require a current project-level `filesystem.project.read` decision in `always_allow` mode; no fake work-package capability metadata and no implicit `allow_once` consumption;
-- operations execute in canonical order, sequentially, and fail closed;
-- a decisive pass/fail is attributed only to one clean, stable Git commit;
-- project, root, filesystem grant, registry, policy, Operation Catalog, repository, or lease drift invalidates the proof rather than being silently ignored;
-- failures record evidence only. They do not edit code, create repair work, alter autonomy, create branches/PRs, merge, or widen MCP/filesystem authority.
-
-Manual proof runs come first. Scheduling is added only after the same goal-owned execution path is proven.
+The first executable version remains **read-only**. It does not edit code, repair failures, create branches/PRs, merge, deploy, issue live MCP handles, or modify autonomy.
 
 ---
 
-## 2. Existing contracts that must not be weakened
+## 2. Current repository facts that constrain this design
 
-### 2.1 ADR 0013 registry semantics
+### 2.1 Verification goals are definition-only today
 
-The merged #187 registry work establishes that:
+ADR 0013 and PRs #328–#330 establish:
 
-- `.forge/verification-goals/*.json` is repository configuration;
-- schema v1 contains goal metadata plus exact zero-input Operation Catalog references;
-- imports create immutable goal snapshots and complete predecessor-linked registry revisions;
-- the current registry head identifies the authoritative complete registry, including an empty registry;
-- the registry revision captures project ownership/archive state, project local-path identity, opaque `rootRef`, root-binding revision, grant-decision revision, project revision, ordered membership, and manifest digest;
-- a snapshot or registry head authorizes **nothing** and does not mean a goal ran or passed.
+- repository files under `.forge/verification-goals/*.json`;
+- schema-v1 goal definitions with exact identity/metadata and zero-input Operation Catalog references;
+- immutable `verification_goal_snapshots`;
+- immutable predecessor-linked registry revisions and entries;
+- one protected current registry head;
+- project/root/grant/project-revision authority captured at import;
+- no execution authority.
 
-This architecture preserves that meaning. No historical schema-v1 row becomes executable after an upgrade.
+A historical v1 snapshot must never become executable merely because Forge is upgraded.
 
-### 2.2 ADR 0011 Operation Catalog semantics
+### 2.2 Operation execution is task-owned today
 
-The current production catalog is code-owned and contains three fixed read-only Git operations. The current `executeTrustedOperation` path:
+Current production operation execution:
 
-- requires an approved/running task;
-- derives project/root/revision state from PostgreSQL;
-- requires current work-package + project filesystem authority for `filesystem.project.read`;
-- refuses `allow_once` because it cannot consume that authority atomically;
+- requires a `task_id`;
+- derives repository-read capability from current work-package + project filesystem authority;
+- refuses `allow_once`;
 - constructs fixed argv itself;
-- records command-audit evidence;
-- requires deterministic output verification before completion;
-- can leave a nonterminal `operation_run` when an adapter does not settle after cancellation.
+- records command audits;
+- verifies deterministic output before terminalization.
 
-Goal execution must reuse the executor and fixed adapters, not copy them, but must introduce a real goal-owned authority loader instead of fabricating task state.
+A goal run has no legitimate work package. The new design cannot manufacture one.
 
-### 2.3 ADR 0010 / ADR 0012 task ownership today
+### 2.3 Shared ledgers are task-owned today
 
-Current storage assumes a task:
+Current PostgreSQL constraints include:
 
-- `execution_outcomes.task_id` is non-null and identity is task + attempt key;
-- `operation_runs.task_id` is non-null and identity is task + idempotency key;
-- repository command audits are task-owned;
-- `capability_attempts.task_id` is non-null.
+- `execution_outcomes.task_id NOT NULL` and unique task+attempt key;
+- `operation_runs.task_id NOT NULL` and unique task+idempotency key;
+- repository command-audit ownership by task;
+- `capability_attempts.task_id NOT NULL` and reliability contract version 1.
 
-Those records must be generalized with explicit subject foreign keys. Referential integrity may not be replaced by an unchecked polymorphic UUID.
+Those contracts must be generalized without weakening historical task referential integrity.
 
-### 2.4 PostgreSQL remains truth
+### 2.4 Current outcome semantics are insufficient for decisive project failure
 
-PostgreSQL is authoritative for:
+The current executor can map both a deterministic fixed-command failure and an evidence/database failure into a generic `unknown` failure. A proof history cannot safely call both “project failed.”
 
-- current project/registry/policy authority;
-- run identity and lifecycle;
-- schedule-slot identity;
-- lease/fencing state;
-- result/evidence history.
+Goal-owned operation execution therefore depends on a versioned canonical outcome extension that identifies **failure class**.
 
-Redis is only a wake-up/claim transport. A Redis loss, reconnect, duplicate delivery, or lost response cannot create a new authoritative run or change a result.
+### 2.5 PostgreSQL is business truth; Redis is delivery only
+
+For goal runs:
+
+- PostgreSQL owns run identity, policy/authority binding, state, lease, evidence, history, and schedule slots;
+- Redis wakes workers and carries bounded occurrence identity only;
+- duplicate/lost Redis delivery cannot create a second authoritative run or decide a proof result.
 
 ---
 
-## 3. Governing decisions
+## 3. Non-negotiable invariants
 
-### D1 — first-class closed execution subjects
+| ID | Invariant |
+|---|---|
+| I1 | A verification goal run is never represented by a synthetic task/work package/agent run/task attempt. |
+| I2 | Schema-v1 goal snapshots remain definition-only forever. |
+| I3 | A new run binds to the exact current registry revision, exact entry, exact repository snapshot, exact code-owned execution binding, and exact current project policy revision. |
+| I4 | Before admission and around execution, the live repository goal registry must attest to the current imported registry manifest; mismatch blocks/stops execution. |
+| I5 | Repository configuration can only make execution stricter/request work; it can never increase permission, rate, concurrency, deadline, evidence authority, verifier authority, or autonomy. |
+| I6 | Project verification execution is disabled by default for existing and new projects. |
+| I7 | Only code-owned explicitly allowlisted Operation Catalog id/version pairs may be executed by goal runs. Absence from the allowlist means denied. |
+| I8 | Initial eligible operations are zero-input, trusted-project, read-only, deterministic, hardened against repository-configured helper execution, and require no unsupported human/independent verifier. |
+| I9 | Goal repository reads require current project-level `filesystem.project.read` authority in `always_allow` mode. `allow_once` is never silently consumed. |
+| I10 | Every admitted run has one PostgreSQL identity before Redis delivery. |
+| I11 | At most one active run exists per project + logical goal id in v1 across manual and scheduled triggers. |
+| I12 | A live PostgreSQL goal-run lease generation/token is the sole business mutation fence. Redis claim state is not business authority. |
+| I13 | Goal-subject operation/audit/outcome writes are database-enforced against the live goal lease; stale workers cannot append authoritative evidence. |
+| I14 | A decisive pass/fail is bound to one clean Git repository identity (`sha1` or `sha256`) plus a bounded execution-environment fingerprint. |
+| I15 | Registry/project/root/grant/policy/catalog/eligibility/repository/system-availability drift produces no stale pass/fail. |
+| I16 | Operations execute in canonical sorted order, sequentially, with one overall deadline; no workflow language, piping, variables, dependency graph, or parallelism exists in v1. |
+| I17 | Transport success/exit zero alone cannot produce a pass. Required deterministic verification and subject-bound evidence must be durable. |
+| I18 | Only a versioned `functional` operation/verification failure can produce goal result `failed`; authority/infrastructure/evidence/timeout/unknown conditions are inconclusive. |
+| I19 | Incomplete child operation runs are never replayed inside the same goal run and never inferred into pass/fail. |
+| I20 | Goal terminalization atomically writes the overall canonical outcome, final event, and terminal run state. |
+| I21 | Overall goal outcome never creates a capability-reliability attempt; only exact child operation outcomes may feed #186. |
+| I22 | Repeated observations of one identical evidence unit do not manufacture independent reliability sample count; conflicting repeats are visible. |
+| I23 | Scheduler uses database-time bindings/slots, one current slot only, bounded batches, no historical catch-up stampede, and project-wide start budgets. |
+| I24 | Goal failure records evidence only. It cannot repair code, change autonomy, create GitHub mutations, widen grants, or invoke a model. |
+| I25 | Unknown contract/schema/policy/manifest/eligibility versions fail closed. |
 
-Shared execution/evidence code uses a discriminated union:
+---
 
-```ts
-export type ExecutionSubject =
-  | { kind: 'task'; taskId: string }
-  | { kind: 'verification_goal_run'; verificationGoalRunId: string }
-```
+## 4. Contract/version inventory
 
-This is not stored as one polymorphic `subject_id`. Each table keeps real nullable foreign keys plus an exclusive database shape check.
-
-No goal execution path may create a synthetic task, work package, task attempt, agent run, approval gate, or task log.
-
-### D2 — schema v1 stays non-executable; schema v2 requests bounded execution
-
-Schema v1 keeps its historical meaning.
-
-Schema v2 adds an `execution` declaration:
-
-```json
-{
-  "schemaVersion": 2,
-  "goalId": "repository-readable",
-  "definitionVersion": 2,
-  "title": "Repository remains readable",
-  "description": "Forge can inspect the trusted project without running repository-authored code.",
-  "capability": "filesystem.project.read",
-  "severity": "high",
-  "enabled": true,
-  "operations": [
-    {
-      "operationId": "repository.status.read",
-      "operationVersion": 1
-    }
-  ],
-  "execution": {
-    "manual": true,
-    "schedule": null,
-    "deadlineSeconds": 120,
-    "requiredEvidence": []
-  }
-}
-```
-
-Initial schedule declaration, when Slice E lands:
-
-```json
-{
-  "kind": "interval",
-  "everySeconds": 86400
-}
-```
-
-Not allowed in schema v2:
-
-- shell text;
-- command/argv;
-- operation inputs;
-- cwd/path;
-- environment variables;
-- adapter/tool/server names;
-- credentials;
-- callback names;
-- cron expressions;
-- operation dependency/data-flow expressions;
-- autonomy actions;
-- model prompts or verifier prompts.
-
-The execution declaration is a **request**. It is never authority.
-
-### D3 — repository severity is reporting metadata only
-
-`severity` is repository-owned and can affect presentation/escalation metadata. It cannot:
-
-- reduce Operation Catalog risk;
-- reduce evidence requirements;
-- bypass project policy;
-- bypass Security/Reviewer/MCP/filesystem policy;
-- grant/revoke autonomy;
-- select a verifier.
-
-A malicious repository changing `critical` to `low` therefore cannot weaken a safety boundary.
-
-### D4 — four-layer monotonic policy intersection
-
-Effective execution policy is the deterministic intersection of:
-
-1. repository goal declaration;
-2. current operator-owned project verification-policy revision;
-3. exact code-owned Operation Catalog definitions bound at import;
-4. centralized absolute system protocol/safety ceilings.
-
-The result is always equal or stricter than every permissive repository request.
-
-Examples:
-
-- repo manual=true + project manual=false -> manual disabled;
-- repo schedule + project scheduling=false -> no schedule;
-- repo every 60s + project minimum 3600s -> effective interval >=3600s;
-- repo deadline 1800s + project maximum 600s -> effective deadline=600s;
-- 12 operations + project maxOperationsPerRun=4 -> admission denied;
-- filesystem read not currently approved -> denied regardless of declaration/policy;
-- operation requires independent verification before #188 can supply it -> run admission blocked, never silently downgraded.
-
-### D5 — operator-tunable controls are database-backed and versioned
-
-Do not scatter rate, concurrency, queue, deadline, or operation-count constants through routes/workers/tests.
-
-Project verification policy is immutable revision history plus one protected current head. Values that operators may tune live in these records. Code constants remain only for closed enums, integer-encoding limits, and absolute safety ceilings that must survive corrupted configuration.
-
-### D6 — verification is disabled by default
-
-Migration and new-project creation both establish a valid current project verification policy with:
+The implementation must use explicit versions; do not reuse “v1” after changing meaning.
 
 ```text
-manual_enabled = false
-scheduling_enabled = false
+Verification goal definition:
+  v1 = definition-only (existing)
+  v2 = executable declaration
+
+Registry manifest:
+  v1 = existing definition-only membership manifest
+  v2 = membership + executable entry binding digest
+
+Registry execution binding:
+  v1 = code-owned binding stored on v2 registry entries
+
+Verification project policy:
+  v1
+
+Resolved run policy:
+  v1
+
+Verification goal run row/events:
+  v1
+
+Repository identity evidence:
+  v1
+
+Execution environment evidence:
+  v1
+
+Canonical execution outcome:
+  v1 = existing
+  v2 = adds closed failure classification / required new stop codes
+
+Capability reliability:
+  v1 = existing task-centric contract
+  v2 = supports goal subject + environment/evidence-unit semantics
+
+Verification goal operation eligibility policy:
+  v1, code-owned security allowlist
+
+Redis verification-run envelope:
+  v1
+
+Scheduler binding/slot:
+  v1
 ```
 
-No upgrade silently starts executing repository goals.
-
-An authenticated project owner must explicitly opt in through the policy surface.
-
-### D7 — no repository-controlled autonomy action
-
-The original #187 example mentions a failure autonomy action. That is intentionally not executable in #187.
-
-A decisive failed proof produces bounded failure evidence. #189 may later consume that evidence under its own operator-owned autonomy policy. #190 may later convert a regression into a Sentinel finding. Repository text cannot tell Forge to change permission.
-
-### D8 — one shared execution/evidence model, not parallel ledgers
-
-Do not create a second `verification_execution_outcomes` or second deterministic-operation engine.
-
-Generalize the existing shared outcome, operation-run, and command-audit records with explicit task/goal subjects. Historical task rows keep their current meaning and constraints.
-
-### D9 — decisive proof requires one stable clean repository identity
-
-A proof is not allowed to claim “last green commit” against arbitrary dirty state.
-
-Before the first operation, capture a trusted repository snapshot:
-
-```ts
-export type VerificationRepositoryIdentityV1 = {
-  schemaVersion: 1
-  objectFormat: 'sha1' | 'sha256'
-  oid: string
-  clean: true
-  rootRef: string
-  rootBindingRevision: string
-  grantDecisionRevision: string
-  projectRevision: string
-  snapshotFingerprint: string
-}
-```
-
-Rules:
-
-- object format is read by fixed `git rev-parse --show-object-format`;
-- OID is read by fixed `git rev-parse HEAD`;
-- `sha1` requires exactly 40 lowercase hex characters;
-- `sha256` requires exactly 64 lowercase hex characters;
-- clean/dirty is determined by a fixed no-shell status helper;
-- raw dirty file names are used only in memory to derive `clean`; they are not stored in the goal-run ledger, schedule state, Redis, API response, or repository-snapshot evidence;
-- root/project/grant authority is rechecked with the snapshot;
-- the same identity is rechecked before each operation and before terminalization.
-
-A dirty tree or changed identity produces an inconclusive proof, never a clean pass/fail.
-
-### D10 — operation references remain a canonical set
-
-Schema v2 does not become a workflow language.
-
-- operation references are sorted canonically by id/version;
-- initial execution is sequential;
-- no output-to-input piping;
-- no dependency graph;
-- no variables/interpolation;
-- first non-passing operation or authority/evidence drift stops the sequence;
-- parallel execution is out of scope until a separately reviewed shared-cancellation/lease contract exists.
+Semantic code changes to any of these must bump the relevant version/digest. Unknown newer versions never fall back to older interpretation.
 
 ---
 
-## 4. Executable-goal import contract
+## 5. Goal definition schema v2
 
-### 4.1 TypeScript contract
-
-Add v2 beside v1. Do not mutate v1 parsing behavior.
+### 5.1 Shape
 
 ```ts
 export type VerificationGoalEvidenceRequirement =
   | 'repository_identity'
+  | 'execution_environment'
   | 'canonical_operation_outcomes'
   | 'operation_evidence'
 
@@ -317,25 +215,167 @@ export type VerificationGoalDefinitionV2 = {
 }
 ```
 
-### 4.2 Evidence requirements are additive only
+### 5.2 Explicitly forbidden fields
 
-Base evidence is mandatory regardless of `requiredEvidence`:
+Schema v2 has no place for:
 
-- exact registry revision + entry + snapshot;
+- command or shell text;
+- argv;
+- operation input values;
+- cwd/path;
+- environment variables;
+- adapter/tool/MCP/server names;
+- credentials/tokens;
+- model/provider/verifier choice;
+- prompt text;
+- callbacks/webhooks;
+- cron expressions;
+- operation dependencies/output piping;
+- autonomy or repair actions.
+
+Unknown keys fail import.
+
+### 5.3 Severity is not a permission input
+
+Repository `severity` is reporting/escalation metadata only. It cannot lower:
+
+- Operation Catalog risk;
+- eligibility policy;
+- project/system policy;
+- evidence requirements;
+- filesystem/MCP/security gates;
+- independent verification requirements;
+- autonomy policy.
+
+### 5.4 Evidence requirements are additive
+
+The runner always requires base evidence:
+
+- current registry revision/entry/binding;
 - current project/root/grant/policy authority;
-- import-time Operation Catalog bindings;
+- execution environment;
 - clean repository identity;
-- every operation run;
-- every canonical operation outcome;
-- every adapter-required evidence reference.
+- every child operation run/outcome;
+- adapter-required evidence.
 
-`requiredEvidence` can only add a supported requirement. It cannot remove base evidence. Import rejects any requested evidence kind that the current runner/operations cannot produce.
+`requiredEvidence` may only add a supported requirement. It cannot remove base evidence. Import rejects a requested evidence kind the current runner/eligible operations cannot produce.
 
-### 4.3 Import-time Operation Catalog binding
+### 5.5 Database snapshot support
 
-A v2 snapshot must remember **which exact Operation Catalog definitions were validated when it was imported**, not only id/version text.
+`verification_goal_snapshots` remains repository-definition truth.
 
-Add storage for a bounded canonical list:
+Add/backfill:
+
+```text
+definition_schema_version integer not null default 1
+```
+
+Replace the exact-v1 JSONB constraint with a closed disjunction:
+
+```text
+valid exact v1 shape
+OR
+valid exact v2 shape
+```
+
+The v2 database check enforces:
+
+- exact top-level keys;
+- schemaVersion=2 and column parity;
+- exact execution keys;
+- manual boolean;
+- null or exact interval schedule object;
+- bounded positive integer deadline/interval;
+- closed duplicate-free evidence array;
+- bounded operation array.
+
+Existing v1 rows remain byte/meaning compatible.
+
+---
+
+## 6. Code-owned verification-goal operation eligibility
+
+A goal must not automatically inherit every future zero-input Operation Catalog entry.
+
+### 6.1 Separate security allowlist
+
+Do **not** add a new eligibility field to historical `OperationDefinition` objects if that would change existing definition digests without version bumps.
+
+Create a separate code-owned security allowlist:
+
+```ts
+export const VERIFICATION_GOAL_OPERATION_ELIGIBILITY_VERSION = 1 as const
+
+export type VerificationGoalOperationEligibility =
+  | 'not_allowed'
+  | 'manual_only'
+  | 'manual_and_scheduled'
+
+export const VERIFICATION_GOAL_OPERATION_ELIGIBILITY = new Map<
+  `${string}@${number}`,
+  VerificationGoalOperationEligibility
+>()
+```
+
+Absence = `not_allowed`.
+
+This is intentionally a code-level security allowlist, not DB/operator-editable metadata.
+
+### 6.2 Initial eligibility predicate
+
+In addition to explicit allowlist membership, v1 execution requires the current OperationDefinition to remain:
+
+```text
+inputKeys.length == 0
+scope == trusted_project
+risk == read_only
+approvalRequired == false
+recovery == none_read_only (or equivalent reviewed read-only recovery)
+verification is a supported deterministic verifier
+adapter kind is reviewed for goal execution
+```
+
+If `independentVerificationRequired=true` before #188 can produce independent evidence, run admission blocks `required_verifier_unavailable`.
+
+A scheduled goal may contain only `manual_and_scheduled` operations.
+
+### 6.3 Harden eligible Git reads before allowlisting
+
+“Read-only argv” is not sufficient if repository-local Git configuration can trigger helper execution.
+
+Before any current Git adapter is allowlisted for goal execution, harden/prove the exact eligible command family:
+
+- `GIT_CONFIG_NOSYSTEM=1`;
+- `GIT_CONFIG_GLOBAL=/dev/null` (or platform-equivalent code-owned null config);
+- prompts/pagers disabled;
+- `GIT_OPTIONAL_LOCKS=0` for proof reads;
+- explicit `-c core.fsmonitor=false` (prevent repository-configured fsmonitor hook/daemon behavior);
+- a code-owned empty hooks path or equivalent no-hook boundary where applicable;
+- diff commands keep `--no-ext-diff --no-textconv`;
+- no command uses shell expansion;
+- adversarial fixture attempts repository-configured helper execution and must not trigger a sentinel.
+
+### 6.4 Submodules are unsupported in v1
+
+Initial clean-identity/operation semantics do not claim containment over submodule worktrees.
+
+A fixed safe preflight detects a gitlink (`mode 160000`) in the index. If present, the run completes inconclusive with:
+
+```text
+submodule_repository_unsupported
+```
+
+A later runner version may introduce explicit submodule root/ref bindings.
+
+---
+
+## 7. Executable binding belongs to the registry entry, not the snapshot
+
+A snapshot says what the repository file declared. Code-owned execution semantics can change independently.
+
+### 7.1 Binding contract
+
+For each v2 registry entry, import computes:
 
 ```ts
 export type VerificationGoalOperationBindingV1 = {
@@ -344,336 +384,592 @@ export type VerificationGoalOperationBindingV1 = {
   definitionDigest: string
   capability: string
   adapter: string
-  requiredPolicyCeiling: string
+  risk: string
+  scope: string
   timeoutMs: number
   verification: string
+  approvalRequired: boolean
   independentVerificationRequired: boolean
+  eligibility: 'manual_only' | 'manual_and_scheduled'
+}
+
+export type VerificationGoalExecutionBindingV1 = {
+  schemaVersion: 1
+  eligibilityPolicyVersion: 1
+  eligibilityPolicyDigest: string
+  operations: VerificationGoalOperationBindingV1[]
 }
 ```
 
-Recommended snapshot columns:
+Canonical sorted binding -> domain-separated SHA-256 `execution_binding_digest`.
+
+### 7.2 Registry entry storage
+
+Extend immutable entries:
 
 ```text
-definition_schema_version integer not null
-operation_bindings jsonb null
-operation_bindings_digest text null
+entry_contract_version integer not null default 1
+execution_binding jsonb null
+execution_binding_digest text null
 ```
 
 Shape:
 
-- v1 snapshot -> schema=1, bindings null;
-- v2 snapshot -> schema=2, non-empty exact sorted bindings + SHA-256 binding digest.
-
-The v2 definition digest remains the digest of repository configuration. The operation-binding digest is separate code-owned execution evidence.
-
-At run admission and before each operation, current catalog definition digest must equal the imported binding. If a catalog implementation changes without a new operation version, execution fails closed as `operation_contract_changed`. Reimporting the same goal/definition version under a different binding is a hard conflict, not an implicit rebind.
-
-### 4.4 PostgreSQL snapshot constraint must explicitly support v1 OR v2
-
-The current `verification_goal_snapshots.canonical_definition` constraint is exact-v1. The executable-goal migration must replace it with a closed disjunction:
-
 ```text
-valid_v1_shape OR valid_v2_shape
+entry v1 / goal definition v1:
+  entry_contract_version=1
+  binding fields null
+
+executable goal definition v2:
+  entry_contract_version=2
+  binding fields required
 ```
 
-V2 database checks must enforce at least:
+The binding may differ in a later registry revision while referencing the same immutable repository snapshot. This avoids forcing the repository author to change `definitionVersion` merely because Forge's code-owned eligibility/catalog policy changed.
 
-- exact top-level keys;
-- `schemaVersion=2`;
-- exact execution keys;
-- manual boolean;
-- schedule null or exact interval object;
-- bounded integer deadline/interval;
-- bounded, duplicate-free closed evidence values;
-- bounded operation count;
-- v2 operation bindings required and matching snapshot capability/operation identities.
+### 7.3 Current catalog drift
 
-Existing v1 rows must pass unchanged.
+At run admission and before every child operation, re-resolve the exact Operation Catalog id/version and eligibility policy. Their current digests must equal the bound entry.
 
-### 4.5 Definition version rule
+Mismatch -> no execution/pass/fail:
 
-Any change to execution declaration, operations, capability, severity, enabled state, title, or description requires the repository author to increment `definitionVersion` under the existing immutable snapshot conflict rule.
+```text
+operation_contract_changed
+```
+
+Operator must re-import the registry to explicitly activate the new binding.
 
 ---
 
-## 5. Project verification policy
+## 8. Registry manifest v2 and live registry attestation
 
-### 5.1 Data model
+### 8.1 Manifest versioning
+
+Add to `verification_goal_registry_revisions`:
+
+```text
+manifest_schema_version integer not null default 1
+```
+
+Historical revisions are v1.
+
+Manifest v1 remains exactly compatible with existing definition-only imports.
+
+Any registry containing a schema-v2 executable entry uses manifest v2. V2 membership includes, in canonical order:
+
+```text
+goal id
+definition version
+definition digest
+repository-relative source path
+entry contract version
+execution binding digest (null sentinel only for non-executable v1 entries)
+```
+
+The manifest digest domain includes manifest schema version.
+
+Protected revision-construction SQL validates/recomputes the declared version. Transition uniqueness/dedup is version-safe.
+
+### 8.2 Import response
+
+The import API response is versioned/additive to expose at least:
+
+- registry revision id/sequence;
+- manifest schema version;
+- manifest digest;
+- head advanced/existing;
+- snapshot counts.
+
+Do not silently reinterpret the existing response version after adding fields with semantic meaning.
+
+### 8.3 Explicit import remains activation boundary
+
+The runner/scheduler does **not** auto-import changed repository goal files in v1.
+
+If live repository configuration differs from current imported registry:
+
+```text
+registry_content_stale
+```
+
+and operator action is “import verification goals.”
+
+This preserves explicit configuration activation while keeping repository files the source content.
+
+### 8.4 Read-only live registry attestation
+
+Add a non-mutating attestation path using the same hardened directory-anchored/no-follow bounded reader as import.
+
+It returns only validated/canonical registry identity:
+
+```ts
+{
+  manifestSchemaVersion,
+  manifestDigest,
+  registryEntryIdentities,
+  capturedProjectAuthority
+}
+```
+
+No commands or repository code execute.
+
+### 8.5 Two-phase admission
+
+Do not hold project/database locks while traversing goal files.
+
+Manual/scheduler admission:
+
+1. authenticate / identify candidate project;
+2. capture current project/root/registry authority;
+3. read/attest live registry outside long DB locks;
+4. enter canonical transaction;
+5. lock/recheck project, current filesystem authority, registry head/revision, selected entry, policy head/revision, active-run/budget state;
+6. require the attested live manifest equals the still-current imported head;
+7. create run or fail.
+
+### 8.6 Runtime registry re-attestation
+
+After a worker acquires DB lease, before the first child operation and before terminalization (and conservatively before each child operation), re-attest the live registry.
+
+Mismatch -> completed/inconclusive:
+
+```text
+registry_content_changed
+```
+
+No stale functional result is recorded.
+
+---
+
+## 9. Exact registry-to-current project authority
+
+Run admission also requires the current project authority tuple to equal the registry revision captured at import:
+
+```text
+project.submitted_by             == registry.project_submitted_by
+project.archived_at              == null == registry.project_archived_at
+project.local_path               == registry.project_local_path
+project.root_ref                 == registry.root_ref
+project.root_binding_revision    == registry.root_binding_revision
+project.grant_decision_revision  == registry.grant_decision_revision
+project.updated_at               == registry.project_revision
+```
+
+Any mismatch:
+
+```text
+registry_authority_stale
+```
+
+Operator must re-import after confirming/restoring authority.
+
+Queued/running work rechecks exact current registry head + project tuple. V1 conservatively stops on any registry-head revision change even if a future semantic analysis could prove this goal unchanged.
+
+---
+
+## 10. Project verification policy
+
+### 10.1 Immutable DB policy
 
 ```text
 verification_goal_policy_revisions
-- id uuid primary key
-- project_id uuid not null
-- revision_sequence bigint not null
-- schema_version integer not null
-- policy_digest text not null
-- manual_enabled boolean not null
-- scheduling_enabled boolean not null
-- min_schedule_interval_seconds integer not null
-- max_run_deadline_seconds integer not null
-- max_operations_per_run integer not null
-- max_concurrent_runs integer not null
-- max_queued_runs integer not null
-- start_budget_window_seconds integer not null
-- max_starts_per_window integer not null
-- actor_kind text not null               -- system_default | migration_seed | human
-- actor_user_id uuid null
-- predecessor_revision_id uuid null
-- created_at timestamptz not null
+- id uuid PK
+- project_id uuid NOT NULL
+- revision_sequence bigint NOT NULL
+- schema_version integer NOT NULL = 1
+- policy_digest text NOT NULL
+- manual_enabled boolean NOT NULL
+- scheduling_enabled boolean NOT NULL
+- min_schedule_interval_seconds integer NOT NULL
+- max_run_deadline_seconds integer NOT NULL
+- max_queue_age_seconds integer NOT NULL
+- max_operations_per_run integer NOT NULL
+- max_concurrent_runs integer NOT NULL
+- max_queued_runs integer NOT NULL
+- start_budget_window_seconds integer NOT NULL
+- max_starts_per_window integer NOT NULL
+- actor_kind text NOT NULL        -- migration_seed | system_default | human
+- actor_user_id uuid NULL
+- predecessor_revision_id uuid NULL
+- created_at timestamptz NOT NULL
 
 verification_goal_policy_heads
-- project_id uuid primary key
-- policy_revision_id uuid not null
-- revision_sequence bigint not null
-- updated_at timestamptz not null
+- project_id uuid PK
+- policy_revision_id uuid NOT NULL
+- revision_sequence bigint NOT NULL
+- updated_at timestamptz NOT NULL
 ```
 
-Required constraints:
+Constraints:
 
-- append-only policy revisions;
-- sequence starts at 1 and advances by one;
-- predecessor belongs to same project;
-- human actor -> user id required;
-- system_default/migration_seed -> user id null;
-- positive bounded numeric fields;
-- `maxOperationsPerRun` cannot exceed the parser/system absolute goal-operation bound;
-- head points to exact project/revision sequence;
-- one current head per project.
+- append-only revisions;
+- gapless per-project sequence;
+- predecessor same project;
+- human actor requires user id;
+- system/migration actor requires null user;
+- closed positive numeric bounds;
+- one exact project head;
+- policy digest canonical/domain-separated.
 
-### 5.2 Protected write authority
+### 10.2 Protected writes
 
-Policy changes affect execution permission. The ordinary application login must not directly update/delete policy history or move a head.
+Ordinary app role cannot directly update/delete policy history or move the head.
 
-Use a fixed-search-path protected routine owned by a non-login role, following the protected-registry pattern:
+Use a fixed-search-path protected routine (name illustrative):
 
 ```text
 forge.append_verification_goal_policy_revision_v1(...)
 ```
 
-It must:
+It:
 
-1. lock the project;
-2. verify active project and application-asserted authenticated owner;
-3. lock the current policy head;
-4. verify expected current revision/fingerprint;
-5. validate closed bounded policy values;
-6. append exactly one revision;
-7. advance only the matching head;
-8. commit atomically.
+1. locks project;
+2. verifies active project and application-authenticated owner relationship;
+3. locks expected current head;
+4. validates exact bounded values;
+5. appends one revision;
+6. advances only exact expected head;
+7. commits atomically.
 
-As with the registry actor field, the documentation must be honest: PostgreSQL verifies project ownership relationships but does not independently authenticate the web session behind an application-asserted user id.
+Document the same provenance caveat as current registry: PostgreSQL can verify stored project/actor relationships but does not independently authenticate the web session that supplied the application actor id.
 
-### 5.3 Default-disabled lifecycle
+### 10.3 Disabled default
 
-Existing projects receive one `migration_seed` revision with manual/scheduling disabled.
-
-New projects must receive a `system_default` disabled policy/head atomically through a protected project-insert trigger or equally fail-closed database-backed initializer. A missing policy head is an actionable blocked state; application code never falls back to permissive hardcoded defaults.
-
-### 5.4 Project-wide start budget
-
-`maxConcurrentRuns` and `maxQueuedRuns` do not prevent a repository with many goals from consuming unbounded starts over time. Every manual/scheduled run admission also enforces:
+Both existing-project migration and new-project creation establish a valid current policy with:
 
 ```text
-max_starts_per_window / start_budget_window_seconds
+manual_enabled=false
+scheduling_enabled=false
 ```
 
-The project policy-head lock serializes admissions for the project, so concurrent route/scheduler workers cannot both observe the same remaining budget and exceed it.
+Missing policy head fails closed. No permissive fallback constant.
 
-Manual runs do not bypass this safety budget merely because a human clicked the button.
+New projects receive a disabled `system_default` policy/head atomically via a protected DB initializer/trigger installed after backfill.
+
+### 10.4 One canonical default seed source
+
+Default numeric values are declared once in a versioned verification-policy default contract/seed and tested for exact parity with migration/new-project initialization. Do not duplicate them through SQL, TypeScript, UI, docs, and tests.
+
+Recommended initial **DB defaults** (operator-editable after creation):
+
+```text
+manual_enabled=false
+scheduling_enabled=false
+min_schedule_interval_seconds=3600
+max_run_deadline_seconds=600
+max_queue_age_seconds=300
+max_operations_per_run=16
+max_concurrent_runs=2
+max_queued_runs=8
+start_budget_window_seconds=3600
+max_starts_per_window=20
+```
+
+A separate centralized `VERIFICATION_GOAL_SYSTEM_LIMITS_V1` provides absolute stricter sanity ceilings; project values outside those ceilings are rejected. Those system constants are security/protocol limits, not scattered runtime defaults.
+
+### 10.5 Project-wide start budget
+
+Queued/concurrent limits alone do not stop many different goals from creating sustained load.
+
+All manual/scheduled admissions enforce the project rolling start budget under the serialized policy-head lock. Idempotency replays do not consume budget again.
+
+### 10.6 Minimal policy operator surface
+
+Before manual execution can be useful, provide an authenticated project-owner policy read/update API (and a minimal Project Settings surface or supported operator command):
+
+```text
+GET   /api/projects/:projectId/verification-policy
+PATCH /api/projects/:projectId/verification-policy
+```
+
+PATCH body contains exact policy fields + expected revision/sequence only. Server derives actor from session. Caller cannot provide actor user id or policy digest.
 
 ---
 
-## 6. Canonical lock order
+## 11. System/runtime availability ceiling
 
-Every code path that touches the same authority must use one order to avoid deadlocks.
+Project policy cannot turn on code that is not released/healthy.
 
-For run admission and policy/registry concurrency:
+Central fail-closed runtime gates:
 
 ```text
-1. project row
-2. current project filesystem decision pointer/read authority snapshot
-3. verification goal registry head
+manualVerificationGoalExecutionAvailable
+scheduledVerificationGoalExecutionAvailable
+```
+
+Rules:
+
+- missing/unavailable -> false;
+- gate can only restrict;
+- project policy must separately opt in;
+- Slice B keeps both false;
+- Slice C release enables manual only after release proof;
+- Slice E independently enables scheduling;
+- emergency disable blocks new work and causes running work to become inconclusive at the next authority checkpoint;
+- gate contract version participates in resolved run policy.
+
+---
+
+## 12. Dedicated project-level filesystem authority
+
+Goal runs have no work package. Never call task/package capability code with fabricated metadata.
+
+Add:
+
+```ts
+loadVerificationGoalFilesystemAuthority(projectId, goalCapability)
+```
+
+For v1:
+
+```text
+goal capability = filesystem.project.read
+current project filesystem decision exists
+current decision is approved
+current decision covers filesystem.project.read
+grant mode = always_allow
+current root/grant revisions match registry/run authority
+```
+
+`allow_once` fails closed.
+
+When future non-filesystem capabilities become eligible, each requires its own reviewed code-owned authority adapter. No generic user-editable permissions JSON may bypass that requirement.
+
+---
+
+## 13. Canonical lock order
+
+Before implementation, reconcile this order against existing registry/filesystem routines and use one order everywhere that takes overlapping locks:
+
+```text
+1. project
+2. current project filesystem decision pointer/current decision
+3. verification registry head
 4. bound registry revision + selected entry/snapshot
 5. verification policy head
 6. bound policy revision
-7. project run-budget / current active-run rows in stable id order
-8. new/existing verification goal run
+7. active verification runs / project budget rows in stable order
+8. target verification run
+9. child operation rows only after run lock/lease where applicable
 ```
 
-The implementation pass must compare this with the existing registry importer and filesystem-grant reconciliation lock order. If an existing producer holds a stricter established order, this document's sequence must be adjusted to match it before code is written; never introduce a reverse lock order just for #187.
+If an existing producer has an established conflicting order, adjust this design to match that producer before code is written.
 
-Run workers start from an unlocked lookup of `runId -> projectId`, then acquire authoritative locks in the same project-first order before claiming/revalidating the run.
+Filesystem traversal/live manifest attestation occurs outside long DB locks; transaction then rechecks the captured authority.
 
-No correctness test may rely on sleeps instead of explicit lock/interleaving control.
+Concurrency tests use controlled barriers/advisory locks, not sleeps as correctness proof.
 
 ---
 
-## 7. Exact registry-to-current-authority binding
+## 14. Resolved run policy
 
-Being on the current registry head is not enough. The current project must still be the project that was imported.
+### 14.1 Contract
 
-Before admitting a run, compare the current project to the registry revision's captured authority tuple:
-
-```text
-project.submitted_by          == registry_revision.project_submitted_by
-project.archived_at           == null == registry_revision.project_archived_at
-project.local_path            == registry_revision.project_local_path
-project.root_ref              == registry_revision.root_ref
-project.root_binding_revision == registry_revision.root_binding_revision
-project.grant_decision_revision == registry_revision.grant_decision_revision
-project.updated_at            == registry_revision.project_revision
+```ts
+export type ResolvedVerificationGoalRunPolicyV1 = {
+  schemaVersion: 1
+  resolverContractVersion: 1
+  projectId: string
+  registryRevisionId: string
+  registryManifestSchemaVersion: number
+  registryEntryOrdinal: number
+  goalSnapshotId: string
+  goalId: string
+  goalDefinitionVersion: number
+  goalDefinitionDigest: string
+  executionBindingDigest: string
+  projectPolicyRevisionId: string
+  projectPolicyRevisionSequence: string
+  triggerKind: 'manual' | 'scheduled'
+  effectiveDeadlineSeconds: number
+  effectiveQueueAgeSeconds: number
+  effectiveScheduleEverySeconds: number | null
+  effectiveRequiredEvidence: VerificationGoalEvidenceRequirement[]
+  operations: Array<{
+    operationId: string
+    operationVersion: number
+    definitionDigest: string
+    eligibility: 'manual_only' | 'manual_and_scheduled'
+    timeoutMs: number
+  }>
+  systemAvailabilityContractVersion: number
+}
 ```
 
-If any field differs, admission fails with a fixed `registry_authority_stale` response and tells the operator to re-import the registry after restoring/confirming project authority.
+### 14.2 Store exact resolved policy
 
-This prevents an old imported goal from silently running after root rebind, grant revision, owner/project update, archive/reopen, or repository-path change.
+`verification_goal_runs` stores:
 
-A running/queued goal also rechecks that:
+```text
+resolved_policy jsonb NOT NULL
+resolved_policy_fingerprint text NOT NULL
+```
 
-- registry head is still exactly its bound revision;
-- current project tuple still equals the bound registry tuple;
-- policy head is still exactly its bound policy revision.
+with exact DB shape/size/version checks.
 
-The first implementation conservatively stops on **any** registry or policy-head revision change, even if a later semantic comparison might prove the selected goal unaffected. Optimizing that requires a later contract.
+Workers load that snapshot. They do not rerun a newer resolver and replace semantics for an existing run. They only verify that current authority/gates still permit the stored run.
+
+V1 stops on any current policy-head revision change rather than trying to prove semantic equivalence.
 
 ---
 
-## 8. Goal-run persistence
+## 15. Verification goal run persistence
 
-### 8.1 Exact registry membership foreign key
+### 15.1 Exact registry entry identity
 
-A run must reference an **entry in its exact registry revision**, not two unrelated IDs.
-
-Add/ensure a unique registry-entry identity such as:
+Add a composite unique identity on registry entries sufficient for a run/schedule FK:
 
 ```text
-UNIQUE(
-  registry_revision_id,
-  project_id,
-  ordinal,
-  snapshot_id,
-  goal_id,
-  definition_version,
-  definition_digest
-)
+registry_revision_id
+project_id
+ordinal
+snapshot_id
+goal_id
+definition_version
+definition_digest
+entry_contract_version
+execution_binding_digest
 ```
 
-`verification_goal_runs` stores that same tuple and has a composite foreign key to it.
+For definition-only entries the binding digest is represented by the schema's approved null shape; executable runs require non-null binding.
 
-This structurally prevents a run from combining revision A with snapshot/goal B.
+### 15.2 Exact policy identity
 
-### 8.2 Exact policy foreign key
-
-Policy revisions expose:
+Policy revisions expose a composite unique identity:
 
 ```text
-UNIQUE(id, project_id, revision_sequence)
+(id, project_id, revision_sequence)
 ```
 
-The run stores and foreign-keys the exact policy tuple.
-
-### 8.3 `verification_goal_runs`
-
-Recommended fields:
+### 15.3 `verification_goal_runs`
 
 ```text
-id uuid primary key
-project_id uuid not null
-registry_revision_id uuid not null
-registry_entry_ordinal integer not null
-goal_snapshot_id uuid not null
-goal_id text not null
-definition_version integer not null
-definition_digest text not null
-policy_revision_id uuid not null
-policy_revision_sequence bigint not null
-policy_fingerprint text not null
-authority_fingerprint text not null
-trigger_kind text not null                      -- manual | scheduled
-request_actor_kind text not null                -- human | scheduler_v1
-requested_by_user_id uuid null
-manual_idempotency_key uuid null
-manual_request_fingerprint text null
-schedule_binding_id uuid null
-schedule_slot_sequence bigint null
-repository_snapshot_id uuid null
-status text not null                            -- queued | running | recovery_required | completed
-result text null                                -- passed | failed | inconclusive
-terminal_code text null
-lease_generation bigint not null default 0
-lease_token uuid null
-lease_owner text null
-lease_expires_at timestamptz null
-started_at timestamptz null
-completed_at timestamptz null
-created_at timestamptz not null
-updated_at timestamptz not null
+id uuid PK
+project_id uuid NOT NULL
+
+registry_revision_id uuid NOT NULL
+registry_entry_ordinal integer NOT NULL
+goal_snapshot_id uuid NOT NULL
+goal_id text NOT NULL
+definition_version integer NOT NULL
+definition_digest text NOT NULL
+entry_contract_version integer NOT NULL
+execution_binding_digest text NOT NULL
+
+policy_revision_id uuid NOT NULL
+policy_revision_sequence bigint NOT NULL
+resolved_policy jsonb NOT NULL
+resolved_policy_fingerprint text NOT NULL
+authority_fingerprint text NOT NULL
+
+trigger_kind text NOT NULL                 -- manual | scheduled
+request_actor_kind text NOT NULL           -- human | scheduler_v1
+requested_by_user_id uuid NULL
+manual_idempotency_key uuid NULL
+manual_request_fingerprint text NULL
+schedule_binding_id uuid NULL
+schedule_slot_sequence bigint NULL
+
+admission_expires_at timestamptz NOT NULL
+status text NOT NULL                       -- queued | running | recovery_required | completed | expired
+result text NULL                           -- passed | failed | inconclusive, completed only
+terminal_code text NULL
+execution_outcome_id uuid NULL             -- overall goal outcome, completed only
+
+lease_generation bigint NOT NULL DEFAULT 0
+lease_token uuid NULL
+lease_owner text NULL
+lease_expires_at timestamptz NULL
+recovery_not_before timestamptz NULL
+
+created_at timestamptz NOT NULL
+started_at timestamptz NULL
+finished_at timestamptz NULL
+updated_at timestamptz NOT NULL
 ```
 
-Required shapes:
+Required FKs:
+
+- exact composite registry entry;
+- exact policy revision/project;
+- project;
+- requested user when present;
+- overall outcome when terminal (installed after generalized outcome table can represent goal subject).
+
+### 15.4 Trigger shape
 
 ```text
 manual:
+  trigger_kind=manual
   actor_kind=human
-  requested_by_user_id != null
-  manual_idempotency_key != null
-  manual_request_fingerprint != null
+  requested_by_user_id not null
+  manual idempotency/fingerprint not null
   schedule fields null
 
 scheduled:
+  trigger_kind=scheduled
   actor_kind=scheduler_v1
   requested_by_user_id null
   manual fields null
-  schedule_binding/slot != null
+  schedule binding/slot not null
 ```
 
-Lifecycle shape:
+### 15.5 Lifecycle shape
 
 ```text
 queued:
-  started_at=null, completed_at=null, result=null
+  started=null, finished=null, result=null, overall outcome=null, no business lease
 
 running:
-  started_at!=null, completed_at=null, result=null, live lease required
+  started!=null, finished=null, result=null, live lease required
 
 recovery_required:
-  started_at!=null, completed_at=null, result=null
+  started!=null, finished=null, result=null, no current live worker lease,
+  recovery_not_before!=null
 
 completed:
-  started_at!=null, completed_at!=null, result in passed|failed|inconclusive
+  started!=null, finished!=null,
+  result in passed|failed|inconclusive,
+  overall outcome != null,
   no live lease
+
+expired:
+  started=null, finished!=null, result=null, overall outcome=null, no live lease,
+  terminal_code=dispatch_expired
 ```
 
-No arbitrary UPDATE/DELETE permission. Claim/renew/recovery/terminal transitions use fixed guarded routines or narrowly scoped SQL helpers with exact expected state + generation/token predicates.
+### 15.6 One active logical goal
 
-### 8.4 Run events
-
-`verification_goal_run_events` is append-only:
+Partial unique:
 
 ```text
-id
-run_id
-sequence bigint
-phase                  -- admission | dispatch | lease | repository_snapshot | operation | finalization | recovery
-status                 -- observed | passed | failed | blocked
-code                   -- closed code
-operation_run_id null
-repository_snapshot_id null
-evidence_refs jsonb UUID[]
-created_at
+UNIQUE(project_id, goal_id)
+WHERE status IN ('queued','running','recovery_required')
 ```
 
-No free-form error/prose/path/prompt fields.
+A distinct second manual request for an active goal gets `goal_run_active`. Same idempotency replay returns the same row.
 
-The goal ledger references operation evidence rather than copying operation output.
+### 15.7 Useful indexes
+
+At least:
+
+```text
+(project_id, status, created_at)
+(project_id, goal_id, finished_at)
+(status, admission_expires_at)
+(status, lease_expires_at)
+(goal_snapshot_id, finished_at)
+```
+
+Project start-budget queries must remain indexed/bounded.
 
 ---
 
-## 9. Manual request idempotency
+## 16. Manual idempotency
 
-Manual run creation requires a UUID `Idempotency-Key` header.
+Manual POST requires UUID `Idempotency-Key`.
 
-Persist a deterministic request fingerprint over:
+Request fingerprint:
 
 ```ts
 {
@@ -684,185 +980,159 @@ Persist a deterministic request fingerprint over:
 }
 ```
 
-Replay rules:
+Rules:
 
-- same authenticated actor + same key + same request fingerprint -> return the existing run;
-- same actor + same key + different project/goal fingerprint -> `409 idempotency_key_conflict`;
-- a new deliberate click uses a new UUID and may create another run for the same goal/commit.
+- same actor/key/fingerprint -> return existing run;
+- same actor/key/different fingerprint -> `409 idempotency_key_conflict`;
+- new deliberate run -> new UUID key;
+- a request rejected before creating a run does not consume a durable run idempotency record.
 
-On replay of an already-created run, first authenticate/authorize current project access, then compare the persisted request fingerprint. Do not silently reinterpret the old key against a new current registry revision.
-
-A request that failed before a run was created consumes no durable idempotency identity and may be retried after the blocking state is fixed.
-
----
-
-## 10. Resolved run policy
-
-Admission creates an immutable bounded policy snapshot:
-
-```ts
-export type ResolvedVerificationGoalRunPolicyV1 = {
-  schemaVersion: 1
-  projectId: string
-  registryRevisionId: string
-  registryEntryOrdinal: number
-  goalSnapshotId: string
-  goalId: string
-  goalDefinitionVersion: number
-  goalDefinitionDigest: string
-  operationBindingsDigest: string
-  projectPolicyRevisionId: string
-  projectPolicyRevisionSequence: string
-  triggerKind: 'manual' | 'scheduled'
-  effectiveDeadlineSeconds: number
-  effectiveScheduleEverySeconds: number | null
-  maxOperationsPerRun: number
-  effectiveRequiredEvidence: VerificationGoalEvidenceRequirement[]
-  operationDefinitions: Array<{
-    operationId: string
-    operationVersion: number
-    definitionDigest: string
-    capability: string
-    timeoutMs: number
-    requiredPolicyCeiling: string
-    verification: string
-    independentVerificationRequired: boolean
-  }>
-  policyFingerprint: string
-}
-```
-
-`policyFingerprint` is domain-separated SHA-256 over canonical JSON and semantic contract versions.
-
-A worker never re-resolves different values and pretends they were the original run. It loads the stored resolved policy, then verifies current authority is still equal/stricter and exact heads/bindings are unchanged.
-
-For v1 execution, any policy-head revision change stops the run as inconclusive rather than attempting a partial “still stricter enough” comparison.
+Replay first re-authenticates current project access; it does not reinterpret the old run under a new registry/policy.
 
 ---
 
-## 11. Dedicated goal/project filesystem authority loader
+## 17. Safe repository identity evidence
 
-A goal run has no work package. It must not call task-specific capability logic with fabricated package metadata.
-
-Add a dedicated loader conceptually:
-
-```ts
-loadVerificationGoalFilesystemAuthority(projectId, goalCapability)
-```
-
-It reads the current project filesystem decision pointer/decision and current root-binding state under the established project authority rules.
-
-Initial executable requirement:
+### 17.1 Evidence table
 
 ```text
-goal capability == filesystem.project.read
-current project decision covers filesystem.project.read
-decision == approved
-grant mode == always_allow
-root binding/current decision revision match registry/run authority
+verification_goal_repository_snapshots
+- id uuid PK
+- run_id uuid NOT NULL UNIQUE -> verification_goal_runs
+- project_id uuid NOT NULL
+- root_ref uuid NOT NULL
+- root_binding_revision bigint NOT NULL
+- grant_decision_revision bigint NOT NULL
+- project_revision timestamptz NOT NULL
+- object_format text NOT NULL               -- sha1 | sha256
+- oid text NOT NULL
+- clean boolean NOT NULL
+- snapshot_fingerprint text NOT NULL
+- captured_at timestamptz NOT NULL
 ```
 
-`allow_once` fails closed. Scheduled execution can never silently consume an interactive one-time decision.
+The run table does **not** require a snapshot FK, avoiding circular mandatory insertion. Query by unique run id; events may reference snapshot id after creation.
 
-The loader returns a typed server-derived ceiling; callers cannot supply capability, grant mode, project id, root, decision revision, or policy version.
+### 17.2 Fixed commands
 
-When future non-filesystem deterministic capabilities are added, each receives its own code-owned authority adapter. Do not grow one generic “permissions JSON” escape hatch.
-
----
-
-## 12. Trusted repository identity
-
-### 12.1 Dedicated safe snapshot evidence
-
-Add append-only `verification_goal_repository_snapshots`:
-
-```text
-id uuid primary key
-run_id uuid not null unique
-project_id uuid not null
-root_ref uuid not null
-root_binding_revision bigint not null
-grant_decision_revision bigint not null
-project_revision timestamptz not null
-object_format text not null                -- sha1 | sha256
-oid text not null
-clean boolean not null
-snapshot_fingerprint text not null
-captured_at timestamptz not null
-```
-
-A dirty preflight may store `clean=false` with the safe repository identity but never raw status paths.
-
-### 12.2 Fixed helper
-
-Use only fixed no-shell Git reads with the existing hardened environment pattern:
+A dedicated hardened helper uses fixed Git reads, including:
 
 ```text
 git rev-parse --show-object-format
 git rev-parse HEAD
-git status --porcelain=v1 -z --untracked-files=all
+fixed clean-status/index checks
+fixed gitlink/submodule detection
 ```
 
-Status bytes are reduced in memory to a boolean and discarded.
+Do not reuse a presentation helper if it stores file/path lists.
 
-Do not call the existing presentation-oriented repository-evidence helper if doing so would persist path lists/output that the proof ledger does not need.
+Validation:
 
-### 12.3 Revalidation points
+```text
+sha1   -> exactly 40 lowercase hex OID
+sha256 -> exactly 64 lowercase hex OID
+unknown object format -> inconclusive
+unborn/no HEAD -> inconclusive
+bare/unsupported repo shape -> inconclusive
+submodule gitlink -> inconclusive in v1
+```
 
-Revalidate clean identity:
+Raw dirty paths remain in memory only long enough to derive `clean=false` and are discarded.
 
-1. immediately after acquiring run lease and current authority;
-2. before every operation starts;
-3. after every operation settles and its evidence is durable;
-4. immediately before goal terminalization.
+### 17.3 Revalidation
 
-Any mismatch after run start -> completed/inconclusive `repository_changed`.
+Recheck repository identity:
+
+1. after run lease claim;
+2. before every child operation;
+3. after every child operation settles/evidence is durable;
+4. before terminalization.
+
+Mismatch -> `repository_changed` inconclusive.
 
 ---
 
-## 13. Generalizing canonical execution outcomes
+## 18. Safe execution environment evidence
 
-### 13.1 Storage subject shape
+Issue #187 requires an environment fingerprint.
 
-Generalize `execution_outcomes`:
-
-```text
-subject_kind: task | verification_goal_run
-task_id uuid null
-verification_goal_run_id uuid null
-```
-
-Database shape:
+Add append-only one-per-run:
 
 ```text
-subject_kind=task:
-  task_id != null
-  verification_goal_run_id = null
-
-subject_kind=verification_goal_run:
-  task_id = null
-  verification_goal_run_id != null
-  work_package_id = null
-  agent_run_id = null
-  task_attempt_id = null
+verification_goal_environment_snapshots
+- id uuid PK
+- run_id uuid NOT NULL UNIQUE
+- project_id uuid NOT NULL
+- schema_version integer NOT NULL = 1
+- runner_contract_version integer NOT NULL
+- platform text NOT NULL
+- architecture text NOT NULL
+- node_runtime_version text NOT NULL
+- git_runtime_version text NOT NULL
+- operation_binding_digest text NOT NULL
+- eligibility_policy_version integer NOT NULL
+- eligibility_policy_digest text NOT NULL
+- environment_fingerprint text NOT NULL
+- captured_at timestamptz NOT NULL
 ```
 
-Use subject-specific partial uniqueness:
+Normalize runtime versions through one closed parser; bound strings.
+
+Do not store:
+
+- hostname;
+- username;
+- local path;
+- environment-variable dump;
+- secret/token;
+- network address;
+- arbitrary process metadata.
+
+`environment_fingerprint` is the domain-separated digest of the safe normalized compatibility fields. Goal history and goal-subject reliability use it as a comparability input.
+
+Duration is deterministically derived from DB `started_at` / `finished_at` and exposed by the read path; no separate mutable duration counter is required.
+
+---
+
+## 19. Generalizing canonical outcomes
+
+### 19.1 Subject identity
+
+Extend `execution_outcomes`:
+
+```text
+subject_kind text NOT NULL                  -- task | verification_goal_run
+task_id uuid NULL
+verification_goal_run_id uuid NULL
+```
+
+Shape:
+
+```text
+task:
+  task_id not null
+  goal_run_id null
+
+verification_goal_run:
+  task_id null
+  goal_run_id not null
+  work_package_id null
+  agent_run_id null
+  task_attempt_id null
+```
+
+Subject-specific partial uniqueness:
 
 ```text
 UNIQUE(task_id, attempt_key) WHERE subject_kind='task'
 UNIQUE(verification_goal_run_id, attempt_key) WHERE subject_kind='verification_goal_run'
 ```
 
-Add a composite goal-run/project FK where the table also stores project scope indirectly through the linked operation/run; do not permit cross-project subject mismatches.
+Historical rows backfill task subject before cutover.
 
-Historical rows are backfilled to `subject_kind='task'` before the exclusive check becomes valid.
+### 19.2 Outcome contract v2
 
-### 13.2 Outcome semantics v2 prerequisite
-
-Current operation failure handling can map both a real fixed-command failure and an evidence/database failure to the same generic `unknown` outcome. That is insufficient for project pass/fail history.
-
-Before a goal can record a **decisive failed proof**, add canonical outcome schema v2 (or an equally explicit versioned extension) with a closed failure class:
+Goal-owned operation outcomes and the overall goal outcome require schema v2:
 
 ```ts
 export type ExecutionFailureClassV2 =
@@ -874,61 +1144,57 @@ export type ExecutionFailureClassV2 =
   | 'cancelled'
 ```
 
-Goal-owned operations require v2 outcomes. Historical/task v1 outcomes remain readable; task producers may remain v1 until deliberately migrated.
+V2 retains existing normalized transport/result/evidence/verifier fields and adds `failureClass` plus required closed stop reasons sufficient to distinguish at least:
 
-Required distinction for the existing repository adapter:
+```text
+operation_execution_failed
+evidence_persistence_failed
+authority_changed
+operation_contract_changed
+registry_content_changed
+system_execution_disabled
+dispatch_expired
+```
 
-- fixed Git command ran, audit is durably written, command returned a deterministic non-zero result -> `functional` with audit evidence;
-- command audit/evidence persistence failed -> `evidence`;
-- database/adapter infrastructure failed without decisive command evidence -> `infrastructure`;
-- current authority changed -> `authority`;
-- timeout/cancellation -> `infrastructure` or `cancelled` according to exact terminal contract;
-- deterministic output verifier rejected completed adapter output -> `functional` with `validation_failed`.
+Database checks enforce legal result/failure-class combinations.
 
-Do not infer functional failure from `stopReasonCode='unknown'`.
+Historical v1 remains readable. Do not rewrite v1 evidence to pretend it had failure-class information.
 
-### 13.3 Goal decision table
+### 19.3 Existing repository adapter distinction
 
-| Operation state | Required evidence valid? | Goal interpretation |
-|---|---:|---|
-| completed + deterministic verification passed | Yes | operation pass |
-| v2 failed + failureClass=functional | Yes | decisive operation failure |
-| validation_failed + functional evidence | Yes | decisive operation failure |
-| policy/authority block | Any | inconclusive |
-| timeout/cancelled | Any | inconclusive |
-| infrastructure/evidence failure | Any | inconclusive |
-| legacy/generic `unknown` | Any | inconclusive |
-| nonterminal operation run | Any | recovery required |
-| missing/malformed/mismatched evidence | No | inconclusive |
+Goal eligibility cannot be enabled until the adapter path can distinguish:
 
-A goal is `failed` only if at least one operation has a decisive functional failure while authority/repository identity remains valid. Everything else that prevents proof is inconclusive.
+- fixed command returns deterministic non-zero + durable exact audit -> functional;
+- deterministic output verification failure + evidence -> functional;
+- audit/evidence persistence failure -> evidence;
+- DB/adapter infrastructure failure without decisive evidence -> infrastructure;
+- authority drift -> authority;
+- timeout/cancel -> infrastructure/cancelled.
+
+`stopReasonCode='unknown'` is never a decisive goal failure.
 
 ---
 
-## 14. Generalizing deterministic operation runs
+## 20. Generalizing operation runs
 
-### 14.1 Subject shape
+Extend `operation_runs` with the same exclusive subject identity.
 
-Generalize `operation_runs` exactly as outcomes:
+Goal subject requires:
 
 ```text
-subject_kind
-task_id nullable
-verification_goal_run_id nullable
+verification_goal_run_id not null
+project_id matches goal run project via composite FK
+task/workPackage/agentRun/taskAttempt null
 ```
 
-Goal subject shape requires:
+Subject-specific unique idempotency:
 
-- `verification_goal_run_id != null`;
-- `task/workPackage/agentRun/taskAttempt = null`;
-- `project_id` equals the goal run project through a composite FK;
-- one exact goal-run operation idempotency key.
+```text
+UNIQUE(task_id, idempotency_key) WHERE task
+UNIQUE(verification_goal_run_id, idempotency_key) WHERE goal
+```
 
-Subject-specific unique indexes replace task-only uniqueness without weakening task history.
-
-### 14.2 Shared context composition
-
-Refactor task-specific loading into:
+Refactor context composition:
 
 ```ts
 type TrustedProjectOperationScope = {
@@ -945,135 +1211,188 @@ type TrustedOperationSubjectContext =
   | VerificationGoalOperationSubjectContext
 ```
 
-Flow:
-
 ```text
-load task authority --------┐
-                            ├-> trusted project scope -> shared policy -> fixed executor/adapter
-load goal-run authority ----┘
+Task authority loader -----┐
+                           ├-> shared trusted project scope -> shared policy -> fixed executor/adapters
+Goal authority loader -----┘
 ```
 
-The goal loader:
+Goal loader verifies exact:
 
-- loads the exact run;
-- verifies live lease generation/token;
-- verifies project + registry authority tuple;
-- verifies exact current policy head;
-- verifies import-time operation binding digest/current catalog digest;
-- verifies current dedicated project capability authority;
-- verifies repository snapshot identity;
-- derives allowed capability/ceiling server-side.
+- live goal lease;
+- registry head/entry/binding/live manifest;
+- project/root/grant authority;
+- policy head/resolved policy;
+- system runtime availability;
+- repository identity;
+- eligibility/catalog binding.
 
-Caller supplies only goal run id + internally derived operation ordinal/attempt identity. No project/root/capability/policy/command is caller-controlled.
+No caller supplies project path, capability set, policy, grant, command, adapter, or tool.
 
-### 14.3 Deterministic operation request for a goal
+---
 
-The runner constructs:
+## 21. External cancellation / overall run deadline
+
+The current shared executor needs an optional outer execution boundary:
 
 ```ts
-{
-  schemaVersion: 1,
-  operationId,
-  operationVersion,
-  inputs: {},
-  requestedCapability: goalCapability,
-  reason: 'verification_goal_run'
-}
+executeTrustedOperation(request, context, {
+  signal?: AbortSignal,
+  deadline?: MonotonicDeadline
+})
 ```
 
-Use a fixed audit reason, not repository title/description.
+Task callers that omit it keep current behavior.
 
-Operation idempotency key is domain-separated over:
+Goal runner composes:
+
+- operation's own timeout;
+- remaining overall run deadline;
+- DB lease-loss watchdog;
+- emergency system-availability disable.
+
+Effective child deadline:
 
 ```text
-goal run id + canonical operation ordinal + operation id/version + attempt generation
+min(operation timeout, remaining run deadline)
 ```
 
-The route/repository cannot choose it.
+Overall run deadline begins at DB `started_at`, not queue time.
+
+No new operation starts after deadline. Deadline exhaustion is inconclusive, never functional failure.
 
 ---
 
-## 15. Command-audit evidence integrity
+## 22. Goal-subject evidence writes must be DB-lease fenced
 
-### 15.1 Subject generalization
+Application helper convention is not enough for stale-worker correctness.
 
-Repository command audits must support task or verification-goal-run ownership with the same exclusive subject rule.
-
-Goal audits have:
-
-- `verification_goal_run_id` set;
-- task/workPackage/agentRun null;
-- project relationship consistent with the run;
-- existing fixed argv/safe-env/redaction rules unchanged.
-
-Existing task/non-goal audits retain their historical fields.
-
-### 15.2 Bind operation evidence to the exact operation run
-
-For Operation Catalog executions, add/populate `operation_run_id` on command audits (or an equivalent relational link) so goal terminalization can prove an evidence UUID belongs to the exact operation run that cites it.
-
-For the initial repository adapters, a decisive operation result requires:
+For goal subjects, use fixed protected routines and/or database triggers that verify exact current run:
 
 ```text
-operation run -> evidence ref -> command audit
+run id
+lease generation
+lease token
+running state
+DB lease not expired
 ```
 
-with exact subject/run binding.
+before authoritative mutation.
 
-Future adapter evidence kinds must add their own typed validator. Do not turn UUID arrays into an unchecked “anything exists somewhere” proof.
+Protect at least:
 
-### 15.3 Path privacy boundary
+- operation-run begin/event/finalize;
+- goal-subject command-audit insert;
+- goal-run event insertion where it represents worker evidence;
+- repository/environment evidence linking;
+- child outcome creation/link where required;
+- overall outcome terminalization.
 
-Existing command audits may contain internal cwd/argv according to current Forge behavior. Goal-run events, repository-snapshot records, Redis messages, public API responses, reliability rows, and schedule records must not copy those paths/raw outputs.
+Task-subject legacy behavior remains compatible.
+
+A stale worker whose subprocess returns after lease loss cannot add goal evidence.
 
 ---
 
-## 16. Manual-run API
+## 23. Command-audit evidence integrity
 
-### 16.1 Create
+Generalize repository command audits to goal subject with exclusive task/goal ownership.
+
+For Operation Catalog executions, add/populate exact `operation_run_id` (or equivalent relational binding).
+
+Initial adapter evidence chain must validate:
+
+```text
+goal run
+  -> child operation run
+  -> child outcome
+  -> exact command audit/evidence
+```
+
+An arbitrary UUID-shaped evidence reference is insufficient for decisive failure.
+
+Existing internal audit cwd/argv behavior may remain in the protected command-audit sink; goal events/repository snapshot/Redis/public API/reliability rows do not copy raw local paths/output.
+
+---
+
+## 24. Manual run API
+
+### 24.1 Create
 
 ```text
 POST /api/projects/:projectId/verification-goals/:goalId/runs
 Idempotency-Key: <UUID>
 ```
 
-Body: **must be absent/empty**.
+Request body must be absent/empty.
 
 Caller cannot submit:
 
-- snapshot/revision ids;
-- path/ref/commit;
-- operation list/input;
-- capability;
-- timeout/rate/concurrency;
-- evidence requirement;
-- actor id;
-- grant/policy;
-- provider/verifier.
+- revision/snapshot/binding ids;
+- repo path/ref/commit;
+- operation/input/capability;
+- time/rate/concurrency;
+- evidence/verifier;
+- actor/policy/grant;
+- runtime/provider/model.
 
-### 16.2 Admission transaction
+### 24.2 Two-phase admission
 
-Canonical steps under the lock order:
+Phase 1, outside long DB locks:
 
-1. authenticate session;
-2. resolve project and verify current owner/access + project-management ingress gate;
-3. check manual idempotency replay/conflict;
-4. lock project + current project filesystem authority;
-5. lock/read current registry head/revision/selected entry;
-6. verify exact registry-to-current project authority tuple;
-7. require v2 + enabled + manual requested;
-8. verify import-time operation bindings still match current catalog;
-9. lock current policy head/revision;
-10. require project manual execution enabled;
-11. resolve monotonic effective policy;
-12. enforce max operations, queued/running ceilings, project start budget;
-13. create exactly one queued run + bounded dispatch event;
-14. commit;
-15. publish the run identity to Redis best-effort/retryably.
+1. authenticate session/project access;
+2. check idempotency replay intent;
+3. capture project/root/current registry authority;
+4. read/attest live registry manifest using hardened bounded reader.
 
-A post-commit enqueue failure does not delete the run. A dispatcher/recovery scan republishes queued identities. Duplicate Redis deliveries are harmless because the database run/lease is authoritative.
+Phase 2 transaction under canonical locks:
 
-### 16.3 Create response
+1. re-auth/lock project + current project filesystem decision;
+2. lock registry head/revision/selected exact entry;
+3. require live manifest == current imported manifest;
+4. require exact project authority == registry import authority;
+5. require v2 enabled goal + manual requested + executable binding;
+6. verify current Operation Catalog + eligibility binding;
+7. lock current project policy;
+8. require global manual availability + project manual enabled;
+9. resolve/store exact monotonic run policy;
+10. enforce `always_allow` goal filesystem authority;
+11. enforce active-goal uniqueness + queued/running + start budget;
+12. calculate DB-time `admission_expires_at`;
+13. create one queued run + bounded dispatch event;
+14. commit.
+
+After commit: best-effort/retryable Redis publish of run identity.
+
+### 24.3 Fixed error taxonomy
+
+Expected errors use stable redacted codes, including:
+
+```text
+unexpected_request_body
+invalid_idempotency_key
+idempotency_key_conflict
+project_not_found
+registry_not_imported
+registry_content_stale
+registry_authority_stale
+goal_not_found
+goal_schema_not_executable
+goal_disabled
+operation_not_goal_eligible
+operation_binding_stale
+required_verifier_unavailable
+system_execution_disabled
+manual_execution_disabled
+filesystem_authority_denied
+goal_run_active
+start_budget_exhausted
+queue_capacity_exhausted
+```
+
+No local paths/raw SQL/Redis details/goal internals leak in public error text.
+
+### 24.4 Create response
 
 ```json
 {
@@ -1085,171 +1404,33 @@ A post-commit enqueue failure does not delete the run. A dispatcher/recovery sca
 }
 ```
 
-### 16.4 Minimal read path required by #187
+### 24.5 Minimal read path
 
-Do not wait for #191's full dashboard to make proof runs observable.
-
-Provide an authenticated bounded endpoint such as:
+#187 itself must make a run inspectable before #191 dashboard work:
 
 ```text
 GET /api/projects/:projectId/verification-goal-runs/:runId
 ```
 
-Return only:
+Return bounded:
 
-- run id / goal id;
+- run/goal id;
 - trigger kind;
 - lifecycle status;
-- passed/failed/inconclusive result if terminal;
-- stable terminal/recovery code;
-- clean commit object format/OID if captured;
-- timestamps;
-- bounded operation run IDs and evidence-reference IDs;
-- whether operator action/retry is required.
+- terminal proof result/code;
+- repository object format/OID if captured;
+- environment fingerprint;
+- created/started/finished/duration;
+- bounded child operation run IDs + outcome/evidence reference IDs;
+- whether operator recovery/reimport/rerun is required.
 
-Do not return local path, raw command output, policy internals, Redis claim data, lease token, or database error text.
-
-#191 later owns aggregation/filtering/dashboard/export polish.
+Hide local path, raw output, policy JSON, Redis internals, lease token/generation, DB error text.
 
 ---
 
-## 17. Goal-run state machine
+## 25. Redis delivery and PostgreSQL business lease
 
-Use one lifecycle state dimension and one terminal result dimension.
-
-```text
-queued
-  -> running
-  -> recovery_required
-  -> completed
-
-running -> completed
-queued  -> completed   (only through a protected pre-start cancellation/inconclusive transition if needed)
-```
-
-Terminal result exists only for `completed`:
-
-```text
-passed
-failed
-inconclusive
-```
-
-### 17.1 Semantics
-
-**Passed**
-
-All canonical operations completed, deterministic verification passed, required evidence is linked/valid, and registry/project/root/grant/policy/catalog/repository authority remained current through terminalization.
-
-**Failed**
-
-At least one operation produced a versioned **functional** failure with required evidence while all authority/repository bindings remained valid.
-
-**Inconclusive**
-
-Forge could not decide pass/fail because of dirty/drifting repository, policy/registry/root/grant change, timeout, cancellation, lease loss, infrastructure/evidence failure, operation-contract drift, missing evidence, or recovery uncertainty.
-
-### 17.2 Admission denial vs run result
-
-Conditions detected before a run identity is validly admitted (v1/disabled goal, manual disabled, stale registry authority, no filesystem authority, budget/queue limit) return fixed API/scheduler denial and create no false proof result.
-
-Conditions found after a run is created/claimed (for example repository dirty at worker preflight) terminalize the run as `inconclusive` when it is safe to do so.
-
-### 17.3 Stable terminal codes
-
-Initial closed taxonomy:
-
-```text
-passed
-functional_operation_failed
-functional_verification_failed
-repository_dirty
-repository_changed
-registry_superseded
-registry_authority_changed
-policy_changed
-root_or_grant_authority_changed
-operation_contract_changed
-required_verifier_unavailable
-missing_required_evidence
-operation_infrastructure_failed
-operation_evidence_failed
-timeout
-lease_lost
-queue_recovery_failed
-operator_cancelled
-internal_infrastructure_error
-```
-
-`failed` is allowed only for the two `functional_*` codes. All other terminal codes are inconclusive.
-
----
-
-## 18. Database lease and stale-worker fencing
-
-Redis ownership is not sufficient to authorize PostgreSQL mutation.
-
-### 18.1 Claim
-
-A fixed guarded claim transition:
-
-- uses database time;
-- requires `status=queued` or an explicitly recoverable state;
-- increments `lease_generation`;
-- writes fresh UUID token + bounded owner id;
-- sets `lease_expires_at` to bounded future DB time;
-- moves queued -> running on first claim.
-
-### 18.2 Renewal
-
-Renewal requires exact:
-
-```text
-run id + lease generation + lease token + current running state
-```
-
-and database time before expiry.
-
-Every authoritative event, repository snapshot link, operation start authorization, recovery mutation, and terminalization verifies the same current lease tuple.
-
-A stale worker's later adapter return cannot write authoritative goal state.
-
-### 18.3 Local cancellation
-
-Lease loss aborts the local `AbortSignal` and prevents any new operation from starting. Abort is advisory; the PostgreSQL generation/token check is the actual fence.
-
----
-
-## 19. Child operation recovery and uncertain effects
-
-The current Operation Catalog deliberately leaves an operation run nonterminal when a cancelled adapter does not settle. A goal runner must respect that boundary.
-
-### 19.1 No automatic replay of an incomplete child operation
-
-If a child `operation_run` is still `running`/recovery-required after goal worker loss:
-
-- do not run the same goal operation again under the same goal run;
-- do not create a second reliability attempt;
-- do not infer a pass/fail;
-- parent goal moves/stays `recovery_required`.
-
-### 19.2 Safe parent closure
-
-Recovery may close the parent as inconclusive only after it proves that no child operation can still create authoritative evidence/effects under the lost lease, for example the built-in read-only subprocess has settled/quiesced and stale database writes are fenced.
-
-If that cannot be proven, leave the parent `recovery_required` for operator inspection. Never manufacture terminal evidence merely to unblock the queue.
-
-The incomplete child operation row remains historical evidence.
-
-A later deliberate manual goal run uses a **new goal-run identity**; a scheduler uses a later slot. Neither overwrites the incomplete run.
-
----
-
-## 20. Dispatch, Redis, and recovery
-
-### 20.1 Envelope
-
-Redis carries only:
+### 25.1 Envelope
 
 ```ts
 {
@@ -1259,613 +1440,896 @@ Redis carries only:
 }
 ```
 
-No path, goal JSON, command, policy JSON, evidence, actor token, lease token, or secret.
+Nothing else.
 
-### 20.2 Post-commit dispatch recovery
+### 25.2 Do not add a fourth copy-pasted queue implementation
 
-The PostgreSQL `queued` row is sufficient dispatch truth. A bounded dispatcher scans queued/unleased runs and may republish them. Lost publish responses can create duplicate Redis occurrences; database claim fencing converges them on one run.
+Current queue code duplicates task/approval/answers definitions. Before adding verification runs, extract/reuse generic queue-definition + envelope/claim/malformed/receipt primitives where safe.
 
-If generic queue occurrence/retry primitives are extracted from the task queues, policy remains outside those primitives. Queue code transports typed identity; it does not decide goal permission.
+Verification policy remains outside queue code.
 
-### 20.3 Functional failure is never auto-retried
+### 25.3 Ownership hierarchy
 
-A decisive failed proof is evidence, not a transient job failure.
+Recommended call path:
 
-Initial manual runner does not auto-create a second goal run after inconclusive infrastructure failure either. The operator may request a new run. The scheduler waits for the next normal slot.
+1. receive/claim Redis occurrence;
+2. load run/project identity;
+3. acquire PostgreSQL goal-run business lease;
+4. once DB lease is durable, acknowledge/release the Redis occurrence best-effort;
+5. execute under DB lease only.
 
-This keeps infrastructure retry semantics separate from project behavior.
+If Redis ack is lost, a duplicate may later arrive. Duplicate worker cannot acquire DB lease and safely drops/acks its occurrence.
 
----
+If DB cannot confirm lease, do not discard transport based on assumed ownership.
 
-## 21. Canonical runner flow
+Redis outage after a valid DB lease does not grant/revoke business authority. DB lease + local watchdog decide continuation.
 
-```text
-PostgreSQL queued run already exists
-  -> Redis occurrence wakes worker
-  -> worker obtains project id without lock
-  -> acquire canonical project/registry/policy/run locks
-  -> acquire database execution lease
-  -> revalidate exact registry-to-current authority + policy + catalog bindings
-  -> revalidate project-level always_allow capability authority
-  -> capture safe clean repository identity
-  -> if dirty/unavailable: safely complete inconclusive
-  -> for each canonical operation sequentially:
-       -> verify live run lease
-       -> revalidate project/registry/policy/catalog/filesystem authority
-       -> revalidate clean repository identity
-       -> construct fixed goal-owned OperationRequest with {}
-       -> execute shared deterministic Operation Catalog entry
-       -> require terminal operation outcome v2 + typed evidence
-       -> verify exact command/evidence ownership
-       -> revalidate repository identity after settlement
-       -> on decisive functional failure: stop sequence
-       -> on any other non-pass: inconclusive/recovery-required
-  -> revalidate lease + all authority + clean repository identity
-  -> atomically append final event + terminalize run
-  -> only after durable terminalization: best-effort reliability ingestion
-```
+### 25.4 Queued redispatch
 
-No model is invoked by this deterministic proof path.
+Queued PostgreSQL rows are recoverable dispatch truth. A bounded dispatcher scans queued/unexpired rows and republishes. Duplicate delivery is safe.
+
+Malformed Redis messages can be quarantined/discarded through shared safe primitives; a real queued DB run remains redispatchable.
 
 ---
 
-## 22. History semantics
+## 26. DB run lease and PostgreSQL-outage watchdog
 
-Compute from immutable decisive run history. Do not add a mutable status summary in the first execution slice.
+### 26.1 Claim
 
-A history cohort is at least:
+Protected transition:
+
+- DB transaction time;
+- run still `queued`, unexpired, current authority still valid enough to claim;
+- increment `lease_generation`;
+- fresh UUID token + bounded owner id;
+- bounded `lease_expires_at`;
+- set `started_at` once;
+- queued -> running.
+
+### 26.2 Renewal
+
+Exact predicate:
 
 ```text
-project
-+ goal snapshot / definition digest
-+ operation-bindings digest
-+ project verification-policy fingerprint
+run id + running + lease generation + lease token + unexpired DB time
 ```
 
-Only clean-commit decisive passed/failed runs count.
+### 26.3 Local monotonic safety deadline
+
+After each successful claim/renewal, worker derives a local **monotonic** stop deadline no later than the persisted lease horizon.
+
+DB renewal uncertainty:
+
+- bounded retries allowed before local deadline;
+- failure never extends deadline;
+- at deadline abort outer executor signal and start no new work;
+- late renewal response cannot revive a locally fenced worker.
+
+When DB returns, only current generation/token can mutate.
+
+---
+
+## 27. Canonical runner flow
+
+```text
+queued PostgreSQL run exists
+  -> Redis wake-up
+  -> acquire DB goal lease
+  -> ack Redis occurrence best-effort
+  -> capture safe execution environment
+  -> revalidate system/project/registry/live-manifest/policy/filesystem/catalog/eligibility authority
+  -> capture clean repository identity
+  -> if unsupported/dirty: completed inconclusive (when terminalization is safe)
+  -> for each canonical bound operation:
+       -> verify live DB lease + overall deadline
+       -> revalidate authority + live registry + repository identity
+       -> build fixed request:
+            schemaVersion=1
+            exact bound operation id/version
+            inputs={}
+            requestedCapability=goal capability
+            reason='verification_goal_run'
+       -> execute shared deterministic executor with outer signal/deadline
+       -> child goal-subject ledger/evidence writes require live lease
+       -> require terminal canonical outcome-v2 + exact typed evidence
+       -> revalidate repository/live registry/authority after settlement
+       -> functional failure => stop with failed candidate
+       -> nonfunctional non-pass => inconclusive/recovery path
+  -> revalidate lease + system/project/registry/live-manifest/policy/filesystem/catalog/repo identity
+  -> atomically create overall goal outcome + final event + completed run
+  -> after commit only: best-effort capability reliability-v2 ingestion for child operations
+```
+
+No LLM call exists in this path.
+
+---
+
+## 28. Goal result decision table
+
+| Child/authority condition | Decisive? | Goal effect |
+|---|---:|---|
+| all child operations completed + deterministic verification + exact evidence | Yes | passed |
+| child outcome-v2 `failureClass=functional` + exact evidence | Yes | failed |
+| deterministic verifier functional failure + evidence | Yes | failed |
+| repository dirty/changed | No | inconclusive |
+| registry live manifest/head/authority changed | No | inconclusive |
+| policy/system/filesystem/catalog/eligibility changed | No | inconclusive |
+| timeout/cancel | No | inconclusive |
+| infrastructure/evidence failure | No | inconclusive |
+| current/legacy `unknown` failure | No | inconclusive |
+| missing/mismatched evidence | No | inconclusive |
+| child operation nonterminal | No | recovery_required then inconclusive if safely recoverable |
+
+Only explicit functional codes may map `verification_goal_runs.result='failed'`.
+
+---
+
+## 29. Overall canonical goal outcome
+
+Every **completed** goal run writes one overall outcome-v2 anchored to the same `verification_goal_run` subject under a reserved final attempt key.
+
+Mapping:
+
+```text
+run passed:
+  outcome.result = completed
+  failureClass = null
+
+run failed:
+  outcome.result = failed
+  failureClass = functional
+
+run inconclusive:
+  outcome.result = needs_attention (or the exact approved v2 inconclusive mapping)
+  failureClass = authority | infrastructure | evidence | cancelled as appropriate
+```
+
+The architecture implementation pass must freeze the exact v2 result/stop-reason mapping before migration.
+
+Atomic terminal transaction:
+
+1. lock run, verify live lease/generation/token;
+2. validate exact repository + environment snapshots;
+3. validate exact expected child operation set/outcomes/evidence;
+4. append overall execution outcome;
+5. append final goal event;
+6. set run execution_outcome_id/result/terminal_code/finished_at/status=completed;
+7. clear lease;
+8. commit.
+
+Response loss/replay returns existing terminal state; no duplicate outcome/event.
+
+`expired` queued runs do **not** fabricate an overall proof outcome.
+
+---
+
+## 30. Child operation recovery
+
+### 30.1 No in-run replay after uncertainty
+
+If worker lease is lost/crashes and a child `operation_run` is nonterminal:
+
+- never rerun that child in the same goal run;
+- never create a second child reliability observation for the same in-run ordinal;
+- never infer result from a command audit alone;
+- parent becomes `recovery_required`.
+
+### 30.2 Crash points
+
+```text
+crash after command, before audit:
+  no decisive evidence
+
+crash after audit, before child operation finalization:
+  audit alone is not pass/fail
+
+crash after child terminalization, before next child:
+  v1 does not resume parent after lease loss; parent recovery closes inconclusive
+```
+
+The deliberate v1 rule is **no resume after business worker lease loss**. A new manual run/new schedule slot is a new proof identity.
+
+### 30.3 Read-only quarantine horizon
+
+Because v1 eligible operations are proven read-only and every goal evidence write is DB-lease fenced:
+
+1. recovery fences expired generation/token;
+2. running -> recovery_required;
+3. set DB-time `recovery_not_before` at least maximum eligible child timeout + abort/quiescence margin beyond the last trusted lease horizon;
+4. after horizon, verify no current lease/overall outcome/new authorized child evidence;
+5. close parent completed/inconclusive `lease_lost` or exact recovery code;
+6. preserve incomplete child row.
+
+No child replay and no functional inference.
+
+Side-effecting future operations are not covered by this recovery contract.
+
+---
+
+## 31. Queued expiry
+
+Admission computes:
+
+```text
+admission_expires_at = DB transaction time + effective max queue age
+```
+
+A bounded dispatcher/recovery process moves an unstarted expired queued run:
+
+```text
+queued -> expired
+terminal_code=dispatch_expired
+finished_at=DB time
+result=null
+overall outcome=null
+```
+
+An expired run never contributes proof history/reliability.
+
+---
+
+## 32. Run events
+
+Append-only bounded event table:
+
+```text
+verification_goal_run_events
+- id
+- run_id
+- sequence bigint
+- phase                -- admission | dispatch | lease | environment | repository | operation | recovery | finalization
+- status               -- observed | passed | failed | blocked
+- code                 -- closed taxonomy
+- operation_run_id null
+- repository_snapshot_id null
+- environment_snapshot_id null
+- evidence_refs UUID[]
+- created_at
+```
+
+No free-text/path/prompt/raw error columns.
+
+Worker-authored goal events require live lease when they affect proof evidence. Protected recovery/system events use their own guarded routine/actor code.
+
+---
+
+## 33. History semantics
+
+Current history cohort includes at least:
+
+```text
+project id
+goal snapshot / definition digest
+registry execution binding digest
+resolved goal policy fingerprint
+execution environment fingerprint
+```
+
+Only clean-commit completed `passed|failed` runs count as decisive history.
 
 Definitions:
 
-- `lastGreen` = most recent decisive passed run in current cohort;
-- `consecutivePasses` = decisive passes after most recent decisive failure; inconclusive runs do not break/increase streak;
-- `consecutiveFailures` = decisive failures after most recent decisive pass; inconclusive runs do not break/increase streak;
-- `firstObservedFailingCommit` = earliest decisive failed clean commit in the current unresolved failure episode;
-- a later decisive pass closes the episode but preserves history.
+- `lastGreen` = most recent decisive pass in current cohort;
+- `firstObservedFailingCommit` = earliest decisive failed clean commit in current unresolved failure episode;
+- `consecutivePasses` = decisive passes since latest decisive failure; inconclusive ignored;
+- `consecutiveFailures` = decisive failures since latest decisive pass; inconclusive ignored;
+- later pass closes failure episode but preserves history.
 
-Use **first observed failing commit**, not “regression introduced by commit.” Forge has not performed a bisect and must not claim causation.
+Do not call it “first bad commit” without a separate bisect/causality proof.
 
-A definition/binding/policy cohort change begins new current streak semantics; prior history remains queryable.
-
----
-
-## 23. Reliability integration
-
-Do not write one synthetic goal-level capability attempt.
-
-Each completed deterministic operation may feed #186 under its existing key:
-
-```text
-operation:<operation-id>@<version>
-```
-
-Required generalization:
-
-```text
-capability_attempts.subject_kind
-capability_attempts.task_id nullable
-capability_attempts.verification_goal_run_id nullable
-```
-
-Goal subject rejects task/workPackage/agent/taskAttempt links and keeps exact `operation_run_id`.
-
-### 23.1 Prevent silent mixing with task-issued operations
-
-Reliability scope/policy fingerprint for a goal-owned operation includes:
-
-```text
-executionSubjectKind = verification_goal_run
-goal policy fingerprint
-registry/goal binding identity
-project/root/grant scope
-```
-
-Task-issued and proof-issued samples therefore do not silently collapse into one cohort when their authority/policy context differs.
-
-### 23.2 No incomplete/uncertain ingest
-
-Never ingest a goal operation if:
-
-- operation run is nonterminal;
-- canonical outcome/evidence is missing/drifted;
-- parent goal lease/evidence attribution is uncertain.
-
-Reliability ingestion remains best-effort after canonical evidence. Its failure cannot change the goal result.
-
-`independent_agent` remains refused until #188 produces an independent verification record.
+A definition/binding/policy/environment cohort change begins new current-cohort history while preserving old evidence.
 
 ---
 
-## 24. Independent verification extension point (#188)
+## 34. Capability reliability v2
 
-#187 deterministic goal result is immutable evidence. #188 must not rewrite it into “verified.”
+### 34.1 Overall goal outcome excluded
 
-Future independent verification appends/links separate records:
+Only child outcomes linked to terminal `operation_runs` create operation capability observations.
+
+Overall goal outcome never creates a capability attempt.
+
+### 34.2 Goal-subject reliability contract v2
+
+Current v1 DB requires task id/contract=1 and v1 outcome taxonomy. Goal execution requires a versioned reliability extension:
 
 ```text
-verification subject = verification_goal_run
-verifier run identity
-bounded source evidence
-criterion/check findings
-verification result/history
+subject_kind = verification_goal_run
+verification_goal_run_id != null
+task/workPackage/agent/taskAttempt = null
+contract_version = 2
+evidence_unit_fingerprint NOT NULL
+environment_fingerprint NOT NULL
+outcome-v2 compatible failure fields/checks
 ```
 
-Reverification appends history.
+Task v1 remains readable unchanged.
 
-Human-browser and Playwright-browser lanes remain separate. Schema v2 does not define browser verifier types, does not reuse a human browser session, and does not allow a repository to select a model/verifier runtime.
+V2 deterministic runtime fingerprint includes:
 
-If an imported Operation Catalog binding says `independentVerificationRequired=true` while #188 support is unavailable, manual/scheduled admission is blocked with `required_verifier_unavailable`; it is never downgraded to self/deterministic verification.
+```ts
+{
+  kind: 'deterministic_adapter',
+  adapterKind,
+  executionEnvironmentFingerprint
+}
+```
+
+V2 policy fingerprint includes:
+
+```text
+executionSubjectKind=verification_goal_run
+resolved goal policy
+registry goal/binding identity
+```
+
+so task-issued and proof-issued operation evidence does not silently share a cohort under materially different policy.
+
+### 34.3 Evidence unit prevents sample inflation without hiding repeats
+
+Every goal child observation derives:
+
+```text
+evidence_unit_fingerprint = H(
+  project,
+  goal snapshot/binding,
+  operation id/version,
+  clean repo object format/OID,
+  resolved goal policy,
+  environment fingerprint
+)
+```
+
+Store every observation; do **not** discard repeated executions.
+
+Metrics expose:
+
+- raw observation count;
+- unique evidence-unit count;
+- promotion-grade sample count based on unique evidence units.
+
+If one evidence unit has conflicting decisive outcomes, reliability enters an explicit evidence-instability/conflict state and cannot support autonomy promotion until #189 policy handles it.
+
+Repeated daily/manual proof of one unchanged commit therefore remains visible operational history but cannot manufacture independent trust samples.
+
+### 34.4 No uncertain ingest
+
+No reliability v2 row from:
+
+- nonterminal child operation;
+- missing/drifted evidence;
+- uncertain subject attribution;
+- expired/non-started goal run;
+- overall goal outcome.
+
+Ingest remains best-effort after canonical operation evidence; failure never changes goal result.
 
 ---
 
-## 25. Scheduling architecture (after manual execution)
+## 35. Scheduling (Slice E, after manual vertical slice)
 
-### 25.1 Do not include repository HEAD in pre-dispatch dedup identity
+### 35.1 Repository request + operator/system permission
 
-The scheduler must not inspect the filesystem before creating a run merely to build a dedup key.
+A v2 goal may request interval scheduling. It schedules only when:
 
-Scheduled slot identity is based on authoritative configuration/time only. The worker later captures the clean HEAD and binds the proof.
+- current live registry exactly matches imported head;
+- current entry is executable v2;
+- every operation binding is `manual_and_scheduled`;
+- project scheduling policy enabled;
+- global scheduling availability enabled;
+- project authority/current filesystem `always_allow` valid.
 
-### 25.2 Schedule binding
-
-When the scheduler first observes an eligible current v2 goal + current policy, create/reuse an immutable schedule binding:
+### 35.2 Immutable schedule binding
 
 ```text
 verification_goal_schedule_bindings
 - id
 - project_id
-- registry_revision_id
-- goal_snapshot_id
-- policy_revision_id
+- exact registry entry composite identity
+- exact policy revision composite identity
+- execution_binding_digest
 - schedule_fingerprint
 - interval_seconds
-- anchor_at                 -- database time
+- anchor_at (DB time)
 - created_at
 ```
 
-The schedule fingerprint includes exact goal definition/binding/policy identities and effective interval.
+A registry/policy/binding change produces a new binding.
 
-A registry or policy change creates a new binding with a new database-time anchor. Old bindings remain historical and do not emit new slots.
+First due:
 
-### 25.3 Slots
+```text
+anchor_at + effective interval
+```
+
+Enabling scheduling does not surprise-run immediately; operator may manually run now.
+
+### 35.3 Slot table
 
 ```text
 verification_goal_schedule_slots
 - binding_id
 - slot_sequence bigint
 - slot_due_at timestamptz
-- disposition              -- run_created | overlap_skipped | budget_skipped | policy_stale
+- disposition text
+    run_created
+    overlap_skipped
+    budget_skipped
+    registry_stale
+    policy_stale
+    system_disabled
+- skipped_prior_slots integer default 0
 - run_id uuid null
 - created_at
 PRIMARY KEY(binding_id, slot_sequence)
 ```
 
-Slot sequence derives from `anchor_at + n * interval` using database time.
+No repository HEAD in slot/dedup identity. Worker captures HEAD after run starts.
 
-Two scheduler workers racing on one slot converge on the unique row.
+### 35.4 Multi-worker and downtime behavior
 
-### 25.4 No catch-up stampede
+- DB unique slot makes scheduler races idempotent;
+- scheduler uses bounded cursor/batch processing with named centralized scan limits;
+- no LLM;
+- if offline across many intervals, materialize at most the current eligible slot and bounded skipped count; do not enqueue every missed interval;
+- one active logical goal across manual/scheduled means overlap slot is skipped;
+- project queued/running/start budget applies;
+- budget/overlap skipped slots do not create delayed backlog.
 
-If Forge was offline through many intervals, the scheduler does not enqueue every missed slot. It materializes at most the current eligible slot and records a bounded skipped/catch-up disposition as needed.
+### 35.5 Live registry attestation
 
-### 25.5 Overlap and project budget
-
-V1 permits at most one active run per project+goal. If the prior goal run is active, the slot is `overlap_skipped`.
-
-Project-wide queued/running/start-budget ceilings also apply. If budget is unavailable, record `budget_skipped`; do not build an unbounded delayed backlog.
-
-### 25.6 Disabled/superseded goals
-
-Every scheduler pass resolves the current registry/policy heads. Removed, v1, disabled, policy-disabled, superseded, or stale-authority goals do not execute historical snapshots.
+Scheduler may perform one bounded live-registry attestation per captured project/root authority and reuse it only within that exact bounded project batch. Each run/slot transaction rechecks DB authority/head. Mismatch -> `registry_stale`, no auto-import.
 
 ---
 
-## 26. Regression signal boundary for #190/#189
+## 36. #189 / #190 / #188 boundaries
 
-#187 owns proof evidence/history. It does not own Sentinel/autonomy policy.
+### 36.1 Regression candidate only
 
-Expose a deterministic query/event condition:
+#187 can deterministically expose:
 
 ```text
-current-cohort decisive transition:
-  prior latest decisive result = passed
-  new decisive result = failed
+current-cohort prior decisive latest = passed
+new decisive result = failed
 ```
 
-This is a **regression candidate**, not a Sentinel finding and not an autonomy action.
+This is a regression **candidate**, not a Sentinel finding.
 
-#190 may later deduplicate/escalate it into `sentinel_findings`. #189 may independently evaluate failed-proof evidence under operator policy.
+#190 later creates/deduplicates findings.
 
-No #187 worker creates repair tasks, GitHub issues, autonomy decisions, or code changes.
+### 36.2 No direct autonomy action
 
----
+Repository schema v2 has no executable autonomy action. #189 consumes proof/reliability evidence under its own operator-owned policy.
 
-## 27. Security / abuse cases
+### 36.3 Independent verification is append-only future evidence
 
-| Attack / failure | Required behavior |
-|---|---|
-| Repo sets manual/schedule permissively | Project policy/system ceiling wins |
-| Repo creates hundreds of goals | Project start window + queue/concurrency ceilings bound starts |
-| Repo lowers severity | Reporting metadata only; safety unchanged |
-| Repo references dangerous/unknown op | Import fails closed |
-| Catalog same id/version silently changes | Import binding digest mismatch blocks execution |
-| Repo asks for evidence runner cannot produce | Import/admission fails closed |
-| Repo prompt-injects title/description | Metadata never reaches request reason/argv/policy/model |
-| Project root/grant changes after import | Registry-authority stale; re-import required |
-| Registry/policy changes while queued/running | Run stops inconclusive |
-| Worktree dirty | No decisive pass/fail |
-| HEAD/object format changes | Run stops inconclusive |
-| Symlink/path root rebound | Existing root identity checks fail closed |
-| Only `allow_once` grant exists | Proof run denied; scheduler never consumes it |
-| Duplicate Redis delivery | One DB lease/run wins |
-| Old worker returns after lease loss | DB generation/token rejects mutation |
-| Audit DB write fails after Git runs | Evidence/infrastructure failure; never functional fail |
-| Operation adapter does not settle | Parent recovery_required; no replay/pass/fail |
-| Same manual idempotency key used for another goal | 409 conflict |
-| Scheduler restarts after downtime | No missed-slot stampede |
-| Repo asks to revoke autonomy | No executable field; #189 owns decision |
-| Repo asks for browser/model verifier | Not in schema v2; #188 owns later path |
+#188 later links separate verifier runs/history to a verification goal run/overall outcome. It never rewrites #187 deterministic result.
+
+Human-browser and Playwright-browser lanes remain separate; schema v2 cannot choose a browser/model/provider/verifier.
 
 ---
 
-## 28. Migration and ACL strategy
+## 37. Migration / rolling-release sequence
 
-Execution must remain disabled until the complete migration/constraint chain is proven.
+Do not combine all schema changes into one unsafe cutover.
 
-Recommended order:
+### Phase 0 — registry expansion
 
-1. Extend goal snapshot storage/checks for exact v1 OR v2 plus import-time operation bindings.
-2. Add protected project verification-policy revisions/heads and disabled default lifecycle for existing/new projects.
-3. Add `verification_goal_runs`, repository snapshots, events, guarded lease/terminal routines.
-4. Generalize `execution_outcomes` subject identity; preserve task rows/partial uniqueness; add v2 failure semantics needed by goal operations.
-5. Generalize `operation_runs` subject identity and ledger API.
-6. Generalize repository command audits + exact operation-run evidence linkage.
-7. Refactor trusted operation scope into task/goal subject loaders; runtime goal execution still feature-disabled.
-8. Add manual run route/queue/worker and enable only after PostgreSQL/ACL/CI proof.
-9. Generalize capability attempts for goal subject and add history queries.
-10. Add schedule binding/slot tables and scheduler only after manual vertical slice is proven.
+- add definition schema version support for v2 snapshots;
+- add registry manifest schema version;
+- add entry contract/binding columns;
+- extend protected registry routine/import response;
+- v1 manifests/imports remain compatible;
+- no goal execution.
 
-Every migration slice must include:
+### Phase 1 — policy foundation
 
-- current-tip migration journal proof;
-- populated upgrade from real previous schema with historical task outcomes/runs/audits;
-- no window where old task FK/uniqueness is dropped before replacement constraints are active;
-- invalid zero-subject/two-subject/cross-project combinations rejected by PostgreSQL;
-- append-only/protected-routine owner checks;
-- ordinary app ACL closed inventory;
-- `PUBLIC` function execute revocation where protected routines are used;
-- managed installer + legacy repair + populated upgrade proof;
-- forced protected-owner handoff failure and cleanup proof consistent with current Forge migration safety style;
-- migration retry/idempotency proof;
-- v1 snapshots/history remain readable and non-executable.
+- add protected policy revisions/heads/default disabled backfill/new-project initializer;
+- policy GET/PATCH/project settings;
+- manual/schedule global availability false.
 
-Do not mark execution feature-enabled from a migration alone. Code/runtime activation remains separately gated.
+### Phase 2 — shared-ledger expand compatibility
+
+- add nullable `verification_goal_run_id`, subject/version fields to shared outcome/operation/audit tables while existing task NOT NULL/task paths remain valid where possible;
+- deploy dual-version readers/types;
+- audit every generic query/caller that assumes task id non-null;
+- goal execution still false.
+
+### Phase 3 — goal run/evidence tables
+
+- add run/events/repository/environment evidence + protected lease/terminal routines;
+- add outcome-v2 contracts but no goal rows yet.
+
+### Phase 4 — shared-ledger cutover
+
+- backfill historical rows `subject_kind=task`;
+- install exclusive subject checks/composite FKs/partial unique indexes;
+- safely relax task NOT NULL only after dual consumers deployed;
+- database guard prevents old unsupported consumers from seeing/writing goal rows during cutover;
+- prove historical task behavior.
+
+### Phase 5 — manual execution release
+
+- harden/allowlist eligible Git adapters;
+- outer abort/deadline support;
+- goal authority loader;
+- manual route/Redis delivery/DB lease/runner/minimal GET;
+- full proof;
+- then enable global manual availability; every project still default-disabled.
+
+### Phase 6 — reliability v2/history
+
+- extend capability attempts/readers/metrics for goal subject/evidence units/outcome-v2;
+- activate only after dual-version proof.
+
+### Phase 7 — scheduler
+
+- schedule bindings/slots/scheduler loop;
+- full multi-worker/offline/budget proof;
+- then enable global scheduling availability.
+
+No goal-subject row is written while a supported old consumer can misinterpret nullable task identity.
 
 ---
 
-## 29. Module boundaries
+## 38. Migration/ACL proof requirements
 
-Suggested architecture:
+Every slice that touches PostgreSQL includes:
+
+- current Drizzle journal parity;
+- populated upgrade from current production schema;
+- installer-managed, legacy-repair, populated 0026/0027/current-tip paths as relevant;
+- protected-owner failure/handoff cleanup proof consistent with existing Forge style;
+- fixed-search-path protected functions;
+- immediate `REVOKE ... FROM PUBLIC` for protected functions;
+- closed ordinary-app ACL inventory;
+- no temporary gap where task uniqueness/FK protection is removed before replacement constraints exist;
+- invalid zero-subject/two-subject/cross-project/cross-registry/cross-policy shapes rejected by PostgreSQL;
+- migration crash/retry idempotency;
+- v1 goal snapshots and historical task outcomes/operation runs/reliability remain readable with original meaning.
+
+---
+
+## 39. Module boundaries
 
 ```text
 web/lib/verification-goals/contracts.ts
-  v1/v2 definition parsing, canonicalization, definition/binding digests
+  v1/v2 repo definitions; canonical definition digests
+
+web/lib/verification-goals/eligibility.ts
+  code-owned exact operation goal-eligibility allowlist/version/digest
 
 web/lib/verification-goals/policy-contracts.ts
-  project policy types, resolved policy, pure monotonic intersection
+  project policy + resolved policy + monotonic pure resolver
 
 web/lib/verification-goals/history.ts
-  pure/current-cohort history computation from decisive runs
+  pure decisive-history calculation
+
+web/worker/verification-goals/registry-attestation.ts
+  bounded non-mutating live registry manifest read using trusted importer primitives
 
 web/worker/verification-goals/admission.ts
-  current project/registry/policy/catalog/authority load + manual/scheduled admission
+  two-phase manual/scheduler admission + exact authority rechecks
 
 web/worker/verification-goals/filesystem-authority.ts
-  project-level capability authority, no work-package shim
+  project-level goal capability authority, no work-package shim
 
 web/worker/verification-goals/repository-snapshot.ts
-  fixed clean SHA-1/SHA-256 HEAD evidence
+  hardened clean SHA-1/SHA-256 identity + submodule refusal
 
-web/worker/verification-goals/runner.ts
-  lease-fenced sequential orchestration only
+web/worker/verification-goals/environment-snapshot.ts
+  safe bounded runtime compatibility fingerprint
 
 web/worker/verification-goals/ledger.ts
-  run/events/lease/terminal guarded storage
+  goal run/events/lease/recovery/terminal protected persistence
+
+web/worker/verification-goals/runner.ts
+  sequential orchestration only
 
 web/worker/verification-goals/scheduler.ts
-  deterministic DB-time binding/slot materialization; no LLM
+  bounded DB-time binding/slot scheduler; no LLM
 
 web/worker/operations/context.ts
-  shared trusted project scope + task and goal-run authority adapters
+  shared project scope + task/goal subject adapters
 
 web/worker/operations/executor.ts
-  shared deterministic executor; subject-neutral after validated context
+  subject-neutral deterministic executor + optional outer abort/deadline
 
 web/worker/queue/*
-  reusable occurrence/claim transport primitives; no verification policy
+  reusable transport primitives; no verification policy
 ```
 
 Rules:
 
-- `lib` contracts are DB-free;
-- policy intersection/history are pure functions;
+- pure contracts do not import DB;
 - routes are thin auth/orchestration shells;
-- filesystem/root work goes through one trusted boundary;
-- subject-specific authority is isolated at adapters, not scattered `if (task else goal)` throughout the executor;
-- queue code carries identity, never policy;
-- schedule code never invokes an LLM;
-- no repo-controlled registration of adapters/verifiers/policies;
-- no unexplained magic numbers outside one contract/default source.
+- filesystem access stays behind trusted project-root/registry/repository helpers;
+- subject differences live at authority/persistence adapters, not scattered switches in every executor phase;
+- queue carries identity, not policy;
+- scheduler performs deterministic DB/filesystem checks only;
+- no repo-controlled adapter/verifier/policy registration;
+- operator-tunable numeric values are DB-backed; code constants are closed protocol/security ceilings only.
 
 ---
 
-## 30. Implementation slices for #187
+## 40. Implementation slices
 
-### Slice A — executable-goal + project-policy contracts
+### Slice A — executable definition + registry binding + project policy
 
-- add v2 parser while freezing v1 meaning;
-- add v2 snapshot DB shape + import-time operation bindings;
-- add protected project policy revisions/heads;
-- seed disabled defaults for old/new projects;
-- pure monotonic resolver + fingerprints;
-- no run/queue/execution.
+- v2 parser/DB shape;
+- registry manifest v2 + entry execution bindings + live attestation;
+- code-owned operation eligibility policy;
+- protected policy revisions/heads/defaults + policy API/settings;
+- no run/execution.
 
-### Slice B — goal-run/evidence subject foundation
+### Slice B — goal execution-subject/evidence foundation
 
-- add goal runs/events/repository snapshot/lease schema;
-- exact registry-entry/policy composite FKs;
-- generalize canonical outcomes to explicit subjects + outcome-v2 failure class;
-- generalize operation runs + command audits;
-- relationally bind initial command evidence to operation run;
-- refactor trusted operation context into subject adapters;
-- goal runtime remains disabled.
+- goal run/events/repo/environment tables;
+- exact composite FKs;
+- protected goal lease/evidence routines;
+- shared outcome/operation/audit subject expansion;
+- outcome-v2 failure class;
+- dual-reader/rolling compatibility;
+- global execution still disabled.
 
-### Slice C — manual deterministic vertical slice
+### Slice C — manual read-only proof vertical slice
 
-- bodyless owner-authorized POST + UUID idempotency conflict semantics;
-- minimal GET status endpoint;
-- DB-first queued run + Redis transport/re-dispatch;
-- DB lease/fencing/recovery;
+- harden/allowlist current read adapters;
+- outer abort/deadline support;
 - dedicated project filesystem authority;
-- clean SHA-1/SHA-256 repo identity;
-- sequential zero-input operations;
-- explicit pass/functional-fail/inconclusive decision table;
-- no scheduler.
+- bodyless idempotent POST + bounded GET;
+- DB-first queue/early Redis ack/DB lease/watchdog;
+- clean SHA-1/SHA-256 identity + submodule refusal;
+- sequential deterministic operations;
+- overall canonical outcome;
+- no scheduling.
 
-### Slice D — history + reliability
+### Slice D — history + reliability v2
 
-- current-cohort last-green/first-observed-failure/streak queries;
-- generalize capability attempts to goal subject;
-- subject/policy cohort separation;
-- no synthetic goal aggregate attempt;
-- no independent-agent verification yet.
+- last green / first observed failure / streaks;
+- capability attempt goal subject;
+- environment + evidence-unit comparability;
+- evidence-instability state;
+- overall outcome excluded;
+- no #188 independent agent yet.
 
-### Slice E — bounded scheduling
+### Slice E — bounded scheduler
 
-- immutable DB-time schedule bindings;
-- unique slot observations;
+- binding/slot tables;
+- bounded cursor loop;
+- live manifest current check;
 - current-slot only / no catch-up stampede;
-- project start budget, queued/running ceilings, overlap skip;
-- no historical/superseded execution;
-- operator runbook.
+- active-goal/queue/concurrency/start-budget controls;
+- scheduler recovery/runbook;
+- global scheduling activation only after proof.
 
-### Slice F — #187 closure proof
+### Slice F — #187 closure proof/docs
 
-- checked-in sample schema-v2 goal;
-- manual + scheduled end-to-end proof;
-- exact migration/ACL/Redis response-loss/duplicate/recovery tests;
-- clean commit history proof;
-- docs/operator recovery commands;
-- confirm #187 acceptance criteria without implementing #188/#189/#190 authority.
+- checked-in sample v2 goal;
+- manual and scheduled end-to-end evidence;
+- migration/ACL/Redis/DB-lease/registry-drift/repo-drift tests;
+- operator run/reimport/recovery guidance;
+- acceptance-criteria traceability.
 
 ---
 
-## 31. Acceptance-criteria mapping and deliberate deviations
+## 41. Acceptance-criteria mapping
 
-| #187 requirement | Architecture mapping |
+| #187 requirement | This architecture |
 |---|---|
-| Repo-visible versioned goal | v1 preserved; executable v2 under same strict registry |
-| Strict unsafe-command rejection | No commands/args/paths/inputs in goal; exact code-owned op bindings |
-| Persist definitions and runs | Existing snapshots/revisions + goal-run/event/snapshot history |
-| Manual first | Slice C before scheduling |
-| Controlled schedule | Slice E DB-time binding/slot + operator policy |
-| No overlapping duplicate evidence | One active goal run + unique schedule slot + DB lease |
-| Last green / first failure | Decisive current-cohort history rules |
-| Canonical outcomes | Shared outcomes generalized + v2 failure class prerequisite |
-| Reliability | Per-operation #186 attempts after durable terminal evidence |
-| Disabled goals do not run | Import/admission/scheduler checks + current registry head |
-| Failure does not auto-repair | Explicit non-goal / #190 boundary |
-| Human and Playwright lanes separate | No browser verifier in v2; #188 separate verification records |
-| Redaction | Closed run events, UUID refs, no raw dirty paths/Redis payloads |
+| repository-backed versioned goal | v1 preserved; v2 executable declaration |
+| deterministic safe verifier | code-owned eligible Operation Catalog bindings only |
+| timeout/resource bounds | DB policy + system ceilings + overall external deadline |
+| manual first | Slice C before Slice E |
+| controlled scheduling | DB-time binding/slot + policy/budgets/availability |
+| structured persisted result/evidence | run/events/repo/env + child outcomes + overall outcome |
+| repository commit/environment fingerprint | safe repo identity + environment snapshot |
+| last green / first observed failure | decisive current-cohort history |
+| canonical outcomes | outcome-v2 child + overall goal outcome |
+| reliability compatible | reliability-v2 child operation observations/evidence units |
+| overlap/dedup | one active goal + unique schedule slot + DB lease |
+| disabled goals never run | current live/imported registry + project/system policy checks |
+| failure no unreviewed repair | explicit #190/#189 boundary |
+| human/Playwright lanes separate | no browser verifier in v2; #188 separate records |
+| redaction | closed events; no raw dirty paths/Redis policy/lease secret/public raw errors |
 
-**Deliberate deviation: `failure.autonomyAction` is not executable in #187.** #189 owns autonomy policy and will consume proof evidence. This is a safety boundary, not a missing implementation.
+### Deliberate deviation — autonomy action
 
-**Deliberate wording: “first observed failing commit,” not “first bad commit.”** #187 does not perform causality/bisect proof.
+The issue's early example includes a failure autonomy action. #187 does not make repository configuration executable autonomy policy. #189 owns that decision and consumes #187 evidence.
+
+### Deliberate wording — first observed failing commit
+
+#187 does not bisect or prove causality. Report “first observed failing commit,” not “commit that introduced failure.”
 
 ---
 
-## 32. Verification matrix
+## 42. Verification matrix
 
-### 32.1 Contract/import
+### 42.1 Definition/registry
 
-- v1 parses exactly as before and is non-executable;
-- v2 exact top-level/execution keys;
-- v1/v2 PostgreSQL JSONB shape checks;
-- unknown schedule/evidence keys fail;
-- non-integer/overflow bounds fail;
-- duplicate evidence/operation refs fail;
-- input-bearing/unknown/disabled/deprecated/mismatched operations fail;
-- imported operation binding digest stable and sorted;
-- same goal/version + changed binding hard-conflicts;
-- severity cannot influence policy resolver;
-- policy resolver property test proves repository inputs never widen policy.
+- v1 exact behavior retained/non-executable;
+- v2 exact parser/DB keys and bounds;
+- duplicate-key/unknown-key/overflow rejected;
+- operation unknown/disabled/deprecated/input-bearing/capability mismatch rejected;
+- operation not in goal eligibility allowlist rejected;
+- scheduled goal with manual-only operation rejected;
+- eligibility/catalog binding canonical/deterministic;
+- manifest v1 remains compatible;
+- manifest v2 includes binding digest;
+- same repo snapshot may appear in later revision with new code binding;
+- live registry mismatch blocks manual/schedule;
+- post-admission live registry change makes run inconclusive.
 
-### 32.2 Policy/ACL
+### 42.2 Git security/identity
 
-- existing/new project gets valid disabled head;
-- no hardcoded permissive fallback if head missing;
-- human actor shape + owner authorization;
-- migration/system actor shape;
-- append-only revisions;
-- head advances one exact predecessor;
-- stale expected head race fails;
-- app role lacks direct UPDATE/DELETE/head mutation;
-- PUBLIC cannot execute protected routine.
+Adversarial repository config attempts:
 
-### 32.3 Referential integrity
+- fsmonitor hook/helper;
+- global/system config contamination;
+- pager/prompt;
+- diff external/textconv;
+- optional index lock/write.
 
-- exact registry revision+entry+snapshot goal tuple required;
-- exact policy revision/project tuple required;
-- goal run cannot mix another project's entry/policy;
+Proof no helper sentinel runs and no optional repo mutation occurs.
+
+Also:
+
+- SHA-1 40 hex;
+- SHA-256 64 hex;
+- unknown format/unborn/bare unsupported -> inconclusive;
+- gitlink/submodule -> unsupported inconclusive;
+- dirty tracked/untracked state -> clean=false with zero stored path list.
+
+### 42.3 Policy/ACL
+
+- migration/new project gets disabled policy;
+- missing head no fallback;
+- human/system actor shape;
+- owner/CAS stale-head race;
+- app cannot direct update/delete/head move;
+- PUBLIC cannot execute protected routine;
+- repo request never widens resolved policy property tests;
+- system availability always stricter.
+
+### 42.4 Referential integrity
+
+- run exact registry entry + binding FK;
+- schedule exact entry + policy FK;
 - outcome/operation/audit goal subject cannot carry task links;
-- task historical rows still require task subject;
-- zero/two subjects rejected;
-- goal operation run project must equal goal run project.
+- task rows remain task-shaped;
+- zero/two subject rejected;
+- cross-project goal operation rejected;
+- completed run requires exact overall outcome;
+- expired run cannot have proof result/outcome.
 
-### 32.4 Authority races
+### 42.5 Admission races
 
-Use controlled interleavings, not sleeps:
+Controlled interleavings:
 
-- project/root/grant changes before admission commit;
-- registry head changes after entry read;
+- project/root/grant changes during attestation;
+- registry head changes after attestation;
 - policy head changes after resolution;
-- registry/policy changes after queue but before claim;
-- root/grant changes before each operation;
-- catalog same-version digest changes after admission;
-- repo becomes dirty between operations;
-- HEAD changes after last operation before terminalization.
+- active run created concurrently;
+- start budget concurrent admissions;
+- eligibility/catalog build mismatch;
+- live registry file commit/change after attestation.
 
-Expected: no stale pass/fail.
+No stale run admitted as valid.
 
-### 32.5 Repository identity
+### 42.6 Outcome classification
 
-- SHA-1 object format + 40 hex OID;
-- SHA-256 object format + 64 hex OID;
-- unknown format refused;
-- detached HEAD accepted if OID valid;
-- unborn/no HEAD -> inconclusive;
-- dirty tracked/untracked changes -> clean=false without persisted path list;
-- fsmonitor/textconv/external helpers cannot execute through hardened helper.
-
-### 32.6 Operation result classification
-
-- completed+verified+evidence -> pass;
-- fixed command nonzero + durable exact audit -> functional fail;
-- deterministic verifier fail -> functional fail;
-- audit persistence failure -> inconclusive evidence failure;
-- DB/adapter infrastructure failure -> inconclusive;
+- completed+deterministically verified+evidence -> child pass;
+- fixed nonzero command + durable exact audit -> functional failure;
+- verifier reject -> functional failure;
+- audit DB failure -> evidence/inconclusive;
+- adapter DB/infra failure -> inconclusive;
 - authority drift -> inconclusive;
 - timeout -> inconclusive;
-- legacy `unknown` -> inconclusive;
-- missing/mismatched evidence UUID -> inconclusive;
-- second operation never starts after decisive failure/drift.
+- legacy/generic unknown -> inconclusive;
+- arbitrary/mismatched evidence UUID -> inconclusive;
+- overall goal outcome atomically matches run result.
 
-### 32.7 Lease/recovery
+### 42.7 Lease/queue/recovery
 
-- duplicate Redis occurrence -> one lease winner;
-- stale token/generation cannot event/operation/terminalize;
-- lease loss aborts local worker;
-- adapter returns after lease loss -> no authoritative write;
-- nonsettling child op -> parent recovery_required;
-- no automatic replay of incomplete child;
-- safe quiescence can close parent inconclusive;
-- otherwise recovery remains required;
-- lost enqueue response -> queued run eventually redispatched;
-- lost terminal response -> replay reads terminal row, no duplicate evidence.
+- duplicate Redis delivery -> one DB lease winner;
+- loser safely acks duplicate;
+- Redis ack response lost after DB claim -> no duplicate business work;
+- DB unavailable -> no assumed lease/unsafe drop;
+- lease renewal uncertainty -> monotonic stop deadline;
+- late renewal cannot revive fenced worker;
+- stale token cannot insert audit/op event/outcome/run event/terminal state;
+- crash command-before-audit -> no inference;
+- crash audit-before-op-final -> no inference;
+- nonsettling child -> recovery_required;
+- read-only quarantine horizon -> parent inconclusive without child replay;
+- queued run past admission expiry -> expired;
+- lost terminal response -> exact existing outcome/state replay.
 
-### 32.8 Manual API
+### 42.8 Manual API
 
-- unauthenticated -> 401;
-- non-owner/inaccessible/archived project -> hidden/denied under current app convention;
-- nonempty body -> 400;
-- invalid/missing idempotency UUID -> 400;
-- v1/disabled/manual-false goal -> no run;
-- policy disabled -> no run;
-- stale registry authority -> re-import required;
-- no `always_allow` read -> no run;
-- start budget/queue/concurrency exhausted -> no run;
-- same key+same actor/project/goal -> same run;
-- same key+different intent -> 409;
-- GET returns bounded state and hides internals.
+- unauthenticated/non-owner/inaccessible/archived denied under current app convention;
+- body rejected;
+- idempotency invalid/missing rejected;
+- key same intent replay;
+- key different intent 409;
+- v1/disabled/manual-false/registry stale/policy disabled/system disabled/no always_allow/budget/active-run all no execution;
+- GET bounded output/leakage checks.
 
-### 32.9 History/reliability
+### 42.9 History/reliability
 
-- inconclusive never changes pass/fail streaks;
-- first observed failing commit begins episode;
-- later failure retains first observed commit;
-- later pass closes episode;
-- definition/binding/policy change creates new current cohort;
-- task vs goal operation reliability does not silently mix;
-- no reliability row from nonterminal/missing evidence;
-- ingest failure does not alter canonical goal result.
+- inconclusive/expired excluded from decisive streaks;
+- first observed failing commit episode rules;
+- policy/binding/environment cohort change resets current cohort;
+- overall outcome excluded from capability attempts;
+- goal reliability contract v2 preserves task v1;
+- repeated same evidence unit does not increase unique sample count;
+- conflicting repeated unit yields evidence instability;
+- nonterminal/missing evidence no ingest;
+- reliability ingest failure cannot change goal result.
 
-### 32.10 Scheduler
+### 42.10 Scheduler
 
-- project scheduling=false beats repo schedule;
-- minimum interval beats too-frequent request;
-- binding uses DB time;
-- registry/policy change creates new binding;
-- duplicate scheduler workers create one slot disposition;
-- active goal -> overlap_skipped;
-- project start/queue budget -> budget_skipped;
-- no missed-slot stampede after downtime;
-- removed/disabled/v1/stale goal never executes;
-- HEAD is captured by worker and is not needed for slot dedup.
+- scheduling false wins;
+- global gate false wins;
+- minimum interval wins;
+- first due = anchor+interval;
+- duplicate scheduler workers one slot;
+- manual active -> schedule overlap skipped;
+- project budget -> budget skipped;
+- live registry stale -> no run/auto-import;
+- policy/registry change -> new binding;
+- downtime -> current slot only, bounded skipped count;
+- bounded cursor/scan limit;
+- removed/disabled/v1 goal never runs.
 
-### 32.11 Security/adversarial
+### 42.11 Migration/rolling compatibility
 
-- title/description prompt injection cannot reach operation reason/argv/policy;
-- repo cannot set actor/user/policy/grant/adapter/verifier;
-- root rebind/symlink replacement fails through trusted project boundary;
-- raw dirty paths not stored in goal ledger/snapshot/Redis/API;
-- lease token not exposed;
-- `allow_once` not consumed;
-- repo cannot trigger autonomy/GitHub/code/MCP mutations;
-- schedule cannot bypass project-wide budget;
-- malformed JSON/duplicate-key/bounds handled by existing strict registry parser contract.
+- old task-only consumers remain valid through expand;
+- static/runtime audit finds unguarded task-id assumptions;
+- no goal row before dual consumers deployed;
+- cutover subject checks/partial uniques preserve task semantics;
+- populated current-tip upgrade;
+- failure-safe protected owner cleanup/retry;
+- task/outcome/op/reliability historical rows unchanged in meaning.
 
 ---
 
-## 33. CI / release evidence required before #187 closure
+## 43. Release evidence before #187 closure
 
-Each implementation slice must run the normal Forge gates plus its focused proof. The final closure must include:
+Required, in addition to normal Forge gates:
 
 - lint;
 - TypeScript;
-- complete zero-skip unit command under repository CI convention;
+- complete zero-skip unit command under repository convention;
 - production build;
-- real PostgreSQL migration/populated-upgrade/ACL tests;
-- real Redis duplicate/response-loss/claim recovery tests for the new job type;
-- deterministic authority race tests;
-- SHA-1 and SHA-256 repository fixtures;
-- manual API vertical E2E;
-- scheduler two-worker/slot/budget proof;
-- evidence-leakage sentinel for goal-run DB/API/Redis/log outputs;
+- real PostgreSQL migration/populated-upgrade/ACL/subject-shape tests;
+- real Redis delivery duplicate/loss/malformed/recovery tests;
+- DB lease/outage/watchdog controlled tests;
+- malicious Git repo-config helper execution sentinel;
+- SHA-1 and SHA-256 fixture repositories;
+- live registry content drift tests;
+- manual API end-to-end;
+- scheduler multi-worker/offline/budget proof;
+- cross-sink leakage scan for goal DB/API/Redis/log output;
+- mutation tests for critical fail-closed predicates;
 - `git diff --check`;
 - PR Contract Check;
-- Security/Adversarial review for all migrations, auth/authority, filesystem/command, queue/lease, and scheduler slices.
+- Security/Adversarial review for every auth/filesystem/command/DB lease/migration/scheduler slice.
 
-Architecture review and model confidence do not substitute for this evidence.
+Architecture review confidence is not release evidence.
 
 ---
 
-## 34. Explicit non-goals
+## 44. Explicit non-goals
 
 - synthetic task/work-package proof execution;
-- arbitrary model/repository shell;
+- arbitrary shell/model commands;
 - repository-supplied operation inputs;
-- decisive proof on dirty worktree;
-- parallel goal operations;
-- operation dependency/data-flow language;
+- dirty-worktree decisive proof;
+- submodule proof coverage in v1;
+- side-effecting goal operations in v1;
+- parallel operations;
+- operation workflow language/data flow;
 - automatic repair;
 - direct autonomy change;
 - Sentinel finding implementation;
@@ -1875,31 +2339,29 @@ Architecture review and model confidence do not substitute for this evidence.
 - live MCP tool grants;
 - broad host cron;
 - production deployment;
-- full #191 dashboard/reporting.
+- full #191 dashboard/export.
 
 ---
 
-## 35. Architecture review rule
+## 45. Post-consolidation architecture review rule
 
-Before implementation, run the repository's full orthogonal review against this document and the live code/contracts. Review must separately cover:
+Review this consolidated design afresh against live code, not merely against the prior finding list.
 
-1. #184/#187 contract and deliberate deviations;
-2. exact v1/v2 registry storage compatibility;
-3. import-time Operation Catalog binding;
-4. execution-subject FKs and historical task compatibility;
-5. canonical outcome failure classification;
-6. command/evidence ownership;
-7. project/registry/policy/filesystem/catalog/repository authority races;
-8. canonical lock order/deadlocks;
-9. DB lease, Redis duplicate/loss, child-operation recovery;
-10. history/reliability comparability;
-11. schedule abuse/dedup/overlap/offline recovery;
-12. auth/ACL/protected routine/migration cleanup;
-13. API/operator recovery clarity;
-14. #188/#189/#190/#191 extension boundaries;
-15. modularity/reuse and hardcoded-value audit;
-16. CI/release evidence completeness.
+Required independent passes:
 
-After every amendment, first verify prior findings are resolved, then run fresh passes for runtime flow, state/persistence, recovery, security, compatibility, and evidence readiness.
+1. contract/#187 acceptance/deviation;
+2. data model + FK/version/migration compatibility;
+3. complete call path from API/scheduler -> registry attestation -> DB admission -> Redis -> DB lease -> repository -> operation executor -> outcomes -> history;
+4. failure/recovery and every response-loss/crash boundary;
+5. security: auth/ACL, Git config/helper execution, root/path, stale worker, resource abuse, leakage;
+6. reliability/#189 trust-sample integrity;
+7. scheduler scalability/overlap/offline behavior;
+8. API/operator recovery clarity;
+9. rolling deployment/regression against current tasks/outcomes/operations/reliability;
+10. CI/release-evidence sufficiency;
+11. modularity/reuse/hardcoded-value audit;
+12. downstream #188/#189/#190/#191 compatibility.
 
-A final review may say **“No blockers found in the inspected scope.”** It may not claim absence of defects. Remaining unchecked areas must be named.
+If a pass finds a material issue, amend the primary design, verify the finding is resolved, and start fresh passes again.
+
+A final verdict may state **“No blockers found in the inspected architecture scope.”** It must still name residual uncertainty and may not claim that no defects exist.
