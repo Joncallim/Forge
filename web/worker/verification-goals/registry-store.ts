@@ -100,8 +100,9 @@ function manifestMatchesGoals(input: VerificationGoalRegistryCommitInput): boole
 
     if (!('schemaVersion' in input.manifest)) return goal.definition.schemaVersion === 1
     if (!('entrySchemaVersion' in entry) || entry.entrySchemaVersion !== goal.definition.schemaVersion) return false
-    if (goal.definition.schemaVersion === 1) return entry.executionBindingDigest === null
-    return entry.executionBindingDigest === buildVerificationGoalExecutionBindingV1(goal.definition).executionBindingDigest
+    const v2Entry = entry as unknown as { executionBindingDigest: string | null }
+    if (goal.definition.schemaVersion === 1) return v2Entry.executionBindingDigest === null
+    return v2Entry.executionBindingDigest === buildVerificationGoalExecutionBindingV1(goal.definition).executionBindingDigest
   })
 }
 

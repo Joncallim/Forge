@@ -246,6 +246,13 @@
       "when": 1787011200000,
       "tag": "0034_verification_goal_executable_bindings",
       "breakpoints": true
+    },
+    {
+      "idx": 35,
+      "version": "7",
+      "when": 1787097600000,
+      "tag": "0035_verification_goal_execution_schema",
+      "breakpoints": true
     }
   ]
 }

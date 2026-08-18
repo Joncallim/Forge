@@ -12,6 +12,7 @@ REGISTRY_MIGRATION_WRAPPER="$SCRIPT_DIR/../web/scripts/ci/apply-verification-goa
 PROTECTED_OWNER_BOOTSTRAP="$SCRIPT_DIR/../web/scripts/bootstrap-epic-172-s5-recovery-owner.ts"
 MIGRATE_THROUGH_0028="$SCRIPT_DIR/../web/scripts/ci/migrate-through-0028.ts"
 MIGRATE_THROUGH_0033="$SCRIPT_DIR/../web/scripts/ci/migrate-through-0033.ts"
+MIGRATE_THROUGH_0035="$SCRIPT_DIR/../web/scripts/ci/migrate-through-0035.ts"
 TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/forge-managed-migrations.XXXXXX")"
 trap 'rm -rf "$TEST_ROOT"' EXIT
 TEST_SECRET='TEST_APP_DATABASE_URL_MUST_NOT_APPEAR'
@@ -108,6 +109,8 @@ assert_contains 'role_row.rolpassword IS NULL' "$PRIVILEGE_SQL"
 assert_contains "membership.member IN (" "$PRIVILEGE_SQL"
 assert_contains "routine.proconfig = ARRAY['search_path=pg_catalog']" "$PRIVILEGE_SQL"
 assert_contains 'GRANT EXECUTE ON FUNCTION public.forge_commit_verification_goal_registry_revision_v1(' "$PRIVILEGE_SQL"
+assert_contains 'GRANT EXECUTE ON FUNCTION public.forge_commit_verification_goal_policy_revision_v1(' "$PRIVILEGE_SQL"
+assert_contains 'npx tsx scripts/ci/migrate-through-0035.ts' "$REGISTRY_MIGRATION_WRAPPER"
 registry_current_read_scope_count="$(grep -c "scope: 'current-read-only'" \
   "$SCRIPT_DIR/../web/scripts/repair-epic-172-legacy-release.ts")"
 [ "$registry_current_read_scope_count" = 3 ] \
@@ -158,6 +161,8 @@ assert_contains "const PREDECESSOR_MIGRATION = '0027_epic_172_s4_packet_context'
 assert_contains "const TARGET_MIGRATION = '0028_epic_172_s5_recovery_actions'" "$MIGRATE_THROUGH_0028"
 assert_contains "const PREDECESSOR_MIGRATION = '0032_verification_goal_snapshots'" "$MIGRATE_THROUGH_0033"
 assert_contains "const TARGET_MIGRATION = '0033_verification_goal_registry_revisions'" "$MIGRATE_THROUGH_0033"
+assert_contains "const PREDECESSOR_MIGRATION = '0034_verification_goal_executable_bindings'" "$MIGRATE_THROUGH_0035"
+assert_contains "const TARGET_MIGRATION = '0035_verification_goal_execution_schema'" "$MIGRATE_THROUGH_0035"
 assert_contains 'routine.oid = any(array[${BEGIN}::regprocedure, ${FINALIZE}::regprocedure])' "$PROTECTED_OWNER_BOOTSTRAP"
 assert_contains "revoke create on schema public, forge from forge_s4_routines_owner" "$PROTECTED_OWNER_BOOTSTRAP"
 assert_contains "grant usage on schema forge to forge_s4_routines_owner" "$PROTECTED_OWNER_BOOTSTRAP"
@@ -197,8 +202,8 @@ sed -n '/canonical-protected-owner-map-begin/,/canonical-protected-owner-map-end
   | sed -n "s/^  { name: '\([^']*\)', owner: \([^,]*\),.*/\1|\2/p" \
   | sed 's/|releaseOwner$/|forge_release_routines_owner/; s/|s4Owner$/|forge_s4_routines_owner/' \
   | sort > "$ts_owner_map"
-[ "$(wc -l < "$sql_owner_map" | tr -d '[:space:]')" = 40 ] \
-  || fail 'shared SQL must define the exact 40-table protected owner map'
+[ "$(wc -l < "$sql_owner_map" | tr -d '[:space:]')" = 49 ] \
+  || fail 'shared SQL must define the exact 49-table protected owner map'
 cmp -s "$sql_owner_map" "$ts_owner_map" \
   || fail 'shared SQL and legacy normalizer protected owner maps drifted'
 

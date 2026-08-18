@@ -5,10 +5,10 @@ set -euo pipefail
 : "${FORGE_DATABASE_ADMIN_URL:?FORGE_DATABASE_ADMIN_URL is required.}"
 
 # Migration 0033 consumes and revokes its temporary S4 owner handoff before it
-# commits. Migration 0034 is a separate protected stage and therefore must
-# receive a fresh handoff rather than attempting to reuse 0033's authority.
-# Each stage is independently failure-safe and the EXIT trap cleans up any
-# handoff left open by an interrupted or failed stage.
+# commits. Migrations 0034 and 0035 are separate protected stages and therefore
+# must each receive a fresh handoff rather than attempting to reuse a previous
+# stage's authority. Each stage is independently failure-safe and the EXIT trap
+# cleans up any handoff left open by an interrupted or failed stage.
 stage_active=0
 
 cleanup_active_stage() {
@@ -65,3 +65,4 @@ fi
 
 run_stage npx tsx scripts/ci/migrate-through-0033.ts
 run_stage npx tsx scripts/ci/migrate-through-0034.ts
+run_stage npx tsx scripts/ci/migrate-through-0035.ts
