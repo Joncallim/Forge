@@ -4,8 +4,9 @@ set -euo pipefail
 : "${DATABASE_URL:?DATABASE_URL is required.}"
 : "${FORGE_DATABASE_ADMIN_URL:?FORGE_DATABASE_ADMIN_URL is required.}"
 
-# Migration 0033 uses the same bounded BEGIN/FINALIZE protected-owner handoff
-# as 0028. Always restore the exact boundary, including after a committed BEGIN.
+# Migrations 0033 and 0034 use the same bounded BEGIN/FINALIZE protected-owner
+# handoff as 0028. Always restore the exact boundary, including after a
+# committed BEGIN or a failure between protected migrations.
 cleanup() {
   local original_status=$?
   set +e
@@ -31,4 +32,4 @@ if [[ "${FORGE_REGISTRY_FORCE_HANDOFF_FAILURE:-0}" == '1' ]]; then
     --command 'select public.forge_begin_epic_172_s4_owner_bootstrap_v1();'
   exit 1
 fi
-npx tsx scripts/ci/migrate-through-0033.ts
+npx tsx scripts/ci/migrate-through-0034.ts
