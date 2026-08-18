@@ -239,6 +239,13 @@
       "when": 1786752000000,
       "tag": "0033_verification_goal_registry_revisions",
       "breakpoints": true
+    },
+    {
+      "idx": 34,
+      "version": "7",
+      "when": 1787011200000,
+      "tag": "0034_verification_goal_executable_bindings",
+      "breakpoints": true
     }
   ]
 }
