@@ -10,7 +10,8 @@ export type VerificationGoalSnapshotImportResult = {
   snapshotId: string
   goalId: string
   definitionVersion: number
-  definitionSchemaVersion: 1 | 2
+  /** Added by executable-goal v2; omitted by legacy test stores/adapters. */
+  definitionSchemaVersion?: 1 | 2
   kind: 'inserted' | 'existing'
 }
 
