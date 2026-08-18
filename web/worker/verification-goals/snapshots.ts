@@ -73,7 +73,6 @@ async function insertOrResolveSnapshot(
       projectId,
       goalId: goal.definition.goalId,
       definitionVersion: goal.definition.definitionVersion,
-      definitionSchemaVersion: goal.definition.schemaVersion,
       canonicalDefinition: canonicalDefinitionValue(goal),
       definitionDigest: goal.definitionDigest,
       sourcePath: goal.sourcePath,
@@ -97,14 +96,9 @@ async function insertOrResolveSnapshot(
     }
   }
 
-  // A concurrent INSERT ... ON CONFLICT waits for the winning transaction.
-  // This following statement gets a fresh READ COMMITTED snapshot and can
-  // therefore resolve the committed winner rather than misreporting it as
-  // missing.
   const [existing] = await tx
     .select({
       id: verificationGoalSnapshots.id,
-      definitionSchemaVersion: verificationGoalSnapshots.definitionSchemaVersion,
       definitionDigest: verificationGoalSnapshots.definitionDigest,
     })
     .from(verificationGoalSnapshots)
@@ -118,10 +112,7 @@ async function insertOrResolveSnapshot(
   if (!existing) {
     throw new Error('Idempotent verification goal snapshot could not be resolved.')
   }
-  if (
-    existing.definitionSchemaVersion !== goal.definition.schemaVersion
-    || existing.definitionDigest !== goal.definitionDigest
-  ) {
+  if (existing.definitionDigest !== goal.definitionDigest) {
     throw new VerificationGoalSnapshotConflictError({
       projectId,
       goalId: goal.definition.goalId,
@@ -139,10 +130,6 @@ async function insertOrResolveSnapshot(
 
 export { insertOrResolveSnapshot as insertOrResolveVerificationGoalSnapshot }
 
-/**
- * Imports the already-validated registry in one transaction. A divergent
- * identity conflict rolls back every snapshot inserted by this import.
- */
 export function createDatabaseVerificationGoalSnapshotStore(
   database: typeof db = db,
 ): VerificationGoalSnapshotStore {
@@ -150,9 +137,6 @@ export function createDatabaseVerificationGoalSnapshotStore(
     async importSnapshots(projectId, goals) {
       if (goals.length === 0) return []
       return database.transaction(async (tx) => {
-        // A concurrent importer may hold the same unique identity open. The
-        // normal critical section is milliseconds; cap the wait so a parked
-        // peer cannot pin this worker connection indefinitely.
         await tx.execute(sql`SET LOCAL lock_timeout = '5s'`)
         const results: VerificationGoalSnapshotImportResult[] = []
         for (const goal of goals) {
