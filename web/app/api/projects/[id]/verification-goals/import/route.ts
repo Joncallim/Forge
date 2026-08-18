@@ -98,9 +98,6 @@ export async function POST(
       return NextResponse.json({ error: 'Project not found' }, { status: 404 })
     }
 
-    // This command has no caller-controlled payload. Reject the presence of a
-    // body without parsing or consuming it so definitions, paths, or operation
-    // arguments can never become importer inputs.
     if (request.body !== null) {
       return NextResponse.json(
         { error: 'This endpoint does not accept a request body.', code: 'unexpected_request_body' },
@@ -116,6 +113,7 @@ export async function POST(
       snapshotId: snapshot.snapshotId,
       goalId: snapshot.goalId,
       definitionVersion: snapshot.definitionVersion,
+      definitionSchemaVersion: snapshot.definitionSchemaVersion ?? 1,
       state: snapshot.kind,
     }))
 
@@ -123,6 +121,7 @@ export async function POST(
       schemaVersion: 2,
       projectId,
       registryRevisionId: result.registryRevisionId,
+      manifestSchemaVersion: result.manifestSchemaVersion ?? 1,
       manifestDigest: result.manifestDigest,
       headState: result.headState,
       snapshots,
