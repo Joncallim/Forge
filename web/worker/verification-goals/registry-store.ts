@@ -74,12 +74,24 @@ function manifestSchemaVersion(manifest: VerificationGoalRegistryManifest): 1 | 
   return 'schemaVersion' in manifest ? manifest.schemaVersion : 1
 }
 
+function goalById(goals: readonly LoadedVerificationGoal[]): ReadonlyMap<string, LoadedVerificationGoal> {
+  const map = new Map<string, LoadedVerificationGoal>()
+  for (const goal of goals) {
+    if (map.has(goal.definition.goalId)) {
+      throw new Error('Verification goal registry contains duplicate goal identity.')
+    }
+    map.set(goal.definition.goalId, goal)
+  }
+  return map
+}
+
 function manifestMatchesGoals(input: VerificationGoalRegistryCommitInput): boolean {
   if (input.goals.length !== input.manifest.entries.length) return false
-  return input.goals.every((goal, index) => {
-    const entry = input.manifest.entries[index]
+  const goals = goalById(input.goals)
+  return input.manifest.entries.every((entry) => {
+    const goal = goals.get(entry.goalId)
     if (
-      entry?.goalId !== goal.definition.goalId
+      !goal
       || entry.definitionVersion !== goal.definition.definitionVersion
       || entry.definitionDigest !== goal.definitionDigest
       || entry.sourcePath !== goal.sourcePath
@@ -164,10 +176,11 @@ export function createDatabaseVerificationGoalRegistryStore(
           ))
         }
         const snapshotByGoal = new Map(snapshots.map((snapshot) => [snapshot.goalId, snapshot]))
+        const goals = goalById(input.goals)
         const schemaVersion = manifestSchemaVersion(input.manifest)
-        const entries = input.manifest.entries.map((entry, index): CommitRoutineEntryV1 | CommitRoutineEntryV2 => {
+        const entries = input.manifest.entries.map((entry): CommitRoutineEntryV1 | CommitRoutineEntryV2 => {
           const snapshot = snapshotByGoal.get(entry.goalId)
-          const goal = input.goals[index]
+          const goal = goals.get(entry.goalId)
           if (!snapshot || !goal) throw new Error('Verification goal registry snapshot membership is incomplete.')
           const base: CommitRoutineEntryV1 = {
             snapshotId: snapshot.snapshotId,
