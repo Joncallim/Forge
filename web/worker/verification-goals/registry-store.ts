@@ -33,8 +33,8 @@ export type VerificationGoalRegistryCommitInput = Readonly<{
 export type VerificationGoalRegistryCommitResult = Readonly<{
   registryRevisionId: string
   manifestDigest: string
-  /** Added by executable-goal v2; legacy test stores may omit it. */
-  manifestSchemaVersion?: 1 | 2
+  /** Present only for executable manifest v2; omitted for historical v1 compatibility. */
+  manifestSchemaVersion?: 2
   headState: 'advanced' | 'existing'
   snapshots: readonly VerificationGoalSnapshotImportResult[]
 }>
@@ -153,11 +153,6 @@ async function invokeCommitRoutine(
   }
 }
 
-/**
- * Inserts immutable definition snapshots, then asks the protected database
- * routine to construct and advance the authoritative registry revision. The
- * application login has no direct write privilege on revision state.
- */
 export function createDatabaseVerificationGoalRegistryStore(
   database: typeof db = db,
 ): VerificationGoalRegistryStore {
@@ -206,7 +201,7 @@ export function createDatabaseVerificationGoalRegistryStore(
         return {
           registryRevisionId: committed.registryRevisionId,
           manifestDigest: input.manifest.digest,
-          manifestSchemaVersion: schemaVersion,
+          ...(schemaVersion === 2 ? { manifestSchemaVersion: 2 as const } : {}),
           headState: committed.headState,
           snapshots,
         }
