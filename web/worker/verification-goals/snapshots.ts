@@ -10,6 +10,7 @@ export type VerificationGoalSnapshotImportResult = {
   snapshotId: string
   goalId: string
   definitionVersion: number
+  definitionSchemaVersion: 1 | 2
   kind: 'inserted' | 'existing'
 }
 
@@ -36,7 +37,7 @@ export class VerificationGoalSnapshotConflictError extends Error {
 }
 
 function canonicalDefinitionValue(goal: LoadedVerificationGoal): Record<string, unknown> {
-  return {
+  const base = {
     schemaVersion: goal.definition.schemaVersion,
     goalId: goal.definition.goalId,
     definitionVersion: goal.definition.definitionVersion,
@@ -46,6 +47,18 @@ function canonicalDefinitionValue(goal: LoadedVerificationGoal): Record<string, 
     severity: goal.definition.severity,
     enabled: goal.definition.enabled,
     operations: goal.definition.operations.map((operation) => ({ ...operation })),
+  }
+  if (goal.definition.schemaVersion === 1) return base
+  return {
+    ...base,
+    execution: {
+      manual: goal.definition.execution.manual,
+      schedule: goal.definition.execution.schedule === null
+        ? null
+        : { ...goal.definition.execution.schedule },
+      deadlineSeconds: goal.definition.execution.deadlineSeconds,
+      requiredEvidence: [...goal.definition.execution.requiredEvidence],
+    },
   }
 }
 
@@ -60,6 +73,7 @@ async function insertOrResolveSnapshot(
       projectId,
       goalId: goal.definition.goalId,
       definitionVersion: goal.definition.definitionVersion,
+      definitionSchemaVersion: goal.definition.schemaVersion,
       canonicalDefinition: canonicalDefinitionValue(goal),
       definitionDigest: goal.definitionDigest,
       sourcePath: goal.sourcePath,
@@ -78,6 +92,7 @@ async function insertOrResolveSnapshot(
       snapshotId: inserted.id,
       goalId: goal.definition.goalId,
       definitionVersion: goal.definition.definitionVersion,
+      definitionSchemaVersion: goal.definition.schemaVersion,
       kind: 'inserted',
     }
   }
@@ -89,6 +104,7 @@ async function insertOrResolveSnapshot(
   const [existing] = await tx
     .select({
       id: verificationGoalSnapshots.id,
+      definitionSchemaVersion: verificationGoalSnapshots.definitionSchemaVersion,
       definitionDigest: verificationGoalSnapshots.definitionDigest,
     })
     .from(verificationGoalSnapshots)
@@ -102,7 +118,10 @@ async function insertOrResolveSnapshot(
   if (!existing) {
     throw new Error('Idempotent verification goal snapshot could not be resolved.')
   }
-  if (existing.definitionDigest !== goal.definitionDigest) {
+  if (
+    existing.definitionSchemaVersion !== goal.definition.schemaVersion
+    || existing.definitionDigest !== goal.definitionDigest
+  ) {
     throw new VerificationGoalSnapshotConflictError({
       projectId,
       goalId: goal.definition.goalId,
@@ -113,6 +132,7 @@ async function insertOrResolveSnapshot(
     snapshotId: existing.id,
     goalId: goal.definition.goalId,
     definitionVersion: goal.definition.definitionVersion,
+    definitionSchemaVersion: goal.definition.schemaVersion,
     kind: 'existing',
   }
 }
