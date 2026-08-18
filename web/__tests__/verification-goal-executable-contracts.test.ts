@@ -2,7 +2,10 @@ import { describe, expect, it } from 'vitest'
 
 import { createOperationCatalog } from '@/lib/operations/catalog'
 import { type OperationDefinition } from '@/lib/operations/contracts'
-import { parseVerificationGoalDefinition } from '@/lib/verification-goals/contracts'
+import {
+  parseVerificationGoalDefinition,
+  parseVerificationGoalDefinitionV1,
+} from '@/lib/verification-goals/contracts'
 import {
   buildVerificationGoalExecutionBindingV1,
   executableVerificationGoalDefinitionDigest,
@@ -63,10 +66,11 @@ describe('executable verification goal v2 contracts', () => {
     expect(binding.eligibilityPolicyDigest).toBe(verificationGoalEligibilityPolicyDigest())
   })
 
-  it('keeps schema v1 definition semantics unchanged', () => {
-    expect(() => parseVerificationGoalDefinition(definition())).toThrow(
+  it('keeps the explicit schema-v1 parser definition-only while the registry dispatcher accepts v2', () => {
+    expect(() => parseVerificationGoalDefinitionV1(definition())).toThrow(
       'Verification goal must contain exactly the v1 definition keys.',
     )
+    expect(parseVerificationGoalDefinition(definition()).schemaVersion).toBe(2)
   })
 
   it('rejects arbitrary command or policy fields before execution binding', () => {
