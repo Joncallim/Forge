@@ -58,7 +58,30 @@ describe('verification goal snapshot migration', () => {
     expect(migration).not.toMatch(/goal_runs|last_green|first_fail|schedule|outcome/i)
   })
 
-  it('makes the ordinary app read-only on protected history and exposes one commit routine', async () => {
+  it('expands registry activation for executable v2 definitions without changing v1 history', async () => {
+    const migration = await readFile(
+      path.join(process.cwd(), 'db/migrations/0034_verification_goal_executable_bindings.sql'),
+      'utf8',
+    )
+    expect(migration).toContain('DROP CONSTRAINT verification_goal_snapshots_canonical_definition_check')
+    expect(migration).toContain("'schemaVersion', 1")
+    expect(migration).toContain("'schemaVersion', 2")
+    expect(migration).toContain("'manual', 'schedule', 'deadlineSeconds', 'requiredEvidence'")
+    expect(migration).toContain('ADD COLUMN manifest_schema_version integer NOT NULL DEFAULT 1')
+    expect(migration).toContain('ADD COLUMN entry_schema_version integer NOT NULL DEFAULT 1')
+    expect(migration).toContain('ADD COLUMN execution_binding jsonb')
+    expect(migration).toContain('ADD COLUMN execution_binding_digest text')
+    expect(migration).toContain('verification_goal_registry_entries_schema_binding_check')
+    expect(migration).toContain('forge_commit_verification_goal_registry_revision_v2(')
+    expect(migration).toContain("'forge:verification-goal:registry-manifest:v2'")
+    expect(migration).toContain('FROM public.forge_commit_verification_goal_registry_revision_v1(')
+    expect(migration).toContain('ALTER FUNCTION public.forge_commit_verification_goal_registry_revision_v2(')
+    expect(migration).toContain('OWNER TO forge_s4_routines_owner')
+    expect(migration).toContain('GRANT EXECUTE ON FUNCTION public.forge_commit_verification_goal_registry_revision_v2(')
+    expect(migration).not.toMatch(/goal_runs|last_green|first_fail|outcome/i)
+  })
+
+  it('makes the ordinary app read-only on protected history and keeps the v1 commit routine available', async () => {
     const workflow = await readFile(path.join(process.cwd(), '../.github/workflows/web-ci.yml'), 'utf8')
     const reconciler = await readFile(
       path.join(process.cwd(), '../scripts/reconcile-forge-app-privileges.sql'),
@@ -85,14 +108,18 @@ describe('verification goal snapshot migration', () => {
     )
   })
 
-  it('records migration 0033 as the current journal tip', async () => {
+  it('records migration 0034 as the current journal tip immediately after 0033', async () => {
     const journal = JSON.parse(await readFile(
       path.join(process.cwd(), 'db/migrations/meta/_journal.json'),
       'utf8',
     )) as { entries: Array<{ idx: number; tag: string }> }
-    expect(journal.entries.at(-1)).toEqual(expect.objectContaining({
+    expect(journal.entries.at(-2)).toEqual(expect.objectContaining({
       idx: 33,
       tag: '0033_verification_goal_registry_revisions',
+    }))
+    expect(journal.entries.at(-1)).toEqual(expect.objectContaining({
+      idx: 34,
+      tag: '0034_verification_goal_executable_bindings',
     }))
   })
 
