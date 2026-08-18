@@ -18,7 +18,7 @@ import {
   compareVerificationGoalStrings,
   type VerificationGoalOperationReference,
   type VerificationGoalSeverity,
-} from './contracts'
+} from './base'
 import {
   VERIFICATION_GOAL_OPERATION_ELIGIBILITY_VERSION,
   resolveVerificationGoalOperationBinding,
