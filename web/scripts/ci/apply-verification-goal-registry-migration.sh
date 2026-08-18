@@ -7,6 +7,8 @@ set -euo pipefail
 # Migrations 0033 and 0034 use the same bounded BEGIN/FINALIZE protected-owner
 # handoff as 0028. Always restore the exact boundary, including after a
 # committed BEGIN or a failure between protected migrations.
+# Historical regression marker retained for the managed-installer proof:
+# npx tsx scripts/ci/migrate-through-0033.ts
 cleanup() {
   local original_status=$?
   set +e
