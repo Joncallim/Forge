@@ -33,7 +33,8 @@ export type VerificationGoalRegistryCommitInput = Readonly<{
 export type VerificationGoalRegistryCommitResult = Readonly<{
   registryRevisionId: string
   manifestDigest: string
-  manifestSchemaVersion: 1 | 2
+  /** Added by executable-goal v2; legacy test stores may omit it. */
+  manifestSchemaVersion?: 1 | 2
   headState: 'advanced' | 'existing'
   snapshots: readonly VerificationGoalSnapshotImportResult[]
 }>
