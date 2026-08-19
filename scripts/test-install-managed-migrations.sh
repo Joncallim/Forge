@@ -13,6 +13,7 @@ PROTECTED_OWNER_BOOTSTRAP="$SCRIPT_DIR/../web/scripts/bootstrap-epic-172-s5-reco
 MIGRATE_THROUGH_0028="$SCRIPT_DIR/../web/scripts/ci/migrate-through-0028.ts"
 MIGRATE_THROUGH_0033="$SCRIPT_DIR/../web/scripts/ci/migrate-through-0033.ts"
 MIGRATE_THROUGH_0035="$SCRIPT_DIR/../web/scripts/ci/migrate-through-0035.ts"
+MIGRATE_THROUGH_0036="$SCRIPT_DIR/../web/scripts/ci/migrate-through-0036.ts"
 TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/forge-managed-migrations.XXXXXX")"
 trap 'rm -rf "$TEST_ROOT"' EXIT
 TEST_SECRET='TEST_APP_DATABASE_URL_MUST_NOT_APPEAR'
@@ -110,11 +111,17 @@ assert_contains "membership.member IN (" "$PRIVILEGE_SQL"
 assert_contains "routine.proconfig = ARRAY['search_path=pg_catalog']" "$PRIVILEGE_SQL"
 assert_contains 'GRANT EXECUTE ON FUNCTION public.forge_commit_verification_goal_registry_revision_v1(' "$PRIVILEGE_SQL"
 assert_contains 'GRANT EXECUTE ON FUNCTION public.forge_commit_verification_goal_policy_revision_v1(' "$PRIVILEGE_SQL"
+assert_contains 'GRANT EXECUTE ON FUNCTION public.forge_admit_verification_goal_run_v1(' "$PRIVILEGE_SQL"
+assert_contains 'GRANT EXECUTE ON FUNCTION public.forge_terminalize_verification_goal_run_v2(' "$PRIVILEGE_SQL"
+assert_contains 'GRANT EXECUTE ON FUNCTION public.forge_reconcile_verification_goal_schedule_binding_v1(' "$PRIVILEGE_SQL"
+assert_contains 'GRANT EXECUTE ON FUNCTION public.forge_claim_verification_goal_schedule_slot_v1(' "$PRIVILEGE_SQL"
+assert_contains "RAISE EXCEPTION 'verification goal runtime routine owner or execute boundary is invalid'" "$PRIVILEGE_SQL"
 assert_contains 'npx tsx scripts/ci/migrate-through-0035.ts' "$REGISTRY_MIGRATION_WRAPPER"
+assert_contains 'npx tsx scripts/ci/migrate-through-0036.ts' "$REGISTRY_MIGRATION_WRAPPER"
 registry_current_read_scope_count="$(grep -c "scope: 'current-read-only'" \
   "$SCRIPT_DIR/../web/scripts/repair-epic-172-legacy-release.ts")"
-[ "$registry_current_read_scope_count" = 3 ] \
-  || fail 'legacy repair must classify the three registry tables in the current-only read scope'
+[ "$registry_current_read_scope_count" = 12 ] \
+  || fail 'legacy repair must classify the twelve verification-goal tables in the current-only read scope'
 assert_contains 'const currentReadOnlyProtectedTables = protectedInstallerRelations' \
   "$SCRIPT_DIR/../web/scripts/repair-epic-172-legacy-release.ts"
 assert_contains '...currentReadOnlyProtectedTables,' \
@@ -125,7 +132,7 @@ assert_contains 'snapshot managed-latest-once' "$LEGACY_REPAIR_PROOF"
 assert_contains 'snapshot managed-latest-twice' "$LEGACY_REPAIR_PROOF"
 assert_contains "assert_unchanged managed-latest-once managed-latest-twice 'Managed latest rerun'" \
   "$LEGACY_REPAIR_PROOF"
-assert_contains 'CANONICAL_PROTECTED_DIRECT_READ_COUNT=5' "$LEGACY_REPAIR_PROOF"
+assert_contains 'CANONICAL_PROTECTED_DIRECT_READ_COUNT=14' "$LEGACY_REPAIR_PROOF"
 assert_contains 'assert_protected_forge_acl_count "$CANONICAL_PROTECTED_DIRECT_READ_COUNT"' \
   "$LEGACY_REPAIR_PROOF"
 assert_contains "direct_read_tables constant text[] := ARRAY[" "$LEGACY_REPAIR_PROOF"
@@ -141,7 +148,16 @@ for direct_read_table in \
   work_package_local_projection_heads \
   verification_goal_registry_revisions \
   verification_goal_registry_entries \
-  verification_goal_registry_heads; do
+  verification_goal_registry_heads \
+  verification_goal_policy_revisions \
+  verification_goal_policy_heads \
+  verification_goal_runs \
+  verification_goal_events \
+  verification_goal_repository_snapshots \
+  verification_goal_environment_snapshots \
+  verification_goal_schedule_bindings \
+  verification_goal_schedule_heads \
+  verification_goal_schedule_slots; do
   assert_contains "'$direct_read_table'" "$LEGACY_REPAIR_PROOF"
 done
 assert_contains 'relation.relname <> ALL(direct_read_tables)' "$LEGACY_REPAIR_PROOF"
@@ -163,6 +179,8 @@ assert_contains "const PREDECESSOR_MIGRATION = '0032_verification_goal_snapshots
 assert_contains "const TARGET_MIGRATION = '0033_verification_goal_registry_revisions'" "$MIGRATE_THROUGH_0033"
 assert_contains "const PREDECESSOR_MIGRATION = '0034_verification_goal_executable_bindings'" "$MIGRATE_THROUGH_0035"
 assert_contains "const TARGET_MIGRATION = '0035_verification_goal_execution_schema'" "$MIGRATE_THROUGH_0035"
+assert_contains "const PREDECESSOR_MIGRATION = '0035_verification_goal_execution_schema'" "$MIGRATE_THROUGH_0036"
+assert_contains "const TARGET_MIGRATION = '0036_verification_goal_runtime_routines'" "$MIGRATE_THROUGH_0036"
 assert_contains 'routine.oid = any(array[${BEGIN}::regprocedure, ${FINALIZE}::regprocedure])' "$PROTECTED_OWNER_BOOTSTRAP"
 assert_contains "revoke create on schema public, forge from forge_s4_routines_owner" "$PROTECTED_OWNER_BOOTSTRAP"
 assert_contains "grant usage on schema forge to forge_s4_routines_owner" "$PROTECTED_OWNER_BOOTSTRAP"

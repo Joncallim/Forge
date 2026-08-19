@@ -1573,7 +1573,7 @@ export const operationRuns = pgTable(
     check('operation_runs_definition_schema_check', sql`${t.definitionSchemaVersion} = 1`),
     check('operation_runs_operation_version_check', sql`${t.operationVersion} > 0`),
     check('operation_runs_status_check', sql`${t.status} IN ('running', 'completed', 'blocked', 'failed')`),
-    check('operation_runs_verification_status_check', sql`${t.verificationStatus} IN ('not_started', 'passed', 'failed')`),
+    check('operation_runs_verification_status_check', sql`${t.verificationStatus} IN ('not_started', 'passed', 'failed', 'not_required', 'inconclusive')`),
     check('operation_runs_fingerprints_check', sql`
       ${t.idempotencyKey} ~ '^[0-9a-f]{64}$' AND
       ${t.definitionDigest} ~ '^[0-9a-f]{64}$' AND
@@ -2086,6 +2086,8 @@ export const verificationGoalPolicyRevisions = pgTable(
       .on(t.projectId, t.revisionSequence),
     uniqueIndex('verification_goal_policy_revisions_id_project_idx')
       .on(t.id, t.projectId),
+    uniqueIndex('verification_goal_policy_revisions_id_project_sequence_idx')
+      .on(t.id, t.projectId, t.revisionSequence),
     foreignKey({
       columns: [t.predecessorRevisionId, t.projectId],
       foreignColumns: [t.id, t.projectId],
@@ -2203,6 +2205,7 @@ export const verificationGoalRuns = pgTable(
     startedAt: timestamp('started_at', tsOpts),
     finishedAt: timestamp('finished_at', tsOpts),
     recoveryNotBefore: timestamp('recovery_not_before', tsOpts),
+    redisDispatchedAt: timestamp('redis_dispatched_at', tsOpts),
     createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
   },
   (t) => [
@@ -2220,6 +2223,9 @@ export const verificationGoalRuns = pgTable(
       .on(t.projectId, t.createdAt),
     index('verification_goal_runs_status_expiries_recovery_idx')
       .on(t.status, t.leaseExpiresAt, t.recoveryNotBefore),
+    index('verification_goal_runs_redis_dispatch_idx')
+      .on(t.status, t.redisDispatchedAt)
+      .where(sql`${t.status} = 'queued'`),
     index('verification_goal_runs_snapshot_history_idx')
       .on(t.snapshotId, t.createdAt),
     foreignKey({
@@ -2617,8 +2623,9 @@ export const verificationGoalScheduleHeads = pgTable(
   'verification_goal_schedule_heads',
   {
     projectId: uuid('project_id')
-      .primaryKey()
+      .notNull()
       .references(() => projects.id, { onDelete: 'restrict', onUpdate: 'restrict' }),
+    goalId: text('goal_id').notNull(),
     scheduleBindingId: uuid('schedule_binding_id').references(() => verificationGoalScheduleBindings.id, {
       onDelete: 'restrict',
       onUpdate: 'restrict',
@@ -2627,6 +2634,7 @@ export const verificationGoalScheduleHeads = pgTable(
     updatedAt: timestamp('updated_at', tsOpts).defaultNow().notNull(),
   },
   (t) => [
+    primaryKey({ columns: [t.projectId, t.goalId] }),
     check('verification_goal_schedule_heads_shape_check', sql`
       (
         ${t.scheduleBindingId} is null

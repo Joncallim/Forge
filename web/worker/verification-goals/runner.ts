@@ -172,7 +172,7 @@ export async function executeVerificationGoalRun(
       })
 
       const childOutcome = classifyChildResult(launchResult)
-      await finalizeChildOperation(childId, childOutcome)
+      await finalizeChildOperation(context, childId, childOutcome)
 
       if (childOutcome.result !== 'passed') {
         return terminalize(context, {
@@ -258,16 +258,47 @@ async function beginChildOperation(
   return row!.id
 }
 
+function mapChildOutcome(outcome: {
+  result: VerificationGoalRunResult
+  terminalCode: VerificationGoalRunTerminalCode
+}): {
+  transportStatus: 'ok' | 'error'
+  result: 'completed' | 'failed' | 'needs_attention'
+  failureClass: 'functional' | 'infrastructure' | 'cancelled' | null
+} {
+  if (outcome.result === 'passed') {
+    return { transportStatus: 'ok', result: 'completed', failureClass: null }
+  }
+  if (outcome.result === 'failed') {
+    return { transportStatus: 'error', result: 'failed', failureClass: 'functional' }
+  }
+  // Conservative v1 classifier: no deterministic functional negative exists,
+  // so non-pass children are needs_attention (architecture section 25 closed
+  // child mapping). Deadlines map to cancellation, everything else to
+  // infrastructure.
+  if (outcome.terminalCode === 'execution_deadline_exceeded') {
+    return { transportStatus: 'error', result: 'needs_attention', failureClass: 'cancelled' }
+  }
+  return { transportStatus: 'error', result: 'needs_attention', failureClass: 'infrastructure' }
+}
+
 async function finalizeChildOperation(
+  context: VerificationGoalRunnerContext,
   childId: string,
   outcome: { result: VerificationGoalRunResult; terminalCode: VerificationGoalRunTerminalCode },
 ): Promise<void> {
+  const mapping = mapChildOutcome(outcome)
   await db.execute(sql`
-    UPDATE public.operation_runs
-    SET status = ${outcome.result === 'passed' ? 'completed' : 'failed'},
-        completed_at = now(),
-        outcome_fingerprint = ${operationFingerprint('outcome', outcome.terminalCode)}
-    WHERE id = ${childId}::uuid
+    SELECT public.forge_finalize_verification_goal_child_operation_v1(
+      ${context.runId}::uuid,
+      ${childId}::uuid,
+      ${mapping.transportStatus}::text,
+      ${mapping.result}::text,
+      ${mapping.failureClass === null ? null : mapping.failureClass}::text,
+      ${false}::boolean,
+      ${'not_required'}::text,
+      ${operationFingerprint('outcome', `${childId}:${outcome.terminalCode}`)}::text
+    )
   `)
 }
 
@@ -278,35 +309,16 @@ async function terminalize(
   const evidenceSetDigest = sha256Hex(`${context.runId}:${outcome.terminalCode}`)
   const evidenceUnitFingerprint = sha256Hex(`${context.runId}:${outcome.result}`)
 
-  // Create a minimal v2 outcome row for the run.
-  const [outcomeRow] = await db.execute<{ id: string }>(sql`
-    INSERT INTO public.execution_outcomes (
-      verification_goal_run_id, attempt_key, schema_version, transport_status,
-      result, failure_class, retryable, evidence_refs, verifier_required,
-      verification_status
-    ) VALUES (
-      ${context.runId}::uuid,
-      ${'verification-goal-run'}::text,
-      2,
-      'ok',
-      ${outcome.result === 'passed' ? 'completed' : outcome.result === 'failed' ? 'failed' : 'needs_attention'},
-      ${outcome.result === 'failed' ? 'functional' : null},
-      false,
-      '[]'::jsonb,
-      false,
-      'not_required'
-    )
-    RETURNING id
-  `)
-
+  // The v2 terminalizer validates the child prefix and atomically writes the
+  // overall outcome, evidence digests, final event, and terminal run state.
   await db.execute(sql`
-    SELECT public.forge_terminalize_verification_goal_run_v1(
+    SELECT public.forge_terminalize_verification_goal_run_v2(
       ${context.runId}::uuid,
       ${outcome.result}::text,
       ${outcome.terminalCode}::text,
-      ${outcomeRow!.id}::uuid,
       ${evidenceSetDigest}::text,
-      ${evidenceUnitFingerprint}::text
+      ${evidenceUnitFingerprint}::text,
+      ${outcome.result === 'failed' ? 'functional' : null}::text
     )
   `)
 

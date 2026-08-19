@@ -108,22 +108,22 @@ describe('verification goal snapshot migration', () => {
     )
   })
 
-  it('records migration 0035 as the current journal tip after 0034', async () => {
+  it('records migration 0036 as the current journal tip after 0035', async () => {
     const journal = JSON.parse(await readFile(
       path.join(process.cwd(), 'db/migrations/meta/_journal.json'),
       'utf8',
     )) as { entries: Array<{ idx: number; tag: string }> }
     expect(journal.entries.at(-3)).toEqual(expect.objectContaining({
-      idx: 33,
-      tag: '0033_verification_goal_registry_revisions',
-    }))
-    expect(journal.entries.at(-2)).toEqual(expect.objectContaining({
       idx: 34,
       tag: '0034_verification_goal_executable_bindings',
     }))
-    expect(journal.entries.at(-1)).toEqual(expect.objectContaining({
+    expect(journal.entries.at(-2)).toEqual(expect.objectContaining({
       idx: 35,
       tag: '0035_verification_goal_execution_schema',
+    }))
+    expect(journal.entries.at(-1)).toEqual(expect.objectContaining({
+      idx: 36,
+      tag: '0036_verification_goal_runtime_routines',
     }))
   })
 

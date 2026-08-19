@@ -6,6 +6,20 @@
 -- and expands the shared execution-subject ledgers for the future dual-subject
 -- cutover. New protected tables follow the same S4-owner bootstrap/handoff
 -- pattern as migrations 0033 and 0034.
+--
+-- The migration login owns the ordinary application tables and the shared
+-- ledgers these new protected surfaces reference. Establish the exact
+-- temporary REFERENCES grants before entering the protected-owner role so the
+-- foreign keys below can be created; the mirror revoke near the end restores
+-- the reconciled owner boundary.
+GRANT REFERENCES ON TABLE
+  public.projects,
+  public.users,
+  public.execution_outcomes,
+  public.operation_runs,
+  public.verification_goal_snapshots
+TO forge_s4_routines_owner;
+--> statement-breakpoint
 SELECT public.forge_begin_epic_172_s4_owner_bootstrap_v1();
 --> statement-breakpoint
 SET ROLE forge_s4_routines_owner;
@@ -70,6 +84,9 @@ ON "verification_goal_policy_revisions" USING btree ("project_id", "revision_seq
 --> statement-breakpoint
 CREATE UNIQUE INDEX "verification_goal_policy_revisions_id_project_idx"
 ON "verification_goal_policy_revisions" USING btree ("id", "project_id");
+--> statement-breakpoint
+CREATE UNIQUE INDEX "verification_goal_policy_revisions_id_project_sequence_idx"
+ON "verification_goal_policy_revisions" USING btree ("id", "project_id", "revision_sequence");
 --> statement-breakpoint
 ALTER TABLE "verification_goal_policy_revisions"
 ADD CONSTRAINT "verification_goal_policy_revisions_predecessor_fk"
@@ -320,47 +337,7 @@ CREATE INDEX "verification_goal_runs_snapshot_history_idx"
 ON "verification_goal_runs" USING btree ("snapshot_id", "created_at");
 --> statement-breakpoint
 
-CREATE TABLE "verification_goal_events" (
-  "id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
-  "verification_goal_run_id" uuid NOT NULL,
-  "event_sequence" integer NOT NULL,
-  "phase" text NOT NULL,
-  "status" text NOT NULL,
-  "code" text,
-  "operation_run_id" uuid,
-  "repository_snapshot_id" uuid,
-  "environment_snapshot_id" uuid,
-  "evidence_ref" uuid,
-  "created_at" timestamp with time zone DEFAULT now() NOT NULL,
-  CONSTRAINT "verification_goal_events_run_fk"
-    FOREIGN KEY ("verification_goal_run_id") REFERENCES "public"."verification_goal_runs"("id")
-    ON DELETE restrict ON UPDATE restrict,
-  CONSTRAINT "verification_goal_events_operation_run_fk"
-    FOREIGN KEY ("operation_run_id") REFERENCES "public"."operation_runs"("id")
-    ON DELETE restrict ON UPDATE restrict,
-  CONSTRAINT "verification_goal_events_repository_snapshot_fk"
-    FOREIGN KEY ("repository_snapshot_id") REFERENCES "public"."verification_goal_repository_snapshots"("id")
-    ON DELETE restrict ON UPDATE restrict,
-  CONSTRAINT "verification_goal_events_environment_snapshot_fk"
-    FOREIGN KEY ("environment_snapshot_id") REFERENCES "public"."verification_goal_environment_snapshots"("id")
-    ON DELETE restrict ON UPDATE restrict,
-  CONSTRAINT "verification_goal_events_phase_check"
-    CHECK ("phase" IN (
-      'admitted', 'claimed', 'repository_captured', 'environment_captured',
-      'child_begun', 'child_completed', 'terminalized', 'expired', 'recovered'
-    )),
-  CONSTRAINT "verification_goal_events_status_check"
-    CHECK ("status" IN ('ok', 'blocked', 'failed', 'inconclusive')),
-  CONSTRAINT "verification_goal_events_code_check"
-    CHECK ("code" IS NULL OR length("code") BETWEEN 1 AND 64)
-);
---> statement-breakpoint
-CREATE UNIQUE INDEX "verification_goal_events_run_sequence_idx"
-ON "verification_goal_events" USING btree ("verification_goal_run_id", "event_sequence");
---> statement-breakpoint
-CREATE INDEX "verification_goal_events_run_created_idx"
-ON "verification_goal_events" USING btree ("verification_goal_run_id", "created_at");
---> statement-breakpoint
+
 
 -- ---------------------------------------------------------------------------
 -- Immutable run evidence snapshots
@@ -471,6 +448,50 @@ ON "verification_goal_environment_snapshots" USING btree ("project_id", "capture
 --> statement-breakpoint
 
 -- ---------------------------------------------------------------------------
+-- Run events (defined after both snapshot surfaces they reference)
+-- ---------------------------------------------------------------------------
+CREATE TABLE "verification_goal_events" (
+  "id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
+  "verification_goal_run_id" uuid NOT NULL,
+  "event_sequence" integer NOT NULL,
+  "phase" text NOT NULL,
+  "status" text NOT NULL,
+  "code" text,
+  "operation_run_id" uuid,
+  "repository_snapshot_id" uuid,
+  "environment_snapshot_id" uuid,
+  "evidence_ref" uuid,
+  "created_at" timestamp with time zone DEFAULT now() NOT NULL,
+  CONSTRAINT "verification_goal_events_run_fk"
+    FOREIGN KEY ("verification_goal_run_id") REFERENCES "public"."verification_goal_runs"("id")
+    ON DELETE restrict ON UPDATE restrict,
+  CONSTRAINT "verification_goal_events_operation_run_fk"
+    FOREIGN KEY ("operation_run_id") REFERENCES "public"."operation_runs"("id")
+    ON DELETE restrict ON UPDATE restrict,
+  CONSTRAINT "verification_goal_events_repository_snapshot_fk"
+    FOREIGN KEY ("repository_snapshot_id") REFERENCES "public"."verification_goal_repository_snapshots"("id")
+    ON DELETE restrict ON UPDATE restrict,
+  CONSTRAINT "verification_goal_events_environment_snapshot_fk"
+    FOREIGN KEY ("environment_snapshot_id") REFERENCES "public"."verification_goal_environment_snapshots"("id")
+    ON DELETE restrict ON UPDATE restrict,
+  CONSTRAINT "verification_goal_events_phase_check"
+    CHECK ("phase" IN (
+      'admitted', 'claimed', 'repository_captured', 'environment_captured',
+      'child_begun', 'child_completed', 'terminalized', 'expired', 'recovered'
+    )),
+  CONSTRAINT "verification_goal_events_status_check"
+    CHECK ("status" IN ('ok', 'blocked', 'failed', 'inconclusive')),
+  CONSTRAINT "verification_goal_events_code_check"
+    CHECK ("code" IS NULL OR length("code") BETWEEN 1 AND 64)
+);
+--> statement-breakpoint
+CREATE UNIQUE INDEX "verification_goal_events_run_sequence_idx"
+ON "verification_goal_events" USING btree ("verification_goal_run_id", "event_sequence");
+--> statement-breakpoint
+CREATE INDEX "verification_goal_events_run_created_idx"
+ON "verification_goal_events" USING btree ("verification_goal_run_id", "created_at");
+--> statement-breakpoint
+-- ---------------------------------------------------------------------------
 -- Scheduling surfaces
 -- ---------------------------------------------------------------------------
 CREATE TABLE "verification_goal_schedule_bindings" (
@@ -574,6 +595,14 @@ ON "verification_goal_schedule_slots" USING btree ("due_at");
 -- ---------------------------------------------------------------------------
 -- Shared ledger expansion for dual execution subjects
 -- ---------------------------------------------------------------------------
+-- These ledgers are owned by the migration login, so temporarily leave the
+-- protected-owner role for the exact ALTERs below. Their new foreign keys
+-- point at the protected run surface, so the owner grants the migration login
+-- the exact REFERENCES privilege first and revokes it immediately after.
+GRANT REFERENCES ON TABLE public.verification_goal_runs TO SESSION_USER;
+--> statement-breakpoint
+RESET ROLE;
+--> statement-breakpoint
 ALTER TABLE "public"."execution_outcomes"
 ADD COLUMN "verification_goal_run_id" uuid,
 ADD COLUMN "failure_class" text;
@@ -725,6 +754,10 @@ ON "public"."capability_attempts" USING btree ("verification_goal_run_id");
 -- ---------------------------------------------------------------------------
 -- Append-only / immutable evidence guards
 -- ---------------------------------------------------------------------------
+SET ROLE forge_s4_routines_owner;
+--> statement-breakpoint
+REVOKE REFERENCES ON TABLE public.verification_goal_runs FROM SESSION_USER;
+--> statement-breakpoint
 CREATE FUNCTION public.forge_guard_verification_goal_evidence_mutation_v1()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -1230,5 +1263,13 @@ GRANT EXECUTE ON FUNCTION public.forge_terminalize_verification_goal_run_v1(
 --> statement-breakpoint
 
 RESET ROLE;
+--> statement-breakpoint
+REVOKE REFERENCES ON TABLE
+  public.projects,
+  public.users,
+  public.execution_outcomes,
+  public.operation_runs,
+  public.verification_goal_snapshots
+FROM forge_s4_routines_owner;
 --> statement-breakpoint
 SELECT public.forge_finalize_epic_172_s4_owner_bootstrap_v1();
