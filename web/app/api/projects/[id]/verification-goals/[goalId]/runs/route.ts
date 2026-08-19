@@ -118,12 +118,25 @@ export async function POST(
     }
 
     // Ensure a default-disabled policy exists for the project.
-    const [existingHead] = await db.execute<{ policy_revision_id: string }>(sql`
-      SELECT policy_revision_id FROM public.verification_goal_policy_heads
+    const [existingHead] = await db.execute<{
+      policy_revision_id: string
+      revision_sequence: bigint
+    }>(sql`
+      SELECT policy_revision_id, revision_sequence FROM public.verification_goal_policy_heads
       WHERE project_id = ${projectId}::uuid
     `)
-    if (!existingHead) {
-      await seedVerificationGoalPolicy({ projectId, actorKind: 'system_default' })
+    let policyRevisionId: string
+    let policyRevisionSequence: bigint
+    if (existingHead) {
+      policyRevisionId = existingHead.policy_revision_id
+      policyRevisionSequence = existingHead.revision_sequence
+    } else {
+      const seededHead = await seedVerificationGoalPolicy({
+        projectId,
+        actorKind: 'system_default',
+      })
+      policyRevisionId = seededHead.policyRevisionId
+      policyRevisionSequence = seededHead.revisionSequence
     }
 
     // Find the current registry entry for the requested goal.
@@ -202,17 +215,11 @@ export async function POST(
       definitionDigest: entry.definition_digest,
       registryRevisionId: entry.registry_revision_id,
       registryEntryOrdinal: entry.ordinal,
-      executionBinding: entry.execution_binding_digest
-        ? {
-            schemaVersion: 1,
-            eligibilityPolicyVersion: 1,
-            eligibilityPolicyDigest: entry.execution_binding_digest,
-            operations: [],
-            executionBindingDigest: entry.execution_binding_digest,
-          }
-        : null,
+      executionBindingDigest: entry.execution_binding_digest,
       requestedByUserId: session.userId.toLowerCase(),
       manualIdempotencyKey: idempotencyKey.toLowerCase(),
+      policyRevisionId,
+      policyRevisionSequence,
     })
 
     // For the manual-runner vertical slice, execute synchronously. Future slices
@@ -220,7 +227,9 @@ export async function POST(
     const trustedExecutables = await resolveTrustedExecutables({
       nodePath: process.execPath,
       gitPath: process.env.FORGE_TRUSTED_GIT_PATH ?? '/usr/bin/git',
-      workspaceRoots: [process.cwd()],
+      workspaceRoots: [process.cwd(), project.localPath].filter(
+        (root): root is string => typeof root === 'string' && root.trim() !== '',
+      ),
     })
 
     const outcome = await executeVerificationGoalRun({
@@ -238,6 +247,40 @@ export async function POST(
       terminalCode: outcome.terminalCode,
     })
   } catch (error) {
+    const sqlState = (error as { code?: unknown } | null)?.code
+    if (typeof sqlState === 'string') {
+      // Closed SQLSTATE mapping for the protected admission/runner boundary.
+      if (sqlState === 'P1871') {
+        return NextResponse.json(
+          { error: 'Verification goal execution is unavailable for this project.', code: 'execution_unavailable' },
+          { status: 409 },
+        )
+      }
+      if (sqlState === 'P1872') {
+        return NextResponse.json(
+          { error: 'Project verification policy or lease state changed. Retry the request.', code: 'policy_or_lease_changed' },
+          { status: 409 },
+        )
+      }
+      if (sqlState === 'P1873') {
+        return NextResponse.json(
+          { error: 'Verification goal is not executable under the current project policy or registry state.', code: 'execution_denied' },
+          { status: 409 },
+        )
+      }
+      if (sqlState === 'P1874') {
+        return NextResponse.json(
+          { error: 'Verification goal capacity limit reached. Retry later.', code: 'capacity_limit' },
+          { status: 429 },
+        )
+      }
+      if (sqlState === 'P1876') {
+        return NextResponse.json(
+          { error: 'The Idempotency-Key was already used for a different request.', code: 'idempotency_conflict' },
+          { status: 409 },
+        )
+      }
+    }
     return respondToRouteError(
       'POST /api/projects/:id/verification-goals/:goalId/runs',
       error,
