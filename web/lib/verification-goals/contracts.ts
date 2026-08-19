@@ -10,6 +10,37 @@ import {
   OPERATION_CATALOG,
   resolveOperationDefinition,
 } from '@/lib/operations/catalog'
+import {
+  MAX_VERIFICATION_GOAL_CAPABILITY_LENGTH,
+  MAX_VERIFICATION_GOAL_DEFINITION_VERSION,
+  MAX_VERIFICATION_GOAL_DESCRIPTION_LENGTH,
+  MAX_VERIFICATION_GOAL_ID_LENGTH,
+  MAX_VERIFICATION_GOAL_OPERATIONS,
+  MAX_VERIFICATION_GOAL_TITLE_LENGTH,
+  VERIFICATION_GOAL_SEVERITIES,
+  compareVerificationGoalStrings,
+  type VerificationGoalOperationReference,
+  type VerificationGoalSeverity,
+} from './base'
+import {
+  ExecutableVerificationGoalContractError,
+  executableVerificationGoalDefinitionDigest,
+  parseExecutableVerificationGoalDefinition,
+  type VerificationGoalDefinitionV2,
+} from './executable-contracts'
+
+export {
+  MAX_VERIFICATION_GOAL_CAPABILITY_LENGTH,
+  MAX_VERIFICATION_GOAL_DEFINITION_VERSION,
+  MAX_VERIFICATION_GOAL_DESCRIPTION_LENGTH,
+  MAX_VERIFICATION_GOAL_ID_LENGTH,
+  MAX_VERIFICATION_GOAL_OPERATIONS,
+  MAX_VERIFICATION_GOAL_TITLE_LENGTH,
+  VERIFICATION_GOAL_SEVERITIES,
+  compareVerificationGoalStrings,
+  type VerificationGoalOperationReference,
+  type VerificationGoalSeverity,
+} from './base'
 
 export const VERIFICATION_GOAL_SCHEMA_VERSION = 1 as const
 export const VERIFICATION_GOAL_KEYS = [
@@ -28,28 +59,7 @@ export const VERIFICATION_GOAL_OPERATION_KEYS = [
   'operationVersion',
 ] as const
 
-export const VERIFICATION_GOAL_SEVERITIES = [
-  'low',
-  'medium',
-  'high',
-  'critical',
-] as const
-
-export const MAX_VERIFICATION_GOAL_ID_LENGTH = 64
-export const MAX_VERIFICATION_GOAL_DEFINITION_VERSION = 1_000_000
-export const MAX_VERIFICATION_GOAL_TITLE_LENGTH = 160
-export const MAX_VERIFICATION_GOAL_DESCRIPTION_LENGTH = 2_000
-export const MAX_VERIFICATION_GOAL_CAPABILITY_LENGTH = 200
-export const MAX_VERIFICATION_GOAL_OPERATIONS = 16
-
-export type VerificationGoalSeverity = typeof VERIFICATION_GOAL_SEVERITIES[number]
-
-export type VerificationGoalOperationReference = {
-  operationId: string
-  operationVersion: number
-}
-
-export type VerificationGoalDefinition = {
+export type VerificationGoalDefinitionV1 = {
   schemaVersion: 1
   goalId: string
   definitionVersion: number
@@ -60,6 +70,8 @@ export type VerificationGoalDefinition = {
   enabled: boolean
   operations: VerificationGoalOperationReference[]
 }
+
+export type VerificationGoalDefinition = VerificationGoalDefinitionV1 | VerificationGoalDefinitionV2
 
 export class VerificationGoalContractError extends Error {
   readonly code:
@@ -77,13 +89,6 @@ export class VerificationGoalContractError extends Error {
 const SAFE_TEXT_CONTROL_CHARACTERS = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u
 const OPERATION_OR_CAPABILITY_GRAMMAR = /^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)+$/
 const GOAL_ID_GRAMMAR = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/
-
-/** Locale-independent ordering for canonical identities. */
-export function compareVerificationGoalStrings(left: string, right: string): number {
-  if (left < right) return -1
-  if (left > right) return 1
-  return 0
-}
 
 function invalid(message: string): never {
   throw new VerificationGoalContractError('invalid_definition', message)
@@ -166,10 +171,10 @@ function parseOperationReference(
  * only: operation inputs, commands, paths, adapters, and policy overrides are
  * unknown keys and therefore fail closed before any persistence or execution.
  */
-export function parseVerificationGoalDefinition(
+export function parseVerificationGoalDefinitionV1(
   value: unknown,
   catalog: ReadonlyMap<string, OperationDefinition> = OPERATION_CATALOG,
-): VerificationGoalDefinition {
+): VerificationGoalDefinitionV1 {
   if (!isPlainRecord(value) || !hasExactKeys(value, VERIFICATION_GOAL_KEYS)) {
     return invalid('Verification goal must contain exactly the v1 definition keys.')
   }
@@ -248,8 +253,33 @@ export function parseVerificationGoalDefinition(
   }
 }
 
+/**
+ * Registry parser for all accepted goal-definition schemas. Schema v1 remains
+ * definition-only. Schema v2 is accepted only after its executable declaration
+ * and code-owned operation binding have validated fail closed.
+ */
+export function parseVerificationGoalDefinition(
+  value: unknown,
+  catalog: ReadonlyMap<string, OperationDefinition> = OPERATION_CATALOG,
+): VerificationGoalDefinition {
+  if (isPlainRecord(value) && value.schemaVersion === 2) {
+    try {
+      return parseExecutableVerificationGoalDefinition(value, catalog)
+    } catch (error) {
+      if (error instanceof ExecutableVerificationGoalContractError) {
+        throw new VerificationGoalContractError(error.code, error.message)
+      }
+      throw error
+    }
+  }
+  return parseVerificationGoalDefinitionV1(value, catalog)
+}
+
 /** Stable, domain-separated digest of the validated canonical definition. */
 export function verificationGoalDefinitionDigest(definition: VerificationGoalDefinition): string {
+  if (definition.schemaVersion === 2) {
+    return executableVerificationGoalDefinitionDigest(definition)
+  }
   return createHash('sha256')
     .update('forge:verification-goal:definition:v1\0', 'utf8')
     .update(canonicalJson(definition), 'utf8')

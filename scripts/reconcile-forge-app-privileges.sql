@@ -26,6 +26,15 @@ INSERT INTO forge_expected_protected_owner_inventory (relation_name, owner_name)
   ('verification_goal_registry_revisions', 'forge_s4_routines_owner'),
   ('verification_goal_registry_entries', 'forge_s4_routines_owner'),
   ('verification_goal_registry_heads', 'forge_s4_routines_owner'),
+  ('verification_goal_policy_revisions', 'forge_s4_routines_owner'),
+  ('verification_goal_policy_heads', 'forge_s4_routines_owner'),
+  ('verification_goal_runs', 'forge_s4_routines_owner'),
+  ('verification_goal_events', 'forge_s4_routines_owner'),
+  ('verification_goal_repository_snapshots', 'forge_s4_routines_owner'),
+  ('verification_goal_environment_snapshots', 'forge_s4_routines_owner'),
+  ('verification_goal_schedule_bindings', 'forge_s4_routines_owner'),
+  ('verification_goal_schedule_heads', 'forge_s4_routines_owner'),
+  ('verification_goal_schedule_slots', 'forge_s4_routines_owner'),
   ('architect_plan_versions', 'forge_s4_routines_owner'),
   ('architect_plan_entries', 'forge_s4_routines_owner'),
   ('architect_plan_execution_references', 'forge_s4_routines_owner'),
@@ -107,7 +116,7 @@ BEGIN
   ) THEN
     RAISE EXCEPTION 'protected owner roles are outside the exact safe boundary';
   END IF;
-  IF (SELECT count(*) FROM forge_expected_protected_owner_inventory) <> 40 OR EXISTS (
+  IF (SELECT count(*) FROM forge_expected_protected_owner_inventory) <> 49 OR EXISTS (
     SELECT 1
     FROM forge_expected_protected_owner_inventory expected
     LEFT JOIN pg_catalog.pg_class relation
@@ -126,7 +135,7 @@ BEGIN
   WHERE namespace_row.nspname = 'public'
     AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
     AND owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner');
-  IF protected_count < 40 THEN
+  IF protected_count < 49 THEN
     RAISE EXCEPTION 'protected ownership boundary is incomplete';
   END IF;
 END;
@@ -171,7 +180,16 @@ REVOKE ALL PRIVILEGES ON TABLE
   public.verification_goal_snapshots,
   public.verification_goal_registry_revisions,
   public.verification_goal_registry_entries,
-  public.verification_goal_registry_heads
+  public.verification_goal_registry_heads,
+  public.verification_goal_policy_revisions,
+  public.verification_goal_policy_heads,
+  public.verification_goal_runs,
+  public.verification_goal_events,
+  public.verification_goal_repository_snapshots,
+  public.verification_goal_environment_snapshots,
+  public.verification_goal_schedule_bindings,
+  public.verification_goal_schedule_heads,
+  public.verification_goal_schedule_slots
 FROM forge;
 GRANT SELECT, INSERT ON TABLE public.verification_goal_snapshots TO forge;
 
@@ -221,7 +239,16 @@ GRANT SELECT ON TABLE
   public.work_package_local_projection_heads,
   public.verification_goal_registry_revisions,
   public.verification_goal_registry_entries,
-  public.verification_goal_registry_heads
+  public.verification_goal_registry_heads,
+  public.verification_goal_policy_revisions,
+  public.verification_goal_policy_heads,
+  public.verification_goal_runs,
+  public.verification_goal_events,
+  public.verification_goal_repository_snapshots,
+  public.verification_goal_environment_snapshots,
+  public.verification_goal_schedule_bindings,
+  public.verification_goal_schedule_heads,
+  public.verification_goal_schedule_slots
 TO forge;
 REVOKE ALL ON FUNCTION public.forge_commit_verification_goal_registry_revision_v1(
   uuid,uuid,uuid,uuid,timestamptz,text,uuid,bigint,bigint,timestamptz,text,jsonb
@@ -229,12 +256,96 @@ REVOKE ALL ON FUNCTION public.forge_commit_verification_goal_registry_revision_v
 GRANT EXECUTE ON FUNCTION public.forge_commit_verification_goal_registry_revision_v1(
   uuid,uuid,uuid,uuid,timestamptz,text,uuid,bigint,bigint,timestamptz,text,jsonb
 ) TO forge;
+REVOKE ALL ON FUNCTION public.forge_commit_verification_goal_policy_revision_v1(
+  uuid,uuid,uuid,bigint,boolean,boolean,bigint,bigint,bigint,integer,
+  integer,integer,integer,bigint,bigint,text,uuid,text
+) FROM PUBLIC, forge;
+GRANT EXECUTE ON FUNCTION public.forge_commit_verification_goal_policy_revision_v1(
+  uuid,uuid,uuid,bigint,boolean,boolean,bigint,bigint,bigint,integer,
+  integer,integer,integer,bigint,bigint,text,uuid,text
+) TO forge;
+REVOKE ALL ON FUNCTION public.forge_claim_verification_goal_run_lease_v1(uuid, bigint, uuid, timestamptz)
+  FROM PUBLIC, forge;
+GRANT EXECUTE ON FUNCTION public.forge_claim_verification_goal_run_lease_v1(uuid, bigint, uuid, timestamptz)
+  TO forge;
+REVOKE ALL ON FUNCTION public.forge_begin_verification_goal_child_operation_v1(
+  uuid,integer,text,integer,text,text,text,text,text,text,text,jsonb
+) FROM PUBLIC, forge;
+GRANT EXECUTE ON FUNCTION public.forge_begin_verification_goal_child_operation_v1(
+  uuid,integer,text,integer,text,text,text,text,text,text,text,jsonb
+) TO forge;
+REVOKE ALL ON FUNCTION public.forge_admit_verification_goal_run_v1(
+  uuid,uuid,integer,uuid,text,integer,text,text,text,uuid,bigint,
+  jsonb,text,text,uuid,uuid,text,uuid,uuid,timestamptz,text
+) FROM PUBLIC, forge;
+GRANT EXECUTE ON FUNCTION public.forge_admit_verification_goal_run_v1(
+  uuid,uuid,integer,uuid,text,integer,text,text,text,uuid,bigint,
+  jsonb,text,text,uuid,uuid,text,uuid,uuid,timestamptz,text
+) TO forge;
+REVOKE ALL ON FUNCTION public.forge_renew_verification_goal_run_lease_v1(uuid, bigint, uuid, timestamptz)
+  FROM PUBLIC, forge;
+GRANT EXECUTE ON FUNCTION public.forge_renew_verification_goal_run_lease_v1(uuid, bigint, uuid, timestamptz)
+  TO forge;
+REVOKE ALL ON FUNCTION public.forge_fence_verification_goal_run_recovery_v1(uuid)
+  FROM PUBLIC, forge;
+GRANT EXECUTE ON FUNCTION public.forge_fence_verification_goal_run_recovery_v1(uuid)
+  TO forge;
+REVOKE ALL ON FUNCTION public.forge_complete_verification_goal_recovery_v1(uuid, text, text)
+  FROM PUBLIC, forge;
+GRANT EXECUTE ON FUNCTION public.forge_complete_verification_goal_recovery_v1(uuid, text, text)
+  TO forge;
+REVOKE ALL ON FUNCTION public.forge_finalize_verification_goal_child_operation_v1(
+  uuid,uuid,uuid,text,text,text,boolean,text,text
+) FROM PUBLIC, forge;
+GRANT EXECUTE ON FUNCTION public.forge_finalize_verification_goal_child_operation_v1(
+  uuid,uuid,uuid,text,text,text,boolean,text,text
+) TO forge;
+REVOKE ALL ON FUNCTION public.forge_record_verification_goal_repository_snapshot_v1(
+  uuid,uuid,timestamptz,bigint,bigint,text,text,boolean,text,text,text,text
+) FROM PUBLIC, forge;
+GRANT EXECUTE ON FUNCTION public.forge_record_verification_goal_repository_snapshot_v1(
+  uuid,uuid,timestamptz,bigint,bigint,text,text,boolean,text,text,text,text
+) TO forge;
+REVOKE ALL ON FUNCTION public.forge_record_verification_goal_environment_snapshot_v1(
+  uuid,integer,integer,text,text,integer,text,text,text,text,text,
+  integer,text,text,text,text,integer,text,text
+) FROM PUBLIC, forge;
+GRANT EXECUTE ON FUNCTION public.forge_record_verification_goal_environment_snapshot_v1(
+  uuid,integer,integer,text,text,integer,text,text,text,text,text,
+  integer,text,text,text,text,integer,text,text
+) TO forge;
+REVOKE ALL ON FUNCTION public.forge_expire_verification_goal_run_v1(uuid)
+  FROM PUBLIC, forge;
+GRANT EXECUTE ON FUNCTION public.forge_expire_verification_goal_run_v1(uuid)
+  TO forge;
+REVOKE ALL ON FUNCTION public.forge_mark_verification_goal_run_dispatched_v1(uuid)
+  FROM PUBLIC, forge;
+GRANT EXECUTE ON FUNCTION public.forge_mark_verification_goal_run_dispatched_v1(uuid)
+  TO forge;
+REVOKE ALL ON FUNCTION public.forge_terminalize_verification_goal_run_v2(
+  uuid,text,text,text,text,text
+) FROM PUBLIC, forge;
+GRANT EXECUTE ON FUNCTION public.forge_terminalize_verification_goal_run_v2(
+  uuid,text,text,text,text,text
+) TO forge;
+REVOKE ALL ON FUNCTION public.forge_reconcile_verification_goal_schedule_binding_v1(
+  uuid,text,text,uuid,integer,uuid,integer,text,text,uuid,bigint,bigint,timestamptz,boolean
+) FROM PUBLIC, forge;
+GRANT EXECUTE ON FUNCTION public.forge_reconcile_verification_goal_schedule_binding_v1(
+  uuid,text,text,uuid,integer,uuid,integer,text,text,uuid,bigint,bigint,timestamptz,boolean
+) TO forge;
+REVOKE ALL ON FUNCTION public.forge_claim_verification_goal_schedule_slot_v1(
+  uuid,bigint,jsonb,text,timestamptz,text
+) FROM PUBLIC, forge;
+GRANT EXECUTE ON FUNCTION public.forge_claim_verification_goal_schedule_slot_v1(
+  uuid,bigint,jsonb,text,timestamptz,text
+) TO forge;
 
 DO $verify$
 DECLARE
   projection_name text;
 BEGIN
-  IF (SELECT count(*) FROM forge_expected_protected_owner_inventory) <> 40 OR EXISTS (
+  IF (SELECT count(*) FROM forge_expected_protected_owner_inventory) <> 49 OR EXISTS (
     SELECT 1
     FROM forge_expected_protected_owner_inventory expected
     LEFT JOIN pg_catalog.pg_class relation
@@ -314,13 +425,85 @@ BEGIN
   ) THEN
     RAISE EXCEPTION 'verification goal registry commit routine owner or execute boundary is invalid';
   END IF;
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_proc routine
+    WHERE routine.oid = 'public.forge_commit_verification_goal_policy_revision_v1(uuid,uuid,uuid,bigint,boolean,boolean,bigint,bigint,bigint,integer,integer,integer,integer,bigint,bigint,text,uuid,text)'::pg_catalog.regprocedure
+      AND routine.proowner = 'forge_s4_routines_owner'::pg_catalog.regrole
+      AND routine.prosecdef
+      AND routine.proconfig = ARRAY['search_path=pg_catalog']
+      AND pg_catalog.has_function_privilege('forge', routine.oid, 'EXECUTE')
+      AND NOT EXISTS (
+        SELECT 1
+        FROM pg_catalog.aclexplode(
+          COALESCE(routine.proacl, pg_catalog.acldefault('f', routine.proowner))
+        ) privilege
+        WHERE privilege.privilege_type = 'EXECUTE'
+          AND privilege.grantee NOT IN (
+            'forge'::pg_catalog.regrole,
+            'forge_s4_routines_owner'::pg_catalog.regrole
+          )
+      )
+  ) THEN
+    RAISE EXCEPTION 'verification goal policy commit routine owner or execute boundary is invalid';
+  END IF;
+  IF EXISTS (
+    SELECT 1
+    FROM unnest(ARRAY[
+      'forge_admit_verification_goal_run_v1(uuid,uuid,integer,uuid,text,integer,text,text,text,uuid,bigint,jsonb,text,text,uuid,uuid,text,uuid,uuid,timestamp with time zone,text)',
+      'forge_claim_verification_goal_run_lease_v1(uuid,bigint,uuid,timestamp with time zone)',
+      'forge_renew_verification_goal_run_lease_v1(uuid,bigint,uuid,timestamp with time zone)',
+      'forge_fence_verification_goal_run_recovery_v1(uuid)',
+      'forge_complete_verification_goal_recovery_v1(uuid,text,text)',
+      'forge_finalize_verification_goal_child_operation_v1(uuid,uuid,uuid,text,text,text,boolean,text,text)',
+      'forge_record_verification_goal_repository_snapshot_v1(uuid,uuid,timestamp with time zone,bigint,bigint,text,text,boolean,text,text,text,text)',
+      'forge_record_verification_goal_environment_snapshot_v1(uuid,integer,integer,text,text,integer,text,text,text,text,text,integer,text,text,text,text,integer,text,text)',
+      'forge_expire_verification_goal_run_v1(uuid)',
+      'forge_mark_verification_goal_run_dispatched_v1(uuid)',
+      'forge_terminalize_verification_goal_run_v2(uuid,text,text,text,text,text)',
+      'forge_reconcile_verification_goal_schedule_binding_v1(uuid,text,text,uuid,integer,uuid,integer,text,text,uuid,bigint,bigint,timestamp with time zone,boolean)',
+      'forge_claim_verification_goal_schedule_slot_v1(uuid,bigint,jsonb,text,timestamp with time zone,text)'
+    ]) runtime_routine
+    CROSS JOIN LATERAL (
+      SELECT routine.oid, routine.proowner, routine.prosecdef, routine.proconfig, routine.proacl
+      FROM pg_catalog.pg_proc routine
+      WHERE routine.oid = ('public.' || runtime_routine)::pg_catalog.regprocedure
+    ) routine_row
+    WHERE routine_row.oid IS NULL
+       OR routine_row.proowner <> 'forge_s4_routines_owner'::pg_catalog.regrole
+       OR NOT routine_row.prosecdef
+       OR routine_row.proconfig IS DISTINCT FROM ARRAY['search_path=pg_catalog']
+       OR NOT pg_catalog.has_function_privilege('forge', routine_row.oid, 'EXECUTE')
+       OR EXISTS (
+         SELECT 1
+         FROM pg_catalog.aclexplode(
+           COALESCE(routine_row.proacl, pg_catalog.acldefault('f', routine_row.proowner))
+         ) privilege
+         WHERE privilege.privilege_type = 'EXECUTE'
+           AND privilege.grantee NOT IN (
+             'forge'::pg_catalog.regrole,
+             'forge_s4_routines_owner'::pg_catalog.regrole
+           )
+       )
+  ) THEN
+    RAISE EXCEPTION 'verification goal runtime routine owner or execute boundary is invalid';
+  END IF;
   IF EXISTS (
     SELECT 1
     FROM unnest(ARRAY[
       'verification_goal_snapshots',
       'verification_goal_registry_revisions',
       'verification_goal_registry_entries',
-      'verification_goal_registry_heads'
+      'verification_goal_registry_heads',
+      'verification_goal_policy_revisions',
+      'verification_goal_policy_heads',
+      'verification_goal_runs',
+      'verification_goal_events',
+      'verification_goal_repository_snapshots',
+      'verification_goal_environment_snapshots',
+      'verification_goal_schedule_bindings',
+      'verification_goal_schedule_heads',
+      'verification_goal_schedule_slots'
     ]) registry_table
     CROSS JOIN unnest(ARRAY[
       'SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER'
@@ -354,7 +537,16 @@ BEGIN
           'work_package_local_projection_heads',
           'verification_goal_registry_revisions',
           'verification_goal_registry_entries',
-          'verification_goal_registry_heads'
+          'verification_goal_registry_heads',
+          'verification_goal_policy_revisions',
+          'verification_goal_policy_heads',
+          'verification_goal_runs',
+          'verification_goal_events',
+          'verification_goal_repository_snapshots',
+          'verification_goal_environment_snapshots',
+          'verification_goal_schedule_bindings',
+          'verification_goal_schedule_heads',
+          'verification_goal_schedule_slots'
         )
         OR privilege.privilege_type <> 'SELECT'
         OR privilege.is_grantable
@@ -437,7 +629,16 @@ BEGIN
             'work_package_local_projection_heads',
             'verification_goal_registry_revisions',
             'verification_goal_registry_entries',
-            'verification_goal_registry_heads'
+            'verification_goal_registry_heads',
+            'verification_goal_policy_revisions',
+            'verification_goal_policy_heads',
+            'verification_goal_runs',
+            'verification_goal_events',
+            'verification_goal_repository_snapshots',
+            'verification_goal_environment_snapshots',
+            'verification_goal_schedule_bindings',
+            'verification_goal_schedule_heads',
+            'verification_goal_schedule_slots'
           )
           AND (
             pg_catalog.has_table_privilege(forge_role.oid, relation.oid, 'SELECT')
@@ -453,7 +654,16 @@ BEGIN
     'work_package_local_projection_heads',
     'verification_goal_registry_revisions',
     'verification_goal_registry_entries',
-    'verification_goal_registry_heads'
+    'verification_goal_registry_heads',
+    'verification_goal_policy_revisions',
+    'verification_goal_policy_heads',
+    'verification_goal_runs',
+    'verification_goal_events',
+    'verification_goal_repository_snapshots',
+    'verification_goal_environment_snapshots',
+    'verification_goal_schedule_bindings',
+    'verification_goal_schedule_heads',
+    'verification_goal_schedule_slots'
   ]
   LOOP
     IF (

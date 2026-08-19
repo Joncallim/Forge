@@ -187,6 +187,7 @@ describe('Epic 172 project route ingress sentinel', () => {
       '../app/api/projects/[id]/mcps/route.ts:PUT',
       '../app/api/projects/[id]/mcps/install-recommended/route.ts:POST',
       '../app/api/projects/[id]/verification-goals/import/route.ts:POST',
+      '../app/api/projects/[id]/verification-goals/[goalId]/runs/route.ts:POST',
     ].sort())
   })
 

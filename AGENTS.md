@@ -30,13 +30,20 @@ catalog.
 The normal web runtime is not a manual agent session. The web app enqueues tasks
 to Redis, and the Forge worker consumes those jobs. The worker runs Architect
 planning, moves a task to `awaiting_approval`, and after approval can execute
-specialist packages and apply local repository file edits by default. Set
-`FORGE_WORK_PACKAGE_EXECUTION=0` for handoff artifacts only, or
-`FORGE_HOST_REPOSITORY_WRITES=0` to keep generated files sandbox-only.
+bounded specialist packages in Forge's execution sandbox when the relevant
+execution gates are explicitly enabled.
+
+Direct host-repository application is currently fail-closed: Forge does not yet
+have the OS-enforced project-root namespace / hardened repository-write adapter
+required to make generated-file application a generally available capability.
+Generated files therefore remain sandbox evidence unless a separately reviewed
+safe write boundary is available. Environment flags may make an implemented
+capability stricter; they must never be interpreted as creating an unavailable
+capability.
 
 Do not imply capabilities Forge does not have yet: parallel autonomous
-specialists, commits, PR creation, merge automation, or unrestricted MCP runtime
-grants.
+specialists, commits, PR creation, merge automation, unrestricted MCP runtime
+grants, or general host-repository writes.
 
 ## Roles
 
@@ -62,8 +69,9 @@ or prompt overlays layered onto them, not extra top-level agents.
 
 When operating Forge manually through a runtime such as Codex or Claude Code,
 act as the **project manager and lead architect**: plan, decompose, delegate,
-and review — you do not write implementation code directly unless no specialist
-role is appropriate.
+and review. Prefer the appropriate specialist role for implementation, but the
+PM may also implement directly when the user explicitly asks it to own an
+end-to-end delivery or when no separate specialist is appropriate.
 
 Manual Codex operation may spawn native subagents defined under `.codex/agents/`.
 Those files are an optional manual helper surface mirroring the roles above; they
@@ -76,6 +84,32 @@ are not the product source of truth for the app catalogue.
 3. **Review** every pull request before merge via the Review role.
 4. **Maintain** architectural consistency across components.
 5. **Approve or reject** output; spawn rework when needed.
+
+### Delivery PR rule
+
+`Architect first` is a **sequencing and evidence rule**, not a requirement to
+open a separate architecture-only pull request.
+
+For a feature or cross-cutting change, the normal delivery shape may be one
+**combined draft PR** containing architecture, implementation, tests, and review
+work when that keeps one coherent source issue and one reviewable change set.
+
+- Establish the architecture contract before or alongside the first dependent
+  implementation change, and keep implementation traceable to that contract.
+- Specialist agents may commit their implementation and QA work to the same
+  delivery branch/PR. Do not create artificial PR boundaries solely because the
+  work moved from Architect to Backend/Frontend/QA.
+- Keep the PR draft while implementation or required verification is incomplete.
+- A source issue with implementation acceptance criteria is not complete merely
+  because its architecture document is complete. Do not present an
+  architecture-only PR as delivery-complete unless the user explicitly scoped
+  the PR to architecture only.
+- The PR body should state the delivery mode (`combined`, `architecture`, or
+  `implementation`) and, for combined PRs, identify architecture evidence,
+  implementation evidence, tests/verification, and remaining scope.
+- Large combined PRs still need small internal slices and reviewable commits.
+  `Combined` does not mean bypassing QA, security review, migrations, CI, or
+  human gates.
 
 ### Default review behaviour
 
@@ -113,30 +147,33 @@ never overwrite their customization silently.
 
 ### Workflow (target/manual path)
 
-```
+```text
 Issue / Request
       │
       ▼
-1. Architect → design doc + task breakdown
+1. Architect → design contract + task breakdown
+      │
+      ├──────────── same draft delivery PR is allowed ────────────┐
+      ▼                                                           │
+2. Backend / Frontend / DevOps → implementation slices            │
+      │                                                           │
+      ▼                                                           │
+3. QA → tests and verification                                    │
+      │                                                           │
+      ▼                                                           │
+4. Review → orthogonal review (Security/Adversarial when needed) ─┘
       │
       ▼
-2. Assign subtasks to Backend / Frontend / DevOps
-      │
-      ▼
-3. QA → write tests for each subtask
-      │
-      ▼
-4. Review → orthogonal review protocol (Security/Adversarial for high-risk changes)
-      │
-      ▼
-5. PM (you) → merge or rework
+5. PM → merge or rework after required gates pass
 ```
 
 ### Decision rules
 
 - **Always** run Architect first for any new feature or cross-cutting change.
+- Architect-first does **not** require a separate PR; combined delivery PRs are
+  preferred when architecture and implementation are one coherent change.
 - **Always** run Review before merging any PR.
-- **Never** merge without passing QA tests.
+- **Never** merge without passing the required QA/CI evidence.
 - For refactors touching >3 files, run Architect before Backend/Frontend.
 - For security-sensitive changes (auth, secrets, filesystem, command execution,
   repository writes, tool permissions, prompt injection, merge automation),

@@ -288,6 +288,7 @@ async function recordOperationCapabilityAttemptBestEffort(input: {
       .where(eq(executionOutcomes.id, input.executionOutcomeId))
       .limit(1)
     if (!outcomeRow) return
+    if (!run.taskId) return
     const outcomeCandidate: unknown = {
       schemaVersion: outcomeRow.schemaVersion,
       transportStatus: outcomeRow.transportStatus,

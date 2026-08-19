@@ -3,6 +3,7 @@ import { sql } from 'drizzle-orm'
 import { db } from '@/db'
 import type { LoadedVerificationGoal } from '@/lib/verification-goals/registry'
 import type { VerificationGoalRegistryManifest } from '@/lib/verification-goals/manifest'
+import { buildVerificationGoalExecutionBindingV1 } from '@/lib/verification-goals/executable-contracts'
 import { VerificationGoalImportError } from './errors'
 import {
   insertOrResolveVerificationGoalSnapshot,
@@ -32,6 +33,8 @@ export type VerificationGoalRegistryCommitInput = Readonly<{
 export type VerificationGoalRegistryCommitResult = Readonly<{
   registryRevisionId: string
   manifestDigest: string
+  /** Present only for executable manifest v2; omitted for historical v1 compatibility. */
+  manifestSchemaVersion?: 2
   headState: 'advanced' | 'existing'
   snapshots: readonly VerificationGoalSnapshotImportResult[]
 }>
@@ -46,12 +49,18 @@ type RegistryCommitRow = {
   headState: 'advanced' | 'existing'
 }
 
-type CommitRoutineEntry = {
+type CommitRoutineEntryV1 = {
   snapshotId: string
   goalId: string
   definitionVersion: number
   definitionDigest: string
   sourcePath: string
+}
+
+type CommitRoutineEntryV2 = CommitRoutineEntryV1 & {
+  entrySchemaVersion: 1 | 2
+  executionBinding: ReturnType<typeof buildVerificationGoalExecutionBindingV1> | null
+  executionBindingDigest: string | null
 }
 
 function sqlState(error: unknown): string | null {
@@ -62,21 +71,45 @@ function sqlState(error: unknown): string | null {
   return typeof nested === 'string' ? nested : null
 }
 
+function manifestSchemaVersion(manifest: VerificationGoalRegistryManifest): 1 | 2 {
+  return 'schemaVersion' in manifest ? manifest.schemaVersion : 1
+}
+
+function goalById(goals: readonly LoadedVerificationGoal[]): ReadonlyMap<string, LoadedVerificationGoal> {
+  const map = new Map<string, LoadedVerificationGoal>()
+  for (const goal of goals) {
+    if (map.has(goal.definition.goalId)) {
+      throw new Error('Verification goal registry contains duplicate goal identity.')
+    }
+    map.set(goal.definition.goalId, goal)
+  }
+  return map
+}
+
 function manifestMatchesGoals(input: VerificationGoalRegistryCommitInput): boolean {
   if (input.goals.length !== input.manifest.entries.length) return false
-  return input.goals.every((goal, index) => {
-    const entry = input.manifest.entries[index]
-    return entry?.goalId === goal.definition.goalId
-      && entry.definitionVersion === goal.definition.definitionVersion
-      && entry.definitionDigest === goal.definitionDigest
-      && entry.sourcePath === goal.sourcePath
+  const goals = goalById(input.goals)
+  return input.manifest.entries.every((entry) => {
+    const goal = goals.get(entry.goalId)
+    if (
+      !goal
+      || entry.definitionVersion !== goal.definition.definitionVersion
+      || entry.definitionDigest !== goal.definitionDigest
+      || entry.sourcePath !== goal.sourcePath
+    ) return false
+
+    if (!('schemaVersion' in input.manifest)) return goal.definition.schemaVersion === 1
+    if (!('entrySchemaVersion' in entry) || entry.entrySchemaVersion !== goal.definition.schemaVersion) return false
+    const v2Entry = entry as unknown as { executionBindingDigest: string | null }
+    if (goal.definition.schemaVersion === 1) return v2Entry.executionBindingDigest === null
+    return v2Entry.executionBindingDigest === buildVerificationGoalExecutionBindingV1(goal.definition).executionBindingDigest
   })
 }
 
 async function invokeCommitRoutine(
   tx: VerificationGoalSnapshotTransaction,
   input: VerificationGoalRegistryCommitInput,
-  entries: readonly CommitRoutineEntry[],
+  entries: readonly (CommitRoutineEntryV1 | CommitRoutineEntryV2)[],
 ): Promise<RegistryCommitRow> {
   try {
     const rows = await tx.execute<RegistryCommitRow>(sql`
@@ -84,7 +117,7 @@ async function invokeCommitRoutine(
         committed.registry_revision_id as "registryRevisionId",
         committed.revision_sequence as "revisionSequence",
         committed.head_state as "headState"
-      from public.forge_commit_verification_goal_registry_revision_v1(
+      from public.forge_commit_verification_goal_registry_revision_v2(
         ${input.authority.projectId}::uuid,
         ${input.authority.applicationAssertedActorUserId}::uuid,
         ${input.authority.priorHeadRevisionId}::uuid,
@@ -95,6 +128,7 @@ async function invokeCommitRoutine(
         ${input.authority.rootBindingRevision}::bigint,
         ${input.authority.grantDecisionRevision}::bigint,
         ${input.authority.projectRevision}::timestamptz,
+        ${manifestSchemaVersion(input.manifest)}::integer,
         ${input.manifest.digest}::text,
         ${JSON.stringify(entries)}::jsonb
       ) committed
@@ -120,11 +154,6 @@ async function invokeCommitRoutine(
   }
 }
 
-/**
- * Inserts immutable definition snapshots, then asks the protected database
- * routine to construct and advance the authoritative registry revision. The
- * application login has no direct write privilege on revision state.
- */
 export function createDatabaseVerificationGoalRegistryStore(
   database: typeof db = db,
 ): VerificationGoalRegistryStore {
@@ -144,21 +173,36 @@ export function createDatabaseVerificationGoalRegistryStore(
           ))
         }
         const snapshotByGoal = new Map(snapshots.map((snapshot) => [snapshot.goalId, snapshot]))
-        const entries = input.manifest.entries.map((entry) => {
+        const goals = goalById(input.goals)
+        const schemaVersion = manifestSchemaVersion(input.manifest)
+        const entries = input.manifest.entries.map((entry): CommitRoutineEntryV1 | CommitRoutineEntryV2 => {
           const snapshot = snapshotByGoal.get(entry.goalId)
-          if (!snapshot) throw new Error('Verification goal registry snapshot membership is incomplete.')
-          return {
+          const goal = goals.get(entry.goalId)
+          if (!snapshot || !goal) throw new Error('Verification goal registry snapshot membership is incomplete.')
+          const base: CommitRoutineEntryV1 = {
             snapshotId: snapshot.snapshotId,
             goalId: entry.goalId,
             definitionVersion: entry.definitionVersion,
             definitionDigest: entry.definitionDigest,
             sourcePath: entry.sourcePath,
           }
+          if (schemaVersion === 1) return base
+
+          const executionBinding = goal.definition.schemaVersion === 2
+            ? buildVerificationGoalExecutionBindingV1(goal.definition)
+            : null
+          return {
+            ...base,
+            entrySchemaVersion: goal.definition.schemaVersion,
+            executionBinding,
+            executionBindingDigest: executionBinding?.executionBindingDigest ?? null,
+          }
         })
         const committed = await invokeCommitRoutine(tx, input, entries)
         return {
           registryRevisionId: committed.registryRevisionId,
           manifestDigest: input.manifest.digest,
+          ...(schemaVersion === 2 ? { manifestSchemaVersion: 2 as const } : {}),
           headState: committed.headState,
           snapshots,
         }

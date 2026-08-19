@@ -19,7 +19,7 @@ WEB_ROOT="$(cd -P "$SCRIPT_DIR/../.." && pwd)"
 REPO_ROOT="$(cd -P "$WEB_ROOT/.." && pwd)"
 FIXTURE="$SCRIPT_DIR/sql/installer-legacy-0023-0025-fixture.sql"
 CONSUMER_OTHER_DATABASE=forge_installer_legacy_consumer_other_test
-CANONICAL_PROTECTED_DIRECT_READ_COUNT=5
+CANONICAL_PROTECTED_DIRECT_READ_COUNT=14
 TEMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/forge-legacy-repair-dbr1.XXXXXX")"
 trap 'rm -rf "$TEMP_ROOT"' EXIT
 source "$REPO_ROOT/scripts/ci/current-migration-ledger.sh"
@@ -599,7 +599,16 @@ DECLARE
     'work_package_local_projection_heads',
     'verification_goal_registry_revisions',
     'verification_goal_registry_entries',
-    'verification_goal_registry_heads'
+    'verification_goal_registry_heads',
+    'verification_goal_policy_revisions',
+    'verification_goal_policy_heads',
+    'verification_goal_runs',
+    'verification_goal_events',
+    'verification_goal_repository_snapshots',
+    'verification_goal_environment_snapshots',
+    'verification_goal_schedule_bindings',
+    'verification_goal_schedule_heads',
+    'verification_goal_schedule_slots'
   ];
 BEGIN
   IF EXISTS (
@@ -1329,7 +1338,7 @@ run_managed_sequence
 # A real legacy install ran the broad app grant after reaching latest. Recreate
 # that state before the next upgrade so the 0028 normalizer sees a real shape.
 grant_exact_forge_contamination
-assert_protected_forge_acl_count 160
+assert_protected_forge_acl_count 196
 run_managed_sequence
 snapshot managed-latest-once
 assert_protected_forge_acl_count "$CANONICAL_PROTECTED_DIRECT_READ_COUNT"
@@ -1369,7 +1378,7 @@ CREATE TABLE public.forge_legacy_ordinary_acl_probe (
 );
 SQL
 grant_exact_forge_contamination
-assert_protected_forge_acl_count 160
+assert_protected_forge_acl_count 196
 echo 'Proving legacy normalizer role races block, then refuse the committed unsafe boundary.'
 prove_role_boundary_race_refusal legacy attribute
 prove_role_boundary_race_refusal legacy membership

@@ -1,12 +1,35 @@
 # GitHub Agent Pull Request Contract
 
-Every implementation pull request in the GitHub-native agent workflow must point
-back to the issue it came from. That link lets a reviewer see the original
-request, the acceptance criteria, the agent run that prepared the work, and the
-tests the author says they ran.
+Every delivery pull request in the GitHub-native agent workflow must point back
+to the issue it came from. A **delivery PR** may be implementation-only or a
+combined architecture+implementation PR. Architecture-first remains required for
+cross-cutting changes, but Forge does not require a separate architecture PR
+unless there is a concrete safety, dependency, or review reason to split the
+work.
+
+That link lets a reviewer see the original request, the acceptance criteria, the
+agent run that prepared the work, the architecture evidence when applicable, the
+implementation evidence, and the tests the author says they ran.
 
 This is traceability and review support. It is not proof that the code is
 correct.
+
+## Delivery Modes
+
+A PR should identify one delivery mode in the `Agent Run` section:
+
+- `combined` — architecture, implementation, QA, and review progress are carried
+  in one draft delivery PR. This is the normal choice when they belong to one
+  coherent source issue.
+- `architecture` — architecture-only by explicit scope. This does **not** satisfy
+  implementation acceptance criteria unless the source issue/user explicitly
+  scoped the PR to architecture only.
+- `implementation` — implementation against an already accepted architecture or
+  a change small enough not to require a new architecture contract.
+
+`Architect first` is an ordering rule inside a combined PR, not a phase-specific
+PR rule. Specialist agents may continue on the same branch/PR as ownership moves
+from Architect to Backend/Frontend/DevOps/QA/Reviewer.
 
 ## Required Sections
 
@@ -22,8 +45,13 @@ Closes #<issue-number>
 
 Runtime: claude-code | codex | dry-run | manual
 Run ID: <run-id or n/a>
+Delivery mode: combined | architecture | implementation
 
 ## Summary
+
+Architecture evidence: <design / ADR / invariant references or n/a>
+Implementation evidence: <code / migration / behavior references or n/a>
+Remaining delivery scope: <remaining work in this PR or none>
 
 ## Acceptance Criteria Validation
 
@@ -35,7 +63,26 @@ Run ID: <run-id or n/a>
 ```
 
 The shared section list lives in
-`web/scripts/github-agent-workflow/contracts/pr-contract-sections.ts`.
+`web/scripts/github-agent-workflow/contracts/pr-contract-sections.ts`. The
+template renderer lives in
+`web/scripts/github-agent-workflow/core/pr-contract.ts`.
+
+## Combined PR Rules
+
+For a combined delivery PR:
+
+1. Establish the architecture contract before or alongside the first dependent
+   implementation change.
+2. Keep implementation traceable to architecture decisions/invariants and source
+   acceptance criteria.
+3. Keep the PR draft while implementation or required verification is incomplete.
+4. Do not mark a source issue complete merely because architecture is complete
+   when implementation acceptance criteria remain.
+5. Keep internal slices and commits reviewable even though they share one PR.
+6. QA, Security/Adversarial, migration, CI, and human approval gates remain in
+   force. Combined delivery never bypasses them.
+7. Update `Remaining delivery scope` as slices land so the PR says what is still
+   missing instead of implying future work is complete.
 
 ## Source Issue Link
 
@@ -50,9 +97,9 @@ The `Source Issue` section must include one supported link phrase:
 #123` is available when a pull request should be linked for review but should
 not automatically close the issue.
 
-Every implementation pull request needs this link because Forge reads the source
-issue to find the acceptance criteria. Without it, a reviewer has to guess what
-the pull request is supposed to satisfy.
+Every delivery pull request needs this link because Forge reads the source issue
+to find the acceptance criteria. Without it, a reviewer has to guess what the
+pull request is supposed to satisfy.
 
 ## Acceptance Criteria Validation
 
@@ -64,7 +111,7 @@ Good examples:
 ```text
 - [x] Dispatch refuses closed issues — covered by github-agent-dispatch.test.ts.
 - [x] Handoff artifacts stay git-ignored — verified with git check-ignore and unit test.
-- [ ] Documentation updated — not done; follow-up needed.
+- [ ] Scheduled proof runs deduplicate — scheduler slice not implemented yet in this draft PR.
 ```
 
 Weak examples:

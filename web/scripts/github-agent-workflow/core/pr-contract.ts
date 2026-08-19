@@ -12,6 +12,8 @@ import { normalizeSectionHeading, parseSections } from './sections'
 // global-flag `lastIndex` never leaks between callers.
 const ISSUE_LINK_REGEX_SOURCE = `\\b(${ISSUE_LINK_KEYWORDS.join('|')})\\b\\s*:?\\s+#(\\d+)`
 
+export type PrDeliveryMode = 'combined' | 'architecture' | 'implementation'
+
 export function issueLinkPattern(): RegExp {
   return new RegExp(ISSUE_LINK_REGEX_SOURCE, 'gi')
 }
@@ -47,11 +49,13 @@ export function renderPrContractTemplate(input: {
   issueNumber?: number | null
   runtime?: string | null
   runId?: string | null
+  deliveryMode?: PrDeliveryMode | null
   acceptanceCriteria?: readonly string[]
 } = {}): string {
   const issueReference = input.issueNumber ? `Closes #${input.issueNumber}` : 'Closes #<issue-number>'
   const runtime = input.runtime?.trim() || 'claude-code | codex | dry-run | manual'
   const runId = input.runId?.trim() || '<run-id or n/a>'
+  const deliveryMode = input.deliveryMode ?? 'combined'
   const validation = renderAcceptanceCriteriaValidation(input.acceptanceCriteria ?? [])
 
   return [
@@ -63,8 +67,13 @@ export function renderPrContractTemplate(input: {
     '',
     `Runtime: ${runtime}`,
     `Run ID: ${runId}`,
+    `Delivery mode: ${deliveryMode}`,
     '',
     `## ${PR_CONTRACT_SECTION_TITLES[2]}`,
+    '',
+    'Architecture evidence: <design / ADR / invariant references or n/a>',
+    'Implementation evidence: <code / migration / behavior references or n/a>',
+    'Remaining delivery scope: <remaining work in this PR or none>',
     '',
     `## ${PR_CONTRACT_SECTION_TITLES[3]}`,
     '',

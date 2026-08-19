@@ -10,6 +10,8 @@ export type VerificationGoalSnapshotImportResult = {
   snapshotId: string
   goalId: string
   definitionVersion: number
+  /** Added by executable-goal v2; omitted by legacy test stores/adapters. */
+  definitionSchemaVersion?: 1 | 2
   kind: 'inserted' | 'existing'
 }
 
@@ -36,7 +38,7 @@ export class VerificationGoalSnapshotConflictError extends Error {
 }
 
 function canonicalDefinitionValue(goal: LoadedVerificationGoal): Record<string, unknown> {
-  return {
+  const base = {
     schemaVersion: goal.definition.schemaVersion,
     goalId: goal.definition.goalId,
     definitionVersion: goal.definition.definitionVersion,
@@ -46,6 +48,18 @@ function canonicalDefinitionValue(goal: LoadedVerificationGoal): Record<string, 
     severity: goal.definition.severity,
     enabled: goal.definition.enabled,
     operations: goal.definition.operations.map((operation) => ({ ...operation })),
+  }
+  if (goal.definition.schemaVersion === 1) return base
+  return {
+    ...base,
+    execution: {
+      manual: goal.definition.execution.manual,
+      schedule: goal.definition.execution.schedule === null
+        ? null
+        : { ...goal.definition.execution.schedule },
+      deadlineSeconds: goal.definition.execution.deadlineSeconds,
+      requiredEvidence: [...goal.definition.execution.requiredEvidence],
+    },
   }
 }
 
@@ -78,14 +92,11 @@ async function insertOrResolveSnapshot(
       snapshotId: inserted.id,
       goalId: goal.definition.goalId,
       definitionVersion: goal.definition.definitionVersion,
+      definitionSchemaVersion: goal.definition.schemaVersion,
       kind: 'inserted',
     }
   }
 
-  // A concurrent INSERT ... ON CONFLICT waits for the winning transaction.
-  // This following statement gets a fresh READ COMMITTED snapshot and can
-  // therefore resolve the committed winner rather than misreporting it as
-  // missing.
   const [existing] = await tx
     .select({
       id: verificationGoalSnapshots.id,
@@ -113,16 +124,13 @@ async function insertOrResolveSnapshot(
     snapshotId: existing.id,
     goalId: goal.definition.goalId,
     definitionVersion: goal.definition.definitionVersion,
+    definitionSchemaVersion: goal.definition.schemaVersion,
     kind: 'existing',
   }
 }
 
 export { insertOrResolveSnapshot as insertOrResolveVerificationGoalSnapshot }
 
-/**
- * Imports the already-validated registry in one transaction. A divergent
- * identity conflict rolls back every snapshot inserted by this import.
- */
 export function createDatabaseVerificationGoalSnapshotStore(
   database: typeof db = db,
 ): VerificationGoalSnapshotStore {
@@ -130,9 +138,6 @@ export function createDatabaseVerificationGoalSnapshotStore(
     async importSnapshots(projectId, goals) {
       if (goals.length === 0) return []
       return database.transaction(async (tx) => {
-        // A concurrent importer may hold the same unique identity open. The
-        // normal critical section is milliseconds; cap the wait so a parked
-        // peer cannot pin this worker connection indefinitely.
         await tx.execute(sql`SET LOCAL lock_timeout = '5s'`)
         const results: VerificationGoalSnapshotImportResult[] = []
         for (const goal of goals) {

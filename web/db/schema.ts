@@ -1464,7 +1464,11 @@ export const executionOutcomes = pgTable(
   'execution_outcomes',
   {
     id: uuid('id').primaryKey().defaultRandom(),
-    taskId: uuid('task_id').notNull().references(() => tasks.id, { onDelete: 'restrict' }),
+    // Exactly one of taskId or verificationGoalRunId must be set. A row is
+    // either a legacy task-owned outcome (schema v1) or a goal-owned outcome
+    // (schema v2) with the goal-run foreign key populated.
+    taskId: uuid('task_id').references(() => tasks.id, { onDelete: 'restrict' }),
+    verificationGoalRunId: uuid('verification_goal_run_id').references(() => verificationGoalRuns.id, { onDelete: 'restrict' }),
     // Admission may stop before a run or queue-attempt row exists.
     workPackageId: uuid('work_package_id').references(() => workPackages.id, { onDelete: 'set null' }),
     agentRunId: uuid('agent_run_id').references(() => agentRuns.id, { onDelete: 'set null' }),
@@ -1473,6 +1477,7 @@ export const executionOutcomes = pgTable(
     schemaVersion: integer('schema_version').notNull().default(1),
     transportStatus: text('transport_status').notNull(),
     result: text('result').notNull(),
+    failureClass: text('failure_class'),
     stopReasonCode: text('stop_reason_code'),
     stopReasonSummary: text('stop_reason_summary'),
     retryable: boolean('retryable').notNull(),
@@ -1484,15 +1489,34 @@ export const executionOutcomes = pgTable(
   },
   (t) => [
     uniqueIndex('execution_outcomes_task_attempt_key_idx').on(t.taskId, t.attemptKey),
+    uniqueIndex('execution_outcomes_goal_attempt_key_idx')
+      .on(t.verificationGoalRunId, t.attemptKey)
+      .where(sql`${t.verificationGoalRunId} is not null`),
+    index('execution_outcomes_verification_goal_run_id_idx').on(t.verificationGoalRunId),
     index('execution_outcomes_work_package_id_idx').on(t.workPackageId),
     index('execution_outcomes_agent_run_id_idx').on(t.agentRunId),
     index('execution_outcomes_task_attempt_id_idx').on(t.taskAttemptId),
-    check('execution_outcomes_schema_version_check', sql`${t.schemaVersion} = 1`),
+    check('execution_outcomes_schema_version_check', sql`${t.schemaVersion} IN (1, 2)`),
     check('execution_outcomes_transport_status_check', sql`${t.transportStatus} IN ('ok', 'error')`),
     check('execution_outcomes_result_check', sql`${t.result} IN ('completed', 'partial', 'refused', 'blocked', 'needs_attention', 'failed', 'cancelled')`),
+    check('execution_outcomes_failure_class_check', sql`${t.failureClass} IS NULL OR ${t.failureClass} IN ('functional', 'policy', 'authority', 'infrastructure', 'evidence', 'cancelled')`),
     check('execution_outcomes_stop_reason_code_check', sql`${t.stopReasonCode} IS NULL OR ${t.stopReasonCode} IN ('provider_transport_failure', 'model_refusal', 'invalid_output', 'validation_failed', 'missing_capability', 'admission_denied', 'policy_blocked', 'security_blocked', 'missing_repository_context', 'timeout', 'context_limit', 'output_limit', 'retry_exhausted', 'human_cancelled', 'unknown')`),
     check('execution_outcomes_verification_status_check', sql`${t.verificationStatus} IN ('not_required', 'pending', 'passed', 'failed', 'inconclusive')`),
     check('execution_outcomes_verifier_consistency_check', sql`(${t.verifierRequired} AND ${t.verificationStatus} IN ('pending', 'passed', 'failed', 'inconclusive')) OR (NOT ${t.verifierRequired} AND ${t.verificationStatus} = 'not_required')`),
+    check('execution_outcomes_subject_check', sql`
+      (
+        ${t.taskId} is not null
+        and ${t.verificationGoalRunId} is null
+        and ${t.schemaVersion} = 1
+      ) or (
+        ${t.taskId} is null
+        and ${t.verificationGoalRunId} is not null
+        and ${t.schemaVersion} = 2
+        and ${t.workPackageId} is null
+        and ${t.agentRunId} is null
+        and ${t.taskAttemptId} is null
+      )
+    `),
   ],
 )
 
@@ -1508,13 +1532,17 @@ export const operationRuns = pgTable(
   'operation_runs',
   {
     id: uuid('id').primaryKey().defaultRandom(),
-    taskId: uuid('task_id').notNull().references(() => tasks.id, { onDelete: 'restrict' }),
+    // Exactly one of taskId or verificationGoalRunId must be set. Goal rows
+    // additionally store the canonical ordinal from the resolved run policy.
+    taskId: uuid('task_id').references(() => tasks.id, { onDelete: 'restrict' }),
+    verificationGoalRunId: uuid('verification_goal_run_id').references(() => verificationGoalRuns.id, { onDelete: 'restrict' }),
     projectId: uuid('project_id').notNull().references(() => projects.id, { onDelete: 'restrict' }),
     workPackageId: uuid('work_package_id').references(() => workPackages.id, { onDelete: 'set null' }),
     agentRunId: uuid('agent_run_id').references(() => agentRuns.id, { onDelete: 'set null' }),
     taskAttemptId: uuid('task_attempt_id').references(() => taskAttempts.id, { onDelete: 'set null' }),
     executionOutcomeId: uuid('execution_outcome_id').references(() => executionOutcomes.id, { onDelete: 'restrict' }),
     definitionSchemaVersion: integer('definition_schema_version').notNull().default(1),
+    goalOperationOrdinal: integer('goal_operation_ordinal'),
     operationId: text('operation_id').notNull(),
     operationVersion: integer('operation_version').notNull(),
     capability: text('capability').notNull(),
@@ -1535,13 +1563,17 @@ export const operationRuns = pgTable(
   },
   (t) => [
     uniqueIndex('operation_runs_task_idempotency_key_idx').on(t.taskId, t.idempotencyKey),
+    uniqueIndex('operation_runs_goal_ordinal_idx')
+      .on(t.verificationGoalRunId, t.goalOperationOrdinal)
+      .where(sql`${t.verificationGoalRunId} is not null`),
+    index('operation_runs_verification_goal_run_id_idx').on(t.verificationGoalRunId),
     index('operation_runs_project_id_created_at_idx').on(t.projectId, t.createdAt),
     index('operation_runs_operation_version_idx').on(t.operationId, t.operationVersion),
     index('operation_runs_execution_outcome_id_idx').on(t.executionOutcomeId),
     check('operation_runs_definition_schema_check', sql`${t.definitionSchemaVersion} = 1`),
     check('operation_runs_operation_version_check', sql`${t.operationVersion} > 0`),
     check('operation_runs_status_check', sql`${t.status} IN ('running', 'completed', 'blocked', 'failed')`),
-    check('operation_runs_verification_status_check', sql`${t.verificationStatus} IN ('not_started', 'passed', 'failed')`),
+    check('operation_runs_verification_status_check', sql`${t.verificationStatus} IN ('not_started', 'passed', 'failed', 'not_required', 'inconclusive')`),
     check('operation_runs_fingerprints_check', sql`
       ${t.idempotencyKey} ~ '^[0-9a-f]{64}$' AND
       ${t.definitionDigest} ~ '^[0-9a-f]{64}$' AND
@@ -1555,6 +1587,20 @@ export const operationRuns = pgTable(
     check('operation_runs_terminal_shape_check', sql`
       (${t.status} = 'running' AND ${t.completedAt} IS NULL AND ${t.executionOutcomeId} IS NULL AND ${t.outcomeFingerprint} IS NULL) OR
       (${t.status} <> 'running' AND ${t.completedAt} IS NOT NULL AND ${t.executionOutcomeId} IS NOT NULL AND ${t.outcomeFingerprint} IS NOT NULL)
+    `),
+    check('operation_runs_subject_check', sql`
+      (
+        ${t.taskId} is not null
+        and ${t.verificationGoalRunId} is null
+        and ${t.goalOperationOrdinal} is null
+      ) or (
+        ${t.taskId} is null
+        and ${t.verificationGoalRunId} is not null
+        and ${t.goalOperationOrdinal} is not null
+        and ${t.workPackageId} is null
+        and ${t.agentRunId} is null
+        and ${t.taskAttemptId} is null
+      )
     `),
   ],
 )
@@ -1610,7 +1656,10 @@ export const capabilityAttempts = pgTable(
     id: uuid('id').primaryKey().defaultRandom(),
     attemptGroupId: uuid('attempt_group_id').notNull(),
     projectId: uuid('project_id').notNull().references(() => projects.id, { onDelete: 'restrict' }),
-    taskId: uuid('task_id').notNull().references(() => tasks.id, { onDelete: 'restrict' }),
+    // Exactly one of taskId or verificationGoalRunId must be set. Goal rows
+    // use reliability contract v2 and keep task-only links null.
+    taskId: uuid('task_id').references(() => tasks.id, { onDelete: 'restrict' }),
+    verificationGoalRunId: uuid('verification_goal_run_id').references(() => verificationGoalRuns.id, { onDelete: 'restrict' }),
     workPackageId: uuid('work_package_id').references(() => workPackages.id, { onDelete: 'set null' }),
     agentRunId: uuid('agent_run_id').references(() => agentRuns.id, { onDelete: 'set null' }),
     taskAttemptId: uuid('task_attempt_id').references(() => taskAttempts.id, { onDelete: 'set null' }),
@@ -1647,7 +1696,8 @@ export const capabilityAttempts = pgTable(
     index('capability_attempts_project_capability_idx').on(t.projectId, t.capabilityKey),
     index('capability_attempts_attempt_group_idx').on(t.attemptGroupId),
     index('capability_attempts_execution_outcome_idx').on(t.executionOutcomeId),
-    check('capability_attempts_contract_version_check', sql`${t.contractVersion} = 1`),
+    index('capability_attempts_verification_goal_run_id_idx').on(t.verificationGoalRunId),
+    check('capability_attempts_contract_version_check', sql`${t.contractVersion} IN (1, 2)`),
     check('capability_attempts_capability_key_check', sql`length(${t.capabilityKey}) <= 120 AND ${t.capabilityKey} ~ '^(workpackage:[a-z][a-z0-9-]{0,39}/[a-z][a-z0-9-]{0,39}|operation:[a-z][a-z0-9]*([._-][a-z0-9]+)+@[1-9][0-9]{0,3})$'`),
     check('capability_attempts_classification_state_check', sql`${t.classificationState} IN ('classified', 'missing', 'overflow')`),
     check('capability_attempts_capability_multiplicity_check', sql`${t.capabilityMultiplicity} BETWEEN 1 AND 12`),
@@ -1671,6 +1721,20 @@ export const capabilityAttempts = pgTable(
     check('capability_attempts_verification_mode_check', sql`(${t.verificationMode} = 'none') = (NOT ${t.verifierRequired})`),
     check('capability_attempts_unclassified_check', sql`(${t.classificationState} = 'classified') OR ${t.capabilityKey} LIKE 'workpackage:%/unclassified'`),
     check('capability_attempts_operation_runtime_check', sql`${t.operationRunId} IS NULL OR ${t.verificationMode} IN ('none', 'deterministic_adapter')`),
+    check('capability_attempts_subject_check', sql`
+      (
+        ${t.taskId} is not null
+        and ${t.verificationGoalRunId} is null
+        and ${t.contractVersion} = 1
+      ) or (
+        ${t.taskId} is null
+        and ${t.verificationGoalRunId} is not null
+        and ${t.contractVersion} = 2
+        and ${t.workPackageId} is null
+        and ${t.agentRunId} is null
+        and ${t.taskAttemptId} is null
+      )
+    `),
   ],
 )
 
@@ -1808,6 +1872,7 @@ export const verificationGoalRegistryRevisions = pgTable(
       onUpdate: 'restrict',
     }),
     revisionSequence: bigint('revision_sequence', { mode: 'bigint' }).notNull(),
+    manifestSchemaVersion: integer('manifest_schema_version').notNull().default(1),
     manifestDigest: text('manifest_digest').notNull(),
     applicationAssertedActorUserId: uuid('application_asserted_actor_user_id').notNull().references(() => users.id, {
       onDelete: 'restrict',
@@ -1848,6 +1913,7 @@ export const verificationGoalRegistryRevisions = pgTable(
       name: 'verification_goal_registry_revisions_predecessor_fk',
     }).onDelete('restrict').onUpdate('restrict'),
     check('verification_goal_registry_revisions_sequence_check', sql`${t.revisionSequence} > 0`),
+    check('verification_goal_registry_revisions_manifest_schema_check', sql`${t.manifestSchemaVersion} in (1, 2)`),
     check('verification_goal_registry_revisions_manifest_digest_check', sql`
       ${t.manifestDigest} ~ '^[0-9a-f]{64}$'
     `),
@@ -1877,6 +1943,9 @@ export const verificationGoalRegistryEntries = pgTable(
     definitionVersion: integer('definition_version').notNull(),
     definitionDigest: text('definition_digest').notNull(),
     sourcePath: text('source_path').notNull(),
+    entrySchemaVersion: integer('entry_schema_version').notNull().default(1),
+    executionBinding: jsonb('execution_binding').$type<Record<string, unknown>>(),
+    executionBindingDigest: text('execution_binding_digest'),
     createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
   },
   (t) => [
@@ -1925,6 +1994,23 @@ export const verificationGoalRegistryEntries = pgTable(
       length(${t.sourcePath}) <= 256
       and ${t.sourcePath} ~ '^\\.forge/verification-goals/[A-Za-z0-9][A-Za-z0-9._-]{0,126}\\.json$'
     `),
+    check('verification_goal_registry_entries_schema_binding_check', sql`
+      (
+        ${t.entrySchemaVersion} = 1
+        and ${t.executionBinding} is null
+        and ${t.executionBindingDigest} is null
+      ) or (
+        ${t.entrySchemaVersion} = 2
+        and pg_catalog.jsonb_typeof(${t.executionBinding}) = 'object'
+        and pg_catalog.octet_length(${t.executionBinding}::text) <= 32768
+        and ${t.executionBindingDigest} ~ '^[0-9a-f]{64}$'
+        and ${t.executionBinding} ->> 'executionBindingDigest' = ${t.executionBindingDigest}
+        and ${t.executionBinding} ->> 'schemaVersion' = '1'
+        and ${t.executionBinding} ->> 'eligibilityPolicyVersion' = '1'
+        and pg_catalog.jsonb_typeof(${t.executionBinding} -> 'operations') = 'array'
+        and pg_catalog.jsonb_array_length(${t.executionBinding} -> 'operations') between 1 and 16
+      )
+    `),
   ],
 )
 
@@ -1960,6 +2046,637 @@ export type VerificationGoalRegistryEntry = InferSelectModel<typeof verification
 export type NewVerificationGoalRegistryEntry = InferInsertModel<typeof verificationGoalRegistryEntries>
 export type VerificationGoalRegistryHead = InferSelectModel<typeof verificationGoalRegistryHeads>
 export type NewVerificationGoalRegistryHead = InferInsertModel<typeof verificationGoalRegistryHeads>
+
+// ---------------------------------------------------------------------------
+// verificationGoalPolicyRevisions / verificationGoalPolicyHeads
+// ---------------------------------------------------------------------------
+// Per-project verification execution policy. Revisions are immutable; the head
+// moves forward only through the protected compare-and-set routine. A missing
+// head means execution is denied for that project.
+export const verificationGoalPolicyRevisions = pgTable(
+  'verification_goal_policy_revisions',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    projectId: uuid('project_id')
+      .notNull()
+      .references(() => projects.id, { onDelete: 'restrict', onUpdate: 'restrict' }),
+    revisionSequence: bigint('revision_sequence', { mode: 'bigint' }).notNull(),
+    policyDigest: text('policy_digest').notNull(),
+    manualEnabled: boolean('manual_enabled').notNull().default(false),
+    schedulingEnabled: boolean('scheduling_enabled').notNull().default(false),
+    minScheduleIntervalSeconds: bigint('min_schedule_interval_seconds', { mode: 'bigint' }).notNull(),
+    maxRunDeadlineSeconds: bigint('max_run_deadline_seconds', { mode: 'bigint' }).notNull(),
+    maxQueueAgeSeconds: bigint('max_queue_age_seconds', { mode: 'bigint' }).notNull(),
+    maxOperationsPerRun: integer('max_operations_per_run').notNull(),
+    maxConcurrentRuns: integer('max_concurrent_runs').notNull(),
+    maxQueuedRuns: integer('max_queued_runs').notNull(),
+    maxActiveRuns: integer('max_active_runs').notNull(),
+    startBudgetWindowSeconds: bigint('start_budget_window_seconds', { mode: 'bigint' }).notNull(),
+    maxStartsPerWindow: bigint('max_starts_per_window', { mode: 'bigint' }).notNull(),
+    actorKind: text('actor_kind').notNull(),
+    actorUserId: uuid('actor_user_id').references(() => users.id, {
+      onDelete: 'restrict',
+      onUpdate: 'restrict',
+    }),
+    predecessorRevisionId: uuid('predecessor_revision_id'),
+    createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [
+    uniqueIndex('verification_goal_policy_revisions_project_sequence_idx')
+      .on(t.projectId, t.revisionSequence),
+    uniqueIndex('verification_goal_policy_revisions_id_project_idx')
+      .on(t.id, t.projectId),
+    uniqueIndex('verification_goal_policy_revisions_id_project_sequence_idx')
+      .on(t.id, t.projectId, t.revisionSequence),
+    foreignKey({
+      columns: [t.predecessorRevisionId, t.projectId],
+      foreignColumns: [t.id, t.projectId],
+      name: 'verification_goal_policy_revisions_predecessor_fk',
+    }).onDelete('restrict').onUpdate('restrict'),
+    check('verification_goal_policy_revisions_sequence_check', sql`${t.revisionSequence} > 0`),
+    check('verification_goal_policy_revisions_policy_digest_check', sql`
+      ${t.policyDigest} ~ '^[0-9a-f]{64}$'
+    `),
+    check('verification_goal_policy_revisions_actor_kind_check', sql`
+      ${t.actorKind} in ('migration_seed', 'system_default', 'human')
+    `),
+    check('verification_goal_policy_revisions_actor_shape_check', sql`
+      (
+        ${t.actorKind} in ('migration_seed', 'system_default')
+        and ${t.actorUserId} is null
+      ) or (
+        ${t.actorKind} = 'human'
+        and ${t.actorUserId} is not null
+      )
+    `),
+    check('verification_goal_policy_revisions_positive_bounds_check', sql`
+      ${t.minScheduleIntervalSeconds} > 0
+      and ${t.maxRunDeadlineSeconds} > 0
+      and ${t.maxQueueAgeSeconds} > 0
+      and ${t.maxOperationsPerRun} > 0
+      and ${t.maxConcurrentRuns} > 0
+      and ${t.maxQueuedRuns} > 0
+      and ${t.maxActiveRuns} > 0
+      and ${t.startBudgetWindowSeconds} > 0
+      and ${t.maxStartsPerWindow} > 0
+    `),
+  ],
+)
+
+export type VerificationGoalPolicyRevision = InferSelectModel<typeof verificationGoalPolicyRevisions>
+export type NewVerificationGoalPolicyRevision = InferInsertModel<typeof verificationGoalPolicyRevisions>
+
+export const verificationGoalPolicyHeads = pgTable(
+  'verification_goal_policy_heads',
+  {
+    projectId: uuid('project_id')
+      .primaryKey()
+      .references(() => projects.id, { onDelete: 'restrict', onUpdate: 'restrict' }),
+    policyRevisionId: uuid('policy_revision_id').notNull(),
+    revisionSequence: bigint('revision_sequence', { mode: 'bigint' }).notNull(),
+    updatedAt: timestamp('updated_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [
+    uniqueIndex('verification_goal_policy_heads_revision_idx').on(t.policyRevisionId),
+    foreignKey({
+      columns: [t.policyRevisionId, t.projectId, t.revisionSequence],
+      foreignColumns: [
+        verificationGoalPolicyRevisions.id,
+        verificationGoalPolicyRevisions.projectId,
+        verificationGoalPolicyRevisions.revisionSequence,
+      ],
+      name: 'verification_goal_policy_heads_revision_project_sequence_fk',
+    }).onDelete('restrict').onUpdate('restrict'),
+    check('verification_goal_policy_heads_sequence_check', sql`${t.revisionSequence} > 0`),
+  ],
+)
+
+export type VerificationGoalPolicyHead = InferSelectModel<typeof verificationGoalPolicyHeads>
+export type NewVerificationGoalPolicyHead = InferInsertModel<typeof verificationGoalPolicyHeads>
+
+// ---------------------------------------------------------------------------
+// verificationGoalRuns / verificationGoalEvents
+// ---------------------------------------------------------------------------
+// A verification goal run binds an exact registry entry, exact project policy,
+// and immutable resolved policy snapshot. Its lifecycle is managed through
+// protected routines; completed evidence is append-only.
+export const verificationGoalRuns = pgTable(
+  'verification_goal_runs',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    projectId: uuid('project_id')
+      .notNull()
+      .references(() => projects.id, { onDelete: 'restrict', onUpdate: 'restrict' }),
+    registryRevisionId: uuid('registry_revision_id').notNull(),
+    registryEntryOrdinal: integer('registry_entry_ordinal').notNull(),
+    snapshotId: uuid('snapshot_id').notNull(),
+    goalId: text('goal_id').notNull(),
+    definitionVersion: integer('definition_version').notNull(),
+    definitionDigest: text('definition_digest').notNull(),
+    sourcePath: text('source_path').notNull(),
+    executionBindingDigest: text('execution_binding_digest'),
+    policyRevisionId: uuid('policy_revision_id').notNull(),
+    policyRevisionSequence: bigint('policy_revision_sequence', { mode: 'bigint' }).notNull(),
+    resolvedPolicy: jsonb('resolved_policy').$type<Record<string, unknown>>().notNull(),
+    resolvedPolicyFingerprint: text('resolved_policy_fingerprint').notNull(),
+    triggerKind: text('trigger_kind').notNull(),
+    requestedByUserId: uuid('requested_by_user_id').references(() => users.id, {
+      onDelete: 'restrict',
+      onUpdate: 'restrict',
+    }),
+    manualIdempotencyKey: uuid('manual_idempotency_key'),
+    manualRequestFingerprint: text('manual_request_fingerprint'),
+    scheduleBindingId: uuid('schedule_binding_id').references(() => verificationGoalScheduleBindings.id, {
+      onDelete: 'restrict',
+      onUpdate: 'restrict',
+    }),
+    scheduleSlotId: uuid('schedule_slot_id'),
+    admissionExpiry: timestamp('admission_expiry', tsOpts).notNull(),
+    authorityFingerprint: text('authority_fingerprint').notNull(),
+    status: text('status').notNull().default('queued'),
+    result: text('result'),
+    terminalCode: text('terminal_code'),
+    overallOutcomeId: uuid('overall_outcome_id'),
+    goalEvidenceSetDigest: text('goal_evidence_set_digest'),
+    goalEvidenceUnitFingerprint: text('goal_evidence_unit_fingerprint'),
+    leaseGeneration: bigint('lease_generation', { mode: 'bigint' }),
+    leaseToken: uuid('lease_token'),
+    leaseExpiresAt: timestamp('lease_expires_at', tsOpts),
+    startedAt: timestamp('started_at', tsOpts),
+    finishedAt: timestamp('finished_at', tsOpts),
+    recoveryNotBefore: timestamp('recovery_not_before', tsOpts),
+    redisDispatchedAt: timestamp('redis_dispatched_at', tsOpts),
+    createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [
+    uniqueIndex('verification_goal_runs_active_project_goal_idx')
+      .on(t.projectId, t.goalId)
+      .where(sql`${t.status} in ('queued', 'running', 'recovery_required')`),
+    uniqueIndex('verification_goal_runs_manual_idempotency_idx')
+      .on(t.requestedByUserId, t.manualIdempotencyKey)
+      .where(sql`${t.manualIdempotencyKey} is not null`),
+    index('verification_goal_runs_project_status_created_idx')
+      .on(t.projectId, t.status, t.createdAt),
+    index('verification_goal_runs_project_goal_finished_idx')
+      .on(t.projectId, t.goalId, t.finishedAt),
+    index('verification_goal_runs_project_created_idx')
+      .on(t.projectId, t.createdAt),
+    index('verification_goal_runs_status_expiries_recovery_idx')
+      .on(t.status, t.leaseExpiresAt, t.recoveryNotBefore),
+    index('verification_goal_runs_redis_dispatch_idx')
+      .on(t.status, t.redisDispatchedAt)
+      .where(sql`${t.status} = 'queued'`),
+    index('verification_goal_runs_snapshot_history_idx')
+      .on(t.snapshotId, t.createdAt),
+    foreignKey({
+      columns: [t.registryRevisionId, t.registryEntryOrdinal],
+      foreignColumns: [verificationGoalRegistryEntries.registryRevisionId, verificationGoalRegistryEntries.ordinal],
+      name: 'verification_goal_runs_registry_entry_fk',
+    }).onDelete('restrict').onUpdate('restrict'),
+    foreignKey({
+      columns: [
+        t.snapshotId,
+        t.projectId,
+        t.goalId,
+        t.definitionVersion,
+        t.definitionDigest,
+      ],
+      foreignColumns: [
+        verificationGoalSnapshots.id,
+        verificationGoalSnapshots.projectId,
+        verificationGoalSnapshots.goalId,
+        verificationGoalSnapshots.definitionVersion,
+        verificationGoalSnapshots.definitionDigest,
+      ],
+      name: 'verification_goal_runs_snapshot_identity_fk',
+    }).onDelete('restrict').onUpdate('restrict'),
+    foreignKey({
+      columns: [t.policyRevisionId, t.projectId, t.policyRevisionSequence],
+      foreignColumns: [
+        verificationGoalPolicyRevisions.id,
+        verificationGoalPolicyRevisions.projectId,
+        verificationGoalPolicyRevisions.revisionSequence,
+      ],
+      name: 'verification_goal_runs_policy_revision_fk',
+    }).onDelete('restrict').onUpdate('restrict'),
+    check('verification_goal_runs_status_check', sql`
+      ${t.status} in ('queued', 'running', 'recovery_required', 'completed', 'expired')
+    `),
+    check('verification_goal_runs_result_check', sql`
+      ${t.result} is null or ${t.result} in ('passed', 'failed', 'inconclusive')
+    `),
+    check('verification_goal_runs_terminal_code_check', sql`
+      ${t.terminalCode} is null
+      or ${t.terminalCode} in (
+        'passed', 'functional_operation_failed', 'functional_verification_failed',
+        'repository_dirty', 'repository_changed', 'root_changed',
+        'registry_content_changed', 'registry_superseded', 'registry_authority_changed',
+        'policy_changed', 'filesystem_authority_changed', 'operation_contract_changed',
+        'required_verifier_unavailable', 'linked_worktree_unsupported',
+        'unsupported_git_metadata_layout', 'unsupported_git_config',
+        'partial_clone_unsupported', 'incomplete_object_store',
+        'sparse_checkout_unsupported', 'split_index_unsupported',
+        'grafts_unsupported', 'goal_definition_untracked', 'git_version_unsupported',
+        'git_executable_untrusted', 'submodule_repository_unsupported',
+        'unsupported_repository_identity', 'missing_required_evidence',
+        'operation_infrastructure_failed', 'operation_evidence_failed',
+        'execution_deadline_exceeded', 'lease_lost', 'system_execution_disabled',
+        'internal_infrastructure_error', 'dispatch_expired'
+      )
+    `),
+    check('verification_goal_runs_trigger_kind_check', sql`${t.triggerKind} in ('manual', 'scheduled')`),
+    check('verification_goal_runs_manual_shape_check', sql`
+      (${t.triggerKind} <> 'manual')
+      or (
+        ${t.requestedByUserId} is not null
+        and ${t.manualIdempotencyKey} is not null
+        and ${t.manualRequestFingerprint} is not null
+        and ${t.scheduleBindingId} is null
+        and ${t.scheduleSlotId} is null
+      )
+    `),
+    check('verification_goal_runs_scheduled_shape_check', sql`
+      (${t.triggerKind} <> 'scheduled')
+      or (
+        ${t.requestedByUserId} is null
+        and ${t.manualIdempotencyKey} is null
+        and ${t.manualRequestFingerprint} is null
+        and ${t.scheduleBindingId} is not null
+        and ${t.scheduleSlotId} is not null
+      )
+    `),
+    check('verification_goal_runs_queued_shape_check', sql`
+      (${t.status} <> 'queued')
+      or (
+        ${t.startedAt} is null
+        and ${t.result} is null
+        and ${t.terminalCode} is null
+        and ${t.overallOutcomeId} is null
+        and ${t.goalEvidenceSetDigest} is null
+        and ${t.goalEvidenceUnitFingerprint} is null
+        and ${t.leaseGeneration} is null
+        and ${t.leaseToken} is null
+        and ${t.leaseExpiresAt} is null
+        and ${t.finishedAt} is null
+        and ${t.recoveryNotBefore} is null
+      )
+    `),
+    check('verification_goal_runs_running_shape_check', sql`
+      (${t.status} <> 'running')
+      or (
+        ${t.startedAt} is not null
+        and ${t.result} is null
+        and ${t.terminalCode} is null
+        and ${t.overallOutcomeId} is null
+        and ${t.goalEvidenceSetDigest} is null
+        and ${t.goalEvidenceUnitFingerprint} is null
+        and ${t.leaseGeneration} is not null
+        and ${t.leaseToken} is not null
+        and ${t.leaseExpiresAt} is not null
+        and ${t.finishedAt} is null
+        and ${t.recoveryNotBefore} is null
+      )
+    `),
+    check('verification_goal_runs_recovery_shape_check', sql`
+      (${t.status} <> 'recovery_required')
+      or (
+        ${t.startedAt} is not null
+        and ${t.result} is null
+        and ${t.terminalCode} is null
+        and ${t.overallOutcomeId} is null
+        and ${t.goalEvidenceSetDigest} is null
+        and ${t.goalEvidenceUnitFingerprint} is null
+        and ${t.leaseGeneration} is null
+        and ${t.leaseToken} is null
+        and ${t.leaseExpiresAt} is null
+        and ${t.recoveryNotBefore} is not null
+      )
+    `),
+    check('verification_goal_runs_completed_shape_check', sql`
+      (${t.status} <> 'completed')
+      or (
+        ${t.startedAt} is not null
+        and ${t.finishedAt} is not null
+        and ${t.result} is not null
+        and ${t.terminalCode} is not null
+        and ${t.overallOutcomeId} is not null
+        and ${t.goalEvidenceSetDigest} is not null
+        and ${t.goalEvidenceUnitFingerprint} is not null
+        and ${t.leaseGeneration} is null
+        and ${t.leaseToken} is null
+        and ${t.leaseExpiresAt} is null
+      )
+    `),
+    check('verification_goal_runs_expired_shape_check', sql`
+      (${t.status} <> 'expired')
+      or (
+        ${t.startedAt} is null
+        and ${t.finishedAt} is not null
+        and ${t.result} is null
+        and ${t.terminalCode} = 'dispatch_expired'
+        and ${t.overallOutcomeId} is null
+        and ${t.goalEvidenceSetDigest} is null
+        and ${t.goalEvidenceUnitFingerprint} is null
+        and ${t.leaseGeneration} is null
+        and ${t.leaseToken} is null
+        and ${t.leaseExpiresAt} is null
+      )
+    `),
+  ],
+)
+
+export type VerificationGoalRun = InferSelectModel<typeof verificationGoalRuns>
+export type NewVerificationGoalRun = InferInsertModel<typeof verificationGoalRuns>
+
+export const verificationGoalEvents = pgTable(
+  'verification_goal_events',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    verificationGoalRunId: uuid('verification_goal_run_id')
+      .notNull()
+      .references(() => verificationGoalRuns.id, { onDelete: 'restrict' }),
+    eventSequence: integer('event_sequence').notNull(),
+    phase: text('phase').notNull(),
+    status: text('status').notNull(),
+    code: text('code'),
+    operationRunId: uuid('operation_run_id').references(() => operationRuns.id, {
+      onDelete: 'restrict',
+      onUpdate: 'restrict',
+    }),
+    repositorySnapshotId: uuid('repository_snapshot_id').references(() => verificationGoalRepositorySnapshots.id, {
+      onDelete: 'restrict',
+      onUpdate: 'restrict',
+    }),
+    environmentSnapshotId: uuid('environment_snapshot_id').references(() => verificationGoalEnvironmentSnapshots.id, {
+      onDelete: 'restrict',
+      onUpdate: 'restrict',
+    }),
+    evidenceRef: uuid('evidence_ref'),
+    createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [
+    uniqueIndex('verification_goal_events_run_sequence_idx')
+      .on(t.verificationGoalRunId, t.eventSequence),
+    index('verification_goal_events_run_created_idx')
+      .on(t.verificationGoalRunId, t.createdAt),
+    check('verification_goal_events_phase_check', sql`
+      ${t.phase} in (
+        'admitted', 'claimed', 'repository_captured', 'environment_captured',
+        'child_begun', 'child_completed', 'terminalized', 'expired', 'recovered'
+      )
+    `),
+    check('verification_goal_events_status_check', sql`
+      ${t.status} in ('ok', 'blocked', 'failed', 'inconclusive')
+    `),
+    check('verification_goal_events_code_check', sql`
+      ${t.code} is null or length(${t.code}) between 1 and 64
+    `),
+  ],
+)
+
+export type VerificationGoalEvent = InferSelectModel<typeof verificationGoalEvents>
+export type NewVerificationGoalEvent = InferInsertModel<typeof verificationGoalEvents>
+
+// ---------------------------------------------------------------------------
+// verificationGoalRepositorySnapshots / verificationGoalEnvironmentSnapshots
+// ---------------------------------------------------------------------------
+// Immutable evidence captured during a run. Each run has at most one of each
+// snapshot. Raw repository config and local paths are never stored here.
+export const verificationGoalRepositorySnapshots = pgTable(
+  'verification_goal_repository_snapshots',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    verificationGoalRunId: uuid('verification_goal_run_id')
+      .notNull()
+      .references(() => verificationGoalRuns.id, { onDelete: 'restrict' })
+      .unique(),
+    projectId: uuid('project_id')
+      .notNull()
+      .references(() => projects.id, { onDelete: 'restrict', onUpdate: 'restrict' }),
+    projectSubmittedBy: uuid('project_submitted_by')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict', onUpdate: 'restrict' }),
+    projectRevision: timestamp('project_revision', tsOpts).notNull(),
+    rootBindingRevision: bigint('root_binding_revision', { mode: 'bigint' }).notNull(),
+    grantDecisionRevision: bigint('grant_decision_revision', { mode: 'bigint' }).notNull(),
+    objectFormat: text('object_format'),
+    headOid: text('head_oid'),
+    strictGitClean: boolean('strict_git_clean').notNull().default(false),
+    gitMetadataFingerprint: text('git_metadata_fingerprint'),
+    indexFingerprint: text('index_fingerprint'),
+    configFingerprint: text('config_fingerprint'),
+    repositorySnapshotFingerprint: text('repository_snapshot_fingerprint').notNull(),
+    capturedAt: timestamp('captured_at', tsOpts).notNull(),
+  },
+  (t) => [
+    index('verification_goal_repository_snapshots_project_captured_idx')
+      .on(t.projectId, t.capturedAt),
+    check('verification_goal_repository_snapshots_object_format_check', sql`
+      ${t.objectFormat} is null or ${t.objectFormat} in ('sha1', 'sha256')
+    `),
+    check('verification_goal_repository_snapshots_head_oid_check', sql`
+      ${t.headOid} is null
+      or ${t.headOid} ~ '^[0-9a-f]{40}$'
+      or ${t.headOid} ~ '^[0-9a-f]{64}$'
+    `),
+    check('verification_goal_repository_snapshots_fingerprints_check', sql`
+      (${t.gitMetadataFingerprint} is null or ${t.gitMetadataFingerprint} ~ '^[0-9a-f]{64}$')
+      and (${t.indexFingerprint} is null or ${t.indexFingerprint} ~ '^[0-9a-f]{64}$')
+      and (${t.configFingerprint} is null or ${t.configFingerprint} ~ '^[0-9a-f]{64}$')
+      and ${t.repositorySnapshotFingerprint} ~ '^[0-9a-f]{64}$'
+    `),
+  ],
+)
+
+export type VerificationGoalRepositorySnapshot = InferSelectModel<typeof verificationGoalRepositorySnapshots>
+export type NewVerificationGoalRepositorySnapshot = InferInsertModel<typeof verificationGoalRepositorySnapshots>
+
+export const verificationGoalEnvironmentSnapshots = pgTable(
+  'verification_goal_environment_snapshots',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    verificationGoalRunId: uuid('verification_goal_run_id')
+      .notNull()
+      .references(() => verificationGoalRuns.id, { onDelete: 'restrict' })
+      .unique(),
+    projectId: uuid('project_id')
+      .notNull()
+      .references(() => projects.id, { onDelete: 'restrict', onUpdate: 'restrict' }),
+    schemaVersion: integer('schema_version').notNull(),
+    runnerContractVersion: integer('runner_contract_version').notNull(),
+    forgeBuildIdentity: text('forge_build_identity').notNull(),
+    releaseStateClass: text('release_state_class').notNull(),
+    rootLauncherContractVersion: integer('root_launcher_contract_version').notNull(),
+    rootLauncherDigest: text('root_launcher_digest').notNull(),
+    trustedNodeIdentityDigest: text('trusted_node_identity_digest').notNull(),
+    trustedNodeVersion: text('trusted_node_version').notNull(),
+    trustedGitIdentityDigest: text('trusted_git_identity_digest').notNull(),
+    trustedGitVersion: text('trusted_git_version').notNull(),
+    gitSafetyProfileVersion: integer('git_safety_profile_version').notNull(),
+    gitSafetyProfileDigest: text('git_safety_profile_digest').notNull(),
+    platform: text('platform').notNull(),
+    architecture: text('architecture').notNull(),
+    operationExecutionBindingDigest: text('operation_execution_binding_digest').notNull(),
+    eligibilityVersion: integer('eligibility_version').notNull(),
+    eligibilityDigest: text('eligibility_digest').notNull(),
+    environmentFingerprint: text('environment_fingerprint').notNull(),
+    capturedAt: timestamp('captured_at', tsOpts).notNull(),
+  },
+  (t) => [
+    index('verification_goal_environment_snapshots_project_captured_idx')
+      .on(t.projectId, t.capturedAt),
+    check('verification_goal_environment_snapshots_positive_versions_check', sql`
+      ${t.schemaVersion} > 0
+      and ${t.runnerContractVersion} > 0
+      and ${t.rootLauncherContractVersion} > 0
+      and ${t.gitSafetyProfileVersion} > 0
+      and ${t.eligibilityVersion} > 0
+    `),
+    check('verification_goal_environment_snapshots_digests_check', sql`
+      ${t.rootLauncherDigest} ~ '^[0-9a-f]{64}$'
+      and ${t.trustedNodeIdentityDigest} ~ '^[0-9a-f]{64}$'
+      and ${t.trustedGitIdentityDigest} ~ '^[0-9a-f]{64}$'
+      and ${t.gitSafetyProfileDigest} ~ '^[0-9a-f]{64}$'
+      and ${t.operationExecutionBindingDigest} ~ '^[0-9a-f]{64}$'
+      and ${t.eligibilityDigest} ~ '^[0-9a-f]{64}$'
+      and ${t.environmentFingerprint} ~ '^[0-9a-f]{64}$'
+    `),
+  ],
+)
+
+export type VerificationGoalEnvironmentSnapshot = InferSelectModel<typeof verificationGoalEnvironmentSnapshots>
+export type NewVerificationGoalEnvironmentSnapshot = InferInsertModel<typeof verificationGoalEnvironmentSnapshots>
+
+// ---------------------------------------------------------------------------
+// verificationGoalScheduleBindings / Heads / Slots
+// ---------------------------------------------------------------------------
+// Scheduling state is deliberately separate from execution. Bindings are
+// immutable; only the current head is advanced by a protected routine.
+export const verificationGoalScheduleBindings = pgTable(
+  'verification_goal_schedule_bindings',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    projectId: uuid('project_id')
+      .notNull()
+      .references(() => projects.id, { onDelete: 'restrict', onUpdate: 'restrict' }),
+    registryRevisionId: uuid('registry_revision_id').notNull(),
+    registryEntryOrdinal: integer('registry_entry_ordinal').notNull(),
+    snapshotId: uuid('snapshot_id').notNull(),
+    goalId: text('goal_id').notNull(),
+    definitionVersion: integer('definition_version').notNull(),
+    definitionDigest: text('definition_digest').notNull(),
+    executionBindingDigest: text('execution_binding_digest').notNull(),
+    policyRevisionId: uuid('policy_revision_id').notNull(),
+    policyRevisionSequence: bigint('policy_revision_sequence', { mode: 'bigint' }).notNull(),
+    intervalSeconds: bigint('interval_seconds', { mode: 'bigint' }).notNull(),
+    anchorAt: timestamp('anchor_at', tsOpts).notNull(),
+    bindingFingerprint: text('binding_fingerprint').notNull(),
+    createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [
+    index('verification_goal_schedule_bindings_project_created_idx')
+      .on(t.projectId, t.createdAt),
+    foreignKey({
+      columns: [t.registryRevisionId, t.registryEntryOrdinal],
+      foreignColumns: [verificationGoalRegistryEntries.registryRevisionId, verificationGoalRegistryEntries.ordinal],
+      name: 'verification_goal_schedule_bindings_registry_entry_fk',
+    }).onDelete('restrict').onUpdate('restrict'),
+    foreignKey({
+      columns: [
+        t.snapshotId,
+        t.projectId,
+        t.goalId,
+        t.definitionVersion,
+        t.definitionDigest,
+      ],
+      foreignColumns: [
+        verificationGoalSnapshots.id,
+        verificationGoalSnapshots.projectId,
+        verificationGoalSnapshots.goalId,
+        verificationGoalSnapshots.definitionVersion,
+        verificationGoalSnapshots.definitionDigest,
+      ],
+      name: 'verification_goal_schedule_bindings_snapshot_identity_fk',
+    }).onDelete('restrict').onUpdate('restrict'),
+    foreignKey({
+      columns: [t.policyRevisionId, t.projectId, t.policyRevisionSequence],
+      foreignColumns: [
+        verificationGoalPolicyRevisions.id,
+        verificationGoalPolicyRevisions.projectId,
+        verificationGoalPolicyRevisions.revisionSequence,
+      ],
+      name: 'verification_goal_schedule_bindings_policy_revision_fk',
+    }).onDelete('restrict').onUpdate('restrict'),
+    check('verification_goal_schedule_bindings_interval_check', sql`${t.intervalSeconds} > 0`),
+    check('verification_goal_schedule_bindings_fingerprint_check', sql`
+      ${t.bindingFingerprint} ~ '^[0-9a-f]{64}$'
+      and ${t.executionBindingDigest} ~ '^[0-9a-f]{64}$'
+      and ${t.definitionDigest} ~ '^[0-9a-f]{64}$'
+    `),
+  ],
+)
+
+export type VerificationGoalScheduleBinding = InferSelectModel<typeof verificationGoalScheduleBindings>
+export type NewVerificationGoalScheduleBinding = InferInsertModel<typeof verificationGoalScheduleBindings>
+
+export const verificationGoalScheduleHeads = pgTable(
+  'verification_goal_schedule_heads',
+  {
+    projectId: uuid('project_id')
+      .notNull()
+      .references(() => projects.id, { onDelete: 'restrict', onUpdate: 'restrict' }),
+    goalId: text('goal_id').notNull(),
+    scheduleBindingId: uuid('schedule_binding_id').references(() => verificationGoalScheduleBindings.id, {
+      onDelete: 'restrict',
+      onUpdate: 'restrict',
+    }),
+    bindingFingerprint: text('binding_fingerprint'),
+    updatedAt: timestamp('updated_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.projectId, t.goalId] }),
+    check('verification_goal_schedule_heads_shape_check', sql`
+      (
+        ${t.scheduleBindingId} is null
+        and ${t.bindingFingerprint} is null
+      ) or (
+        ${t.scheduleBindingId} is not null
+        and ${t.bindingFingerprint} is not null
+        and ${t.bindingFingerprint} ~ '^[0-9a-f]{64}$'
+      )
+    `),
+  ],
+)
+
+export type VerificationGoalScheduleHead = InferSelectModel<typeof verificationGoalScheduleHeads>
+export type NewVerificationGoalScheduleHead = InferInsertModel<typeof verificationGoalScheduleHeads>
+
+export const verificationGoalScheduleSlots = pgTable(
+  'verification_goal_schedule_slots',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    scheduleBindingId: uuid('schedule_binding_id')
+      .notNull()
+      .references(() => verificationGoalScheduleBindings.id, { onDelete: 'restrict' }),
+    slotSequence: bigint('slot_sequence', { mode: 'bigint' }).notNull(),
+    dueAt: timestamp('due_at', tsOpts).notNull(),
+    runId: uuid('run_id').references(() => verificationGoalRuns.id, {
+      onDelete: 'set null',
+      onUpdate: 'restrict',
+    }),
+    createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [
+    uniqueIndex('verification_goal_schedule_slots_binding_sequence_idx')
+      .on(t.scheduleBindingId, t.slotSequence),
+    index('verification_goal_schedule_slots_due_idx')
+      .on(t.dueAt),
+    check('verification_goal_schedule_slots_sequence_check', sql`${t.slotSequence} >= 0`),
+  ],
+)
+
+export type VerificationGoalScheduleSlot = InferSelectModel<typeof verificationGoalScheduleSlots>
+export type NewVerificationGoalScheduleSlot = InferInsertModel<typeof verificationGoalScheduleSlots>
 
 // ---------------------------------------------------------------------------
 // artifacts
@@ -2663,9 +3380,11 @@ export const repositoryCommandAudits = pgTable(
   'repository_command_audits',
   {
     id: uuid('id').primaryKey().defaultRandom(),
-    taskId: uuid('task_id')
-      .notNull()
-      .references(() => tasks.id, { onDelete: 'restrict' }),
+    // Exactly one of taskId or verificationGoalRunId must be set. Goal rows
+    // are linked to the exact child operation run that produced the audit.
+    taskId: uuid('task_id').references(() => tasks.id, { onDelete: 'restrict' }),
+    verificationGoalRunId: uuid('verification_goal_run_id').references(() => verificationGoalRuns.id, { onDelete: 'restrict' }),
+    operationRunId: uuid('operation_run_id').references(() => operationRuns.id, { onDelete: 'restrict' }),
     workPackageId: uuid('work_package_id').references(() => workPackages.id, {
       onDelete: 'restrict',
     }),
@@ -2688,10 +3407,23 @@ export const repositoryCommandAudits = pgTable(
   },
   (t) => [
     index('repository_command_audits_task_id_idx').on(t.taskId),
+    index('repository_command_audits_verification_goal_run_id_idx').on(t.verificationGoalRunId),
+    index('repository_command_audits_operation_run_id_idx').on(t.operationRunId),
     index('repository_command_audits_work_package_id_idx').on(t.workPackageId),
     index('repository_command_audits_agent_run_id_idx').on(t.agentRunId),
     index('repository_command_audits_artifact_id_idx').on(t.artifactId),
     index('repository_command_audits_started_at_idx').on(t.startedAt),
+    check('repository_command_audits_subject_check', sql`
+      (
+        ${t.taskId} is not null
+        and ${t.verificationGoalRunId} is null
+        and ${t.operationRunId} is null
+      ) or (
+        ${t.taskId} is null
+        and ${t.verificationGoalRunId} is not null
+        and ${t.operationRunId} is not null
+      )
+    `),
   ],
 )
 
