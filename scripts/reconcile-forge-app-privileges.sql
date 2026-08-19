@@ -295,10 +295,10 @@ REVOKE ALL ON FUNCTION public.forge_complete_verification_goal_recovery_v1(uuid,
 GRANT EXECUTE ON FUNCTION public.forge_complete_verification_goal_recovery_v1(uuid, text, text)
   TO forge;
 REVOKE ALL ON FUNCTION public.forge_finalize_verification_goal_child_operation_v1(
-  uuid,uuid,text,text,text,boolean,text,text
+  uuid,uuid,uuid,text,text,text,boolean,text,text
 ) FROM PUBLIC, forge;
 GRANT EXECUTE ON FUNCTION public.forge_finalize_verification_goal_child_operation_v1(
-  uuid,uuid,text,text,text,boolean,text,text
+  uuid,uuid,uuid,text,text,text,boolean,text,text
 ) TO forge;
 REVOKE ALL ON FUNCTION public.forge_record_verification_goal_repository_snapshot_v1(
   uuid,uuid,timestamptz,bigint,bigint,text,text,boolean,text,text,text,text
@@ -335,10 +335,10 @@ GRANT EXECUTE ON FUNCTION public.forge_reconcile_verification_goal_schedule_bind
   uuid,text,text,uuid,integer,uuid,integer,text,text,uuid,bigint,bigint,timestamptz,boolean
 ) TO forge;
 REVOKE ALL ON FUNCTION public.forge_claim_verification_goal_schedule_slot_v1(
-  uuid,bigint,timestamptz,jsonb,text,timestamptz,text
+  uuid,bigint,jsonb,text,timestamptz,text
 ) FROM PUBLIC, forge;
 GRANT EXECUTE ON FUNCTION public.forge_claim_verification_goal_schedule_slot_v1(
-  uuid,bigint,timestamptz,jsonb,text,timestamptz,text
+  uuid,bigint,jsonb,text,timestamptz,text
 ) TO forge;
 
 DO $verify$
@@ -455,14 +455,14 @@ BEGIN
       'forge_renew_verification_goal_run_lease_v1(uuid,bigint,uuid,timestamp with time zone)',
       'forge_fence_verification_goal_run_recovery_v1(uuid)',
       'forge_complete_verification_goal_recovery_v1(uuid,text,text)',
-      'forge_finalize_verification_goal_child_operation_v1(uuid,uuid,text,text,text,boolean,text,text)',
+      'forge_finalize_verification_goal_child_operation_v1(uuid,uuid,uuid,text,text,text,boolean,text,text)',
       'forge_record_verification_goal_repository_snapshot_v1(uuid,uuid,timestamp with time zone,bigint,bigint,text,text,boolean,text,text,text,text)',
       'forge_record_verification_goal_environment_snapshot_v1(uuid,integer,integer,text,text,integer,text,text,text,text,text,integer,text,text,text,text,integer,text,text)',
       'forge_expire_verification_goal_run_v1(uuid)',
       'forge_mark_verification_goal_run_dispatched_v1(uuid)',
       'forge_terminalize_verification_goal_run_v2(uuid,text,text,text,text,text)',
       'forge_reconcile_verification_goal_schedule_binding_v1(uuid,text,text,uuid,integer,uuid,integer,text,text,uuid,bigint,bigint,timestamp with time zone,boolean)',
-      'forge_claim_verification_goal_schedule_slot_v1(uuid,bigint,timestamp with time zone,jsonb,text,timestamp with time zone,text)'
+      'forge_claim_verification_goal_schedule_slot_v1(uuid,bigint,jsonb,text,timestamp with time zone,text)'
     ]) runtime_routine
     CROSS JOIN LATERAL (
       SELECT routine.oid, routine.proowner, routine.prosecdef, routine.proconfig, routine.proacl

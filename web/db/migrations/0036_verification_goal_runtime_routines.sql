@@ -196,6 +196,27 @@ BEGIN
       USING ERRCODE = 'P1873';
   END IF;
 
+  -- Idempotent manual replay is resolved before any capacity accounting: a
+  -- retried identical request must return its existing run even while the
+  -- project is at a capacity limit. Capacity checks guard new work only.
+  IF p_trigger_kind = 'manual' THEN
+    SELECT * INTO v_existing
+    FROM public.verification_goal_runs
+    WHERE requested_by_user_id = p_requested_by_user_id
+      AND manual_idempotency_key = p_manual_idempotency_key
+    FOR UPDATE;
+    IF FOUND THEN
+      IF v_existing.manual_request_fingerprint IS DISTINCT FROM p_manual_request_fingerprint THEN
+        RAISE EXCEPTION 'verification goal manual idempotency key conflicts with a different request'
+          USING ERRCODE = 'P1876';
+      END IF;
+      run_id := v_existing.id;
+      state := 'existing';
+      RETURN NEXT;
+      RETURN;
+    END IF;
+  END IF;
+
   SELECT count(*) INTO v_queued
   FROM public.verification_goal_runs
   WHERE project_id = p_project_id AND status = 'queued';
@@ -230,24 +251,6 @@ BEGIN
   IF v_recent_starts + 1 > v_policy.max_starts_per_window THEN
     RAISE EXCEPTION 'verification goal start budget limit reached'
       USING ERRCODE = 'P1874';
-  END IF;
-
-  IF p_trigger_kind = 'manual' THEN
-    SELECT * INTO v_existing
-    FROM public.verification_goal_runs
-    WHERE requested_by_user_id = p_requested_by_user_id
-      AND manual_idempotency_key = p_manual_idempotency_key
-    FOR UPDATE;
-    IF FOUND THEN
-      IF v_existing.manual_request_fingerprint IS DISTINCT FROM p_manual_request_fingerprint THEN
-        RAISE EXCEPTION 'verification goal manual idempotency key conflicts with a different request'
-          USING ERRCODE = 'P1876';
-      END IF;
-      run_id := v_existing.id;
-      state := 'existing';
-      RETURN NEXT;
-      RETURN;
-    END IF;
   END IF;
 
   IF EXISTS (
@@ -316,6 +319,10 @@ BEGIN
       USING ERRCODE = '22023';
   END IF;
 
+  -- A claim is only possible for a still-unexpired queued row. An expired
+  -- running row can never be reclaimed here: only the recovery fence may
+  -- transition it, so a competing or stale worker cannot re-enter evidence
+  -- capture for the same run.
   UPDATE public.verification_goal_runs
   SET status = 'running',
       started_at = COALESCE(started_at, pg_catalog.clock_timestamp()),
@@ -323,9 +330,8 @@ BEGIN
       lease_token = p_lease_token,
       lease_expires_at = p_lease_expires_at
   WHERE id = p_run_id
-    AND status IN ('queued', 'running')
-    AND (status <> 'queued' OR admission_expiry > pg_catalog.clock_timestamp())
-    AND (lease_expires_at IS NULL OR lease_expires_at <= pg_catalog.clock_timestamp());
+    AND status = 'queued'
+    AND admission_expiry > pg_catalog.clock_timestamp();
   GET DIAGNOSTICS v_affected = ROW_COUNT;
   IF v_affected <> 1 THEN
     RAISE EXCEPTION 'verification goal run lease claim failed'
@@ -388,6 +394,120 @@ BEGIN
     RETURN 'not_owner';
   END IF;
   RETURN 'not_running';
+END;
+$$;
+--> statement-breakpoint
+
+-- ---------------------------------------------------------------------------
+-- Child begin (replaces 0035 definition to append the child_begun event)
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION public.forge_begin_verification_goal_child_operation_v1(
+  p_run_id uuid,
+  p_ordinal integer,
+  p_operation_id text,
+  p_operation_version integer,
+  p_capability text,
+  p_idempotency_key text,
+  p_definition_digest text,
+  p_scope_fingerprint text,
+  p_request_fingerprint text,
+  p_inputs_fingerprint text,
+  p_reason_fingerprint text,
+  p_policy_decision jsonb
+)
+RETURNS uuid
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $$
+DECLARE
+  v_run public.verification_goal_runs%ROWTYPE;
+  v_existing uuid;
+  v_new_id uuid;
+  v_earlier_count integer;
+  v_next_sequence integer;
+BEGIN
+  IF session_user <> 'forge' OR current_user <> 'forge_s4_routines_owner' THEN
+    RAISE EXCEPTION 'verification goal child begin requires the fixed Forge login'
+      USING ERRCODE = '42501';
+  END IF;
+  IF p_ordinal < 0
+     OR p_operation_version <= 0
+     OR p_idempotency_key !~ '^[0-9a-f]{64}$'
+     OR p_definition_digest !~ '^[0-9a-f]{64}$'
+     OR p_scope_fingerprint !~ '^[0-9a-f]{64}$'
+     OR p_request_fingerprint !~ '^[0-9a-f]{64}$'
+     OR p_inputs_fingerprint !~ '^[0-9a-f]{64}$'
+     OR p_reason_fingerprint !~ '^[0-9a-f]{64}$' THEN
+    RAISE EXCEPTION 'verification goal child operation parameters are invalid'
+      USING ERRCODE = '22023';
+  END IF;
+
+  SELECT * INTO v_run
+  FROM public.verification_goal_runs
+  WHERE id = p_run_id
+  FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'verification goal run does not exist'
+      USING ERRCODE = 'P1873';
+  END IF;
+  IF v_run.status <> 'running'
+     OR v_run.lease_token IS NULL
+     OR v_run.lease_expires_at <= pg_catalog.clock_timestamp() THEN
+    RAISE EXCEPTION 'verification goal run is not leased'
+      USING ERRCODE = 'P1872';
+  END IF;
+
+  SELECT id INTO v_existing
+  FROM public.operation_runs
+  WHERE verification_goal_run_id = p_run_id
+    AND goal_operation_ordinal = p_ordinal;
+  IF FOUND THEN
+    RAISE EXCEPTION 'verification goal child operation already exists at ordinal %', p_ordinal
+      USING ERRCODE = 'P1872';
+  END IF;
+
+  SELECT count(*) INTO v_earlier_count
+  FROM public.operation_runs
+  WHERE verification_goal_run_id = p_run_id
+    AND goal_operation_ordinal < p_ordinal
+    AND status = 'completed';
+  IF v_earlier_count <> p_ordinal THEN
+    RAISE EXCEPTION 'verification goal child operation prefix is incomplete'
+      USING ERRCODE = 'P1873';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1 FROM public.operation_runs
+    WHERE verification_goal_run_id = p_run_id
+      AND goal_operation_ordinal > p_ordinal
+  ) THEN
+    RAISE EXCEPTION 'verification goal child operation cannot start after a later ordinal'
+      USING ERRCODE = 'P1873';
+  END IF;
+
+  INSERT INTO public.operation_runs (
+    task_id, verification_goal_run_id, project_id, work_package_id, agent_run_id,
+    task_attempt_id, execution_outcome_id, definition_schema_version, operation_id,
+    operation_version, capability, idempotency_key, definition_digest, scope_fingerprint,
+    request_fingerprint, inputs_fingerprint, reason_fingerprint, policy_decision,
+    status, verification_status, goal_operation_ordinal
+  ) VALUES (
+    NULL, p_run_id, v_run.project_id, NULL, NULL, NULL, NULL, 1, p_operation_id,
+    p_operation_version, p_capability, p_idempotency_key, p_definition_digest,
+    p_scope_fingerprint, p_request_fingerprint, p_inputs_fingerprint,
+    p_reason_fingerprint, p_policy_decision, 'running', 'not_started', p_ordinal
+  ) RETURNING id INTO v_new_id;
+
+  SELECT COALESCE(max(event_sequence), 0) + 1 INTO v_next_sequence
+  FROM public.verification_goal_events
+  WHERE verification_goal_run_id = p_run_id;
+
+  INSERT INTO public.verification_goal_events (
+    verification_goal_run_id, event_sequence, phase, status, operation_run_id
+  ) VALUES (p_run_id, v_next_sequence, 'child_begun', 'ok', v_new_id);
+
+  RETURN v_new_id;
 END;
 $$;
 --> statement-breakpoint
@@ -567,6 +687,7 @@ SET ROLE forge_s4_routines_owner;
 
 CREATE FUNCTION public.forge_finalize_verification_goal_child_operation_v1(
   p_run_id uuid,
+  p_lease_token uuid,
   p_operation_run_id uuid,
   p_transport_status text,
   p_result text,
@@ -592,7 +713,8 @@ BEGIN
     RAISE EXCEPTION 'verification goal child finalization requires the fixed Forge login'
       USING ERRCODE = '42501';
   END IF;
-  IF p_transport_status NOT IN ('ok', 'error')
+  IF p_lease_token IS NULL
+     OR p_transport_status NOT IN ('ok', 'error')
      OR p_result NOT IN ('completed', 'failed', 'needs_attention', 'blocked', 'cancelled')
      OR p_verification_status NOT IN ('not_required', 'passed', 'failed', 'inconclusive')
      OR p_outcome_fingerprint !~ '^[0-9a-f]{64}$'
@@ -613,6 +735,7 @@ BEGIN
   END IF;
   IF v_run.status <> 'running'
      OR v_run.lease_token IS NULL
+     OR v_run.lease_token <> p_lease_token
      OR v_run.lease_expires_at <= pg_catalog.clock_timestamp() THEN
     RAISE EXCEPTION 'verification goal run is not leased'
       USING ERRCODE = 'P1872';
@@ -1069,6 +1192,19 @@ BEGIN
       RAISE EXCEPTION 'verification goal passed terminalization requires every ordinal to be completed'
         USING ERRCODE = 'P1873';
     END IF;
+    -- The post-execution evidence guard: a run can only be canonicalized as
+    -- passed when its repository and execution-environment evidence exist and
+    -- belong exactly to this run.
+    IF NOT EXISTS (
+      SELECT 1 FROM public.verification_goal_repository_snapshots
+      WHERE verification_goal_run_id = p_run_id
+    ) OR NOT EXISTS (
+      SELECT 1 FROM public.verification_goal_environment_snapshots
+      WHERE verification_goal_run_id = p_run_id
+    ) THEN
+      RAISE EXCEPTION 'verification goal passed terminalization requires repository and environment evidence'
+        USING ERRCODE = 'P1873';
+    END IF;
     v_outcome_result := 'completed';
   ELSIF p_result = 'failed' THEN
     IF v_failed_count <> 1
@@ -1330,7 +1466,6 @@ $$;
 CREATE FUNCTION public.forge_claim_verification_goal_schedule_slot_v1(
   p_schedule_binding_id uuid,
   p_slot_sequence bigint,
-  p_due_at timestamp with time zone,
   p_resolved_policy jsonb,
   p_resolved_policy_fingerprint text,
   p_admission_expiry timestamp with time zone,
@@ -1347,6 +1482,7 @@ DECLARE
   v_entry public.verification_goal_registry_entries%ROWTYPE;
   v_now timestamp with time zone;
   v_current_slot bigint;
+  v_due_at timestamp with time zone;
   v_slot_id uuid;
   v_admitted public.verification_goal_runs.id%TYPE;
   v_state text;
@@ -1401,9 +1537,15 @@ BEGIN
     RETURN;
   END IF;
 
+  -- due_at is derived from the stored binding anchor and interval. A caller
+  -- cannot supply a fabricated deadline for a claimed slot.
+  v_due_at := v_binding.anchor_at + make_interval(
+    secs => ((v_current_slot + 1) * v_binding.interval_seconds)::double precision
+  );
+
   INSERT INTO public.verification_goal_schedule_slots (
     schedule_binding_id, slot_sequence, due_at
-  ) VALUES (p_schedule_binding_id, p_slot_sequence, p_due_at)
+  ) VALUES (p_schedule_binding_id, p_slot_sequence, v_due_at)
   ON CONFLICT (schedule_binding_id, slot_sequence) DO NOTHING
   RETURNING id INTO v_slot_id;
   IF v_slot_id IS NULL THEN
@@ -1487,7 +1629,7 @@ ALTER FUNCTION public.forge_fence_verification_goal_run_recovery_v1(uuid)
 ALTER FUNCTION public.forge_complete_verification_goal_recovery_v1(uuid, text, text)
   OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION public.forge_finalize_verification_goal_child_operation_v1(
-  uuid, uuid, text, text, text, boolean, text, text
+  uuid, uuid, uuid, text, text, text, boolean, text, text
 ) OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION public.forge_record_verification_goal_repository_snapshot_v1(
   uuid, uuid, timestamptz, bigint, bigint, text, text, boolean, text, text, text, text
@@ -1508,7 +1650,7 @@ ALTER FUNCTION public.forge_reconcile_verification_goal_schedule_binding_v1(
   bigint, timestamptz, boolean
 ) OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION public.forge_claim_verification_goal_schedule_slot_v1(
-  uuid, bigint, timestamptz, jsonb, text, timestamptz, text
+  uuid, bigint, jsonb, text, timestamptz, text
 ) OWNER TO forge_s4_routines_owner;
 --> statement-breakpoint
 
@@ -1525,7 +1667,7 @@ REVOKE ALL ON FUNCTION public.forge_fence_verification_goal_run_recovery_v1(uuid
 REVOKE ALL ON FUNCTION public.forge_complete_verification_goal_recovery_v1(uuid, text, text)
   FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.forge_finalize_verification_goal_child_operation_v1(
-  uuid, uuid, text, text, text, boolean, text, text
+  uuid, uuid, uuid, text, text, text, boolean, text, text
 ) FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.forge_record_verification_goal_repository_snapshot_v1(
   uuid, uuid, timestamptz, bigint, bigint, text, text, boolean, text, text, text, text
@@ -1546,7 +1688,7 @@ REVOKE ALL ON FUNCTION public.forge_reconcile_verification_goal_schedule_binding
   bigint, timestamptz, boolean
 ) FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.forge_claim_verification_goal_schedule_slot_v1(
-  uuid, bigint, timestamptz, jsonb, text, timestamptz, text
+  uuid, bigint, jsonb, text, timestamptz, text
 ) FROM PUBLIC;
 --> statement-breakpoint
 
@@ -1563,7 +1705,7 @@ GRANT EXECUTE ON FUNCTION public.forge_fence_verification_goal_run_recovery_v1(u
 GRANT EXECUTE ON FUNCTION public.forge_complete_verification_goal_recovery_v1(uuid, text, text)
   TO forge;
 GRANT EXECUTE ON FUNCTION public.forge_finalize_verification_goal_child_operation_v1(
-  uuid, uuid, text, text, text, boolean, text, text
+  uuid, uuid, uuid, text, text, text, boolean, text, text
 ) TO forge;
 GRANT EXECUTE ON FUNCTION public.forge_record_verification_goal_repository_snapshot_v1(
   uuid, uuid, timestamptz, bigint, bigint, text, text, boolean, text, text, text, text
@@ -1584,7 +1726,7 @@ GRANT EXECUTE ON FUNCTION public.forge_reconcile_verification_goal_schedule_bind
   bigint, timestamptz, boolean
 ) TO forge;
 GRANT EXECUTE ON FUNCTION public.forge_claim_verification_goal_schedule_slot_v1(
-  uuid, bigint, timestamptz, jsonb, text, timestamptz, text
+  uuid, bigint, jsonb, text, timestamptz, text
 ) TO forge;
 --> statement-breakpoint
 
