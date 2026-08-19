@@ -87,6 +87,19 @@ function commandTemplateFor(key: string): readonly string[] {
   return template
 }
 
+/**
+ * Returns the exact reviewed fixed command template for an allowlisted
+ * operation (including the leading executable token, currently always `git`).
+ * Goal runners must execute this template verbatim; there is no default or
+ * fallback template for unknown adapters.
+ */
+export function verificationGoalCommandTemplateFor(
+  operationId: string,
+  operationVersion: number,
+): readonly string[] {
+  return commandTemplateFor(operationKey(operationId, operationVersion))
+}
+
 function executionProfileFor(definition: OperationDefinition): VerificationGoalOperationExecutionProfileV1 {
   const key = operationKey(definition.id, definition.version)
   const commandTemplate = commandTemplateFor(key)

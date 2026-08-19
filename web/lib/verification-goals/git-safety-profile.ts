@@ -42,6 +42,7 @@ export type GoalRepositoryProfileV1 = {
   supported: boolean
   reasonCode: GoalRepositoryProfileReasonCode | null
   objectFormat: 'sha1' | 'sha256' | null
+  headOid: string | null
   metadataFingerprint: string | null
   indexFingerprint: string | null
   configFingerprint: string | null
