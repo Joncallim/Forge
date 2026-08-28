@@ -25,6 +25,11 @@ Use these by default when they fit:
 - `excalidraw-diagram` before major IA or workflow changes when a quick visual
   model would reduce ambiguity.
 
+These names describe preferred capabilities, not guaranteed installations.
+Check the active skill and tool catalogue first. If a named capability is not
+available, use the closest available repository-aware option or the existing
+stack directly; do not install tools or block a narrow fix unless the user asks.
+
 Prefer the current local stack over generic examples:
 
 - Next.js App Router under `web/app`
@@ -37,3 +42,6 @@ For current docs and registries, prefer:
 - `context7` for current Next.js, React, Tailwind, and library docs
 - `shadcn` MCP for registry browsing and component install/search workflows
 - `playwright` MCP for browser validation
+
+When those connectors are unavailable, use the repository's existing test and
+browser tooling and report the unverified visual states.

@@ -54,7 +54,7 @@ Escalate on changes involving:
 - ...
 
 ## Verdict
-Adversarial sign-off: YES/NO
+Adversarial recommendation: BLOCK / NEEDS CHANGES / NO BLOCKERS FOUND IN INSPECTED SCOPE
 ```
 
 Only report plausible issues grounded in the code or documented flow. If a risk

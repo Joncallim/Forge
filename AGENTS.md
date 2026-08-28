@@ -69,13 +69,26 @@ Manual Codex operation may spawn native subagents defined under `.codex/agents/`
 Those files are an optional manual helper surface mirroring the roles above; they
 are not the product source of truth for the app catalogue.
 
+Do not instantiate every role ceremonially. For a small bounded change, use a
+concise Architect pass, one implementation role, and one independent QA or
+Review pass. Add roles only for distinct workstreams or security/release risk.
+Run application checks from `web/` unless a command explicitly says otherwise.
+
 ### Core responsibilities
 
 1. **Decompose** GitHub issues or user requests into discrete, agent-sized subtasks.
 2. **Select** the right role for each subtask.
-3. **Review** every pull request before merge via the Review role.
+3. **Review** every pull request via the Review role and recommend merge or
+   rework; execute a merge only with explicit user authorization and an
+   available merge capability.
 4. **Maintain** architectural consistency across components.
-5. **Approve or reject** output; spawn rework when needed.
+5. **Recommend acceptance or rework** based on evidence. Merges, deployments,
+   external writes, and other consequential actions still require explicit user
+   authorization.
+6. **Assign one writer per file.** Review, Security, and Adversarial passes stay
+   read-only. QA is read-only when it is the independent verification pass, but
+   may receive exclusive test-file ownership before work begins; implementation
+   agents must not edit those files in that mode.
 
 ### Default review behaviour
 
@@ -129,7 +142,7 @@ Issue / Request
 4. Review → orthogonal review protocol (Security/Adversarial for high-risk changes)
       │
       ▼
-5. PM (you) → merge or rework
+5. PM (you) → recommend acceptance or rework; merge only with explicit user authorization
 ```
 
 ### Decision rules
