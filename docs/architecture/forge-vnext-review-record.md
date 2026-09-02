@@ -1,6 +1,6 @@
 # Forge VNext Architecture Review Record
 
-Date: 2026-09-03  
+Date: 2026-09-03
 Scope: Forge VNext product direction, architecture invariants, phase order, Hermes/HearthBot relationship, budget model, installable Workforce design, and compatibility with the live Forge repository.
 
 Reviewed repository state: `main` after `dc78d0e` and the then-current architecture/docs/issues including ADR 0007, ADRs 0010–0013, Epic #184, #187, Operation Catalog/canonical outcome/capability-reliability work, `AGENTS.md`, `README.md`, `docs/roadmap.md`, and `docs/near-term-roadmap.md`.
