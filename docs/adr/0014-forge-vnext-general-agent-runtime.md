@@ -1,6 +1,6 @@
 # ADR 0014: Forge VNext Is A Deterministic, Budget-Aware General Agent Runtime
 
-**Status:** Accepted for Epic #333  
+**Status:** Accepted for Epic #333
 **Date:** 2026-09-03
 
 ## Context
