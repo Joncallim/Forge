@@ -1,6 +1,6 @@
 # Forge VNext — General Agent Runtime Architecture
 
-Status: **Accepted product direction for Epic #333**  
+Status: **Accepted product direction for Epic #333**
 Date: 2026-09-03
 
 This document defines the long-term architecture and implementation order for
