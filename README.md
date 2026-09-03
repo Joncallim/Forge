@@ -113,7 +113,8 @@ Create task
 
 The web app is the control plane. PostgreSQL stores durable state. Redis carries
 wake-up, retry, and dead-letter transport. The worker performs planning,
-handoff, execution, recovery, and evidence capture.
+handoff preparation, recovery, and evidence capture; the specialist mutation
+path remains fail-closed until the confined execution boundary is proven.
 
 ## Quick Start
 
@@ -184,10 +185,12 @@ FORGE is designed around explicit ceilings rather than presumed agent trust:
 - ACP adapters remain local processes and are not presented as operating system (OS) confinement;
 - final authority remains with the operator.
 
-The next deterministic-execution foundation is
-[#201 — Operation Catalog and typed execution harness](https://github.com/Joncallim/Forge/issues/201):
-agents select approved typed operations, while FORGE constructs, executes, and
-verifies the actual action.
+The deterministic
+[#201 Operation Catalog](https://github.com/Joncallim/Forge/issues/201),
+[#185 canonical outcomes](https://github.com/Joncallim/Forge/issues/185), and
+[#186 capability reliability](https://github.com/Joncallim/Forge/issues/186)
+are now delivered trust foundations. Forge VNext builds on those foundations
+rather than introducing a second execution/reliability truth.
 
 ## Current Boundaries
 
@@ -218,18 +221,31 @@ path validation is not an operating-system sandbox.
 
 ## Roadmap
 
-The near-term order is deliberately reliability-first:
+The accepted product direction is
+[Forge VNext](docs/forge-vnext-architecture.md): a local-first,
+budget-aware, deterministic-first runtime for installable AI Workforces. The
+current coding product remains the compatibility and first proof path; VNext is
+not a claim that those future capabilities already ship.
 
-1. finish and prove MCP admission under Epic #172;
-2. run focused end-to-end and failure testing;
-3. close observed safety, recovery, and operator-blocking bugs;
-4. add the deterministic Operation Catalog in #201;
-5. normalize execution outcomes and stop reasons in #185;
-6. continue the reliability and earned-autonomy work in Epic #184;
-7. resume broad Forge Workspace expansion after the trust layer is proven.
+The active implementation order starts with:
 
-See the [near-term execution roadmap](docs/near-term-roadmap.md) for exit criteria
-and the broader [product roadmap](docs/roadmap.md) for the long-form direction.
+1. generic Mission/Execution/Resource/Grant contracts and a compatibility seam (#334);
+2. deterministic budgets, provider routing, routing receipts, and context economics (#335);
+3. the OS-enforced secure generic execution envelope (#336);
+4. end-to-end Software Engineering through those contracts (#337);
+5. extraction into the first declarative installable Workforce (#338).
+
+Deep Research then proves non-repository generality, persistent Missions and
+Triggers establish zero-token idle operation, Infrastructure Ops proves bounded
+side-effectful autonomy, and only then does HearthBot cut over fully to Forge and
+Hermes retire.
+
+Broad Forge Workspace expansion is deferred until the runtime contracts and core
+reference-Workforce proofs justify it. Model ensembles are explicitly out of
+scope for this programme.
+
+See the [near-term execution roadmap](docs/near-term-roadmap.md) for exact phase
+gates and the [product roadmap](docs/roadmap.md) for the canonical product view.
 
 ## Visual Tour
 
@@ -271,8 +287,9 @@ and the broader [product roadmap](docs/roadmap.md) for the long-form direction.
 | MCP admission | The policy decision that classifies and approves, defers, or blocks requested MCP capabilities. |
 | ACP provider | A local coding-agent CLI connected through Agent Client Protocol. |
 | Project Sentinel | Planned deterministic regression and workflow monitoring under Epic #184. |
-| Operation Catalog | Planned typed execution surface where agents request approved operations rather than arbitrary commands. |
-| Forge Workspace | Planned dockable workbench linking browser, repo, docs, terminals, GitHub, Notion, and task evidence. |
+| Operation Catalog | Delivered typed execution surface where agents request approved operations rather than arbitrary commands. |
+| Forge VNext | Accepted general-agent architecture built around Missions, Workforces, budgets, scoped Grants, deterministic orchestration, and evidence. |
+| Forge Workspace | Deferred future dockable workbench linking browser, repo, docs, terminals, GitHub, Notion, and task evidence. |
 
 ## Documentation
 
@@ -281,8 +298,9 @@ and the broader [product roadmap](docs/roadmap.md) for the long-form direction.
 | [Wiki overview](docs/wiki.md) | Plain-English product overview. |
 | [Operator guide](docs/operator-guide.md) | Install, configure, run, repair, deploy, and troubleshoot FORGE. |
 | [Developer guide](docs/developer-guide.md) | Web app, worker, database, tests, prompts, and implementation conventions. |
-| [Near-term roadmap](docs/near-term-roadmap.md) | Current execution order and exit criteria. |
-| [Product roadmap](docs/roadmap.md) | Broader beta, Workforce, and Workspace direction. |
+| [VNext architecture](docs/forge-vnext-architecture.md) | Full general-agent architecture, invariants, review-derived boundaries, and programme. |
+| [Near-term roadmap](docs/near-term-roadmap.md) | Current VNext execution order and exit criteria. |
+| [Product roadmap](docs/roadmap.md) | Canonical VNext product direction and phase programme. |
 | [Visual identity](docs/brand.md) | Logo meaning, components, motion, status, accessibility, and generated assets. |
 | [Design guide](docs/design.md) | Product model, UI principles, screenshots, and visual QA. |
 | [CLI architecture](docs/cli-command-architecture.md) | `forge` command taxonomy and routing. |
@@ -290,7 +308,7 @@ and the broader [product roadmap](docs/roadmap.md) for the long-form direction.
 | [GitHub-native workflow](docs/workflows/github-native-agent-workflow.md) | Controlled issue-to-handoff-to-PR workflow. |
 | [GitHub PR contract](docs/github-agent-pr-contract.md) | Required PR structure and acceptance-criteria evidence. |
 | [GitHub agent run log](docs/github-agent-run-log.md) | Durable GitHub workflow run state. |
-| [Forge Workspace roadmap](docs/workspace-roadmap.md) | Future dockable workspace and context-linking plan. |
+| [Forge Workspace roadmap](docs/workspace-roadmap.md) | Deferred historical design proposal for a future dockable workspace and context-linking plan. |
 | [Architecture decisions](docs/adr/) | Durable technical decisions and safety boundaries. |
 
 ## Repository Profile

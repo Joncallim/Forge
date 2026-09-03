@@ -6,6 +6,13 @@ Accepted for the #124 agent/workforce clarity work. Establishes the naming
 contract; the seed/migration and UI phases of #124 build on it in follow-up
 changes.
 
+**VNext note (2026-09-03):** ADR 0014 partially supersedes this ADR as the
+product-wide ontology. The provider/runtime → role → harness/overlay → Workforce
+separation remains valid, and this coding-oriented role catalogue becomes the
+natural taxonomy for the Software Engineering Workforce. Forge Core must not
+assume that Architect/Product/Frontend/Backend/QA/Review/etc. are the universal
+roles for every installed Workforce.
+
 ## Context
 
 Forge's agent model grew Codex-first. `AGENTS.md` was titled and framed around
@@ -102,3 +109,6 @@ implements them safely.
 - Related: #30 (Workforce umbrella), #108 (naming/slug cleanup), #109 (project
   workspace layout), #114 (ACP model selection), #119 (Executable Workforce
   Beta).
+- Under ADR 0014, these broad coding roles are no longer a product-wide closed
+  catalogue. Other installed Workforces may define domain-specific roles while
+  using the same generic runtime contracts.

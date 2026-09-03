@@ -2,6 +2,15 @@
 
 Last updated: 2026-07-01
 
+> **VNext status — 2026-09-03:** This remains a design/reference proposal for a
+> future Forge Workspace interface. Its sequencing and statements that Workspace
+> is the next major product direction are superseded by
+> [`forge-vnext-architecture.md`](forge-vnext-architecture.md),
+> [ADR 0014](adr/0014-forge-vnext-general-agent-runtime.md), and Epic #333.
+> Broad Workspace expansion is deferred until the VNext runtime contracts and
+> core reference-Workforce proofs justify it. The phases below are therefore
+> historical design slices, not the active implementation order.
+
 ## Plain-English Goal
 
 Forge should eventually feel like a local AI-assisted software workspace: browser,
