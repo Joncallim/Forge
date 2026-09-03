@@ -2,6 +2,15 @@
 
 Last updated: 2026-07-10
 
+> **VNext supersession — 2026-09-03:** The forward-looking product priority and
+> implementation order in this document are superseded by
+> [`forge-vnext-architecture.md`](forge-vnext-architecture.md),
+> [ADR 0014](adr/0014-forge-vnext-general-agent-runtime.md), and
+> [`near-term-roadmap.md`](near-term-roadmap.md). This file remains useful for
+> historical/current-beta detail. In particular, statements below that broad
+> Forge Workspace expansion is the "next major product direction" are no longer
+> current; VNext runtime contracts and the #333 phase gates come first.
+
 ## Plain-English Summary
 
 Forge is in an Orchestrator-stage beta. The web app is the control plane for
