@@ -146,7 +146,7 @@ Mobile screenshots are also available:
 - `docs/assets/gui/mobile-01-setup.png`
 - `docs/assets/gui/mobile-02-providers.png`
 - `docs/assets/gui/mobile-03-task-awaiting-approval.png`
-- `docs/assets/gui/mobile-04-completed.png`
+- `docs/assets/gui/mobile-04-task-completed.png`
 
 If a screenshot and the live app disagree, the live repository/app wins. The
 screenshots are illustrative evidence, not capability contracts.
