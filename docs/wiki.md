@@ -3,29 +3,46 @@
 This is the layman-readable Forge overview. It is written so it can be mirrored
 into Notion without requiring a reader to know the codebase first.
 
-Last synced from the repository: 2026-07-01.
+Last synced from the repository: 2026-09-03.
 
 ## What Forge Is
 
-Forge is a local control room for AI coding work. You open a browser dashboard,
-connect one or more AI providers, choose a project, describe a task, and review
-the plan Forge produces.
+Forge is currently a local control room for AI coding work. You open a browser
+dashboard, connect one or more AI providers, choose a repository-backed project,
+describe a task, and review the plan Forge produces.
 
-The product goal is an AI software team with a human in charge. The current
-beta is more cautious: Forge plans work, stores evidence, and asks for approval.
-Workforce materialization, handoff records, package execution, and local
-repository edits are enabled unless explicitly disabled. Generated package
-output is kept under
-`.forge/task-runs/<task-id>/<work-package-id>/attempt-<attempt-number>/`, then
-repository-affecting files are applied to the local project after the package execution step.
-Executable packages may use bounded read-only project context, but Forge is not
-yet a fully autonomous pull-request machine.
+The current beta is deliberately cautious. Forge can plan work, materialize
+durable work packages and gates, broker capability/MCP admission, preserve
+evidence, and prepare specialist handoff artifacts. Specialist package execution
+and file materialization are currently **unavailable** because Forge does not yet
+have the required operating-system-enforced confined execution path. Reserved
+execution flags do not open that boundary, and direct host-repository writes are
+not available.
 
-The next larger product direction is Forge Workspace: a dockable, AI-assisted
-workbench that can bring browser, repo, notes, docs, Playwright, Notion, GitHub,
-logs, terminals, and task artifacts into one saved context. This should feel
-OS-like over time, but the first implementation should stay a workspace shell
-rather than a full operating system.
+The accepted longer-term direction is **Forge VNext**: a local-first,
+budget-aware, deterministic-first runtime for installable AI Workforces.
+Software Engineering becomes the first Workforce rather than the permanent
+definition of Forge itself.
+
+The key idea is simple:
+
+```text
+Install a Workforce
+  -> bind the resources it may use
+  -> grant bounded capabilities
+  -> give it a Mission
+  -> Forge handles deterministic orchestration, budgets, execution policy,
+     evidence, verification, recovery, and escalation
+```
+
+Models should be temporary workers for bounded reasoning. Scheduling, routing,
+budgets, state, retries, recovery, and trigger processing belong in ordinary
+software. A healthy persistent Forge responsibility should be able to sit idle
+without burning model tokens.
+
+See [Forge VNext architecture](forge-vnext-architecture.md),
+[ADR 0014](adr/0014-forge-vnext-general-agent-runtime.md), and the
+[product roadmap](roadmap.md) for the accepted future direction.
 
 ## What Forge Does Today
 
@@ -37,84 +54,78 @@ You write a task
   -> Redis wakes the worker
   -> Architect writes a plan
   -> Forge saves the plan
-  -> You approve, reject, or revise it
+  -> work packages and review gates are materialized
+  -> you approve, reject, revise, stop, or recover the work
+  -> Forge prepares bounded handoff/evidence state
 ```
 
-Workforce materialization and handoff flow:
+The specialist mutation path remains fail-closed. A current approval does not
+mean an agent receives arbitrary filesystem, shell, network, or MCP authority.
 
-```text
-Architect plan saved
-  -> work packages and plan approval gate
-  -> approved plan
-  -> capability/MCP admission check
-  -> ready package / review-gate state
-  -> optional bounded-context sandbox execution only when enabled
-  -> manual QA/Reviewer/Security gates where required
-```
+Important delivered foundations include:
 
-EPIC #172 (ADR [0009](adr/0009-mcp-admission-contract.md)) introduces one shared
-MCP admission contract across grant preview, plan approval, and handoff. This is
-the target architecture, not yet the shipped behavior: today plan approval
-enforces only required filesystem context grants, and the shared broker check at
-approval time lands with slice S2. Under the contract each MCP request resolves
-to a single mode -- planning-only context, bounded read-only context
-(approve/deny), an MCP that needs setup, or a deferred live-MCP feature -- so a
-block visible in the approval-time MCP snapshot is surfaced at approval rather
-than only at handoff. Health or configuration changes between approval and
-handoff can still introduce a new block.
+- unified capability/MCP admission and recovery work under Epic #172;
+- deterministic typed Operation Catalog (#201 / ADR 0011);
+- canonical execution outcomes (#185 / ADR 0010);
+- append-only capability reliability evidence (#186 / ADR 0012);
+- verification-goal registry foundations (#187 / ADR 0013).
 
-Task detail controls now cover the common operator interventions:
+Those foundations are reused by VNext. Forge should not build a second operation,
+reliability, verification, or autonomy truth merely because the product expands
+beyond coding.
 
-- Stop cancels a non-terminal task and any active package/run state.
-- Delete removes a terminal individual task and its run history without
-  deleting the whole project. Stop active tasks first.
-- Retry task requeues the task from the beginning and can switch providers.
-- Retry handoff is available for retryable blocked package handoffs after the
-  operator fixes the cause.
-- Agent history is the primary activity timeline; queue attempts are collapsed
-  underneath it for lower-level retry evidence.
+Task controls cover common operator interventions such as stop, retry, plan
+revision, approval/rejection, and recovery of supported blocked states. Agent
+history and stored artifacts preserve the evidence instead of relying on a chat
+session as durable state.
 
-Still future work:
+Still future work includes:
 
-- Creating branches, commits, pull requests, or merges.
-- Granting live MCP tools to specialist agents at runtime.
-- Running specialists in parallel.
-- Treating QA, Reviewer, and Security gates as autonomous production-ready merge
-  gates.
-- Providing the Forge Workspace pane system for browser, Playwright, notes,
-  Markdown, coding, logs, Notion, GitHub, and linked task context.
+- the OS-enforced generic execution envelope required for specialist writes;
+- general branch, commit, PR, merge, or deployment authority;
+- parallel specialist mutation with safe resource-concurrency rules;
+- autonomous QA/Reviewer/Security execution that can satisfy trusted gates;
+- persistent Missions and Trigger/Event scheduling;
+- non-repository Workforces such as Deep Research;
+- general Resource/Capability adapters;
+- the deferred broad Forge Workspace pane system.
 
 ## The Simple Analogy
 
-Picture a small software team:
+Today, picture a cautious software team:
 
-- A product owner says what outcome they want.
-- A tech lead writes the plan.
-- Specialists handle backend, frontend, QA, DevOps, docs, and review.
-- A human approves the important decisions.
+- you state the outcome;
+- an Architect prepares the plan;
+- Forge turns that plan into bounded work packages and required capabilities;
+- Forge records what was proposed, approved, blocked, or verified;
+- risky or unsupported execution stays closed rather than being improvised by a
+  model.
 
-Forge is building that pattern for AI coding. The current beta has the control
-room, queue, project records, provider records, Architect planning, artifacts,
-and approval loop. The full specialist team is being added carefully behind
-safety gates.
+VNext generalizes the organisation rather than throwing this away. A Software
+Engineering Workforce, a Deep Research Workforce, and an Infrastructure Ops
+Workforce can eventually share the same Mission, Resource, Grant, Budget,
+Operation, Artifact, and Gate contracts.
 
-Forge Workspace adds the room where that team works: panes for the repo, docs,
-browser, Playwright runs, task notes, GitHub objects, Notion pages, logs, and
-review artifacts, all linked back to the current task.
+The orchestrator itself does not need to be a permanent model. Forge Core owns
+the deterministic state and lends narrowly scoped, revocable authority to each
+bounded run.
 
 ## The Moving Parts
 
-| Part | What it means |
+| Part | What it means today |
 |---|---|
-| Dashboard | The web app you use in the browser. |
-| PostgreSQL | The durable database for users, providers, projects, tasks, artifacts, agents, workforces, approvals, workspaces, pane state, and link records. |
-| Redis | The fast queue that wakes the worker and carries retry/dead-letter jobs. |
-| Worker | The background process that claims queued tasks and calls model providers. |
-| Provider | A model connection, such as OpenAI, Anthropic, OpenRouter, Ollama, LM Studio, LiteLLM, or ACP. |
-| Architect | The planning agent that writes the first implementation plan. |
-| Workforce | Editable agent teams plus task-scoped work packages for specialist execution. |
-| Forge Workspace | Planned dockable shell for browser, Playwright, repo, notes, docs, Notion, GitHub, logs, terminal, and task context. |
-| Artifact | Saved evidence, such as a plan, run output, browser screenshot, trace, note, or future review result. |
+| Dashboard | The browser app for projects, providers, tasks, approvals, blocked states, and evidence. |
+| PostgreSQL | The durable source of orchestration and evidence truth. |
+| Redis | Queue/wakeup, retry, and dead-letter transport; not the authoritative task history. |
+| Worker | Background process that claims queued tasks and calls configured model providers for supported stages. |
+| Provider | A model connection such as a direct API, OpenRouter/LiteLLM, Ollama/LM Studio, or ACP-backed local CLI. |
+| Architect | The current planning agent for coding tasks. Under VNext it becomes a Software Engineering Workforce role, not a universal Forge role. |
+| Workforce | Editable team/work-package model today; VNext turns this into a versioned installable declarative organisation. |
+| Work package | Durable scoped unit of planned specialist work with dependencies, capabilities, inputs, and acceptance criteria. |
+| Artifact | Saved plan, output, evidence, finding, report, or log linked to execution history. |
+| Operation Catalog | Delivered typed deterministic execution surface used to request approved operations instead of arbitrary commands. |
+| Forge VNext | Accepted future runtime architecture built around Missions, Workforces, scoped Grants, budgets, deterministic orchestration, and evidence. |
+| Forge Workspace | Deferred future interface proposal for dockable browser/repo/docs/tool panes and linked context. |
 
 ## Screenshots
 
@@ -135,7 +146,10 @@ Mobile screenshots are also available:
 - `docs/assets/gui/mobile-01-setup.png`
 - `docs/assets/gui/mobile-02-providers.png`
 - `docs/assets/gui/mobile-03-task-awaiting-approval.png`
-- `docs/assets/gui/mobile-04-task-completed.png`
+- `docs/assets/gui/mobile-04-completed.png`
+
+If a screenshot and the live app disagree, the live repository/app wins. The
+screenshots are illustrative evidence, not capability contracts.
 
 ## Provider Options
 
@@ -143,64 +157,101 @@ Forge supports several kinds of model connections:
 
 | Option | Best for | Plain-English note |
 |---|---|---|
-| Direct cloud providers | Teams with provider API keys | Forge talks straight to a known provider endpoint. |
-| OpenRouter | Trying many hosted models quickly | One key can reach many model providers. |
-| LiteLLM | Production-like routing and fallback | You run a gateway that presents many models as one OpenAI-compatible API. |
-| Ollama / LM Studio | Local models | Useful for no-key experiments, privacy, or local GPUs. |
-| ACP | Local coding CLIs | Forge starts a local adapter that talks to tools like Codex CLI or Claude Code. |
+| Direct cloud providers | Configured provider API access | Forge talks directly to a supported provider endpoint. |
+| OpenRouter | Trying hosted model families behind one gateway | One key can reach multiple providers/models. |
+| LiteLLM | Self-controlled routing/gateway setups | A separate gateway presents configured models behind one API shape. |
+| Ollama / LM Studio | Local models | Useful for local/no-key experiments and privacy-sensitive work where capable enough. |
+| ACP | Local coding CLIs | Forge starts a local adapter that talks to tools such as Codex CLI or Claude Code. |
+
+VNext adds a provider-neutral cognitive-class and budget layer above those
+connections. A Workforce should request something like economy/standard/frontier
+requirements rather than permanently binding its identity to a vendor model.
+Routing remains deterministic software; Forge should not spend an LLM call just
+to decide which LLM to call.
 
 ## ACP And Zed, In Simple Terms
 
 ACP stands for Agent Client Protocol. It is a common way for one program to talk
 to a coding agent.
 
-Forge's current ACP support works like this:
+Forge's ACP path is conceptually:
 
 ```text
 Forge
-  -> starts a pinned local ACP adapter binary
+  -> starts a pinned local ACP adapter
   -> adapter speaks ACP over JSON-RPC
   -> adapter wraps a real local CLI such as codex or claude
-  -> the local CLI uses the account already logged in on your machine
+  -> the CLI uses the account already logged in on the machine
   -> text streams back into Forge
 ```
 
-ACP is used for provider calls such as Architect planning and executable
-work-package runs. Executable ACP packages run from the package attempt sandbox,
-and Forge applies only the returned execution JSON through its path guards.
+ACP can support provider calls such as Architect planning. It does **not** turn
+path validation into OS confinement, grant broad host authority, or override the
+current fail-closed specialist execution boundary.
 
-You do not need the Zed editor installed for this path. "Zed connector" means
-Forge uses an Agent Client Protocol adapter package as a translator. The
-adapter process receives a minimal environment instead of Forge's provider,
-database, Redis, GitHub, or encryption secrets. You still need the underlying
-CLI installed and authenticated.
+You do not need the Zed editor installed for this path. "Zed connector" refers
+to the adapter package used as a translator. The adapter is intentionally kept
+away from broad Forge provider/database/Redis/GitHub/encryption secrets where the
+runtime contract permits.
 
 For more detail, see [ACP And The Zed Connector](acp-zed-connector.md).
 
-## Forge Workspace, In Simple Terms
+## Forge VNext, In Simple Terms
 
-Forge Workspace is the planned next shell around Forge. Instead of opening one
-screen for tasks, one app for notes, one browser for testing, one GitHub tab for
-issues, and one Notion page for planning, the workspace should let you keep those
-surfaces together.
+VNext separates the durable mission from individual model calls.
 
-The first version should use dockable panes rather than unrestricted desktop
-windows. Likely panes include:
+A future **Mission** is a durable outcome or responsibility. An **Execution** is
+one bounded attempt or cycle. A **Resource** is the thing Forge may read or
+affect. A **Capability** is a class of action. A **Grant** combines capability,
+resource scope, Principal, constraints, and policy.
 
-- Human browser for docs, previews, local apps, and manual auth flows.
-- Separate Playwright browser for agent-controlled testing and screenshots.
-- Notepad for task scratch.
-- Markdown reader/editor for README files, ADRs, plans, and artifacts.
-- Coding pane for focused file edits and diff review.
-- Terminal/log drawer for commands, tests, workers, and traces.
-- Repo explorer for files, branches, commits, and local diffs.
-- Notion explorer for planning pages and project docs.
-- GitHub explorer for issues, PRs, checks, and comments.
+That lets Forge express work such as:
 
-The Notion and GitHub integration should use link records rather than a blind
-sync mirror. A Notion page can document the intent, a GitHub issue can track the
-work, repo files can hold the implementation, and Forge can link them all to one
-task.
+```text
+Software Engineering Mission
+  -> repository Resource
+  -> filesystem/Git/GitHub capabilities
+
+Deep Research Mission
+  -> web/document Resources
+  -> search/read/evidence capabilities
+
+Infrastructure Ops Mission
+  -> service Resources
+  -> health/read/restart capabilities
+```
+
+An installed Workforce may request capabilities, but installation itself does
+not grant authority or connector credentials. Package-defined gates may add
+restrictions but cannot weaken mandatory Forge/operator security ceilings.
+
+Three reference Workforces prove the architecture in order:
+
+1. **Software Engineering** — safe mutation and deterministic verification.
+2. **Deep Research** — non-repository reasoning and evidence provenance.
+3. **Infrastructure Ops** — persistent event-driven work with zero-token idle
+   periods and bounded reversible side effects.
+
+Only after those proofs does HearthBot cut over fully to Forge and Hermes retire.
+Useful Hermes/HearthBot lessons are re-derived as Forge-native requirements;
+Hermes code, state, config, parent-agent prompts, and routing implementation are
+not imported.
+
+Model ensembles are deliberately outside this programme for now.
+
+## Forge Workspace, Deferred
+
+Forge Workspace remains a useful future interface idea: dockable panes for a
+human browser, separate Playwright browser, repo/docs, notes, diffs, terminal and
+logs, GitHub/Notion links, and task evidence.
+
+It is **not** the next architectural priority. Broad Workspace expansion is
+deferred until the VNext runtime contracts and core reference-Workforce proofs
+are stable enough to justify the extra surface area.
+
+The historical design proposal remains in
+[Forge Workspace roadmap](workspace-roadmap.md). Its old sequencing is explicitly
+superseded by VNext.
 
 ## How To Start Locally
 
@@ -223,15 +274,17 @@ and can optionally set up a small local Ollama path.
 
 ## What To Read Next
 
+- [Forge VNext architecture](forge-vnext-architecture.md) for the accepted
+  general-agent architecture and invariants.
+- [Product roadmap](roadmap.md) for the canonical VNext product direction.
+- [Near-term roadmap](near-term-roadmap.md) for exact implementation order and
+  release gates.
 - [Operator guide](operator-guide.md) for install, startup, health checks,
   deployment, and uninstall.
 - [Developer guide](developer-guide.md) for code structure, worker flow,
   database tables, prompts, and tests.
 - [ACP And The Zed Connector](acp-zed-connector.md) for local ACP provider
   behavior.
-- [Roadmap](roadmap.md) for the current beta boundary, Workforce work, and Forge
-  Workspace direction.
-- [Forge Workspace roadmap](workspace-roadmap.md) for the proposed implementation
-  plan for dockable panes, browsers, Notion/GitHub linking, and permissioned
-  agent operations.
+- [Forge Workspace roadmap](workspace-roadmap.md) for the deferred historical
+  interface proposal.
 - [Design guide](design.md) for UI principles and screenshot evidence.
