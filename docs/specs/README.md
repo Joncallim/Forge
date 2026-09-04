@@ -35,7 +35,7 @@ This specification framework uses RFC 2119 language:
 | Status | Meaning |
 |---|---|
 | **Draft** | Under active development; not yet binding |
-| **Accepted** | Approved for the current programme; binding |
+| **Proposed** | Freeze candidate under review; not yet binding — pending operator-approved merge |
 | **Superseded** | Replaced by a newer spec version |
 | **Deprecated** | Still binding for historical executions; not for new work |
 
@@ -43,18 +43,18 @@ This specification framework uses RFC 2119 language:
 
 | ID | Title | Status | Version |
 |---|---|---|---|
-| SPEC-0001 | Specification Authoring Standard | Accepted | 1.0 |
-| SPEC-0002 | Runtime Contract v1 | Accepted | 1.0 |
-| SPEC-0003 | Authorization & Grants v1 | Accepted | 1.0 |
-| SPEC-0004 | Operation & Side-Effect Semantics v1 | Accepted | 1.0 |
-| SPEC-0005 | Resource Classification, Data Egress & Secrets v1 | Accepted | 1.0 |
-| SPEC-0006 | Model Invocation & Cost Contract v1 | Accepted | 1.0 |
-| SPEC-0007 | Error & Reason Codes v1 | Accepted | 1.0 |
-| SPEC-0008 | Conformance Test Standard v1 | Accepted | 1.0 |
-| SPEC-0009 | Trigger/Event Envelope v1 | Accepted | 1.0 |
-| SPEC-0010 | Workforce Package v1 | Accepted | 1.0 |
-| SPEC-0011 | Provenance & Supply Chain v1 | Accepted | 1.0 |
-| SPEC-0012 | Observability vs Audit v1 | Accepted | 1.0 |
-| SPEC-0013 | Agentic Threat Model v1 | Accepted | 1.0 |
-| SPEC-0014 | Migration & Compatibility v1 | Accepted | 1.0 |
-| SPEC-0015 | Reliability / SLO Profile v1 | Accepted | 1.0 |
+| SPEC-0001 | Specification Authoring Standard | Proposed | 1.0 |
+| SPEC-0002 | Runtime Contract v1 | Proposed | 1.0 |
+| SPEC-0003 | Authorization & Grants v1 | Proposed | 1.0 |
+| SPEC-0004 | Operation & Side-Effect Semantics v1 | Proposed | 1.0 |
+| SPEC-0005 | Resource Classification, Data Egress & Secrets v1 | Proposed | 1.0 |
+| SPEC-0006 | Model Invocation & Cost Contract v1 | Proposed | 1.0 |
+| SPEC-0007 | Error & Reason Codes v1 | Proposed | 1.0 |
+| SPEC-0008 | Conformance Test Standard v1 | Proposed | 1.0 |
+| SPEC-0009 | Trigger/Event Envelope v1 | Proposed | 1.0 |
+| SPEC-0010 | Workforce Package v1 | Proposed | 1.0 |
+| SPEC-0011 | Provenance & Supply Chain v1 | Proposed | 1.0 |
+| SPEC-0012 | Observability vs Audit v1 | Proposed | 1.0 |
+| SPEC-0013 | Agentic Threat Model v1 | Proposed | 1.0 |
+| SPEC-0014 | Migration & Compatibility v1 | Proposed | 1.0 |
+| SPEC-0015 | Reliability / SLO Profile v1 | Proposed | 1.0 |

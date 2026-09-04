@@ -1,6 +1,6 @@
 # ADR 0015: Secure Execution Technology Selection
 
-**Status:** Accepted
+**Status:** Proposed (pending conformance proof)
 **Date:** 2026-09-04
 **Supersedes:** None
 
@@ -56,9 +56,9 @@ Cross-platform security MUST NOT be faked. If a platform cannot meet the conform
 
 #### Candidate A: Rootless hardened container (Docker/podman with user namespaces, seccomp, cgroups)
 
-- **Strengths**: Mature technology, strong isolation, well-understood security model, supports all S1-S23 requirements.
+- **Strengths**: Mature technology, strong isolation, well-understood security model, expected to support all S1-S23 requirements.
 - **Weaknesses**: Requires container runtime installed; daemon dependency; image management overhead.
-- **Verdict**: If this passes the conformance profile, use it.
+- **Verdict**: Preferred first candidate. Must pass hostile conformance proof before acceptance.
 
 #### Candidate B: MicroVM (Firecracker)
 
@@ -80,11 +80,26 @@ Cross-platform security MUST NOT be faked. If a platform cannot meet the conform
 
 ### 5. Decision
 
-**Use rootless hardened containers (Docker/podman with user namespaces, seccomp profiles, cgroups v2) as the first sandbox technology.**
+#### 5.1 Conformance profile frozen
 
-If rootless containers cannot meet the conformance profile on the target host, fall back to a stronger isolation boundary (microVM). If no suitable technology is available, execution fails closed.
+The S1-S23 sandbox conformance profile (section 1) is **frozen** and binding on all implementation. No sandbox technology may be deployed unless it passes all non-waivable conformance requirements on the target host.
 
-Implementation details (exact container image, seccomp profile, cgroup configuration) are deferred to the implementation phase.
+#### 5.2 Technology selection
+
+**Rootless hardened containers (Docker/podman with user namespaces, seccomp profiles, cgroups v2)** are the **preferred first candidate**.
+
+This technology decision is **Accepted in principle pending conformance proof**. It becomes fully Accepted only after hostile conformance proof demonstrates that all S1-S23 requirements are met on the supported Linux host (amd64/arm64).
+
+If rootless containers fail any non-waivable security requirement during conformance testing, evaluate the next candidate:
+
+1. Rootless hardened containers (preferred, lowest complexity).
+2. gVisor (application-layer kernel, stronger isolation).
+3. MicroVM (Firecracker) (hardware-level virtualization, strongest isolation).
+4. Bare namespaces + seccomp (prototype only, not for production).
+
+No weakening exceptions are permitted simply to keep the preferred technology. If rootless containers cannot meet the profile, the next candidate MUST be evaluated.
+
+Implementation details (exact container image, seccomp profile, cgroup configuration, orchestration) are deferred to the implementation phase.
 
 ### 6. What this does not decide
 
@@ -100,15 +115,21 @@ Implementation details (exact container image, seccomp profile, cgroup configura
 
 - Conformance-driven selection ensures security requirements drive technology choice, not vice versa.
 - Rootless containers are well-understood and widely deployed.
-- Migration path to stronger isolation (microVM) is available if needed.
+- Migration path to stronger isolation (microVM/gVisor) is available if needed.
+- The conformance profile is frozen independently of any technology vendor.
 
 ### Costs
 
 - Container runtime must be installed on the host.
 - Image management adds operational complexity.
 - Startup latency is higher than no sandbox.
+- Hostile conformance proof is required before technology acceptance, which may reveal gaps requiring fallback to a stronger technology.
 
 These costs are accepted because the alternative (no OS-enforced sandbox) cannot meet the VNext security requirements.
+
+### Risk
+
+If rootless containers fail conformance testing, the fallback technologies (gVisor, microVM) have higher operational complexity and startup latency. This risk is accepted because the conformance profile is non-negotiable for VNext security goals.
 
 ## References
 

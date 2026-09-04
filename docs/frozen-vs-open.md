@@ -9,10 +9,11 @@ These decisions are frozen by the normative specs and ADRs. Implementation agent
 
 ### Ontology & Lifecycle
 - Entity relationships: Mission → Execution → Work Package → Agent Run / Operation (SPEC-0002 R1)
-- Lifecycle vs outcome separation (SPEC-0002 R2)
-- Mission lifecycle states: draft, active, waiting, paused, completed, cancelled, terminal_failure (SPEC-0002 R3)
+- Lifecycle vs outcome separation for executable/stateful entities (SPEC-0002 R2)
+- Mission lifecycle states: draft, active, waiting, paused, terminal (SPEC-0002 R3); outcome is separate
 - Execution lifecycle states: created, admitted, queued, leased, running, waiting, terminal (SPEC-0002 R4)
 - Execution outcomes: succeeded, failed, cancelled, blocked, indeterminate (SPEC-0002 R5)
+- Work Package lifecycle: pending, running, terminal; outcome: succeeded, failed, cancelled, blocked (SPEC-0002)
 - Gate results: pass, rework, human_required, blocked (SPEC-0002 R6)
 - Opaque identity rule (SPEC-0002 R7)
 - Artifact immutability and versioning (SPEC-0002 R8)
@@ -30,12 +31,13 @@ These decisions are frozen by the normative specs and ADRs. Implementation agent
 - Approval binding to exact revision/digest + scope + policy (SPEC-0003 R8)
 - Current security revoke vs pinned behaviour (SPEC-0003 R9)
 - Grant derivation chain (SPEC-0003 R11)
+- Operator authority limited by hard invariants and system ceilings (SPEC-0003 R10)
 
 ### Operations & Side Effects
 - Operation declaration fields (SPEC-0004 R1)
 - Effect classes: pure, read, local_mutation, external_reversible_mutation, external_mutation, high_risk_or_irreversible (SPEC-0004 R2)
 - Retry classes: replay_safe, idempotent_with_key, reconcile_before_retry, at_most_once, human_required (SPEC-0004 R3)
-- Side-effect lifecycle (SPEC-0004 R4)
+- Side-effect lifecycle as branching state graph (SPEC-0004 R4)
 - Stable Operation identity (SPEC-0004 R5)
 - Submission uncertainty ≠ failure-before-submission (SPEC-0004 R6)
 - Blind retry prohibition after uncertain submission (SPEC-0004 R6)
@@ -44,7 +46,7 @@ These decisions are frozen by the normative specs and ADRs. Implementation agent
 - Classification levels: PUBLIC, INTERNAL, CONFIDENTIAL, SECRET (SPEC-0005 R1)
 - Derived Artifact classification rule (SPEC-0005 R2)
 - Declassification rules (SPEC-0005 R3)
-- Egress authorization order (SPEC-0005 R4)
+- Egress authorization order (SPEC-0005 R4); PERMIT/CONDITIONAL/DENY matrix (SPEC-0005 R6)
 - External Resource contents are untrusted (SPEC-0005 R7)
 - Credential brokering principle (SPEC-0005 R8)
 - Token passthrough prohibition (SPEC-0005 R8)
@@ -59,7 +61,7 @@ These decisions are frozen by the normative specs and ADRs. Implementation agent
 - Atomic budget reservation before invocation (SPEC-0006 R6)
 - Parallel reservation safety (SPEC-0006 R7)
 - Unknown cost remains unknown (SPEC-0006 R8)
-- Provider readiness taxonomy (SPEC-0006 R10)
+- Provider readiness taxonomy (SPEC-0006 R10); circuit-breaking by failure class (SPEC-0006 R14)
 - Routing receipt requirement (SPEC-0006 R11)
 - Optimization target: minimum expected cost to verified outcome (SPEC-0006 R12)
 
@@ -77,14 +79,14 @@ These decisions are frozen by the normative specs and ADRs. Implementation agent
 - Phase closure requirements (SPEC-0008 R6)
 
 ### Triggers & Events
-- CloudEvents-compatible envelope (SPEC-0009 R1)
+- CloudEvents-compatible envelope with valid extension attribute names (SPEC-0009 R1-R2)
 - Forge extensions (SPEC-0009 R2)
 - Auth separate from authorization (SPEC-0009 R3)
 - PostgreSQL as occurrence truth (SPEC-0009 R4)
-- Deduplication strategies (SPEC-0009 R5)
+- Deduplication strategies (SPEC-0009 R5); granular concurrency per dedupe identity (SPEC-0009 concurrency)
 - Trigger occurrence identity ≠ Operation identity (SPEC-0009 R6)
 - Causality tracking (SPEC-0009 R7)
-- Loop prevention (SPEC-0009 R8)
+- Loop prevention including multi-Trigger causal ancestry detection (SPEC-0009 R8)
 - Schedule catch-up policies (SPEC-0009 R9)
 - Zero-token idle for Triggers (SPEC-0009 R10)
 - Filter before model wake (SPEC-0009 R11)
@@ -94,7 +96,7 @@ These decisions are frozen by the normative specs and ADRs. Implementation agent
 - Install does not authorize (SPEC-0010 R2)
 - Manifest schema requirements (SPEC-0010 R3)
 - Capability expansion requires review (SPEC-0010 R4)
-- Immutable package versions (SPEC-0010 R5)
+- Immutable package versions with source resolution and version integrity (SPEC-0010 R5)
 - Lockfile requirements (SPEC-0010 R6)
 - Dependencies do not inherit permissions (SPEC-0010 R7)
 - Package pin for running Missions (SPEC-0010 R8)
