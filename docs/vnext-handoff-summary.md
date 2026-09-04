@@ -141,5 +141,5 @@ These are explicitly documented areas where future decisions are needed (unchang
 - ✅ P0/P1 findings remediated and verified
 - ✅ Supporting documents (phase-reference.md, data-model-reference.md) created
 - ✅ GitHub issues reconciled with corrected specs
-- ⏳ Repository validation — pending PR creation
+- ✅ Repository validation — PR #359 created, CI passing (web ✅, check ✅, GitGuardian ✅)
 - ✅ Remaining uncertainty is genuinely low-level implementation choice or explicitly deferred scope
