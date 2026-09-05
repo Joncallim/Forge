@@ -4,6 +4,7 @@ const GITHUB_TIMEOUT_MS = 8000
 const DEFAULT_GITHUB_API_URL = 'https://api.github.com'
 const GITHUB_API_VERSION = '2022-11-28'
 const LIST_COMMENTS_PAGE_SIZE = 100
+const LIST_ISSUES_PAGE_SIZE = 100
 
 export type GitHubIssue = Readonly<{
   number: number
@@ -11,9 +12,11 @@ export type GitHubIssue = Readonly<{
   body: string | null
   labels: string[]
   state: string
+  stateReason: string | null
   htmlUrl: string
   authorLogin: string
   isPullRequest: boolean
+  updatedAt: string | null
 }>
 
 export type GitHubComment = Readonly<{
@@ -45,6 +48,14 @@ export interface GitHubClient {
   upsertComment(issueNumber: number, input: { markerPrefix: string; botLogin: string; body: string }): Promise<GitHubComment>
   getPullRequest(pullRequestNumber: number): Promise<GitHubPullRequest>
   getCollaboratorPermission(username: string): Promise<GitHubCollaboratorPermission>
+  /**
+   * List open issues in the repository, paginated.
+   * Filters out pull requests.
+   */
+  listOpenIssues(options?: { page?: number; perPage?: number; maxPages?: number }): Promise<{
+    issues: GitHubIssue[]
+    hasMore: boolean
+  }>
 }
 
 type RestGitHubClientOptions = {
@@ -121,11 +132,13 @@ function mapIssue(raw: Record<string, unknown>): GitHubIssue {
           .filter((label) => label !== '')
       : [],
     state: typeof raw.state === 'string' ? raw.state : '',
+    stateReason: typeof raw.state_reason === 'string' ? raw.state_reason : null,
     htmlUrl: typeof raw.html_url === 'string' ? raw.html_url : '',
     authorLogin: raw.user && typeof raw.user === 'object' && typeof (raw.user as { login?: unknown }).login === 'string'
       ? (raw.user as { login: string }).login
       : '',
     isPullRequest: raw.pull_request !== undefined,
+    updatedAt: typeof raw.updated_at === 'string' ? raw.updated_at : null,
   }
 }
 
@@ -256,6 +269,30 @@ export class RestGitHubClient implements GitHubClient {
         return body.permission
       default:
         throw new Error(`Unexpected collaborator permission response for ${username}.`)
+    }
+  }
+
+  async listOpenIssues(options: { page?: number; perPage?: number; maxPages?: number } = {}): Promise<{
+    issues: GitHubIssue[]
+    hasMore: boolean
+  }> {
+    const page = options.page ?? 1
+    const perPage = options.perPage ?? LIST_ISSUES_PAGE_SIZE
+    const maxPages = options.maxPages ?? 50 // Max 5000 issues
+
+    if (page > maxPages) {
+      return { issues: [], hasMore: false }
+    }
+
+    const response = await this.request(
+      `/repos/${this.repo}/issues?state=open&per_page=${perPage}&page=${page}&filter=all`,
+    )
+    const raw = await this.readJson<Array<Record<string, unknown>>>(response)
+    const issues = raw.filter((item) => item.pull_request === undefined).map(mapIssue)
+
+    return {
+      issues,
+      hasMore: raw.length >= perPage && page < maxPages,
     }
   }
 

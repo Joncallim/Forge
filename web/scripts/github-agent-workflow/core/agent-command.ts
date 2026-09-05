@@ -1,6 +1,8 @@
 import { agentCommandSchema, type AgentCommand } from '../contracts/agent-command'
 import { buildRunId, type AgentAction, type AgentRuntime, type RunId } from '../contracts/common'
 import type { GitHubClient, GitHubIssue } from '../io/github-client'
+import { IssueReadinessResolver } from '../shared/issue-readiness-resolver'
+import { findLatestRunForIssue } from '../io/agent-run-log'
 
 export const AGENT_COMMAND_MARKER_PREFIX = '<!-- forge-agent-command -->'
 
@@ -112,10 +114,6 @@ function commandLookupText(normalizedText: string, botLogin?: string): string {
     .trim()
 }
 
-function hasLabel(issue: GitHubIssue, label: string): boolean {
-  const normalized = label.trim().toLowerCase()
-  return issue.labels.some((issueLabel) => issueLabel.trim().toLowerCase() === normalized)
-}
 
 function isPlausibleCommandAttempt(commandText: string, recognized: boolean): boolean {
   if (recognized) return true
@@ -138,7 +136,7 @@ function intendedAgent(command: AgentCommand): string {
   }
 }
 
-async function rejectionFor(command: AgentCommand, issue: GitHubIssue, client: GitHubClient): Promise<string | null> {
+async function rejectionFor(command: AgentCommand, issue: GitHubIssue, client: GitHubClient, runLogRepositoryRoot?: string): Promise<string | null> {
   if (!command.recognized) {
     return 'Unknown request phrase. Put one supported command on the first non-empty line: `claude implement`, `codex implement`, `review`, `checkpoint`, or `handoff`. A leading `/` or `@bot` mention is allowed.'
   }
@@ -147,18 +145,7 @@ async function rejectionFor(command: AgentCommand, issue: GitHubIssue, client: G
     return `The \`${command.command}\` command is recognized, but #143 only records implementation requests. This command will be wired by a later workflow issue.`
   }
 
-  if (hasLabel(issue, 'agent-requested') || hasLabel(issue, 'agent-running')) {
-    return 'An agent request is already pending or running for this issue, so this router did not create another run record.'
-  }
-
-  if (hasLabel(issue, 'needs-clarification')) {
-    return 'Implementation requests are blocked while `needs-clarification` is present. Please clarify the issue and rerun intake validation first.'
-  }
-
-  if (!hasLabel(issue, 'ready-for-agent')) {
-    return 'Implementation requests require the `ready-for-agent` label. Complete issue intake validation before asking an agent to implement.'
-  }
-
+  // Permission check first (before expensive semantic traversal)
   let permission: Awaited<ReturnType<GitHubClient['getCollaboratorPermission']>>
   try {
     permission = await client.getCollaboratorPermission(command.requestedBy)
@@ -168,6 +155,30 @@ async function rejectionFor(command: AgentCommand, issue: GitHubIssue, client: G
 
   if (!WRITE_LEVEL_PERMISSIONS.has(permission)) {
     return 'Implementation requests require repository write access. Ask a maintainer with write, maintain, or admin permission to request agent work.'
+  }
+
+  // Check durable run-log state first (authority, not labels)
+  const latestRun = await findLatestRunForIssue(issue.number, { repositoryRoot: runLogRepositoryRoot })
+  if (latestRun) {
+    const activeStatuses = ['requested', 'handed-off', 'running', 'pr-opened']
+    if (activeStatuses.includes(latestRun.status)) {
+      return `An agent run is already ${latestRun.status} for this issue (run ID: ${latestRun.runId}). A new request cannot be created until that run completes, fails, or is cancelled.`
+    }
+  }
+
+  // Use shared readiness resolver for semantic authority
+  const resolver = new IssueReadinessResolver(client)
+  let readiness
+  try {
+    readiness = await resolver.resolveFromIssue(issue)
+  } catch {
+    return 'Could not verify issue readiness due to an internal error. Please try again or contact a maintainer.'
+  }
+
+  if (!readiness.dispatchable) {
+    const reasons = readiness.reasonCodes.join(', ')
+    const blockers = readiness.blockers.map((b: { detail: string }) => b.detail).join('; ')
+    return `Implementation request rejected because the issue is not semantically dispatchable. Reasons: ${reasons}${blockers ? `. Blockers: ${blockers}` : ''}`
   }
 
   return null
@@ -235,6 +246,7 @@ export async function runAgentCommand(input: {
   githubRunId?: number | string | null
   githubRunAttempt?: number | string | null
   shortSha?: string | null
+  runLogRepositoryRoot?: string
 }): Promise<AgentCommandResult> {
   const parsed = parseAgentCommand({
     issueNumber: input.issue.number,
@@ -254,7 +266,7 @@ export async function runAgentCommand(input: {
     }
   }
 
-  const rejectionReason = await rejectionFor(parsed, input.issue, input.client)
+  const rejectionReason = await rejectionFor(parsed, input.issue, input.client, input.runLogRepositoryRoot)
   const runId = rejectionReason === null
     ? buildRunId({
         issueNumber: input.issue.number,
@@ -273,6 +285,7 @@ export async function runAgentCommand(input: {
     : rejectedComment(command)
 
   if (command.accepted && command.runtime !== null && command.action !== null && runId !== null) {
+    // Create run record BEFORE adding labels (durable first)
     await input.recorder?.recordRequested({
       runId,
       issueNumber: input.issue.number,
