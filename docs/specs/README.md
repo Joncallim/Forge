@@ -39,6 +39,16 @@ This specification framework uses RFC 2119 language:
 | **Superseded** | Replaced by a newer spec version |
 | **Deprecated** | Still binding for historical executions; not for new work |
 
+### Status transition
+
+A spec becomes **Accepted** (canonical, binding) when:
+1. The PR containing it is merged into `main`, AND
+2. The spec status is updated from "Proposed (freeze candidate)" to "Accepted" (may happen in the same merge or a follow-up).
+
+Until merged, all specs in this branch are **Proposed (freeze candidate)** — they represent the intended architecture but are not yet binding on implementation. After merge of #359, the status SHOULD be advanced to **Accepted** via a mechanical commit.
+
+Specs on `main` that are not yet implemented remain authoritative for their scope. A spec that is superseded by a newer version on `main` is marked accordingly.
+
 ## Spec index
 
 | ID | Title | Status | Version |

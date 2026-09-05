@@ -25,7 +25,7 @@
 ### 3. SPEC-0004 branching state graph
 - **Result:** Pass
 - **Evidence:** R4 replaced linear chain with branching state graph showing mutually exclusive paths. Added `denied` state for pre-execution admission failure and `confirmed_failure` for definitive external rejection after submission. Fault-injection table defines recovery for every crash point.
-- **Counterexample:** 
+- **Counterexample:**
   - Admission denied → `denied` state (not `failed_before_submission`). No adapter execution occurred. at_most_once Operations may retry if admission conditions resolved.
   - External system returns 403 Forbidden → `confirmed_failure` (not `submission_uncertain`). Outcome definitively known.
   - Process crash after submitted but before confirmed → `submission_uncertain` → `reconciling`. Blind retry prohibited (R6).
