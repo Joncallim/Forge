@@ -1,7 +1,7 @@
 # Hostile Review Pass E — Implementability
 
 **Date:** 2026-09-05 (final)
-**Reviewer:** Automated hostile pass — all claims verified against branch head **293ec3e1ff45ce038b9c13f8f74af247f15e844d**
+**Reviewer:** Automated hostile pass — all claims verified against branch head **3fd17c1758592cf77d88551312e75141dcfadeda**
 **Scope:** All corrected specs, data-model-reference.md, issues #336/#340
 
 ## Review Verdict
@@ -10,7 +10,7 @@
 **Confidence:** Medium
 **Reason:** Specs are consistent. Data-model-reference accurately reflects actual repo schema and avoids over-freezing physical design.
 
-## Normative text verification (verified against 293ec3e1ff45ce038b9c13f8f74af247f15e844d)
+## Normative text verification (verified against 3fd17c1758592cf77d88551312e75141dcfadeda)
 
 - SPEC-0002 R5a Mission outcomes are succeeded/failed/cancelled only: VERIFIED
 - SPEC-0002 Mission conceptual model matches R5a (succeeded/failed/cancelled only): VERIFIED
