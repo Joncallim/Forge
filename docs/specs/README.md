@@ -36,6 +36,7 @@ This specification framework uses RFC 2119 language:
 |---|---|
 | **Draft** | Under active development; not yet binding |
 | **Proposed** | Freeze candidate under review; not yet binding — pending operator-approved merge |
+| **Accepted** | Canonical and binding for its scope on `main` |
 | **Superseded** | Replaced by a newer spec version |
 | **Deprecated** | Still binding for historical executions; not for new work |
 
@@ -45,7 +46,7 @@ A spec becomes **Accepted** (canonical, binding) when:
 1. The PR containing it is merged into `main`, AND
 2. The spec status is updated from "Proposed (freeze candidate)" to "Accepted" (may happen in the same merge or a follow-up).
 
-Until merged, all specs in this branch are **Proposed (freeze candidate)** — they represent the intended architecture but are not yet binding on implementation. After merge of #359, the status SHOULD be advanced to **Accepted** via a mechanical commit.
+PR #359 merged the reviewed VNext specification tranche into `main`. SPEC-0001 through SPEC-0015 are therefore promoted to **Accepted** by the follow-up governance transition. ADR 0015 remains **Proposed** because the exact sandbox technology still requires S1-S23 conformance proof.
 
 Specs on `main` that are not yet implemented remain authoritative for their scope. A spec that is superseded by a newer version on `main` is marked accordingly.
 
@@ -53,18 +54,18 @@ Specs on `main` that are not yet implemented remain authoritative for their scop
 
 | ID | Title | Status | Version |
 |---|---|---|---|
-| SPEC-0001 | Specification Authoring Standard | Proposed | 1.0 |
-| SPEC-0002 | Runtime Contract v1 | Proposed | 1.0 |
-| SPEC-0003 | Authorization & Grants v1 | Proposed | 1.0 |
-| SPEC-0004 | Operation & Side-Effect Semantics v1 | Proposed | 1.0 |
-| SPEC-0005 | Resource Classification, Data Egress & Secrets v1 | Proposed | 1.0 |
-| SPEC-0006 | Model Invocation & Cost Contract v1 | Proposed | 1.0 |
-| SPEC-0007 | Error & Reason Codes v1 | Proposed | 1.0 |
-| SPEC-0008 | Conformance Test Standard v1 | Proposed | 1.0 |
-| SPEC-0009 | Trigger/Event Envelope v1 | Proposed | 1.0 |
-| SPEC-0010 | Workforce Package v1 | Proposed | 1.0 |
-| SPEC-0011 | Provenance & Supply Chain v1 | Proposed | 1.0 |
-| SPEC-0012 | Observability vs Audit v1 | Proposed | 1.0 |
-| SPEC-0013 | Agentic Threat Model v1 | Proposed | 1.0 |
-| SPEC-0014 | Migration & Compatibility v1 | Proposed | 1.0 |
-| SPEC-0015 | Reliability / SLO Profile v1 | Proposed | 1.0 |
+| SPEC-0001 | Specification Authoring Standard | Accepted | 1.0 |
+| SPEC-0002 | Runtime Contract v1 | Accepted | 1.0 |
+| SPEC-0003 | Authorization & Grants v1 | Accepted | 1.0 |
+| SPEC-0004 | Operation & Side-Effect Semantics v1 | Accepted | 1.0 |
+| SPEC-0005 | Resource Classification, Data Egress & Secrets v1 | Accepted | 1.0 |
+| SPEC-0006 | Model Invocation & Cost Contract v1 | Accepted | 1.0 |
+| SPEC-0007 | Error & Reason Codes v1 | Accepted | 1.0 |
+| SPEC-0008 | Conformance Test Standard v1 | Accepted | 1.0 |
+| SPEC-0009 | Trigger/Event Envelope v1 | Accepted | 1.0 |
+| SPEC-0010 | Workforce Package v1 | Accepted | 1.0 |
+| SPEC-0011 | Provenance & Supply Chain v1 | Accepted | 1.0 |
+| SPEC-0012 | Observability vs Audit v1 | Accepted | 1.0 |
+| SPEC-0013 | Agentic Threat Model v1 | Accepted | 1.0 |
+| SPEC-0014 | Migration & Compatibility v1 | Accepted | 1.0 |
+| SPEC-0015 | Reliability / SLO Profile v1 | Accepted | 1.0 |
