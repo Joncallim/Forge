@@ -317,3 +317,29 @@ VNext is proven when:
 At that point Forge is no longer a coding orchestrator with extra integrations.
 It is a general agent runtime with Software Engineering as one installed
 Workforce.
+
+## Normative Specifications
+
+The VNext programme is governed by a set of normative specifications in `docs/specs/`. These define what Forge MUST do across all components.
+
+| Spec | Title | Key contribution |
+|---|---|---|
+| SPEC-0001 | Specification Authoring Standard | Structure and conventions for all specs |
+| SPEC-0002 | Runtime Contract v1 | Canonical ontology, lifecycle states, identity rules |
+| SPEC-0003 | Authorization & Grants v1 | PARC model, default-deny, child Grant constraint |
+| SPEC-0004 | Operation & Side-Effect Semantics v1 | Operation Catalog, idempotency, reconciliation |
+| SPEC-0005 | Resource Classification, Data Egress & Secrets v1 | Classification levels, egress authorization, credential brokering |
+| SPEC-0006 | Model Invocation & Cost Contract v1 | Budget hierarchy, provider routing, cost telemetry |
+| SPEC-0007 | Error & Reason Codes v1 | Namespaced reason codes, error contract |
+| SPEC-0008 | Conformance Test Standard v1 | Test classes C1-C8, failure injection requirements |
+| SPEC-0009 | Trigger/Event Envelope v1 | CloudEvents compatibility, causality, loop prevention |
+| SPEC-0010 | Workforce Package v1 | Declarative package format, install vs authorize |
+| SPEC-0011 | Provenance & Supply Chain v1 | Content addressing, tamper detection |
+| SPEC-0012 | Observability vs Audit v1 | Audit primacy, telemetry privacy |
+| SPEC-0013 | Agentic Threat Model v1 | Threat-to-control mapping against OWASP/NIST |
+| SPEC-0014 | Migration & Compatibility v1 | EXPAND→BACKFILL→SHADOW→SWITCH→VERIFY→CONTRACT |
+| SPEC-0015 | Reliability / SLO Profile v1 | Hard invariants, SLI baselining |
+
+Issue bodies should reference these specs instead of redefining cross-cutting semantics.
+
+For the frozen-vs-open distinction, see `docs/frozen-vs-open.md`. For the implementation checklist, see `docs/implementation-checklist.md`. For the industry standards matrix, see `docs/industry-benchmark-matrix.md`.
