@@ -33,7 +33,9 @@ type ReconcilePlan = {
 }
 
 export async function main(argv: string[] = process.argv.slice(2), env: NodeJS.ProcessEnv = process.env): Promise<void> {
-  const dryRun = argv.includes('--dry-run') || env.DRY_RUN === '1' || env.FORGE_RECONCILE_DRY_RUN === '1'
+  // Parse dry-run: accept --dry-run flag, or DRY_RUN env as true/false/1/0
+  const dryRunEnv = (env.DRY_RUN || env.FORGE_RECONCILE_DRY_RUN || '').toLowerCase().trim()
+  const dryRun = argv.includes('--dry-run') || dryRunEnv === 'true' || dryRunEnv === '1'
   const startTime = Date.now()
   const plan: ReconcilePlan = {
     scannedIssues: 0,
@@ -145,17 +147,20 @@ export async function main(argv: string[] = process.argv.slice(2), env: NodeJS.P
       }
     }
 
-    // Apply ready-for-agent last (with fresh re-resolution)
+    // Apply ready-for-agent last (with fresh re-resolution using a NEW resolver)
+    // A new resolver ensures no memoized dependency facts poison the final check.
     console.info(JSON.stringify({ phase: 'apply-ready' }))
     for (const [issueNumber, issue] of snapshot.issues) {
       const parsed = snapshot.parsedMetadata.get(issueNumber)
       if (!parsed) continue
 
-      // Re-resolve fresh before adding ready
+      // Use a fresh resolver for each final promotion to avoid memoization poison
       let readiness: IssueReadinessResult
       try {
-        const freshIssue = await client.getIssue(issueNumber)
-        readiness = await resolver.resolveFromIssue(freshIssue)
+        const freshClient = RestGitHubClient.fromEnv(env)
+        const freshResolver = new IssueReadinessResolver(freshClient)
+        const freshIssue = await freshClient.getIssue(issueNumber)
+        readiness = await freshResolver.resolveFromIssue(freshIssue)
       } catch {
         plan.apiFailures++
         continue

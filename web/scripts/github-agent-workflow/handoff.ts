@@ -258,6 +258,8 @@ function renderHandoffMarkdown(input: {
     '## Stop Conditions',
     '',
     '- Stop if the issue is closed or no longer semantically dispatchable.',
+    '- BEFORE starting, run `npm run forge:check-readiness -- --issue-number <n>` to confirm the issue is still dispatchable.',
+    '- If check-readiness exits non-zero, do NOT start work. Rerun the handoff/admission path so the run can be durably blocked.',
     '- Stop if the implementation requires secrets, credentials, unrestricted filesystem access, or executing untrusted pull request code.',
     '- Stop if tests fail in a way that cannot be fixed without weakening existing safety guarantees.',
     '- Stop rather than claiming validation that was not run.',
@@ -452,6 +454,10 @@ export async function runHandoff(input: {
         targetBranch: input.targetBranch,
       })
     }
+    // Remove stale agent-requested before adding agent-blocked
+    if (latestRun?.status === 'requested') {
+      await input.client.removeLabel(issue.number, 'agent-requested').catch(() => {})
+    }
     await input.client.addLabel(issue.number, 'agent-blocked')
     const commentBody = blockedComment({ issueNumber: issue.number, runId: latestRun?.runId ?? null, reason: semantic.reason! })
     await input.client.upsertComment(issue.number, {
@@ -489,6 +495,10 @@ export async function runHandoff(input: {
         runId: latestRun.runId,
         blockedReason: failure,
       }, runLogOptions)
+    }
+    // Remove stale agent-requested before adding agent-blocked
+    if (latestRun?.status === 'requested') {
+      await input.client.removeLabel(issue.number, 'agent-requested').catch(() => {})
     }
     await input.client.addLabel(issue.number, 'agent-blocked')
     const commentBody = blockedComment({ issueNumber: issue.number, runId: latestRun?.runId ?? null, reason: failure })

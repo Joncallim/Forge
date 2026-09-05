@@ -26,6 +26,7 @@ import type { ResolvedDependencyFact } from '../core/issue-readiness'
 import { evaluateReadiness } from '../core/issue-readiness'
 import { parseControlMetadata } from '../core/issue-control'
 import { detectIssueType, validateIssue } from '../core/issue-validation'
+import { scanVisibleMarkdownLines } from '../core/visible-markdown-scanner'
 import { detectCycle, getTransitiveDependencies } from '../core/dependency-graph'
 
 /**
@@ -97,6 +98,10 @@ export class IssueReadinessResolver {
     const body = issue.body ?? ''
     const issueType = detectIssueType({ title: issue.title, body })
 
+    // Scan visible lines first to detect bodyTooLarge
+    const scanResult = scanVisibleMarkdownLines(body)
+    const bodyTooLarge = scanResult.bodyTooLarge
+
     // Structural validation
     const structuralResult = validateIssue({
       number: issue.number,
@@ -107,31 +112,44 @@ export class IssueReadinessResolver {
     // Control metadata
     const controlResult = parseControlMetadata(body, issueType)
 
-    // If structural validation says valid, use it; otherwise use the result
     const structuralValid = structuralResult.valid
 
-    // Resolve dependencies
-    const dependencyFacts = await this.resolveDependencies(
-      issue.number,
-      controlResult.metadata,
-      issueType,
-    )
+    // Determine issue state
+    const issueState = mapIssueState(issue.state)
+    const stateUnknown = issueState === 'unknown'
 
-    // Cycle detection
-    const cycleResult = this.detectCycles(issue.number, controlResult.metadata, issueType)
+    // Resolve dependencies (only if not bodyTooLarge and not unknown state)
+    let dependencyFacts: readonly ResolvedDependencyFact[] = []
+    let hasCycle = false
+    let graphLimitExceeded = false
 
-    // Evaluate readiness
+    if (!bodyTooLarge && !stateUnknown) {
+      dependencyFacts = await this.resolveDependencies(
+        issue.number,
+        controlResult.metadata,
+      )
+
+      // Cycle detection
+      const cycleResult = this.detectCycles(issue.number, controlResult.metadata)
+      hasCycle = cycleResult.hasCycle
+      graphLimitExceeded = cycleResult.limitExceeded
+    }
+
+    // Evaluate readiness with all propagated state
     return evaluateReadiness({
       issueNumber: issue.number,
-      issueState: mapIssueState(issue.state),
+      issueState,
       issueType,
       controlMetadata: controlResult.metadata,
       structuralValid,
       structuralErrors: structuralResult.missingSections,
       dependencyFacts,
-      hasCycle: cycleResult.hasCycle,
-      graphLimitExceeded: cycleResult.limitExceeded,
-      bodyTooLarge: false, // Already handled by parseControlMetadata
+      hasCycle,
+      graphLimitExceeded,
+      bodyTooLarge,
+      controlParseErrors: controlResult.errors,
+      hasDuplicateDeclaration: controlResult.hasDuplicateDeclaration,
+      stateUnknown,
     })
   }
 
@@ -141,7 +159,6 @@ export class IssueReadinessResolver {
   private async resolveDependencies(
     issueNumber: number,
     metadata: IssueControlMetadata,
-    _issueType: IssueType,
   ): Promise<readonly ResolvedDependencyFact[]> {
     if (metadata.dependencies.length === 0) return []
 
@@ -204,8 +221,14 @@ export class IssueReadinessResolver {
         }
       }
 
-      // Check if it's a tracking-only issue
-      if (issue.labels.some((l) => l.toLowerCase() === 'tracking-only')) {
+      // Derive tracking semantics from body/control contract, NOT from labels
+      // Labels are projections only; a closed tracking Epic can lose its label
+      const depBody = issue.body ?? ''
+      const depIssueType = detectIssueType({ title: issue.title, body: depBody })
+      const depControl = parseControlMetadata(depBody, depIssueType)
+      const isTracking = depControl.metadata.executionMode === 'tracking' || depIssueType === 'epic'
+
+      if (isTracking) {
         return {
           issueNumber: dependencyNumber,
           state: 'tracking_only',
@@ -228,7 +251,7 @@ export class IssueReadinessResolver {
             return {
               issueNumber: dependencyNumber,
               state: 'closed_completed',
-              reasonCode: 'queue.issue_dependency_open' as ReadinessReasonCode, // Placeholder, will be overridden
+              reasonCode: 'queue.issue_dependency_open' as ReadinessReasonCode,
             }
           case 'not_planned':
             return {
@@ -285,7 +308,6 @@ export class IssueReadinessResolver {
   private detectCycles(
     issueNumber: number,
     metadata: IssueControlMetadata,
-    _issueType: IssueType,
   ): { hasCycle: boolean; limitExceeded: boolean } {
     if (metadata.dependencies.length === 0) return { hasCycle: false, limitExceeded: false }
 

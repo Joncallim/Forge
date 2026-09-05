@@ -35,10 +35,10 @@ function normalizeBotLogin(botLogin: string): string {
 }
 
 function markerCommentForIssue(comments: GitHubComment[], botLogin: string): GitHubComment | null {
-  const normalizedBotLogin = normalizeBotLogin(botLogin)
+  const normalized = normalizeBotLogin(botLogin)
   return comments.find((comment) => (
-    comment.authorLogin.trim().toLowerCase() === normalizedBotLogin &&
-    comment.body.startsWith(ISSUE_VALIDATION_MARKER_PREFIX)
+    comment.authorLogin.trim().toLowerCase() === normalized
+    && comment.body.startsWith(ISSUE_VALIDATION_MARKER_PREFIX)
   )) ?? null
 }
 
@@ -49,6 +49,7 @@ function markerCommentForIssue(comments: GitHubComment[], botLogin: string): Git
  * - ready → non-ready: remove ready-for-agent before adding blocking label
  * - non-ready → ready: remove blocking labels before adding ready-for-agent last
  * - GitHub write failure must never leave a false-positive ready label
+ * - Labels are guaranteed mutually exclusive (exactly one readiness label at a time)
  */
 async function syncReadinessLabels(
   client: GitHubClient,
@@ -57,6 +58,8 @@ async function syncReadinessLabels(
 ): Promise<void> {
   const currentLabels = issue.labels
   const desiredLabels = readinessResult.desiredReadinessLabels
+
+  // Determine current readiness labels
   const currentReadinessLabels = currentLabels.filter((l) =>
     ISSUE_READINESS_MANAGED_LABELS.includes(l as typeof ISSUE_READINESS_MANAGED_LABELS[number]),
   )
@@ -68,27 +71,39 @@ async function syncReadinessLabels(
   const toRemove = currentReadinessLabels.filter((l) => !desiredLabels.includes(l as typeof ISSUE_READINESS_MANAGED_LABELS[number]))
   const toAdd = desiredLabels.filter((l) => !currentReadinessLabels.includes(l))
 
-  // Safe ordering for ready → non-ready: remove ready-for-agent first
+  // Step 1: If transitioning ready to non-ready, remove ready-for-agent FIRST
   if (currentReadinessLabels.includes('ready-for-agent') && !desiredLabels.includes('ready-for-agent')) {
     await client.removeLabel(issue.number, 'ready-for-agent')
   }
 
-  // Remove other stale readiness labels
+  // Step 2: Remove ALL stale readiness labels (converge to exact set)
   for (const label of toRemove) {
-    if (label !== 'ready-for-agent') { // already removed above if needed
+    if (label !== 'ready-for-agent') {
       await client.removeLabel(issue.number, label)
     }
   }
 
-  // Add blocking/clarification labels
+  // Step 3: Add non-ready labels (blocking/clarification/tracking)
   for (const label of toAdd) {
     if (label !== 'ready-for-agent') {
       await client.addLabel(issue.number, label)
     }
   }
 
-  // For non-ready → ready: add ready-for-agent last
+  // Step 4: For non-ready to ready, add ready-for-agent LAST
+  // If any blocker removal failed, we must NOT add ready-for-agent
   if (!currentReadinessLabels.includes('ready-for-agent') && desiredLabels.includes('ready-for-agent')) {
+    // Verify no stale blocker labels remain before adding ready
+    const labelsAfter = (await client.getIssue(issue.number)).labels
+    const staleBlockers = ['needs-clarification', 'dependency-blocked', 'tracking-only'].filter(
+      (l) => labelsAfter.includes(l),
+    )
+    if (staleBlockers.length > 0) {
+      throw new Error(
+        `Cannot add ready-for-agent: stale blocker labels remain: ${staleBlockers.join(', ')}. ` +
+        `Reason: ${readinessResult.reasonCodes.join(', ')}`,
+      )
+    }
     await client.addLabel(issue.number, 'ready-for-agent')
   }
 }
@@ -115,9 +130,7 @@ async function syncComment(
   }
 
   if (commentBody === null) {
-    // Issue is closed or ready - remove marker comment if it exists
     if (existingMarkerComment) {
-      // We don't delete comments, but we can update it to a minimal ready state
       const readyBody = [
         ISSUE_VALIDATION_MARKER_PREFIX,
         '## FORGE issue validation',
@@ -161,7 +174,6 @@ export async function runIssueValidation(
   try {
     readinessResult = await resolver.resolveFromIssue(issue)
   } catch {
-    // If readiness resolution fails, we still apply structural validation labels
     readinessResult = null
   }
 
@@ -172,7 +184,6 @@ export async function runIssueValidation(
   if (readinessResult) {
     await syncReadinessLabels(client, issue, readinessResult)
   } else {
-    // Fallback to structural-only label sync
     const diff = diffManagedLabels(issue.labels, result.recommendedLabels, ISSUE_READINESS_MANAGED_LABELS)
     for (const label of diff.toAdd) {
       await client.addLabel(issue.number, label)
@@ -182,28 +193,40 @@ export async function runIssueValidation(
     }
   }
 
+  // Sync marker comment
   await syncComment(client, issue, result, readinessResult, existingMarkerComment, options.botLogin)
 
-  return { existingMarkerComment, result, readinessResult }
+  return {
+    existingMarkerComment,
+    result,
+    readinessResult,
+  }
 }
 
-function buildReadinessComment(readiness: IssueReadinessResult, kind: 'ready' | 'blocked'): string {
+function setsEqual(a: Set<string>, b: Set<string>): boolean {
+  if (a.size !== b.size) return false
+  for (const item of a) {
+    if (!b.has(item)) return false
+  }
+  return true
+}
+
+function buildReadinessComment(readinessResult: IssueReadinessResult, status: 'ready' | 'blocked'): string {
   const lines = [
     ISSUE_VALIDATION_MARKER_PREFIX,
-    '## FORGE Readiness',
+    '## FORGE issue validation',
     '',
   ]
 
-  if (kind === 'ready') {
-    lines.push('This issue is **semantically ready** for agent dispatch.')
+  if (status === 'ready') {
+    lines.push('This issue is semantically ready for agent work.')
   } else {
-    lines.push('This issue is **not ready** for agent dispatch.')
+    lines.push('This issue is not semantically dispatchable.')
     lines.push('')
-    if (readiness.blockers.length > 0) {
-      lines.push('Blockers:')
-      for (const blocker of readiness.blockers) {
-        lines.push(`- \`${blocker.reasonCode}\`: ${blocker.detail}`)
-      }
+    lines.push('| Reason | Detail |')
+    lines.push('| --- | --- |')
+    for (const blocker of readinessResult.blockers) {
+      lines.push(`| \`${blocker.reasonCode}\` | ${blocker.detail} |`)
     }
   }
 
@@ -211,10 +234,4 @@ function buildReadinessComment(readiness: IssueReadinessResult, kind: 'ready' | 
   lines.push('> Readiness labels are projections, not authority. Command, dispatch, and handoff always re-resolve current semantic truth.')
 
   return lines.join('\n')
-}
-
-function setsEqual(a: Set<string>, b: Set<string>): boolean {
-  if (a.size !== b.size) return false
-  for (const item of a) if (!b.has(item)) return false
-  return true
 }

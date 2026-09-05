@@ -304,16 +304,22 @@ export async function runDispatch(input: {
     // Record blocked reason in run log if a run exists
     const latestRun = await findLatestRunForIssue(input.issueNumber, { repositoryRoot: input.runLogRepositoryRoot })
     if (!input.dryRun && latestRun !== null) {
-      await recordBlockedReason({
-        issueNumber: input.issueNumber,
-        runId: latestRun.runId,
-        blockedReason: semantic.reason!,
-      }, {
-        repositoryRoot: input.runLogRepositoryRoot,
-        now: input.now,
-        persistRecord: input.persistRunLog ? persistRunRecordToGit : undefined,
-        targetBranch: input.targetBranch,
-      })
+      // Only transition requested/handed-off to blocked.
+      // Active (running/pr-opened) and terminal (completed/failed/cancelled) runs
+      // must not be retroactively rewritten.
+      const canBlock = ['requested', 'handed-off'].includes(latestRun.status)
+      if (canBlock) {
+        await recordBlockedReason({
+          issueNumber: input.issueNumber,
+          runId: latestRun.runId,
+          blockedReason: semantic.reason!,
+        }, {
+          repositoryRoot: input.runLogRepositoryRoot,
+          now: input.now,
+          persistRecord: input.persistRunLog ? persistRunRecordToGit : undefined,
+          targetBranch: input.targetBranch,
+        })
+      }
     }
     if (!input.dryRun) {
       await input.client.addLabel(input.issueNumber, 'agent-blocked')

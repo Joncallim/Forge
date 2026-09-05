@@ -130,14 +130,17 @@ export function scanVisibleMarkdownLines(
     } else {
       const trimmed = line.trim()
       const fenceChar = inFence.type === 'backtick' ? '`' : '~'
-      const closingMatch = trimmed.match(new RegExp(`^(${fenceChar}{${inFence.fenceLength},})(.*)$`))
+      const closingMatch = trimmed.match(new RegExp(`^(${fenceChar}{${inFence.fenceLength},})\s*$`))
       if (closingMatch) {
         inFence = null
-        // Content after closing fence on same line is visible (e.g. ` ``` ` rest)
-        const afterFence = closingMatch[2] ?? ''
-        if (afterFence.trim() !== '') {
-          result.push({ lineNumber: i, text: afterFence })
-        }
+        // Per CommonMark spec, a closing fence may only be followed by whitespace.
+        // Any non-whitespace trailing text remains inside the code block.
+        continue
+      }
+      // Also try with trailing whitespace only (CommonMark compliant)
+      const closingMatchWS = trimmed.match(new RegExp(`^(${fenceChar}{${inFence.fenceLength},})\s+$`))
+      if (closingMatchWS) {
+        inFence = null
         continue
       }
       // Inside fence — skip entirely

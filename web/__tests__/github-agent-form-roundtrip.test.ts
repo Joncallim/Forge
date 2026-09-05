@@ -50,6 +50,9 @@ describe('issue form round-trip', () => {
         hasCycle: false,
         graphLimitExceeded: false,
         bodyTooLarge: false,
+        controlParseErrors: [],
+        hasDuplicateDeclaration: false,
+        stateUnknown: false,
       })
       expect(readiness.dispatchable).toBe(true)
       expect(readiness.state).toBe('ready')
@@ -90,6 +93,9 @@ describe('issue form round-trip', () => {
         hasCycle: false,
         graphLimitExceeded: false,
         bodyTooLarge: false,
+        controlParseErrors: [],
+        hasDuplicateDeclaration: false,
+        stateUnknown: false,
       })
       expect(readiness.dispatchable).toBe(false)
       expect(readiness.state).toBe('dependency-blocked')
@@ -123,6 +129,9 @@ describe('issue form round-trip', () => {
         hasCycle: false,
         graphLimitExceeded: false,
         bodyTooLarge: false,
+        controlParseErrors: [],
+        hasDuplicateDeclaration: false,
+        stateUnknown: false,
       })
       expect(readiness.dispatchable).toBe(true)
       expect(readiness.state).toBe('ready')
@@ -172,6 +181,9 @@ describe('issue form round-trip', () => {
         hasCycle: false,
         graphLimitExceeded: false,
         bodyTooLarge: false,
+        controlParseErrors: [],
+        hasDuplicateDeclaration: false,
+        stateUnknown: false,
       })
       expect(readiness.dispatchable).toBe(false)
       expect(readiness.state).toBe('tracking-only')
@@ -221,6 +233,9 @@ describe('issue form round-trip', () => {
         hasCycle: false,
         graphLimitExceeded: false,
         bodyTooLarge: false,
+        controlParseErrors: [],
+        hasDuplicateDeclaration: false,
+        stateUnknown: false,
       })
       expect(readiness.dispatchable).toBe(false)
       expect(readiness.state).toBe('tracking-only')

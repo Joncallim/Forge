@@ -138,7 +138,7 @@ export class FakeGitHubClient implements GitHubClient {
     return this.collaboratorPermissions.get(username.trim().toLowerCase()) ?? 'none'
   }
 
-  async listOpenIssues(_options: { page?: number; perPage?: number; maxPages?: number } = {}): Promise<{
+  async listOpenIssues(): Promise<{
     issues: GitHubIssue[]
     hasMore: boolean
   }> {

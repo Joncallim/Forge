@@ -55,6 +55,18 @@ export type ReadinessEvaluationInput = Readonly<{
    * Whether body size exceeded limits.
    */
   bodyTooLarge: boolean
+  /**
+   * Control metadata parse errors.
+   */
+  controlParseErrors: readonly string[]
+  /**
+   * Whether duplicate declarations were found.
+   */
+  hasDuplicateDeclaration: boolean
+  /**
+   * Whether the issue state is unknown/unrecognized.
+   */
+  stateUnknown: boolean
 }>
 
 /**
@@ -72,6 +84,17 @@ export function evaluateReadiness(input: ReadinessEvaluationInput): IssueReadine
   if (input.bodyTooLarge) {
     reasonCodes.push('queue.issue_body_too_large')
     return buildResult(input.issueNumber, 'needs-clarification', input.controlMetadata, reasonCodes, blockers, false)
+  }
+
+  // Check if issue state is unknown (must fail closed)
+  if (input.stateUnknown) {
+    reasonCodes.push('queue.issue_dependency_state_unknown')
+    blockers.push({
+      reasonCode: 'queue.issue_dependency_state_unknown',
+      detail: 'Issue state is unknown or unrecognized.',
+      dependencyIssueNumber: null,
+    })
+    return buildResult(input.issueNumber, 'needs-clarification', input.controlMetadata, reasonCodes, blockers, true)
   }
 
   // Check if issue is closed
@@ -96,6 +119,17 @@ export function evaluateReadiness(input: ReadinessEvaluationInput): IssueReadine
   // Check control metadata errors
   const cm = input.controlMetadata
 
+  // Check for duplicate declarations first (most severe)
+  if (input.hasDuplicateDeclaration) {
+    reasonCodes.push('queue.issue_control_duplicate')
+    blockers.push({
+      reasonCode: 'queue.issue_control_duplicate',
+      detail: 'Duplicate or conflicting Execution mode or Depends on declarations found.',
+      dependencyIssueNumber: null,
+    })
+    return buildResult(input.issueNumber, 'needs-clarification', input.controlMetadata, reasonCodes, blockers, true)
+  }
+
   if (!cm.explicit && !cm.isLegacyTrackingEpic) {
     // Missing control metadata on non-legacy issues
     reasonCodes.push('queue.issue_control_missing')
@@ -109,15 +143,27 @@ export function evaluateReadiness(input: ReadinessEvaluationInput): IssueReadine
 
   if (cm.executionMode === null && !cm.isLegacyTrackingEpic) {
     // Invalid execution mode
-    if (reasonCodes.length === 0 || reasonCodes[reasonCodes.length - 1] !== 'queue.issue_control_missing') {
-      reasonCodes.push('queue.issue_execution_mode_invalid')
-      blockers.push({
-        reasonCode: 'queue.issue_execution_mode_invalid',
-        detail: 'Execution mode is missing or invalid. Must be "implementation" or "tracking".',
-        dependencyIssueNumber: null,
-      })
-      return buildResult(input.issueNumber, 'needs-clarification', input.controlMetadata, reasonCodes, blockers, false)
+    reasonCodes.push('queue.issue_execution_mode_invalid')
+    blockers.push({
+      reasonCode: 'queue.issue_execution_mode_invalid',
+      detail: 'Execution mode is missing or invalid. Must be "implementation" or "tracking".',
+      dependencyIssueNumber: null,
+    })
+    return buildResult(input.issueNumber, 'needs-clarification', input.controlMetadata, reasonCodes, blockers, false)
+  }
+
+  // Add any remaining control parse errors as blockers
+  for (const err of input.controlParseErrors) {
+    // Skip errors already covered by duplicate/execution_mode checks
+    if (err.includes('Duplicate') || err.includes('Invalid execution mode')) continue
+    if (!reasonCodes.includes('queue.issue_template_invalid')) {
+      reasonCodes.push('queue.issue_template_invalid')
     }
+    blockers.push({
+      reasonCode: 'queue.issue_template_invalid',
+      detail: err,
+      dependencyIssueNumber: null,
+    })
   }
 
   // Tracking issues are never dispatchable
@@ -179,11 +225,6 @@ export function evaluateReadiness(input: ReadinessEvaluationInput): IssueReadine
   const unsatisfiedDeps = input.dependencyFacts.filter(
     (f) => f.state === 'closed_not_planned' || f.state === 'closed_duplicate',
   )
-  const unknownDeps = input.dependencyFacts.filter(
-    (f) => f.state === 'closed_unknown' || f.state === 'inaccessible' || f.state === 'lookup_failed' ||
-           f.state === 'not_found',
-  )
-
   if (openDeps.length > 0) {
     reasonCodes.push('queue.issue_dependency_open')
     for (const dep of openDeps) {
@@ -208,8 +249,10 @@ export function evaluateReadiness(input: ReadinessEvaluationInput): IssueReadine
     return buildResult(input.issueNumber, 'needs-clarification', input.controlMetadata, reasonCodes, blockers, false)
   }
 
-  if (unknownDeps.length > 0) {
-    for (const dep of unknownDeps) {
+  // not_found is a definitive invalid graph → needs-clarification
+  const notFoundDeps = input.dependencyFacts.filter((f) => f.state === 'not_found')
+  if (notFoundDeps.length > 0) {
+    for (const dep of notFoundDeps) {
       reasonCodes.push(dep.reasonCode)
       blockers.push({
         reasonCode: dep.reasonCode,
@@ -217,13 +260,26 @@ export function evaluateReadiness(input: ReadinessEvaluationInput): IssueReadine
         dependencyIssueNumber: dep.issueNumber,
       })
     }
-    return buildResult(input.issueNumber, 'dependency-blocked', input.controlMetadata, reasonCodes, blockers, false)
+    return buildResult(input.issueNumber, 'needs-clarification', input.controlMetadata, reasonCodes, blockers, false)
+  }
+
+  // Other unknown/inaccessible/lookup-failed → dependency-blocked (may resolve)
+  const otherUnknownDeps = input.dependencyFacts.filter(
+    (f) => f.state === 'closed_unknown' || f.state === 'inaccessible' || f.state === 'lookup_failed',
+  )
+  if (otherUnknownDeps.length > 0) {
+    for (const dep of otherUnknownDeps) {
+      reasonCodes.push(dep.reasonCode)
+      blockers.push({
+        reasonCode: dep.reasonCode,
+        detail: detailForDependencyFact(dep),
+        dependencyIssueNumber: dep.issueNumber,
+      })
+    }
+    return buildResult(input.issueNumber, 'dependency-blocked', input.controlMetadata, reasonCodes, blockers, true)
   }
 
   // All dependencies satisfied (or none) → ready
-  reasonCodes.push('queue.issue_dependency_open') // placeholder removed below
-  reasonCodes.pop()
-
   return buildResult(input.issueNumber, 'ready', input.controlMetadata, reasonCodes, blockers, false)
 }
 
