@@ -1,23 +1,24 @@
-name: Issue Intake
+name: Reconcile Readiness
 
 on:
-  issues:
-    types:
-      - opened
-      - edited
-      - reopened
-      - closed
-      - labeled
-      - unlabeled
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Only compute readiness without mutating labels
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
   issues: write
-  actions: write
+
+concurrency:
+  group: forge-readiness-reconcile-${{ github.repository }}
+  cancel-in-progress: true
 
 jobs:
-  validate:
-    if: ${{ github.event.issue.pull_request == null }}
+  reconcile:
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -35,8 +36,8 @@ jobs:
 
       - run: npm ci
 
-      - run: npm run forge:validate-issue
+      - run: npm run forge:reconcile
         env:
-          GITHUB_BOT_LOGIN: github-actions[bot]
+          DRY_RUN: ${{ inputs.dry_run }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_TOKEN: ${{ github.token }}

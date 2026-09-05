@@ -26,6 +26,8 @@ const SOURCE_ISSUE: GitHubIssue = {
   htmlUrl: 'https://github.com/Joncallim/Forge/issues/145',
   authorLogin: 'Joncallim',
   isPullRequest: false,
+  stateReason: null,
+  updatedAt: null,
 }
 
 const PR_AS_ISSUE: GitHubIssue = {
@@ -37,6 +39,8 @@ const PR_AS_ISSUE: GitHubIssue = {
   htmlUrl: 'https://github.com/Joncallim/Forge/pull/166',
   authorLogin: 'Joncallim',
   isPullRequest: true,
+  stateReason: null,
+  updatedAt: null,
 }
 
 function pullRequest(body: string | null, draft = false): GitHubPullRequest {

@@ -19,6 +19,7 @@ import {
   withRunLogBranchWorktree,
 } from './io/agent-run-log'
 import { RestGitHubClient, type GitHubClient, type GitHubIssue } from './io/github-client'
+import { IssueReadinessResolver } from './shared/issue-readiness-resolver'
 
 export const DISPATCH_MARKER_PREFIX = '<!-- forge-agent-dispatch -->'
 
@@ -49,11 +50,6 @@ export type DispatchResult = Readonly<{
   request: DispatchRequest | null
   commentBody: string | null
 }>
-
-function hasLabel(issue: GitHubIssue, label: string): boolean {
-  const normalized = label.trim().toLowerCase()
-  return issue.labels.some((issueLabel) => issueLabel.trim().toLowerCase() === normalized)
-}
 
 function parsePositiveIssueNumber(value: unknown): number | null {
   if (typeof value === 'number' && Number.isInteger(value) && value > 0) return value
@@ -129,7 +125,7 @@ function dispatchBlockedComment(input: {
     `- Issue: #${input.issueNumber}`,
     `- Run ID: ${input.runId ? `\`${input.runId}\`` : 'n/a'}`,
     `- Reason: ${input.reason}`,
-    '- Next step: fix the issue labels or create a fresh accepted agent request, then rerun dispatch.',
+    '- Next step: fix the issue or run record state, then rerun dispatch.',
     '- Note: no Claude Code or Codex execution has started.',
   ].join('\n')
 }
@@ -226,19 +222,45 @@ export function buildDispatchWorkOrder(input: {
         'Fill every pull request contract section, including acceptance-criteria evidence and tests.',
       ].join('\n'),
       'Stop Conditions': [
-        'Stop if the issue is closed, loses ready-for-agent, gains needs-clarification, or the run record is no longer eligible.',
-        'Stop if satisfying the issue would require secrets, credentials, unrestricted filesystem access, or executing untrusted PR code.',
+        'Stop if the issue is closed or no longer semantically dispatchable.',
+        'Stop if the implementation would require secrets, credentials, unrestricted filesystem access, or executing untrusted PR code.',
         'Stop and report if required tests fail in a way that cannot be fixed without weakening existing safety guarantees.',
       ].join('\n'),
     },
   })
 }
 
+/**
+ * Semantic eligibility check using the shared readiness resolver.
+ * Does NOT trust labels as authority.
+ */
+async function semanticEligibility(
+  issue: GitHubIssue,
+  client: GitHubClient,
+): Promise<{ eligible: boolean; reason: string | null }> {
+  if (issue.isPullRequest) return { eligible: false, reason: 'Source reference is a pull request, not an issue.' }
+  if (issue.state !== 'open') return { eligible: false, reason: 'Source issue is not open.' }
+
+  // Use shared readiness resolver (fresh semantic check, not labels)
+  const resolver = new IssueReadinessResolver(client)
+  let readiness
+  try {
+    readiness = await resolver.resolveFromIssue(issue)
+  } catch {
+    return { eligible: false, reason: 'Could not verify issue readiness due to an internal error.' }
+  }
+
+  if (!readiness.dispatchable) {
+    const reasons = readiness.reasonCodes.join(', ')
+    return { eligible: false, reason: `Issue is not semantically dispatchable: ${reasons}` }
+  }
+
+  return { eligible: true, reason: null }
+}
+
 function eligibilityFailure(issue: GitHubIssue, run: Awaited<ReturnType<typeof findLatestRunForIssue>>): string | null {
   if (issue.isPullRequest) return 'Source reference is a pull request, not an issue.'
   if (issue.state !== 'open') return 'Source issue is not open.'
-  if (!hasLabel(issue, 'ready-for-agent')) return 'Source issue does not have `ready-for-agent`.'
-  if (hasLabel(issue, 'needs-clarification')) return 'Source issue has `needs-clarification`.'
   if (run === null) return 'No run record exists for this issue.'
   if (run.status !== 'requested') return `Latest run status is \`${run.status}\`, not \`requested\`.`
   if (!['claude-code', 'codex', 'dry-run'].includes(run.runtime)) return `Runtime \`${run.runtime}\` is not supported by dispatch.`
@@ -252,8 +274,6 @@ function isIdempotentHandedOffRun(
 ): run is AgentRunRecord & { status: 'handed-off' } {
   return issue.state === 'open'
     && !issue.isPullRequest
-    && hasLabel(issue, 'ready-for-agent')
-    && !hasLabel(issue, 'needs-clarification')
     && run !== null
     && run.status === 'handed-off'
     && ['claude-code', 'codex', 'dry-run'].includes(run.runtime)
@@ -277,6 +297,47 @@ export async function runDispatch(input: {
       reason: 'Skipping agent dispatch because the source reference is a pull request, not an issue.',
     })
   }
+
+  // First, check semantic readiness (authority check)
+  const semantic = await semanticEligibility(issue, input.client)
+  if (!semantic.eligible) {
+    // Record blocked reason in run log if a run exists
+    const latestRun = await findLatestRunForIssue(input.issueNumber, { repositoryRoot: input.runLogRepositoryRoot })
+    if (!input.dryRun && latestRun !== null) {
+      await recordBlockedReason({
+        issueNumber: input.issueNumber,
+        runId: latestRun.runId,
+        blockedReason: semantic.reason!,
+      }, {
+        repositoryRoot: input.runLogRepositoryRoot,
+        now: input.now,
+        persistRecord: input.persistRunLog ? persistRunRecordToGit : undefined,
+        targetBranch: input.targetBranch,
+      })
+    }
+    if (!input.dryRun) {
+      await input.client.addLabel(input.issueNumber, 'agent-blocked')
+    }
+    const commentBody = dispatchBlockedComment({ issueNumber: input.issueNumber, runId: null, reason: semantic.reason! })
+    if (!input.dryRun) {
+      await input.client.upsertComment(input.issueNumber, {
+        markerPrefix: DISPATCH_MARKER_PREFIX,
+        botLogin: input.botLogin,
+        body: commentBody,
+      })
+    }
+    return {
+      status: 'blocked',
+      issueNumber: input.issueNumber,
+      runId: null,
+      branchName: null,
+      blockedReason: semantic.reason,
+      workOrder: null,
+      request: null,
+      commentBody,
+    }
+  }
+
   const latestRun = await findLatestRunForIssue(input.issueNumber, { repositoryRoot: input.runLogRepositoryRoot })
 
   if (isIdempotentHandedOffRun(issue, latestRun)) {

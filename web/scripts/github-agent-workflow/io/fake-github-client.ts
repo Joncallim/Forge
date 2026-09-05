@@ -13,9 +13,11 @@ type MutableGitHubIssue = {
   body: string | null
   labels: string[]
   state: string
+  stateReason: string | null
   htmlUrl: string
   authorLogin: string
   isPullRequest: boolean
+  updatedAt: string | null
 }
 
 type MutableGitHubComment = {
@@ -65,7 +67,7 @@ export class FakeGitHubClient implements GitHubClient {
   private nextCommentId: number
 
   constructor(seed: FakeGitHubClientSeed = {}) {
-    for (const issue of seed.issues ?? []) this.issues.set(issue.number, cloneIssue(issue))
+    for (const issue of seed.issues ?? []) this.issues.set(issue.number, cloneIssue(issue as MutableGitHubIssue))
     for (const [issueNumber, comments] of Object.entries(seed.commentsByIssue ?? {})) {
       this.commentsByIssue.set(Number(issueNumber), comments.map(cloneComment))
     }
@@ -134,6 +136,21 @@ export class FakeGitHubClient implements GitHubClient {
 
   async getCollaboratorPermission(username: string): Promise<GitHubCollaboratorPermission> {
     return this.collaboratorPermissions.get(username.trim().toLowerCase()) ?? 'none'
+  }
+
+  async listOpenIssues(_options: { page?: number; perPage?: number; maxPages?: number } = {}): Promise<{
+    issues: GitHubIssue[]
+    hasMore: boolean
+  }> {
+    const allIssues: GitHubIssue[] = []
+    for (const issue of this.issues.values()) {
+      if (issue.state === 'open' && !issue.isPullRequest) {
+        allIssues.push(cloneIssue(issue))
+      }
+    }
+    // Sort by number for deterministic ordering
+    allIssues.sort((a, b) => a.number - b.number)
+    return { issues: allIssues, hasMore: false }
   }
 
   private mustGetIssue(issueNumber: number): MutableGitHubIssue {
