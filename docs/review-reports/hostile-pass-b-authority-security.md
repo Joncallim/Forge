@@ -1,7 +1,7 @@
 # Hostile Review Pass B — Authority / Security
 
 **Date:** 2026-09-05 (final)
-**Reviewer:** Automated hostile pass — all claims verified against branch head **ff48ce3361dbf7aebd05a4e76a40f95a9235b2b4**
+**Reviewer:** Automated hostile pass — all claims verified against branch head **docs/vnext-specification-framework (branch head)**
 **Scope:** SPEC-0003, 0005, 0010, 0011, 0013; ADR 0015
 
 ## Review Verdict
@@ -10,7 +10,7 @@
 **Confidence:** High
 **Reason:** Grant admission fencing with admission token, revision binding, revocation invalidation, and lease coupling is present in normative SPEC-0003 concurrency section. Operator authority correctly limited by non-overridable hard invariants. All security counterexamples fail closed.
 
-## Normative text verification (verified against ff48ce3361dbf7aebd05a4e76a40f95a9235b2b4)
+## Normative text verification (verified against docs/vnext-specification-framework (branch head))
 
 - SPEC-0003 concurrency section contains admission token revision binding: VERIFIED
 - SPEC-0003 concurrency section contains revocation invalidation of outstanding tokens: VERIFIED

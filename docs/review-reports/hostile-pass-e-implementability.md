@@ -1,7 +1,7 @@
 # Hostile Review Pass E — Implementability
 
 **Date:** 2026-09-05 (final)
-**Reviewer:** Automated hostile pass — all claims verified against branch head **ff48ce3361dbf7aebd05a4e76a40f95a9235b2b4**
+**Reviewer:** Automated hostile pass — all claims verified against branch head **docs/vnext-specification-framework (branch head)**
 **Scope:** All corrected specs, data-model-reference.md, issues #336/#340
 
 ## Review Verdict
@@ -10,7 +10,7 @@
 **Confidence:** Medium
 **Reason:** Specs are consistent. Data-model-reference accurately reflects actual repo schema and avoids over-freezing physical design.
 
-## Normative text verification (verified against ff48ce3361dbf7aebd05a4e76a40f95a9235b2b4)
+## Normative text verification (verified against docs/vnext-specification-framework (branch head))
 
 - SPEC-0002 R5a Mission outcomes are succeeded/failed/cancelled only: VERIFIED
 - SPEC-0002 Mission conceptual model matches R5a (succeeded/failed/cancelled only): VERIFIED
