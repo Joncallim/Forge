@@ -1,6 +1,6 @@
 # Hostile Review Pass E — Implementability
 
-**Date:** 2026-09-04 (post-remediation)
+**Date:** 2026-09-05 (post-second-remediation)
 **Reviewer:** Automated hostile pass
 **Scope:** All corrected specs, issues, and supporting docs
 
@@ -8,7 +8,7 @@
 
 **Status:** No blockers found in the inspected scope
 **Confidence:** Medium
-**Reason:** Specs are consistent and well-structured. Reading burden is addressed by phase-reference.md. Data model ownership clarified by data-model-reference.md. Some implementation decisions remain intentionally open.
+**Reason:** Specs are consistent and well-structured. Reading burden addressed by phase-reference.md. Data model ownership clarified by data-model-reference.md. Some implementation decisions remain intentionally open.
 
 ## Hostile Checks
 
@@ -35,6 +35,9 @@
   - SPEC-0012 (observability) → SPEC-0005 (classification) → SPEC-0004 (audit for recovery) → consistent
   - SPEC-0014 (migration) → SPEC-0002 (ontology mapping) → consistent
   - SPEC-0015 (reliability) → SPEC-0003 (hard invariants) → SPEC-0012 (incident evidence) → consistent
+- **Specific conflict checks:**
+  - SPEC-0008 R2 vs deferred mapping: RESOLVED. R2 now allows phase-level conformance for freeze-candidate specs, with requirement-to-class mapping required before implementation.
+  - SPEC-0014 R1 step 4 vs R2: RESOLVED. Step 4 no longer contains contradictory "old schema accepts writes" language.
 
 ### 3. Which "conceptual tables" look mandatory when they should not?
 - **Result:** Addressed
@@ -43,25 +46,18 @@
 
 ### 4. Is required reading manageable?
 - **Result:** Yes, with phase-reference.md
-- **Evidence:** phase-reference.md lists the subset of specs to read per phase. For Phase 0 (#334), only 5 specs are primary. For Phase 1 (#335), 6 specs. For Phase 2 (#336), 5 specs + ADR. The full set of 15 specs is only needed for cross-cutting understanding.
+- **Evidence:** phase-reference.md lists the subset of specs to read per phase. For Phase 0 (#334), only 5 specs are primary. For Phase 1 (#335), 6 specs. For Phase 2 (#336), 5 specs + ADR.
 - **Counterexample:** An implementer for #341 (Triggers) would read: SPEC-0002 (Mission lifecycle), SPEC-0004 (Operation identity), SPEC-0008 (conformance), SPEC-0009 (Trigger envelope). That's 4 specs plus supporting docs — manageable.
 
 ### 5. Are conformance requirements measurable?
 - **Result:** Mostly yes
-- **Evidence:** SPEC-0008 R1 refined: MUST/MUST NOT requirements need executable test. SHOULD may have manual review. Conformance mechanism should be recorded explicitly.
-- **Counterexample:** SPEC-0006 R12 (optimization target: "Minimum expected total cost to a verified outcome") is a SHOULD-level architecture guidance. It's not directly testable by an automated test, but manual review can verify the routing implementation aligns with this principle. Correct.
+- **Evidence:** SPEC-0008 R1 refined: MUST/MUST NOT requirements need executable test or objectively inspectable method. SHOULD may have manual review. SPEC-0008 R2 allows phase-level conformance for freeze-candidate specs, with requirement-to-class mapping required before implementation.
+- **Counterexample:** SPEC-0006 R12 (optimization target) is a SHOULD-level architecture guidance. It's not directly testable by an automated test, but manual review can verify the routing implementation aligns with this principle. Correct.
 
 ### 6. Does any issue need future code that its dependencies do not provide?
 - **Result:** No
-- **Evidence:** Dependency graph verified:
-  - #341 depends on #340 (Missions) and #347 (durable wakeup) — both provide the required substrate
-  - #336 depends on #334 (contracts) and #335 (budget) — correct
-  - #338 depends on #337 (which depends on #188 and #355) — correct
-  - #342 depends on #341 (Triggers for adapter events) — correct
-  - #343 depends on #342 (adapters) and #190 (Sentinel) — correct
-  - #356 depends on #341 (Triggers) and #355 (on-demand execution) — correct
-  - No issue requires code from an issue that isn't its dependency or transitive dependency
+- **Evidence:** Dependency graph verified — no issue requires code from an issue that isn't its dependency or transitive dependency.
 
 ## Residual Uncertainty
 
-Low. The main residual uncertainties are implementation decisions that are intentionally left open: exact database schema, sandbox technology (pending conformance), package syntax, adapter process boundary, event scheduler, and numerical SLO targets. These are all documented as open in the appropriate specs and supporting docs.
+Low. The main residual uncertainties are implementation decisions that are intentionally left open.

@@ -8,8 +8,8 @@
 These decisions are frozen by the normative specs and ADRs. Implementation agents MUST NOT change them without a spec revision.
 
 ### Ontology & Lifecycle
-- Entity relationships: Mission → Execution → Work Package → Agent Run / Operation (SPEC-0002 R1)
-- Lifecycle vs outcome separation for executable/stateful entities (SPEC-0002 R2)
+- Entity relationships: Mission (0..N Executions) → Execution → Work Package / Operation; Trigger bound to Mission (SPEC-0002 R1)
+- Lifecycle vs outcome separation for Mission, Execution, Work Package, Operation; Agent Run excluded (SPEC-0002 R2)
 - Mission lifecycle states: draft, active, waiting, paused, terminal (SPEC-0002 R3); outcome is separate
 - Execution lifecycle states: created, admitted, queued, leased, running, waiting, terminal (SPEC-0002 R4)
 - Execution outcomes: succeeded, failed, cancelled, blocked, indeterminate (SPEC-0002 R5)
@@ -31,13 +31,13 @@ These decisions are frozen by the normative specs and ADRs. Implementation agent
 - Approval binding to exact revision/digest + scope + policy (SPEC-0003 R8)
 - Current security revoke vs pinned behaviour (SPEC-0003 R9)
 - Grant derivation chain (SPEC-0003 R11)
-- Operator authority limited by hard invariants and system ceilings (SPEC-0003 R10)
+- Operator authority limited by hard invariants (non-overridable, no exception mechanism) and system ceilings (SPEC-0003 R10)
 
 ### Operations & Side Effects
 - Operation declaration fields (SPEC-0004 R1)
 - Effect classes: pure, read, local_mutation, external_reversible_mutation, external_mutation, high_risk_or_irreversible (SPEC-0004 R2)
-- Retry classes: replay_safe, idempotent_with_key, reconcile_before_retry, at_most_once, human_required (SPEC-0004 R3)
-- Side-effect lifecycle as branching state graph (SPEC-0004 R4)
+- Retry classes: replay_safe, idempotent_with_key, reconcile_before_retry, at_most_once (at most one external submission), human_required (SPEC-0004 R3)
+- Side-effect lifecycle as branching state graph with denied, confirmed_failure states (SPEC-0004 R4)
 - Stable Operation identity (SPEC-0004 R5)
 - Submission uncertainty ≠ failure-before-submission (SPEC-0004 R6)
 - Blind retry prohibition after uncertain submission (SPEC-0004 R6)
@@ -53,7 +53,7 @@ These decisions are frozen by the normative specs and ADRs. Implementation agent
 - Sentinel-secret conformance requirement (SPEC-0005 R9)
 
 ### Model Invocation & Cost
-- Production call governance boundary (SPEC-0006 R1)
+- Governed invocation boundary covering production cognition and active operator probes (SPEC-0006 R1)
 - Provider-neutral cognitive requirements (SPEC-0006 R2)
 - No LLM selects the LLM (SPEC-0006 R3)
 - Budget hierarchy (SPEC-0006 R4)
@@ -79,7 +79,7 @@ These decisions are frozen by the normative specs and ADRs. Implementation agent
 - Phase closure requirements (SPEC-0008 R6)
 
 ### Triggers & Events
-- CloudEvents-compatible envelope with valid extension attribute names (SPEC-0009 R1-R2)
+- CloudEvents-compatible envelope with valid lowercase-alphanumeric extension names; rich metadata in data envelope (SPEC-0009 R1-R2)
 - Forge extensions (SPEC-0009 R2)
 - Auth separate from authorization (SPEC-0009 R3)
 - PostgreSQL as occurrence truth (SPEC-0009 R4)
