@@ -16,20 +16,39 @@ import type { GitHubIssue } from '@/scripts/github-agent-workflow/io/github-clie
 
 const tempRoots: string[] = []
 
+/**
+ * A semantically ready issue body with valid structure and control metadata.
+ */
+const READY_ISSUE_BODY = [
+  '## Problem Statement',
+  'Test problem',
+  '## Desired Outcome',
+  'Test outcome',
+  '## User Story',
+  'As a user I want this',
+  '## Requirements',
+  '- Requirement 1',
+  '## Acceptance Criteria',
+  '- [ ] Ready issue dispatches successfully.',
+  '- [ ] Bounded work order is generated.',
+  '## Implementation Scope',
+  'Small',
+  '',
+  'Execution mode: implementation',
+  'Depends on: none',
+].join('\n')
+
 const READY_ISSUE: GitHubIssue = {
   number: 144,
   title: '[FEATURE] Safe agent dispatch / bounded work-order generation',
-  body: [
-    '## Acceptance Criteria',
-    '',
-    '- [ ] Ready issue dispatches successfully.',
-    '- [ ] Bounded work order is generated.',
-  ].join('\n'),
+  body: READY_ISSUE_BODY,
   labels: ['ready-for-agent', 'agent-requested'],
   state: 'open',
+  stateReason: null,
   htmlUrl: 'https://github.com/Joncallim/Forge/issues/144',
   authorLogin: 'Joncallim',
   isPullRequest: false,
+  updatedAt: null,
 }
 
 async function tempRepositoryRoot(): Promise<string> {
@@ -162,7 +181,12 @@ describe('agent dispatch', () => {
 
   it('blocks issues with needs-clarification', async () => {
     const root = await tempRepositoryRoot()
-    const issue = { ...READY_ISSUE, labels: ['ready-for-agent', 'agent-requested', 'needs-clarification'] }
+    const issue = {
+      ...READY_ISSUE,
+      labels: ['ready-for-agent', 'agent-requested', 'needs-clarification'],
+      // Body lacks proper structure to trigger needs-clarification
+      body: 'Some text without proper sections',
+    }
     await seedRequestedRun(root, issue)
     const client = new FakeGitHubClient({ issues: [issue] })
 
@@ -174,7 +198,7 @@ describe('agent dispatch', () => {
     })
 
     expect(result.status).toBe('blocked')
-    expect(result.blockedReason).toContain('needs-clarification')
+    expect(result.blockedReason).toContain('not semantically dispatchable')
   })
 
   it('blocks non-requested runs', async () => {
@@ -229,10 +253,22 @@ describe('agent dispatch', () => {
     const issue = {
       ...READY_ISSUE,
       body: [
+        '## Problem Statement',
+        'Test problem',
+        '## Desired Outcome',
+        'Test outcome',
+        '## User Story',
+        'As a user I want this',
+        '## Requirements',
+        '- Requirement 1',
         '## Acceptance Criteria',
-        '',
         `- [ ] ${'A very long criterion '.repeat(400)}`,
-      ].join('\n'),
+        '## Implementation Scope',
+        'Small',
+        '',
+        'Execution mode: implementation',
+        'Depends on: none',
+].join('\n')
     }
     await seedRequestedRun(root, issue)
     const client = new FakeGitHubClient({ issues: [issue] })
@@ -257,10 +293,22 @@ describe('agent dispatch', () => {
     const issue = {
       ...READY_ISSUE,
       body: [
+        '## Problem Statement',
+        'Test problem',
+        '## Desired Outcome',
+        'Test outcome',
+        '## User Story',
+        'As a user I want this',
+        '## Requirements',
+        '- Requirement 1',
         '## Acceptance Criteria',
-        '',
         `- [ ] Do not leak token=${secret}.`,
-      ].join('\n'),
+        '## Implementation Scope',
+        'Small',
+        '',
+        'Execution mode: implementation',
+        'Depends on: none',
+].join('\n')
     }
     await seedRequestedRun(root, issue)
     const client = new FakeGitHubClient({ issues: [issue] })

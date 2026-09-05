@@ -24,12 +24,30 @@ import type { GitHubIssue } from '@/scripts/github-agent-workflow/io/github-clie
 const READY_ISSUE: GitHubIssue = {
   number: 146,
   title: '[FEATURE] Add durable agent run log for GitHub issue workflow',
-  body: 'Issue body',
+  body: [
+    '## Problem Statement',
+    'Test problem',
+    '## Desired Outcome',
+    'Test outcome',
+    '## User Story',
+    'As a user I want this',
+    '## Requirements',
+    '- Requirement 1',
+    '## Acceptance Criteria',
+    '- [ ] Criterion 1',
+    '## Implementation Scope',
+    'Small',
+    '',
+    'Execution mode: implementation',
+    'Depends on: none',
+  ].join('\n'),
   labels: ['ready-for-agent'],
   state: 'open',
+  stateReason: null,
   htmlUrl: 'https://github.com/Joncallim/Forge/issues/146',
   authorLogin: 'Joncallim',
   isPullRequest: false,
+  updatedAt: null,
 }
 
 const tempRoots: string[] = []

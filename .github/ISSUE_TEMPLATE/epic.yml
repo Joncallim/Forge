@@ -1,0 +1,89 @@
+name: Epic
+description: A large body of work that tracks multiple issues or sub-tasks
+title: "[EPIC] "
+labels:
+  - epic
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this for tracking large, multi-issue bodies of work. Epics are not directly implementable by agents — they track progress across multiple child issues.
+
+  - type: textarea
+    id: forge_control
+    attributes:
+      label: Forge Control Metadata
+      description: Execution mode and dependencies. Do not edit the format.
+      value: |
+        Execution mode: tracking
+        Depends on: none
+    validations:
+      required: true
+
+  - type: dropdown
+    id: issue_type
+    attributes:
+      label: Issue Type
+      description: This is an Epic.
+      options:
+        - Epic
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: What prompted this epic? What background does the agent need?
+      placeholder: "Example: We need to overhaul the agent workflow to support dependency-aware readiness."
+    validations:
+      required: true
+
+  - type: textarea
+    id: desired_outcome
+    attributes:
+      label: Desired Outcome
+      description: What should be true when this epic is complete?
+    validations:
+      required: true
+
+  - type: textarea
+    id: tasks
+    attributes:
+      label: Tasks
+      description: List the concrete sub-tasks or child issues.
+      placeholder: |
+        - [ ] #1 Task one
+        - [ ] #2 Task two
+        - [ ] #3 Task three
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance_criteria
+    attributes:
+      label: Acceptance Criteria
+      description: How do we know this epic is complete?
+      placeholder: |
+        - [ ] All child issues are closed
+        - [ ] Documentation is updated
+        - [ ] Tests pass
+    validations:
+      required: true
+
+  - type: textarea
+    id: out_of_scope
+    attributes:
+      label: Out of Scope
+      description: What should not be handled in this epic?
+    validations:
+      required: false
+
+  - type: textarea
+    id: technical_notes
+    attributes:
+      label: Technical Notes
+      description: Optional notes, references, links, or implementation hints.
+      render: markdown
+    validations:
+      required: false

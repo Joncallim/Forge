@@ -10,6 +10,17 @@ body:
         Use this for new FORGE capabilities. The goal is to make the issue specific enough for an AI coding agent to implement without inventing missing requirements.
 
   - type: textarea
+    id: forge_control
+    attributes:
+      label: Forge Control Metadata
+      description: Execution mode and dependencies. Do not edit the format.
+      value: |
+        Execution mode: implementation
+        Depends on: none
+    validations:
+      required: true
+
+  - type: textarea
     id: problem_statement
     attributes:
       label: Problem Statement

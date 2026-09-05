@@ -10,6 +10,17 @@ body:
         Use this when FORGE behaves incorrectly. The issue should let an AI coding agent reproduce the problem, understand the expected behaviour, and prove the fix.
 
   - type: textarea
+    id: forge_control
+    attributes:
+      label: Forge Control Metadata
+      description: Execution mode and dependencies. Do not edit the format.
+      value: |
+        Execution mode: implementation
+        Depends on: none
+    validations:
+      required: true
+
+  - type: textarea
     id: summary
     attributes:
       label: Bug Summary
