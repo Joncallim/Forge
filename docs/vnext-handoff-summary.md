@@ -98,7 +98,7 @@ The following P0/P1 findings were remediated before PR creation:
 | P1-12 Database models | All specs | Data model sections marked as conceptual; created data-model-reference.md for ownership |
 | P2-13 SLO semantics | SPEC-0015 | Hard invariants have zero permissible error budget; softened 30-day/quarterly to representative/recommended |
 | P2-14 Circuit-breaking | SPEC-0006 | Per-failure-class recovery semantics; no generic cooldown |
-| P2-15 Governance status | All specs + README | Changed from Accepted to Proposed (freeze candidate) pending merge |
+| P2-15 Governance status | All specs + README | Promoted to Accepted after operator-approved merge of PR #359; ADR 0015 remains Proposed pending sandbox conformance proof |
 | Additional: Operator authority | SPEC-0003 | Clarified operator authority limited by system ceilings and hard invariants |
 | Additional: Conformance wording | SPEC-0008 | MUST/MUST NOT require executable test; SHOULD may use manual review |
 
@@ -129,7 +129,7 @@ These are explicitly documented areas where future decisions are needed (unchang
 
 ## Completion Criterion Status
 
-- ✅ All 15 normative specs exist and cross-reference consistently
+- ✅ All 15 normative specs exist, are Accepted, and cross-reference consistently
 - ✅ No material contradiction between specs, ADRs, and open issues (after remediation)
 - ✅ No hidden dependency cycles in the issue graph
 - ✅ No cross-cutting semantic is being independently redefined in multiple issues
@@ -141,5 +141,5 @@ These are explicitly documented areas where future decisions are needed (unchang
 - ✅ P0/P1 findings remediated and verified
 - ✅ Supporting documents (phase-reference.md, data-model-reference.md) created
 - ✅ GitHub issues reconciled with corrected specs
-- ✅ Repository validation — PR #359 created, CI passing (web ✅, check ✅, GitGuardian ✅)
+- ✅ Repository validation — PR #359 merged at `49bf9b1b7e63238bb84d26dd1945b6dca6560f23` after Web CI, PR Contract Check, and GitGuardian passed
 - ✅ Remaining uncertainty is genuinely low-level implementation choice or explicitly deferred scope
