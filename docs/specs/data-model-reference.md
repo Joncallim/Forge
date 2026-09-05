@@ -1,7 +1,7 @@
 # Data Model Reference — Conceptual Ownership & Consolidation
 
 **Date:** 2026-09-05
-**Purpose:** Consolidated reference for all conceptual entities defined across the specification framework. This document shows ownership, governing specs, durability requirements, and whether a new physical table is required or intentionally open.
+**Purpose:** Consolidated reference for all conceptual entities defined across the specification framework. This document shows ownership, governing specs, durability requirements, and the relationship between current foundations and VNext persistence.
 
 > **Note:** The models below are conceptual. They show required semantic fields, not physical schema. Exact table layout, column types, indexes, partitioning, and storage engine are implementation decisions unless an existing table is explicitly marked as normative.
 
@@ -9,42 +9,43 @@
 
 ## Entity Inventory
 
-| Entity | Canonical Owner | Governing Spec | Durable? | Existing Table? | New Physical Table Required? |
+| Entity | Canonical Owner | Governing Spec | Durable? | Current Foundation | VNext Persistence Requirement |
 |---|---|---|---|---|---|
-| Mission | Runtime | SPEC-0002 | Yes | No | Required |
-| Execution | Runtime | SPEC-0002 | Yes | No | Required |
-| Work Package | Runtime | SPEC-0002 | Yes | No | Required |
-| Agent Run receipt | Runtime | SPEC-0002 | Yes (receipt/metadata only) | No | Required (durable receipt; cognitive session ephemeral) |
-| Artifact | Runtime | SPEC-0002 | Yes | `artifacts` | Existing, extend |
-| Gate result | Runtime | SPEC-0002 | Yes | No | Required |
-| Grant | Authorization | SPEC-0003 | Yes | `grants` | Existing, extend (add revision/fencing token) |
-| Approval record | Authorization | SPEC-0003 | Yes | No | Required |
-| Operation definition | Operations | SPEC-0004 | Yes | `operation_catalog` | Existing (ADR 0011) |
-| Operation run | Operations | SPEC-0004 | Yes | `operation_runs` | Existing (ADR 0011) |
-| Resource classification | Classification | SPEC-0005 | Yes | No | Required |
-| Egress policy | Classification | SPEC-0005 | Yes | No | Required |
-| Credential binding | Classification | SPEC-0005 | Yes | No | Required (references secure store) |
-| Budget allocation | Cost | SPEC-0006 | Yes | No | Required |
-| Routing receipt | Cost | SPEC-0006 | Yes | No | Required |
-| Provider readiness | Cost | SPEC-0006 | No | No | Not required (operational state) |
-| Trigger definition | Events | SPEC-0009 | Yes | No | Required |
-| Trigger occurrence | Events | SPEC-0009 | Yes | No | Required |
-| Workforce package | Packages | SPEC-0010 | Yes | No | Required |
-| Mission package pin | Packages | SPEC-0010 | Yes | No | Required |
-| Derived revision | Packages | SPEC-0010 | Yes | No | Required |
-| Provenance record | Supply Chain | SPEC-0011 | Yes | No | Required |
-| Audit event | Observability | SPEC-0012 | Yes | No | Required |
-| Migration registry | Migration | SPEC-0014 | Yes | No | Required |
-| Hard invariant violation | Reliability | SPEC-0015 | Yes | No | Required |
-| SLI measurement | Reliability | SPEC-0015 | No | No | Not required (telemetry) |
-| Conformance test registry | Conformance | SPEC-0008 | No | No | Not required (CI metadata) |
-| Threat model registry | Threat Model | SPEC-0013 | No | No | Documentation only |
+| Mission | Runtime | SPEC-0002 | Yes | Compatibility adapter over Project/Task | New or extended from compatibility adapter |
+| Execution | Runtime | SPEC-0002 | Yes | Compatibility adapter over Project/Task | New or extended from compatibility adapter |
+| Work Package | Runtime | SPEC-0002 | Yes | `work_packages` table exists | Extend existing table with lifecycle/outcome separation |
+| Agent Run receipt | Runtime | SPEC-0002 | Yes (receipt/metadata only; cognitive session ephemeral) | `agent_runs` table exists | Extend existing table with routing snapshot, cost, provenance linkage |
+| Artifact | Runtime | SPEC-0002 | Yes | `artifacts` table exists | Existing, extend |
+| Gate result | Runtime | SPEC-0002 | Yes | `approval_gates` table exists (coding-specific) | Extend or create VNext gate result table if coding-specific schema cannot be reused |
+| Grant | Authorization | SPEC-0003 | Yes | `filesystem_mcp_grant_approvals` (MCP-specific) | New VNext grants table with revision, fencing token; migrate MCP-specific grants |
+| Approval record | Authorization | SPEC-0003 | Yes | Part of `filesystem_mcp_grant_approvals` | New or extended with revision binding |
+| Operation definition | Operations | SPEC-0004 | Yes | Code-backed in `web/lib/operations/catalog.ts` | May remain code-backed or migrate to durable registry |
+| Operation run | Operations | SPEC-0004 | Yes | `operation_runs` table exists (ADR 0011) | Existing, extend with denied/confirmed_failure states |
+| Resource classification | Classification | SPEC-0005 | Yes | No dedicated table | New |
+| Egress policy | Classification | SPEC-0005 | Yes | No dedicated table | New |
+| Credential binding | Classification | SPEC-0005 | Yes | No dedicated table | New (references secure store) |
+| Budget allocation | Cost | SPEC-0006 | Yes | No dedicated table | New |
+| Routing receipt | Cost | SPEC-0006 | Yes | No dedicated table | New |
+| Provider readiness | Cost | SPEC-0006 | No | No dedicated table | Not required (operational state) |
+| Trigger definition | Events | SPEC-0009 | Yes | No dedicated table | New |
+| Trigger occurrence | Events | SPEC-0009 | Yes | No dedicated table | New |
+| Workforce package | Packages | SPEC-0010 | Yes | No dedicated table | New |
+| Mission package pin | Packages | SPEC-0010 | Yes | No dedicated table | New |
+| Derived revision | Packages | SPEC-0010 | Yes | No dedicated table | New |
+| Provenance record | Supply Chain | SPEC-0011 | Yes | No dedicated table | New |
+| Audit event | Observability | SPEC-0012 | Yes | No dedicated table | New |
+| Migration registry | Migration | SPEC-0014 | Yes | No dedicated table | New |
+| Hard invariant violation | Reliability | SPEC-0015 | Yes | No dedicated table | New |
+| SLI measurement | Reliability | SPEC-0015 | No | No dedicated table | Not required (telemetry) |
+| Conformance test registry | Conformance | SPEC-0008 | No | No dedicated table | Not required (CI metadata) |
+| Threat model registry | Threat Model | SPEC-0013 | No | No dedicated table | Documentation only |
 
 ### Mapping notes
 
-- **Project** is NOT a Mission. It is a Software Engineering compatibility/resource-binding/workspace context (SPEC-0014 R7). The existing Project table remains for compatibility but routes through an adapter to the canonical Mission/Execution representation.
+- **Project** is NOT a Mission. It is a Software Engineering compatibility/resource-binding/workspace context (SPEC-0014 R7). The existing Project/Task tables remain for compatibility but route through an adapter to the canonical Mission/Execution representation.
 - **Task** is NOT an Execution. It is a finite coding-request compatibility surface that maps to a Mission (SPEC-0014 R7). Retries produce multiple Executions under one Mission.
-- **Agent Run receipt** is durable (identity, routing snapshot, token/cost usage, provenance linkage). The cognitive session/context is ephemeral.
+- **Agent Run receipt** is durable (identity, routing snapshot, token/cost usage, provenance linkage). The existing `agent_runs` table is the foundation to extend. The cognitive session/context is ephemeral and MUST NOT be treated as durable evidence.
+- **Grant** currently uses MCP-specific `filesystem_mcp_grant_approvals`. VNext requires a generic grants table with revision binding and admission fencing. The MCP-specific table may be migrated or adapted.
 
 ---
 
@@ -111,8 +112,8 @@ Budget Allocation (tree)
 Per SPEC-0002 R10, not every conceptual entity requires a separate physical table. Acceptable coalescing patterns:
 
 1. **Operation state** is part of the Operation run record, not a separate table (already in conceptual model).
-2. **Agent Run cognitive session** is ephemeral; only the receipt (identity, routing, cost, provenance linkage) is durable.
-3. **Gate evaluation** may be stored as evidence artifacts rather than a separate gate table, as long as the result, policy revision, and evaluator identity are durably recorded.
+2. **Agent Run cognitive session** is ephemeral; only the receipt (identity, routing, cost, provenance linkage) is durable. Extend the existing `agent_runs` table rather than creating a parallel receipt table.
+3. **Gate evaluation** may be stored as evidence artifacts rather than a separate gate table, as long as the result, policy revision, and evaluator identity are durably recorded. The existing `approval_gates` table may serve as the coding-specific foundation.
 4. **Credential bindings** reference a secure external store; the binding table may be a projection of the external store's state.
 5. **Provider readiness** is operational state, not authoritative — may use in-memory cache with periodic persistence for recovery.
 
