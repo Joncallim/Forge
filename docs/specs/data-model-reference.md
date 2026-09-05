@@ -17,7 +17,7 @@
 | Agent Run receipt | Runtime | SPEC-0002 | Yes (receipt/metadata only; cognitive session ephemeral) | `agent_runs` table exists | Extend existing table with routing snapshot, cost, provenance linkage |
 | Artifact | Runtime | SPEC-0002 | Yes | `artifacts` table exists | Existing, extend |
 | Gate result | Runtime | SPEC-0002 | Yes | `approval_gates` table exists (coding-specific) | Extend or create VNext gate result table if coding-specific schema cannot be reused |
-| Grant | Authorization | SPEC-0003 | Yes | `filesystem_mcp_grant_approvals` (MCP-specific) | New VNext grants table with revision, fencing token; migrate MCP-specific grants |
+| Grant | Authorization | SPEC-0003 | Yes | `filesystem_mcp_grant_approvals` (MCP-specific) | Generic durable Grant representation required; extend/adapt/migrate existing MCP-specific foundations as appropriate; exact physical schema remains implementation-open |
 | Approval record | Authorization | SPEC-0003 | Yes | Part of `filesystem_mcp_grant_approvals` | New or extended with revision binding |
 | Operation definition | Operations | SPEC-0004 | Yes | Code-backed in `web/lib/operations/catalog.ts` | May remain code-backed or migrate to durable registry |
 | Operation run | Operations | SPEC-0004 | Yes | `operation_runs` table exists (ADR 0011) | Existing, extend with denied/confirmed_failure states |
@@ -45,7 +45,7 @@
 - **Project** is NOT a Mission. It is a Software Engineering compatibility/resource-binding/workspace context (SPEC-0014 R7). The existing Project/Task tables remain for compatibility but route through an adapter to the canonical Mission/Execution representation.
 - **Task** is NOT an Execution. It is a finite coding-request compatibility surface that maps to a Mission (SPEC-0014 R7). Retries produce multiple Executions under one Mission.
 - **Agent Run receipt** is durable (identity, routing snapshot, token/cost usage, provenance linkage). The existing `agent_runs` table is the foundation to extend. The cognitive session/context is ephemeral and MUST NOT be treated as durable evidence.
-- **Grant** currently uses MCP-specific `filesystem_mcp_grant_approvals`. VNext requires a generic grants table with revision binding and admission fencing. The MCP-specific table may be migrated or adapted.
+- **Grant** currently uses MCP-specific `filesystem_mcp_grant_approvals`. VNext requires generic durable Grant representation with revision binding and admission fencing. The exact physical schema (new table, extension of existing table, or adapter over MCP-specific structures) remains implementation-open. Do not create parallel authority state without a documented migration plan.
 
 ---
 
