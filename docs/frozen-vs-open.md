@@ -35,7 +35,7 @@ These decisions are frozen by the normative specs and ADRs. Implementation agent
 
 ### Operations & Side Effects
 - Operation declaration fields (SPEC-0004 R1)
-- Effect classes: pure, read, local_mutation, external_reversible_mutation, external_mutation, high_risk_or_irreversible (SPEC-0004 R2)
+- Effect classes: pure, read, local_mutation, external_reversible_mutation, external_mutation (SPEC-0004 R2)
 - Retry classes: replay_safe, idempotent_with_key, reconcile_before_retry, at_most_once (at most one external submission), human_required (SPEC-0004 R3)
 - Side-effect lifecycle as branching state graph with denied, confirmed_failure states (SPEC-0004 R4)
 - Stable Operation identity (SPEC-0004 R5)
