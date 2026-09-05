@@ -1,7 +1,7 @@
 # Hostile Review Pass B — Authority / Security
 
 **Date:** 2026-09-05 (final)
-**Reviewer:** Automated hostile pass — all claims verified against branch head **db0f0f99e1014851ea6784f47479e253dae8a804**
+**Reviewer:** Automated hostile pass — all claims verified against branch head **293ec3e1ff45ce038b9c13f8f74af247f15e844d**
 **Scope:** SPEC-0003, 0005, 0010, 0011, 0013; ADR 0015
 
 ## Review Verdict
@@ -10,7 +10,7 @@
 **Confidence:** High
 **Reason:** Grant admission fencing with admission token, revision binding, revocation invalidation, and lease coupling is present in normative SPEC-0003 concurrency section. Operator authority correctly limited by non-overridable hard invariants. All security counterexamples fail closed.
 
-## Normative text verification (verified against db0f0f99e1014851ea6784f47479e253dae8a804)
+## Normative text verification (verified against 293ec3e1ff45ce038b9c13f8f74af247f15e844d)
 
 - SPEC-0003 concurrency section contains admission token revision binding: VERIFIED
 - SPEC-0003 concurrency section contains revocation invalidation of outstanding tokens: VERIFIED
