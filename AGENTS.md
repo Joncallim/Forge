@@ -1,47 +1,70 @@
 # Forge — Agent & Workforce Model
 
-Forge has **one** agent/workforce model that is neutral to how a worker runs.
-Claude Code and Codex are **runtimes/providers**, not separate agent
-catalogues. See `docs/adr/0007-forge-agent-workforce-model.md` for the full
-four-layer model and canonical terms.
+Forge has **one** runtime-neutral agent/workforce model. Claude Code and Codex
+are **runtimes/providers**, not separate agent catalogues.
+
+Read the architecture in this order:
+
+- `docs/adr/0014-forge-vnext-general-agent-runtime.md` — product-wide VNext
+  ontology and invariants.
+- `docs/forge-vnext-architecture.md` — full target architecture and phase order.
+- `docs/adr/0007-forge-agent-workforce-model.md` — the current coding/Software
+  Engineering role taxonomy beneath the broader VNext model.
 
 This file is the shared instruction surface for any agent — Claude Code, Codex,
 an API model, or a local model — operating on this repository.
 
 ## The four layers
 
+For the current coding product and future Software Engineering Workforce:
+
 1. **Provider / runtime** — where/how a worker runs (Claude Code via ACP, Codex
    CLI via ACP, Anthropic/OpenAI API, OpenRouter, LiteLLM, Ollama, custom).
-2. **Broad Forge agent role** — the visible catalogue: Architect, Product, UX,
-   Frontend, Backend, QA, Review, Security, DevOps, Documentation, Release, and
-   (optional) MCP Installer.
+2. **Broad Software Engineering role** — Architect, Product, UX, Frontend,
+   Backend, QA, Review, Security, DevOps, Documentation, Release, and optional
+   MCP Installer.
 3. **Specialist harness / prompt overlay** — the bounded prompt/tool policy for a
    specific work package (e.g. React implementation, E2E tests, security review).
-4. **Workforce template** — a reusable team assembled from broad agents plus
-   role labels/harnesses.
+4. **Workforce template** — a reusable team assembled from roles plus
+   labels/harnesses.
 
-The web app stores agents as **editable database records**. The repository ships
-seed prompts as defaults; logged-in users add or edit app agents and assign them
-to editable workforces. Treat the seed files as defaults, not the full runtime
-catalog.
+Under VNext, these coding roles are **not** the universal catalogue for every
+Workforce. Other installed Workforces may define domain-specific roles while
+using the same generic Mission/Execution/Resource/Capability/Grant contracts.
+
+The web app stores the current coding agents as **editable database records**.
+Repository seed prompts are defaults; logged-in users can add or edit app agents
+and assign them to editable workforces. Treat seed files as defaults, not the
+full runtime catalogue.
 
 ## Runtime reality
 
-The normal web runtime is not a manual agent session. The web app enqueues tasks
-to Redis, and the Forge worker consumes those jobs. The worker runs Architect
-planning, moves a task to `awaiting_approval`, and after approval can execute
-specialist packages and apply local repository file edits by default. Set
-`FORGE_WORK_PACKAGE_EXECUTION=0` for handoff artifacts only, or
-`FORGE_HOST_REPOSITORY_WRITES=0` to keep generated files sandbox-only.
+Forge is currently a coding-focused, single-operator beta. The normal web runtime
+is not a manual agent session: the web app records durable task state in
+PostgreSQL, Redis carries queue/wakeup transport, and the Forge worker runs the
+supported planning/admission/evidence stages.
 
-Do not imply capabilities Forge does not have yet: parallel autonomous
-specialists, commits, PR creation, merge automation, or unrestricted MCP runtime
-grants.
+**Specialist execution and host-repository file materialization are currently
+unavailable.** Forge does not yet have the OS-enforced confined writer required
+for those mutations. `FORGE_WORK_PACKAGE_EXECUTION` and
+`FORGE_HOST_REPOSITORY_WRITES` are reserved/request signals; setting them to an
+enable value does **not** create authority or make writes available. The runtime
+must fail closed until the confined execution boundary is implemented and proven.
+
+Do not imply capabilities Forge does not have yet: specialist repository writes,
+parallel autonomous specialists, automatic commits/PRs/merges, unrestricted MCP
+runtime grants, persistent general-agent Missions, or installed non-coding
+Workforces.
+
+VNext is an accepted target architecture, not a claim that those features already
+ship. When docs and runtime differ, inspect the live implementation and current
+release evidence before making a capability claim.
 
 ## Roles
 
-These broad roles are the app-level catalogue. Detailed specialists are harness
-or prompt overlays layered onto them, not extra top-level agents.
+These broad roles describe the current coding product and future Software
+Engineering Workforce. Detailed specialists are harness/prompt overlays layered
+onto them, not extra top-level coding agents.
 
 | Role | Use for |
 |---|---|
@@ -62,17 +85,18 @@ or prompt overlays layered onto them, not extra top-level agents.
 
 When operating Forge manually through a runtime such as Codex or Claude Code,
 act as the **project manager and lead architect**: plan, decompose, delegate,
-and review — you do not write implementation code directly unless no specialist
-role is appropriate.
+and review. Do not write implementation code directly when a specialist role is
+more appropriate.
 
 Manual Codex operation may spawn native subagents defined under `.codex/agents/`.
-Those files are an optional manual helper surface mirroring the roles above; they
-are not the product source of truth for the app catalogue.
+Those files are an optional manual helper surface mirroring the coding roles
+above; they are not the product source of truth for the app catalogue.
 
-Do not instantiate every role ceremonially. For a small bounded change, use a
-concise Architect pass, one implementation role, and one independent QA or
-Review pass. Add roles only for distinct workstreams or security/release risk.
-Run application checks from `web/` unless a command explicitly says otherwise.
+Do not instantiate every role ceremonially. For a small bounded change, use the
+smallest team that provides independent implementation and verification. Add
+roles only for distinct workstreams or security/release risk. Prefer deterministic
+checks over extra model calls. Run application checks from `web/` unless a
+command explicitly says otherwise.
 
 ### Core responsibilities
 
@@ -89,6 +113,10 @@ Run application checks from `web/` unless a command explicitly says otherwise.
    read-only. QA is read-only when it is the independent verification pass, but
    may receive exclusive test-file ownership before work begins; implementation
    agents must not edit those files in that mode.
+7. **Do not invent authority from role or prose.** A model/role saying an action
+   is safe does not grant filesystem, network, GitHub, MCP, or other capability.
+   VNext authority is always constrained by Forge policy and explicit scoped
+   grants.
 
 ### Default review behaviour
 
@@ -108,6 +136,9 @@ especially "No blockers found in the inspected scope" and the explicit
 Review is read-only unless fixes are explicitly requested. Report findings before
 editing, and never use a review recommendation to bypass tests, CI, MCP/tool or
 security policy, repository-write controls, human approval, or merge authority.
+Reviewers/verifiers produce evidence; trusted deterministic Forge/GitHub gates
+make authoritative decisions.
+
 The current web executor's sole exception is persistence of an
 Architect-designated review-report artifact; that is evidence, not authorization
 to edit implementation files. A missing safe artifact path is a blocked work
@@ -126,42 +157,50 @@ never overwrite their customization silently.
 
 ### Workflow (target/manual path)
 
-```
+```text
 Issue / Request
-      │
-      ▼
-1. Architect → design doc + task breakdown
-      │
-      ▼
-2. Assign subtasks to Backend / Frontend / DevOps
-      │
-      ▼
-3. QA → write tests for each subtask
-      │
-      ▼
-4. Review → orthogonal review protocol (Security/Adversarial for high-risk changes)
-      │
-      ▼
-5. PM (you) → recommend acceptance or rework; merge only with explicit user authorization
+      |
+      v
+1. Architect / planning as needed -> design + task breakdown
+      |
+      v
+2. Assign bounded implementation work
+      |
+      v
+3. Deterministic checks + QA evidence
+      |
+      v
+4. Review -> orthogonal review protocol (Security/Adversarial evidence for high-risk changes)
+      |
+      v
+5. PM/operator -> recommend acceptance or rework; merge only with explicit user authorization
 ```
+
+This is a manual/repository workflow description, not proof that the current web
+runtime autonomously executes every stage.
 
 ### Decision rules
 
-- **Always** run Architect first for any new feature or cross-cutting change.
-- **Always** run Review before merging any PR.
-- **Never** merge without passing QA tests.
-- For refactors touching >3 files, run Architect before Backend/Frontend.
+- Run Architect/design work for new features or cross-cutting changes; do not add
+  ceremonial planning calls for trivial mechanical edits.
+- Always run independent Review before recommending merge of substantive PRs.
+- Never recommend merge without the applicable test/CI evidence.
+- For refactors touching >3 files, run an architecture pass before implementation.
 - For security-sensitive changes (auth, secrets, filesystem, command execution,
   repository writes, tool permissions, prompt injection, merge automation),
-  escalate Security/Adversarial review findings before merge.
+  escalate Security/Adversarial findings as **evidence** before merge; a model
+  review is not itself a security-policy allow decision.
 
 ## Stack constraints
 
-- Language/runtime: determined per project — confirm with Architect first.
-- Database: PostgreSQL 16+ for persistence, Redis 7+ for queues/cache.
-- Containers: Docker Compose for local, Docker for production.
-- Models: any configured provider/runtime; unassigned work resolves to the
-  workspace default provider (see #88).
+- Language/runtime: determined per project — confirm from the repository before
+  assuming.
+- Database: PostgreSQL 16+ for durable persistence; Redis 7+ for reconstructable
+  queue/wakeup/cache transport.
+- Models: any supported configured provider/runtime for the current beta. The
+  current coding path still has legacy provider assignments/default-provider
+  fallback; VNext #335 replaces runtime selection with deterministic,
+  provider-neutral budget/routing policy.
 
 ## Documentation style
 
