@@ -10,7 +10,6 @@
  */
 
 import type { GitHubComment, GitHubClient, GitHubIssue } from '../io/github-client'
-import { diffManagedLabels } from '../core/labels'
 import {
   ISSUE_VALIDATION_MARKER_PREFIX,
   validateIssue,
@@ -19,7 +18,6 @@ import { IssueReadinessResolver } from './issue-readiness-resolver'
 import { syncReadinessLabels } from './readiness-projection'
 import type { IssueValidationResult } from '../contracts/issue-validation-result'
 import type { IssueReadinessResult } from '../contracts/issue-readiness-result'
-import { ISSUE_READINESS_MANAGED_LABELS } from '../contracts/common'
 
 type RunIssueValidationOptions = {
   botLogin: string
@@ -105,48 +103,23 @@ export async function runIssueValidation(
 
   // Semantic readiness resolution
   const resolver = new IssueReadinessResolver(client)
-  let readinessResult: IssueReadinessResult | null = null
-  try {
-    readinessResult = await resolver.resolveFromIssue(issue)
-  } catch {
-    readinessResult = null
-  }
+  let readinessResult = await resolver.resolveFromIssue(issue)
 
   const comments = await client.listComments(issue.number)
   const existingMarkerComment = markerCommentForIssue(comments, options.botLogin)
 
   // Sync readiness labels
-  if (readinessResult) {
-    // Use shared projection writer
-    const projection = await syncReadinessLabels(client, issue, readinessResult)
+  // Ready promotion must be based on a fresh semantic read immediately
+  // before the shared writer can add ready-for-agent.
+  let projectionIssue = issue
+  if (readinessResult.dispatchable) {
+    projectionIssue = await client.getIssue(issue.number)
+    readinessResult = await new IssueReadinessResolver(client).resolveFromIssue(projectionIssue)
+  }
 
-    // If projection failed for a ready promotion, try final fresh re-resolution
-    if (!projection.success && readinessResult.dispatchable) {
-      // A stale blocker may have been present; perform fresh re-resolution
-      try {
-        const freshResolver = new IssueReadinessResolver(client)
-        const freshIssue = await client.getIssue(issue.number)
-        const freshResult = await freshResolver.resolveFromIssue(freshIssue)
-
-        if (freshResult.dispatchable) {
-          // Re-attempt projection with fresh result
-          const retryProjection = await syncReadinessLabels(client, freshIssue, freshResult)
-          if (retryProjection.success && retryProjection.addedLabels.includes('ready-for-agent')) {
-            readinessResult = freshResult
-          }
-        }
-      } catch {
-        // Fresh re-resolution failed; keep original result
-      }
-    }
-  } else {
-    const diff = diffManagedLabels(issue.labels, result.recommendedLabels, ISSUE_READINESS_MANAGED_LABELS)
-    for (const label of diff.toAdd) {
-      await client.addLabel(issue.number, label)
-    }
-    for (const label of diff.toRemove) {
-      await client.removeLabel(issue.number, label)
-    }
+  const projection = await syncReadinessLabels(client, projectionIssue, readinessResult)
+  if (!projection.success) {
+    throw new Error(projection.error ?? `Failed to project readiness labels for #${issue.number}.`)
   }
 
   // Sync marker comment

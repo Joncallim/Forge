@@ -205,7 +205,7 @@ function rejectedComment(command: AgentCommand): string {
     '',
     'Agent request not accepted.',
     '',
-    `- Request: \`${command.normalizedText || '(empty comment)'}\``,
+    `- Request: \`${command.recognized ? command.command : 'unrecognized command'}\``,
     `- Reason: ${command.rejectionReason ?? 'Request was rejected.'}`,
     '- Next step: comment with an exact supported command when the issue is ready.',
   ].join('\n')
@@ -267,7 +267,13 @@ export async function runAgentCommand(input: {
   }
 
   const rejectionReason = await rejectionFor(parsed, input.issue, input.client, input.runLogRepositoryRoot)
-  const runId = rejectionReason === null
+  const durableRecorderMissing = rejectionReason === null
+    && isImplementationRequest(parsed)
+    && input.recorder === undefined
+  const finalRejectionReason = durableRecorderMissing
+    ? 'Implementation request could not be accepted because Forge could not establish the required durable run record. Ask a maintainer to repair the run-log recorder and retry.'
+    : rejectionReason
+  const runId = finalRejectionReason === null
     ? buildRunId({
         issueNumber: input.issue.number,
         githubRunId: input.githubRunId,
@@ -277,8 +283,8 @@ export async function runAgentCommand(input: {
     : null
   const command = agentCommandSchema.parse({
     ...parsed,
-    accepted: rejectionReason === null,
-    rejectionReason,
+    accepted: finalRejectionReason === null,
+    rejectionReason: finalRejectionReason,
   })
   const commentBody = command.accepted && runId !== null
     ? acceptedComment(command, input.issue, runId)

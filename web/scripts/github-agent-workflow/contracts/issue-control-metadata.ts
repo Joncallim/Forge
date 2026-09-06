@@ -1,5 +1,6 @@
 import { z } from 'zod'
 import { freezeSchema, positiveIntSchema } from './common'
+import type { ReadinessReasonCode } from './issue-readiness-result'
 
 /**
  * Canonical execution modes for Forge issues.
@@ -33,6 +34,16 @@ export const issueControlMetadataSchema = freezeSchema(z.object({
 }).strict())
 
 export type IssueControlMetadata = z.infer<typeof issueControlMetadataSchema>
+
+/**
+ * A bounded, machine-readable parsing diagnostic.  These values are the
+ * parser's semantic authority; rendered prose is deliberately kept separate.
+ */
+export type ControlDiagnostic = Readonly<{
+  reasonCode: ReadinessReasonCode
+  field: 'execution_mode' | 'depends_on' | 'body'
+  dependencyIssueNumber?: number
+}>
 
 /**
  * Default empty metadata for issues without explicit control lines.

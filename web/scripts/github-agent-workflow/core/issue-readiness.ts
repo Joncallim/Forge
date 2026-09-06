@@ -9,6 +9,7 @@
 
 import type { IssueType } from '../contracts/common'
 import type { IssueControlMetadata } from '../contracts/issue-control-metadata'
+import type { ControlDiagnostic } from '../contracts/issue-control-metadata'
 import {
   type IssueReadinessResult,
   type BlockerRecord,
@@ -30,6 +31,8 @@ export type ResolvedDependencyFact = Readonly<{
    * Parsed from the dependency's control metadata.
    */
   transitiveDependencyIssueNumbers?: readonly number[]
+  /** Typed diagnostics parsed from this dependency's control metadata. */
+  controlDiagnostics?: readonly ControlDiagnostic[]
 }>
 
 /**
@@ -65,6 +68,8 @@ export type ReadinessEvaluationInput = Readonly<{
    * Control metadata parse errors.
    */
   controlParseErrors: readonly string[]
+  /** Typed parser authority. Legacy prose is presentation-only. */
+  controlDiagnostics?: readonly ControlDiagnostic[]
   /**
    * Whether duplicate declarations were found.
    */
@@ -89,7 +94,7 @@ export function evaluateReadiness(input: ReadinessEvaluationInput): IssueReadine
   // Check body size first
   if (input.bodyTooLarge) {
     reasonCodes.push('queue.issue_body_too_large')
-    return buildResult(input.issueNumber, 'needs-clarification', input.controlMetadata, reasonCodes, blockers, false)
+    return buildResult(input.issueNumber, 'needs-clarification', input.controlMetadata, reasonCodes, blockers, true)
   }
 
   // Check if issue state is unknown (must fail closed)
@@ -133,10 +138,24 @@ export function evaluateReadiness(input: ReadinessEvaluationInput): IssueReadine
       detail: 'Duplicate or conflicting Execution mode or Depends on declarations found.',
       dependencyIssueNumber: null,
     })
+    return buildResult(input.issueNumber, 'needs-clarification', input.controlMetadata, reasonCodes, blockers, false)
+  }
+
+  const diagnostics = input.controlDiagnostics ?? []
+  const firstDiagnostic = diagnostics[0]
+
+  if (firstDiagnostic?.reasonCode === 'queue.issue_body_too_large') {
+    reasonCodes.push(firstDiagnostic.reasonCode)
     return buildResult(input.issueNumber, 'needs-clarification', input.controlMetadata, reasonCodes, blockers, true)
   }
 
-  if (!cm.explicit && !cm.isLegacyTrackingEpic) {
+  if (diagnostics.some((diagnostic) => diagnostic.reasonCode === 'queue.issue_control_duplicate')) {
+    reasonCodes.push('queue.issue_control_duplicate')
+    blockers.push({ reasonCode: 'queue.issue_control_duplicate', detail: 'Duplicate control declarations found.', dependencyIssueNumber: null })
+    return buildResult(input.issueNumber, 'needs-clarification', input.controlMetadata, reasonCodes, blockers, false)
+  }
+
+  if (diagnostics.some((diagnostic) => diagnostic.reasonCode === 'queue.issue_control_missing') || (!cm.explicit && !cm.isLegacyTrackingEpic)) {
     // Missing control metadata on non-legacy issues
     reasonCodes.push('queue.issue_control_missing')
     blockers.push({
@@ -147,7 +166,7 @@ export function evaluateReadiness(input: ReadinessEvaluationInput): IssueReadine
     return buildResult(input.issueNumber, 'needs-clarification', input.controlMetadata, reasonCodes, blockers, false)
   }
 
-  if (cm.executionMode === null && !cm.isLegacyTrackingEpic) {
+  if (diagnostics.some((diagnostic) => diagnostic.reasonCode === 'queue.issue_execution_mode_invalid') || (cm.executionMode === null && !cm.isLegacyTrackingEpic)) {
     // Invalid execution mode
     reasonCodes.push('queue.issue_execution_mode_invalid')
     blockers.push({
@@ -161,25 +180,47 @@ export function evaluateReadiness(input: ReadinessEvaluationInput): IssueReadine
   // Add any remaining control parse errors as blockers and TERMINATE
   // Any parse error on an implementation issue must return needs-clarification,
   // never continue toward ready with a silently truncated/fixed dependency set.
-  if (input.controlParseErrors.length > 0) {
-    for (const err of input.controlParseErrors) {
-      if (err.includes('Duplicate') || err.includes('Invalid execution mode')) continue
-      if (!reasonCodes.includes('queue.issue_template_invalid')) {
-        reasonCodes.push('queue.issue_template_invalid')
-      }
+  if (diagnostics.length > 0) {
+    for (const diagnostic of diagnostics) {
+      if (reasonCodes.includes(diagnostic.reasonCode)) continue
+      reasonCodes.push(diagnostic.reasonCode)
       blockers.push({
-        reasonCode: 'queue.issue_template_invalid',
-        detail: err,
-        dependencyIssueNumber: null,
+        reasonCode: diagnostic.reasonCode,
+        detail: detailForControlDiagnostic(diagnostic.reasonCode),
+        dependencyIssueNumber: diagnostic.dependencyIssueNumber ?? null,
       })
     }
-    return buildResult(input.issueNumber, 'needs-clarification', input.controlMetadata, reasonCodes, blockers, false)
+    return buildResult(
+      input.issueNumber,
+      'needs-clarification',
+      input.controlMetadata,
+      reasonCodes,
+      blockers,
+      diagnostics.some((diagnostic) => diagnostic.reasonCode === 'queue.issue_dependency_graph_limit_exceeded'),
+    )
   }
 
   // Tracking issues are never dispatchable
   if (cm.executionMode === 'tracking') {
     reasonCodes.push('queue.issue_tracking_only')
     return buildResult(input.issueNumber, 'tracking-only', input.controlMetadata, reasonCodes, blockers, false)
+  }
+
+  // A malformed reachable dependency is just as authoritative as a malformed
+  // direct declaration.  It must never be treated as a traversable success.
+  const downstreamDiagnostics = input.dependencyFacts.flatMap((fact) =>
+    (fact.controlDiagnostics ?? []).map((diagnostic) => ({ fact, diagnostic })),
+  )
+  if (downstreamDiagnostics.length > 0) {
+    for (const { fact, diagnostic } of downstreamDiagnostics) {
+      reasonCodes.push(diagnostic.reasonCode)
+      blockers.push({
+        reasonCode: diagnostic.reasonCode,
+        detail: detailForControlDiagnostic(diagnostic.reasonCode),
+        dependencyIssueNumber: fact.issueNumber,
+      })
+    }
+    return buildResult(input.issueNumber, 'needs-clarification', input.controlMetadata, reasonCodes, blockers, false)
   }
 
   // Check dependency syntax errors
@@ -227,7 +268,7 @@ export function evaluateReadiness(input: ReadinessEvaluationInput): IssueReadine
         dependencyIssueNumber: null,
       })
     }
-    return buildResult(input.issueNumber, 'needs-clarification', input.controlMetadata, reasonCodes, blockers, false)
+    return buildResult(input.issueNumber, 'needs-clarification', input.controlMetadata, reasonCodes, blockers, input.graphLimitExceeded)
   }
 
   // Check dependency states
@@ -291,6 +332,16 @@ export function evaluateReadiness(input: ReadinessEvaluationInput): IssueReadine
 
   // All dependencies satisfied (or none) → ready
   return buildResult(input.issueNumber, 'ready', input.controlMetadata, reasonCodes, blockers, false)
+}
+
+function detailForControlDiagnostic(reasonCode: ReadinessReasonCode): string {
+  switch (reasonCode) {
+    case 'queue.issue_dependency_syntax_invalid': return 'Dependency syntax is invalid.'
+    case 'queue.issue_dependency_duplicate': return 'Duplicate dependency declarations found.'
+    case 'queue.issue_dependency_self': return 'Issue cannot depend on itself.'
+    case 'queue.issue_dependency_graph_limit_exceeded': return 'Dependency declaration exceeds the supported limit.'
+    default: return 'Issue control metadata is invalid.'
+  }
 }
 
 function buildResult(

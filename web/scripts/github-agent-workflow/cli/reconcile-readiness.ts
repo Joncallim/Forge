@@ -1,314 +1,101 @@
-/**
- * Full readiness reconciliation CLI.
- *
- * Scans all open issues, computes readiness for each, and projects labels.
- * Uses plan -> validate -> apply phases with safe ordering.
- *
- * Usage: npm run forge:reconcile [--dry-run]
- *
- * No model calls.
- */
-
+/** Full readiness reconciliation CLI. */
 import { runMain } from './entrypoint'
-import { RestGitHubClient } from '../io/github-client'
+import { RestGitHubClient, type GitHubClient, type GitHubIssue } from '../io/github-client'
 import { IssueReadinessResolver } from '../shared/issue-readiness-resolver'
+import { syncReadinessLabels } from '../shared/readiness-projection'
 import type { IssueReadinessResult } from '../contracts/issue-readiness-result'
 import { ISSUE_READINESS_MANAGED_LABELS } from '../contracts/common'
 
-type ReconcilePlan = {
-  scannedIssues: number
-  parsedImplementation: number
-  parsedTracking: number
-  parsedInvalid: number
-  readyCount: number
-  blockedCount: number
-  clarificationCount: number
-  trackingOnlyCount: number
-  uniqueDependencyFetches: number
-  cacheHits: number
-  apiFailures: number
-  graphLimitFailures: number
-  labelTransitions: number
-  elapsedMs: number
-  errors: string[]
+const CLOSED_SCAN_MAX_PAGES = 50
+const ISSUE_PAGE_SIZE = 100
+type PlannedIssue = Readonly<{ issue: GitHubIssue; readiness: IssueReadinessResult | null; closedCleanup: boolean }>
+type ReconcilePlan = { scannedIssues: number; closedIssuesScanned: number; readyCount: number; blockedCount: number; clarificationCount: number; trackingOnlyCount: number; labelTransitions: number; apiFailures: number; elapsedMs: number; errors: string[] }
+
+function managedLabels(labels: readonly string[]): string[] {
+  return labels.filter((label) => ISSUE_READINESS_MANAGED_LABELS.includes(label as typeof ISSUE_READINESS_MANAGED_LABELS[number])).sort()
+}
+function sameLabels(left: readonly string[], right: readonly string[]): boolean { return JSON.stringify([...left].sort()) === JSON.stringify([...right].sort()) }
+
+async function discoverClosedIssues(client: GitHubClient): Promise<{ issues: GitHubIssue[]; incomplete: boolean }> {
+  const issues: GitHubIssue[] = []
+  for (let page = 1; page <= CLOSED_SCAN_MAX_PAGES; page += 1) {
+    const result = await client.listClosedIssues({ page, perPage: ISSUE_PAGE_SIZE, maxPages: CLOSED_SCAN_MAX_PAGES })
+    issues.push(...result.issues)
+    if (!result.hasMore) return { issues, incomplete: false }
+  }
+  return { issues, incomplete: true }
 }
 
-type IssueProjectionPlan = {
-  issueNumber: number
-  currentLabels: string[]
-  desiredState: 'ready' | 'needs-clarification' | 'dependency-blocked' | 'tracking-only' | 'closed'
-  desiredLabels: string[]
-  readinessResult: IssueReadinessResult
+async function applyClosedCleanup(client: GitHubClient, issue: GitHubIssue): Promise<number> {
+  const labels = managedLabels(issue.labels)
+  for (const label of labels) await client.removeLabel(issue.number, label)
+  if (managedLabels((await client.getIssue(issue.number)).labels).length !== 0) throw new Error(`Closed issue #${issue.number} still has managed readiness labels after cleanup.`)
+  return labels.length
+}
+
+async function applyOpenProjection(client: GitHubClient, planned: PlannedIssue): Promise<number> {
+  if (!planned.readiness) throw new Error(`Open issue #${planned.issue.number} has no readiness plan.`)
+  const projected = await syncReadinessLabels(client, planned.issue, planned.readiness)
+  if (!projected.success) throw new Error(projected.error ?? `Failed to project readiness for #${planned.issue.number}.`)
+  // Require exact convergence: writer errors must never be a silent partial bulk run.
+  if (!sameLabels(managedLabels((await client.getIssue(planned.issue.number)).labels), planned.readiness.desiredReadinessLabels)) {
+    throw new Error(`Readiness projection for #${planned.issue.number} did not converge to the planned labels.`)
+  }
+  return projected.addedLabels.length + projected.removedLabels.length
 }
 
 export async function main(argv: string[] = process.argv.slice(2), env: NodeJS.ProcessEnv = process.env): Promise<void> {
-  // Parse dry-run: accept --dry-run flag, or DRY_RUN env as true/false/1/0
-  const dryRunEnv = (env.DRY_RUN || env.FORGE_RECONCILE_DRY_RUN || '').toLowerCase().trim()
-  const dryRun = argv.includes('--dry-run') || dryRunEnv === 'true' || dryRunEnv === '1'
-  const startTime = Date.now()
-  const plan: ReconcilePlan = {
-    scannedIssues: 0,
-    parsedImplementation: 0,
-    parsedTracking: 0,
-    parsedInvalid: 0,
-    readyCount: 0,
-    blockedCount: 0,
-    clarificationCount: 0,
-    trackingOnlyCount: 0,
-    uniqueDependencyFetches: 0,
-    cacheHits: 0,
-    apiFailures: 0,
-    graphLimitFailures: 0,
-    labelTransitions: 0,
-    elapsedMs: 0,
-    errors: [],
-  }
-
+  const value = (env.DRY_RUN || env.FORGE_RECONCILE_DRY_RUN || '').trim().toLowerCase()
+  const dryRun = argv.includes('--dry-run') || value === 'true' || value === '1'
+  const start = Date.now()
+  const plan: ReconcilePlan = { scannedIssues: 0, closedIssuesScanned: 0, readyCount: 0, blockedCount: 0, clarificationCount: 0, trackingOnlyCount: 0, labelTransitions: 0, apiFailures: 0, elapsedMs: 0, errors: [] }
   const client = RestGitHubClient.fromEnv(env)
   const resolver = new IssueReadinessResolver(client)
+  const planned: PlannedIssue[] = []
 
-  // ============================================================
-  // Phase 1: Discover/normalize
-  // ============================================================
   console.info(JSON.stringify({ phase: 'discover', dryRun }))
-
-  const snapshot = await resolver.loadOpenIssueSnapshot()
+  let snapshot: Awaited<ReturnType<IssueReadinessResolver['loadOpenIssueSnapshot']>>
+  let closed: { issues: GitHubIssue[]; incomplete: boolean }
+  try { [snapshot, closed] = await Promise.all([resolver.loadOpenIssueSnapshot(), discoverClosedIssues(client)]) }
+  catch (error) { throw new Error(`Readiness discovery failed; no labels were changed: ${error instanceof Error ? error.message : String(error)}`) }
   plan.scannedIssues = snapshot.issues.size
+  plan.closedIssuesScanned = closed.issues.length
+  if (snapshot.exceededLimit) plan.errors.push('Open issue inventory is incomplete.')
+  if (closed.incomplete) plan.errors.push('Closed issue inventory is incomplete.')
 
-  for (const [, parsed] of snapshot.parsedMetadata) {
-    if (parsed.metadata.executionMode === 'implementation') plan.parsedImplementation++
-    else if (parsed.metadata.executionMode === 'tracking') plan.parsedTracking++
-    else plan.parsedInvalid++
-  }
-
-  if (snapshot.exceededLimit) {
-    plan.errors.push('Open issue scan exceeded configured limit or page cap. Snapshot may be incomplete.')
-  }
-
-  // ============================================================
-  // Phase 2: Resolve complete semantic plan for ALL issues
-  // ============================================================
-  console.info(JSON.stringify({ phase: 'resolve-plan', scannedIssues: plan.scannedIssues }))
-
-  const projectionPlan: IssueProjectionPlan[] = []
-
-  for (const [issueNumber, issue] of snapshot.issues) {
-    let readiness: IssueReadinessResult
+  console.info(JSON.stringify({ phase: 'plan', openIssues: plan.scannedIssues, closedIssues: plan.closedIssuesScanned }))
+  for (const issue of snapshot.issues.values()) {
     try {
-      readiness = await resolver.resolveFromIssue(issue)
-    } catch {
-      plan.apiFailures++
-      plan.errors.push(`Failed to resolve readiness for #${issueNumber}`)
-      continue
-    }
-
-    projectionPlan.push({
-      issueNumber,
-      currentLabels: issue.labels,
-      desiredState: readiness.state,
-      desiredLabels: readiness.desiredReadinessLabels,
-      readinessResult: readiness,
-    })
+      const readiness = await resolver.resolveFromIssue(issue)
+      if (readiness.partial) plan.errors.push(`Readiness plan for #${issue.number} is partial.`)
+      planned.push({ issue, readiness, closedCleanup: false })
+      if (readiness.state === 'ready') plan.readyCount += 1
+      else if (readiness.state === 'dependency-blocked') plan.blockedCount += 1
+      else if (readiness.state === 'needs-clarification') plan.clarificationCount += 1
+      else if (readiness.state === 'tracking-only') plan.trackingOnlyCount += 1
+    } catch (error) { plan.apiFailures += 1; plan.errors.push(`Failed to plan #${issue.number}: ${error instanceof Error ? error.message : String(error)}`) }
   }
-
-  // Record resolver metrics
-  plan.uniqueDependencyFetches = resolver.uniqueDependencyFetches
-  plan.cacheHits = resolver.cacheHits
+  for (const issue of closed.issues) planned.push({ issue, readiness: null, closedCleanup: true })
   plan.apiFailures += resolver.apiFailures
-  plan.graphLimitFailures = resolver.graphLimitFailures
+  if (resolver.graphLimitFailures > 0) plan.errors.push(`Dependency graph limits were reached for ${resolver.graphLimitFailures} issue(s).`)
 
-  // ============================================================
-  // Phase 3: Validate global consistency
-  // ============================================================
-  console.info(JSON.stringify({ phase: 'validate', projectedIssues: projectionPlan.length }))
-
-  // Check for snapshot issues
-  if (snapshot.exceededLimit) {
-    plan.errors.push('Snapshot incomplete due to scan limit. No bulk mutations performed.')
-  }
-
-  // Check for resolver failures
-  const failedIssues = projectionPlan.filter((p) => p.readinessResult.partial && p.readinessResult.reasonCodes.includes('queue.issue_dependency_lookup_failed'))
-  if (failedIssues.length > 0) {
-    plan.errors.push(`Partial/failed resolution for ${failedIssues.length} issues (API errors).`)
-  }
-
-  // If any validation errors, abort with zero mutations
+  console.info(JSON.stringify({ phase: 'validate', plannedIssues: planned.length }))
+  if (planned.length !== plan.scannedIssues + plan.closedIssuesScanned) plan.errors.push('Discovery and plan counts do not match.')
   if (plan.errors.length > 0) {
-    console.error(JSON.stringify({
-      phase: 'aborted',
-      reason: 'Validation failed. No bulk mutations applied.',
-      errors: plan.errors,
-      scannedIssues: plan.scannedIssues,
-      projectedIssues: projectionPlan.length,
-    }))
-    plan.elapsedMs = Date.now() - startTime
-    console.info(JSON.stringify(plan, null, 2))
-    process.exit(1)
+    plan.elapsedMs = Date.now() - start
+    console.error(JSON.stringify({ phase: 'aborted', ...plan }))
+    throw new Error('Readiness reconciliation validation failed; no labels were changed.')
   }
-
-  // ============================================================
-  // Phase 4: Apply (only if not dry run)
-  // ============================================================
   if (!dryRun) {
-    // --- Step 4a: Apply removals first (remove ready-for-agent from non-ready issues) ---
-    console.info(JSON.stringify({ phase: 'apply-removals' }))
-
-    for (const item of projectionPlan) {
-      if (!item.desiredLabels.includes('ready-for-agent') && item.currentLabels.includes('ready-for-agent')) {
-        try {
-          await client.removeLabel(item.issueNumber, 'ready-for-agent')
-          plan.labelTransitions++
-        } catch {
-          plan.errors.push(`Failed to remove ready-for-agent from #${item.issueNumber}`)
-        }
-      }
-    }
-
-    // --- Step 4b: Apply non-ready projection changes (needs-clarification, dependency-blocked, tracking-only) ---
-    console.info(JSON.stringify({ phase: 'apply-non-ready' }))
-
-    for (const item of projectionPlan) {
-      for (const label of item.desiredLabels) {
-        if (label !== 'ready-for-agent' && !item.currentLabels.includes(label)) {
-          try {
-            await client.addLabel(item.issueNumber, label)
-            plan.labelTransitions++
-          } catch {
-            plan.errors.push(`Failed to add ${label} to #${item.issueNumber}`)
-          }
-        }
-      }
-    }
-
-    // --- Step 4c: Apply ready-for-agent LAST with fresh targeted re-resolution ---
-    console.info(JSON.stringify({ phase: 'apply-ready' }))
-
-    for (const item of projectionPlan) {
-      if (!item.desiredLabels.includes('ready-for-agent')) {
-        // Count non-ready states
-        if (item.desiredState === 'needs-clarification') plan.clarificationCount++
-        else if (item.desiredState === 'dependency-blocked') plan.blockedCount++
-        else if (item.desiredState === 'tracking-only') plan.trackingOnlyCount++
-        continue
-      }
-
-      // Final fresh targeted re-resolution before adding ready
-      let freshReadiness: IssueReadinessResult
-      try {
-        const freshClient = RestGitHubClient.fromEnv(env)
-        const freshResolver = new IssueReadinessResolver(freshClient)
-        const freshIssue = await freshClient.getIssue(item.issueNumber)
-        freshReadiness = await freshResolver.resolveFromIssue(freshIssue)
-      } catch {
-        plan.apiFailures++
-        plan.errors.push(`Failed fresh re-resolution for #${item.issueNumber}. Skipping ready promotion.`)
-        continue
-      }
-
-      if (!freshReadiness.dispatchable) {
-        // State changed between plan and apply; skip promotion
-        plan.errors.push(`Issue #${item.issueNumber} is no longer dispatchable after fresh re-resolution. Skipping ready promotion.`)
-        continue
-      }
-
-      // Remove blocker labels before adding ready
-      const blockerLabelsToRemove = ['needs-clarification', 'dependency-blocked', 'tracking-only']
-      let blockerRemovalFailed = false
-
-      for (const blockerLabel of blockerLabelsToRemove) {
-        if (item.currentLabels.includes(blockerLabel)) {
-          try {
-            await client.removeLabel(item.issueNumber, blockerLabel)
-          } catch {
-            blockerRemovalFailed = true
-            plan.errors.push(`Failed to remove ${blockerLabel} from #${item.issueNumber}. Cannot add ready-for-agent.`)
-            break
-          }
-        }
-      }
-
-      if (blockerRemovalFailed) {
-        // Must NOT add ready if blocker removal failed
-        plan.errors.push(`Blocked ready promotion for #${item.issueNumber} due to blocker removal failure.`)
-        continue
-      }
-
-      // Re-read labels to verify no stale blockers remain
-      try {
-        const postRemovalIssue = await client.getIssue(item.issueNumber)
-        const staleBlockers = blockerLabelsToRemove.filter((l) => postRemovalIssue.labels.includes(l))
-        if (staleBlockers.length > 0) {
-          plan.errors.push(`Stale blocker labels remain on #${item.issueNumber}: ${staleBlockers.join(', ')}. Cannot add ready-for-agent.`)
-          continue
-        }
-      } catch {
-        plan.errors.push(`Failed to verify label state for #${item.issueNumber}. Skipping ready promotion.`)
-        continue
-      }
-
-      // Add ready-for-agent LAST
-      try {
-        await client.addLabel(item.issueNumber, 'ready-for-agent')
-        plan.labelTransitions++
-        plan.readyCount++
-      } catch {
-        plan.errors.push(`Failed to add ready-for-agent to #${item.issueNumber}`)
-      }
-    }
-
-    // --- Step 4d: Closed-issue cleanup lane ---
-    // Scan a bounded set of recently closed issues that may carry stale readiness labels
-    console.info(JSON.stringify({ phase: 'closed-issue-cleanup' }))
-
-    try {
-      const closedPageSize = 100
-      for (let page = 1; page <= 5; page++) { // Max 500 closed issues to scan
-        const { issues: closedIssues } = await client.listClosedIssues({ page, perPage: closedPageSize })
-        if (closedIssues.length === 0) break
-
-        for (const closedIssue of closedIssues) {
-          const hasManagedLabel = closedIssue.labels.some((l) =>
-            ISSUE_READINESS_MANAGED_LABELS.includes(l as typeof ISSUE_READINESS_MANAGED_LABELS[number]),
-          )
-          if (hasManagedLabel) {
-            // Remove stale readiness labels from closed issues
-            for (const label of ISSUE_READINESS_MANAGED_LABELS) {
-              if (closedIssue.labels.includes(label)) {
-                try {
-                  await client.removeLabel(closedIssue.number, label)
-                  plan.labelTransitions++
-                } catch {
-                  plan.errors.push(`Failed to remove stale ${label} from closed #${closedIssue.number}`)
-                }
-              }
-            }
-          }
-        }
-      }
-    } catch {
-      plan.errors.push('Closed-issue cleanup lane encountered an error. Continuing.')
-    }
-
-  } else {
-    // Dry run: just count states from the plan
-    for (const item of projectionPlan) {
-      if (item.desiredState === 'ready') plan.readyCount++
-      else if (item.desiredState === 'needs-clarification') plan.clarificationCount++
-      else if (item.desiredState === 'dependency-blocked') plan.blockedCount++
-      else if (item.desiredState === 'tracking-only') plan.trackingOnlyCount++
+    console.info(JSON.stringify({ phase: 'apply', plannedIssues: planned.length }))
+    for (const item of planned) {
+      try { plan.labelTransitions += item.closedCleanup ? await applyClosedCleanup(client, item.issue) : await applyOpenProjection(client, item) }
+      catch (error) { plan.errors.push(`Apply failed for #${item.issue.number}: ${error instanceof Error ? error.message : String(error)}`); break }
     }
   }
-
-  // ============================================================
-  // Report
-  // ============================================================
-  plan.elapsedMs = Date.now() - startTime
+  plan.elapsedMs = Date.now() - start
   console.info(JSON.stringify(plan, null, 2))
-
-  if (plan.errors.length > 0) {
-    process.exit(1)
-  }
+  if (plan.errors.length > 0) throw new Error('Readiness reconciliation did not complete.')
 }
 
 runMain(import.meta.url, () => main())

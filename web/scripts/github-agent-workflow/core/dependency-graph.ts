@@ -27,6 +27,7 @@ export type DependencyNode = Readonly<{
  */
 export type CycleDetectionResult = Readonly<{
   hasCycle: boolean
+  limitExceeded: boolean
   /**
    * The cycle path if found (issue numbers in order).
    */
@@ -69,17 +70,22 @@ export function detectCycle(
   nodeMap: ReadonlyMap<number, DependencyNode>,
 ): CycleDetectionResult {
   const visited = new Set<number>()
+  const reachable = new Set<number>()
   const recStack = new Set<number>()
   const allCyclicNodes = new Set<number>()
   let cyclePath: number[] = []
+  let limitExceeded = false
 
-  // Limit graph traversal
-  let nodesVisited = 0
-  const maxNodes = MAX_GRAPH_NODES
-
-  function dfs(node: number, path: number[]): boolean {
-    if (nodesVisited > maxNodes) return false
-    nodesVisited++
+  function dfs(node: number, path: number[], depth: number): boolean {
+    if (depth > MAX_GRAPH_DEPTH || reachable.size > MAX_GRAPH_NODES) {
+      limitExceeded = true
+      return false
+    }
+    reachable.add(node)
+    if (reachable.size > MAX_GRAPH_NODES) {
+      limitExceeded = true
+      return false
+    }
 
     if (recStack.has(node)) {
       // Found a cycle - extract the cycle from the path
@@ -100,14 +106,7 @@ export function detectCycle(
     const deps = nodeMap.get(node)
     if (deps) {
       for (const dep of deps.dependencyIssueNumbers) {
-        if (dfs(dep, path)) {
-          // Continue to mark all nodes in cycle paths
-          if (cyclePath.length > 0) {
-            for (const n of path) {
-              if (n === dep || allCyclicNodes.has(n)) break
-              allCyclicNodes.add(n)
-            }
-          }
+        if (dfs(dep, path, depth + 1)) {
           path.pop()
           recStack.delete(node)
           return true
@@ -120,42 +119,11 @@ export function detectCycle(
     return false
   }
 
-  dfs(targetIssueNumber, [])
-
-  // If no cycle from target, check other nodes too
-  if (!cyclePath.length) {
-    for (const [num] of nodeMap) {
-      if (!visited.has(num)) {
-        dfs(num, [])
-        if (cyclePath.length > 0) break
-      }
-    }
-  }
-
-  // If target is a cyclic node but we didn't start from it, check
-  if (!allCyclicNodes.has(targetIssueNumber) && cyclePath.length > 0) {
-    // Walk from target to see if it leads to a cyclic node
-    const subVisited = new Set<number>()
-    const stack = [targetIssueNumber]
-    while (stack.length > 0) {
-      const current = stack.pop()!
-      if (subVisited.has(current)) continue
-      subVisited.add(current)
-      if (allCyclicNodes.has(current)) {
-        allCyclicNodes.add(targetIssueNumber)
-        break
-      }
-      const deps = nodeMap.get(current)
-      if (deps) {
-        for (const dep of deps.dependencyIssueNumbers) {
-          if (!subVisited.has(dep)) stack.push(dep)
-        }
-      }
-    }
-  }
+  dfs(targetIssueNumber, [], 0)
 
   return {
     hasCycle: cyclePath.length > 0,
+    limitExceeded,
     cyclePath: Object.freeze(cyclePath),
     cyclicNodes: allCyclicNodes,
   }
@@ -172,11 +140,11 @@ export function getTransitiveDependencies(
 ): { dependencies: Set<number>; exceededLimit: boolean } {
   const result = new Set<number>()
   const queue: Array<{ node: number; depth: number }> = [{ node: issueNumber, depth: 0 }]
-  let totalVisited = 0
+  let cursor = 0
 
-  while (queue.length > 0) {
-    const { node, depth } = queue.shift()!
-    if (depth > maxDepth || totalVisited > maxNodes) {
+  while (cursor < queue.length) {
+    const { node, depth } = queue[cursor++]
+    if (depth > maxDepth || result.size > maxNodes) {
       return { dependencies: result, exceededLimit: true }
     }
 
@@ -186,7 +154,6 @@ export function getTransitiveDependencies(
     for (const dep of deps.dependencyIssueNumbers) {
       if (!result.has(dep)) {
         result.add(dep)
-        totalVisited++
         queue.push({ node: dep, depth: depth + 1 })
       }
     }

@@ -212,7 +212,6 @@ export class FakeGitHubClient implements GitHubClient {
     const page = options.page ?? 1
     const perPage = options.perPage ?? 100
     const maxPages = options.maxPages ?? 50
-
     const allIssues: GitHubIssue[] = []
     for (const issue of this.issues.values()) {
       if (issue.state === 'open' && !issue.isPullRequest) {
@@ -230,10 +229,7 @@ export class FakeGitHubClient implements GitHubClient {
     const atPageCap = page >= maxPages
     const pageFull = pageIssues.length >= perPage && start + perPage < allIssues.length
 
-    return {
-      issues: pageIssues,
-      hasMore: !atPageCap && (pageFull || start + perPage < allIssues.length),
-    }
+    return { issues: pageIssues, hasMore: !atPageCap && (pageFull || start + perPage < allIssues.length) }
   }
 
   async listClosedIssues(options: { page?: number; perPage?: number; maxPages?: number } = {}): Promise<{
@@ -242,7 +238,6 @@ export class FakeGitHubClient implements GitHubClient {
   }> {
     const page = options.page ?? 1
     const perPage = options.perPage ?? 100
-    const maxPages = options.maxPages ?? 50
 
     const allIssues: GitHubIssue[] = []
     for (const issue of this.issues.values()) {
@@ -255,13 +250,9 @@ export class FakeGitHubClient implements GitHubClient {
     const start = (page - 1) * perPage
     const pageIssues = allIssues.slice(start, start + perPage)
 
-    const atPageCap = page >= maxPages
-    const pageFull = pageIssues.length >= perPage && start + perPage < allIssues.length
+    const pageFull = pageIssues.length >= perPage
 
-    return {
-      issues: pageIssues,
-      hasMore: !atPageCap && (pageFull || start + perPage < allIssues.length),
-    }
+    return { issues: pageIssues, hasMore: pageFull || start + perPage < allIssues.length }
   }
 
   /**

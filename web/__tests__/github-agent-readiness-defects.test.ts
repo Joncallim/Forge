@@ -26,7 +26,6 @@ import {
   recordRequested,
   updateRunStatus,
   findLatestRunForIssue,
-  FileAgentRunRecorder,
 } from '@/scripts/github-agent-workflow/io/agent-run-log'
 import { FakeGitHubClient } from '@/scripts/github-agent-workflow/io/fake-github-client'
 import type { GitHubIssue } from '@/scripts/github-agent-workflow/io/github-client'
@@ -329,7 +328,7 @@ describe('cycle detection through resolver', () => {
     // Issue A depends on B; issues C and D have a separate cycle
     // A should not be blocked by C↔D cycle
     const issueA = { ...READY_ISSUE, number: 1, title: 'Issue A', body: READY_BODY.replace('Depends on: none', 'Depends on: #2') }
-    const issueB = { ...READY_ISSUE, number: 2, title: 'Issue B', body: READY_BODY.replace('Test', 'Test B').replace('Depends on: none', '') }
+    const issueB = { ...READY_ISSUE, number: 2, title: 'Issue B', body: READY_BODY.replace('Test', 'Test B') }
     const issueC = { ...READY_ISSUE, number: 3, title: 'Issue C', body: READY_BODY.replace('Depends on: none', 'Depends on: #4').replace('Test', 'Test C') }
     const issueD = { ...READY_ISSUE, number: 4, title: 'Issue D', body: READY_BODY.replace('Depends on: none', 'Depends on: #3').replace('Test', 'Test D') }
 

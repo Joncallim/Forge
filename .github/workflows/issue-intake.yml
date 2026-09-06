@@ -18,6 +18,9 @@ permissions:
 jobs:
   validate:
     if: ${{ github.event.issue.pull_request == null }}
+    concurrency:
+      group: issue-intake-${{ github.repository }}-${{ github.event.issue.number }}
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     defaults:
       run:

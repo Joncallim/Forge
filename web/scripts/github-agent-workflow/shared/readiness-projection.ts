@@ -91,15 +91,22 @@ export async function syncReadinessLabels(
     }
   }
 
-  // Step 2: Remove ALL other stale readiness labels (converge to exact set)
+  // Step 2: Remove ALL other stale readiness labels (converge to exact set).
+  // A projection is only truthful when every requested GitHub mutation
+  // succeeds, so do not silently continue after a failed write.
   for (const label of currentReadinessLabels) {
+    if (label === 'ready-for-agent' && removedLabels.includes(label)) continue
     if (!desiredLabels.includes(label as typeof ISSUE_READINESS_MANAGED_LABELS[number])) {
       try {
         await client.removeLabel(issue.number, label)
         removedLabels.push(label)
       } catch {
-        // Non-critical: stale label removal failure is not safety-critical
-        // The semantic resolver still denies authority
+        return {
+          success: false,
+          error: `Failed to remove stale readiness label ${label} from #${issue.number}.`,
+          addedLabels,
+          removedLabels,
+        }
       }
     }
   }
@@ -111,7 +118,12 @@ export async function syncReadinessLabels(
         await client.addLabel(issue.number, label)
         addedLabels.push(label)
       } catch {
-        // Report failure but don't block ready promotion for non-ready labels
+        return {
+          success: false,
+          error: `Failed to add readiness label ${label} to #${issue.number}.`,
+          addedLabels,
+          removedLabels,
+        }
       }
     }
   }
@@ -121,13 +133,14 @@ export async function syncReadinessLabels(
     // Verify no stale blocker labels remain before adding ready
     try {
       const labelsAfter = (await client.getIssue(issue.number)).labels
-      const staleBlockers = ['needs-clarification', 'dependency-blocked', 'tracking-only'].filter(
-        (l) => labelsAfter.includes(l),
-      )
-      if (staleBlockers.length > 0) {
+      const staleLabels = labelsAfter.filter((label) => (
+        ISSUE_READINESS_MANAGED_LABELS.includes(label as typeof ISSUE_READINESS_MANAGED_LABELS[number])
+        && !desiredLabels.includes(label as typeof ISSUE_READINESS_MANAGED_LABELS[number])
+      ))
+      if (staleLabels.length > 0) {
         return {
           success: false,
-          error: `Cannot add ready-for-agent: stale blocker labels remain: ${staleBlockers.join(', ')}.`,
+          error: `Cannot add ready-for-agent: stale readiness labels remain: ${staleLabels.join(', ')}.`,
           addedLabels,
           removedLabels,
         }
@@ -151,6 +164,29 @@ export async function syncReadinessLabels(
         addedLabels,
         removedLabels,
       }
+    }
+  }
+
+  // Verify the exact managed-label projection, including labels that GitHub
+  // accepted but did not persist as expected.
+  try {
+    const finalLabels = (await client.getIssue(issue.number)).labels.filter((label) => (
+      ISSUE_READINESS_MANAGED_LABELS.includes(label as typeof ISSUE_READINESS_MANAGED_LABELS[number])
+    ))
+    if (!setsEqual(new Set(finalLabels), new Set(desiredLabels))) {
+      return {
+        success: false,
+        error: `Readiness label projection for #${issue.number} did not converge to the requested exact label set.`,
+        addedLabels,
+        removedLabels,
+      }
+    }
+  } catch {
+    return {
+      success: false,
+      error: `Failed to verify final readiness label state for #${issue.number}.`,
+      addedLabels,
+      removedLabels,
     }
   }
 

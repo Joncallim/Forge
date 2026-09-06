@@ -26,6 +26,14 @@ export function canTransitionToBlocked(status: RunStatus): boolean {
 }
 
 /**
+ * Whether admission may publish a blocked projection for this run. A missing
+ * run is not durable authority for a blocked state.
+ */
+export function canProjectBlockedRun(status: RunStatus | null): boolean {
+  return status !== null && canTransitionToBlocked(status)
+}
+
+/**
  * Error message for an attempt to block a non-blockable run status.
  */
 export function nonBlockableRunMessage(status: RunStatus): string {

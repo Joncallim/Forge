@@ -117,7 +117,7 @@ describe('agent dispatch', () => {
     expect(run?.events.at(-1)?.message).toContain('did not start a runtime')
   })
 
-  it('blocks when no run record exists', async () => {
+  it('does not project a blocked state when no durable run record exists', async () => {
     const root = await tempRepositoryRoot()
     const client = new FakeGitHubClient({ issues: [READY_ISSUE] })
 
@@ -130,8 +130,9 @@ describe('agent dispatch', () => {
 
     expect(result.status).toBe('blocked')
     expect(result.blockedReason).toContain('No run record')
-    expect((await client.getIssue(144)).labels).toContain('agent-blocked')
-    expect((await client.listComments(144))[0]?.body).toContain('No run record exists')
+    expect((await client.getIssue(144)).labels).not.toContain('agent-blocked')
+    expect(await client.listComments(144)).toEqual([])
+    expect(result.commentBody).toBeNull()
   })
 
   it('ignores pull request numbers without mutating labels, comments, or run logs', async () => {
@@ -201,7 +202,7 @@ describe('agent dispatch', () => {
     expect(result.blockedReason).toContain('not semantically dispatchable')
   })
 
-  it('blocks non-requested runs', async () => {
+  it('does not rewrite or project a blocked state for non-blockable runs', async () => {
     const root = await tempRepositoryRoot()
     await seedRequestedRun(root)
     await updateRunStatus({
@@ -220,7 +221,9 @@ describe('agent dispatch', () => {
 
     expect(result.status).toBe('blocked')
     expect(result.blockedReason).toContain('not `requested`')
-    expect((await findLatestRunForIssue(144, { repositoryRoot: root }))?.status).toBe('blocked')
+    expect((await findLatestRunForIssue(144, { repositoryRoot: root }))?.status).toBe('running')
+    expect((await client.getIssue(144)).labels).not.toContain('agent-blocked')
+    expect(await client.listComments(144)).toEqual([])
   })
 
   it('treats already-handed-off runs as idempotent instead of blocked', async () => {

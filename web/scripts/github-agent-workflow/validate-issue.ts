@@ -69,15 +69,15 @@ async function dispatchReconcileWorkflow(env: NodeJS.ProcessEnv): Promise<void> 
   const token = env.GITHUB_TOKEN
   const repo = env.GITHUB_REPOSITORY
   if (!token || !repo) {
-    console.warn('Cannot dispatch reconcile workflow: missing GITHUB_TOKEN or GITHUB_REPOSITORY.')
-    return
+    throw new Error('Cannot dispatch reconcile workflow: missing GITHUB_TOKEN or GITHUB_REPOSITORY.')
   }
 
   const apiUrl = (env.GITHUB_API_URL || 'https://api.github.com').replace(/\/+$/, '')
   const url = `${apiUrl}/repos/${repo}/actions/workflows/reconcile-readiness.yml/dispatches`
 
+  let response: Response
   try {
-    const response = await fetch(url, {
+    response = await fetch(url, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${token}`,
@@ -91,14 +91,11 @@ async function dispatchReconcileWorkflow(env: NodeJS.ProcessEnv): Promise<void> 
       }),
     })
 
-    if (!response.ok) {
-      console.warn(`Failed to dispatch reconcile workflow: ${response.status}`)
-    } else {
-      console.info('Dispatched reconcile-readiness workflow for full repository reconciliation.')
-    }
   } catch (error) {
-    console.warn(`Failed to dispatch reconcile workflow: ${error instanceof Error ? error.message : String(error)}`)
+    throw new Error(`Failed to dispatch reconcile workflow: ${error instanceof Error ? error.message : String(error)}`)
   }
+  if (!response.ok) throw new Error(`Failed to dispatch reconcile workflow: ${response.status} ${response.statusText}`)
+  console.info('Dispatched reconcile-readiness workflow for full repository reconciliation.')
 }
 
 export async function main(env: NodeJS.ProcessEnv = process.env): Promise<void> {

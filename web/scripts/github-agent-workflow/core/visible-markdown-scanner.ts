@@ -72,7 +72,6 @@ export function scanVisibleMarkdownLines(
 
   let inFence: { type: 'backtick' | 'tilde'; fenceLength: number } | null = null
   let inHtmlComment = false
-  let inIndentedCode = false
 
   for (let i = 0; i < rawLines.length; i++) {
     const line = rawLines[i]
@@ -85,20 +84,11 @@ export function scanVisibleMarkdownLines(
         if (commentEnd === -1) {
           // Multi-line HTML comment started
           inHtmlComment = true
-          // The part before <!-- might still be visible if not in a block
-          const beforeComment = line.slice(0, commentStart)
-          if (beforeComment.trim() !== '' && !inIndentedCode) {
-            result.push({ lineNumber: i, text: beforeComment })
-          }
+          // Never join text across a comment boundary: doing so could turn
+          // untrusted fragments into a canonical control/header line.
           continue
         }
-        // Single-line HTML comment - skip the commented portion
-        const beforeComment = line.slice(0, commentStart)
-        const afterComment = line.slice(commentEnd + 3)
-        const visible = beforeComment + afterComment
-        if (visible.trim() !== '' && !inIndentedCode) {
-          result.push({ lineNumber: i, text: visible })
-        }
+        // A line containing comment elision is never authority-bearing.
         continue
       }
     }
@@ -107,10 +97,6 @@ export function scanVisibleMarkdownLines(
       const commentEnd = line.indexOf('-->')
       if (commentEnd !== -1) {
         inHtmlComment = false
-        const afterComment = line.slice(commentEnd + 3)
-        if (afterComment.trim() !== '' && !inFence && !inIndentedCode) {
-          result.push({ lineNumber: i, text: afterComment })
-        }
       }
       continue
     }
@@ -138,10 +124,9 @@ export function scanVisibleMarkdownLines(
       // Closing fence: at least as many fence chars as opening, followed by ONLY whitespace
       // Per CommonMark spec, trailing non-whitespace after the closing fence sequence
       // does NOT close the fence — it remains part of the code block.
-      const trimmed = line.trim()
       const fenceChar = inFence.type === 'backtick' ? '`' : '~'
       // Match closing fence: at least as many fence chars as opening, followed by optional whitespace only
-      const closingMatch = trimmed.match(new RegExp(`^(${fenceChar}{${inFence.fenceLength},})\\s*$`))
+      const closingMatch = line.match(new RegExp(`^ {0,3}(${fenceChar}{${inFence.fenceLength},})\\s*$`))
       if (closingMatch) {
         inFence = null
         continue
@@ -155,10 +140,8 @@ export function scanVisibleMarkdownLines(
     if (!inFence && !inHtmlComment) {
       const indented = line.startsWith('    ') || line.startsWith('\t')
       if (indented) {
-        inIndentedCode = true
         continue
       }
-      inIndentedCode = false
     }
 
     // Handle blockquotes

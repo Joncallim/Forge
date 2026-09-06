@@ -20,6 +20,7 @@ import {
 } from './io/agent-run-log'
 import { RestGitHubClient, type GitHubClient, type GitHubIssue } from './io/github-client'
 import { IssueReadinessResolver } from './shared/issue-readiness-resolver'
+import { canProjectBlockedRun } from './shared/run-state-guard'
 
 export const DISPATCH_MARKER_PREFIX = '<!-- forge-agent-dispatch -->'
 
@@ -303,29 +304,27 @@ export async function runDispatch(input: {
   if (!semantic.eligible) {
     // Record blocked reason in run log if a run exists
     const latestRun = await findLatestRunForIssue(input.issueNumber, { repositoryRoot: input.runLogRepositoryRoot })
-    if (!input.dryRun && latestRun !== null) {
+    const canProjectBlocked = canProjectBlockedRun(latestRun?.status ?? null)
+    if (!input.dryRun && canProjectBlocked && latestRun !== null) {
       // Only transition requested/handed-off to blocked.
       // Active (running/pr-opened) and terminal (completed/failed/cancelled) runs
       // must not be retroactively rewritten.
-      const canBlock = ['requested', 'handed-off'].includes(latestRun.status)
-      if (canBlock) {
-        await recordBlockedReason({
-          issueNumber: input.issueNumber,
-          runId: latestRun.runId,
-          blockedReason: semantic.reason!,
-        }, {
-          repositoryRoot: input.runLogRepositoryRoot,
-          now: input.now,
-          persistRecord: input.persistRunLog ? persistRunRecordToGit : undefined,
-          targetBranch: input.targetBranch,
-        })
-      }
+      await recordBlockedReason({
+        issueNumber: input.issueNumber,
+        runId: latestRun.runId,
+        blockedReason: semantic.reason!,
+      }, {
+        repositoryRoot: input.runLogRepositoryRoot,
+        now: input.now,
+        persistRecord: input.persistRunLog ? persistRunRecordToGit : undefined,
+        targetBranch: input.targetBranch,
+      })
     }
-    if (!input.dryRun) {
+    if (!input.dryRun && canProjectBlocked) {
       await input.client.addLabel(input.issueNumber, 'agent-blocked')
     }
     const commentBody = dispatchBlockedComment({ issueNumber: input.issueNumber, runId: null, reason: semantic.reason! })
-    if (!input.dryRun) {
+    if (!input.dryRun && canProjectBlocked) {
       await input.client.upsertComment(input.issueNumber, {
         markerPrefix: DISPATCH_MARKER_PREFIX,
         botLogin: input.botLogin,
@@ -340,7 +339,7 @@ export async function runDispatch(input: {
       blockedReason: semantic.reason,
       workOrder: null,
       request: null,
-      commentBody,
+      commentBody: input.dryRun || canProjectBlocked ? commentBody : null,
     }
   }
 
@@ -375,7 +374,8 @@ export async function runDispatch(input: {
   const blockedReason = eligibilityFailure(issue, latestRun)
 
   if (blockedReason !== null) {
-    if (!input.dryRun && latestRun !== null) {
+    const canProjectBlocked = canProjectBlockedRun(latestRun?.status ?? null)
+    if (!input.dryRun && canProjectBlocked && latestRun !== null) {
       await recordBlockedReason({
         issueNumber: input.issueNumber,
         runId: latestRun.runId,
@@ -387,11 +387,11 @@ export async function runDispatch(input: {
         targetBranch: input.targetBranch,
       })
     }
-    if (!input.dryRun) {
+    if (!input.dryRun && canProjectBlocked) {
       await input.client.addLabel(input.issueNumber, 'agent-blocked')
     }
     const commentBody = dispatchBlockedComment({ issueNumber: input.issueNumber, runId: latestRun?.runId ?? null, reason: blockedReason })
-    if (!input.dryRun) {
+    if (!input.dryRun && canProjectBlocked) {
       await input.client.upsertComment(input.issueNumber, {
         markerPrefix: DISPATCH_MARKER_PREFIX,
         botLogin: input.botLogin,
@@ -406,7 +406,7 @@ export async function runDispatch(input: {
       blockedReason,
       workOrder: null,
       request: null,
-      commentBody,
+      commentBody: input.dryRun || canProjectBlocked ? commentBody : null,
     }
   }
 

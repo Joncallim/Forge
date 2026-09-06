@@ -57,6 +57,8 @@ export class IssueReadinessResolver {
    * Memoized dependency facts (including in-flight promises).
    */
   private readonly dependencyCache = new Map<number, Promise<ResolvedDependencyFact>>()
+  private activeFetches = 0
+  private readonly fetchWaiters: Array<() => void> = []
   /**
    * Counters for operational metrics.
    */
@@ -68,7 +70,7 @@ export class IssueReadinessResolver {
   constructor(client: GitHubClient, options: ReadinessResolverOptions = {}) {
     this.client = client
     this.options = {
-      maxFetchConcurrency: options.maxFetchConcurrency ?? DEFAULT_FETCH_CONCURRENCY,
+      maxFetchConcurrency: Math.min(8, Math.max(1, options.maxFetchConcurrency ?? DEFAULT_FETCH_CONCURRENCY)),
       maxOpenIssuesScan: options.maxOpenIssuesScan ?? DEFAULT_MAX_OPEN_ISSUES_SCAN,
     }
   }
@@ -125,7 +127,7 @@ export class IssueReadinessResolver {
     let hasCycle = false
     let graphLimitExceeded = false
 
-    if (!bodyTooLarge && !stateUnknown) {
+    if (!bodyTooLarge && !stateUnknown && controlResult.diagnostics.length === 0) {
       dependencyFacts = await this.resolveDependencies(
         issue.number,
         controlResult.metadata,
@@ -135,6 +137,7 @@ export class IssueReadinessResolver {
       const cycleResult = await this.detectCyclesAsync(issue.number, controlResult.metadata, dependencyFacts)
       hasCycle = cycleResult.hasCycle
       graphLimitExceeded = cycleResult.limitExceeded
+      dependencyFacts = cycleResult.facts
     }
 
     // Evaluate readiness with all propagated state
@@ -150,6 +153,7 @@ export class IssueReadinessResolver {
       graphLimitExceeded,
       bodyTooLarge,
       controlParseErrors: controlResult.errors,
+      controlDiagnostics: controlResult.diagnostics,
       hasDuplicateDeclaration: controlResult.hasDuplicateDeclaration,
       stateUnknown,
     })
@@ -226,9 +230,22 @@ export class IssueReadinessResolver {
     }
 
     this.uniqueDependencyFetches++
-    const promise = this.doFetchDependencyFact(dependencyNumber)
+    const promise = this.withFetchSlot(() => this.doFetchDependencyFact(dependencyNumber))
     this.dependencyCache.set(dependencyNumber, promise)
     return promise
+  }
+
+  private async withFetchSlot<T>(operation: () => Promise<T>): Promise<T> {
+    if (this.activeFetches >= this.options.maxFetchConcurrency) {
+      await new Promise<void>((resolve) => this.fetchWaiters.push(resolve))
+    }
+    this.activeFetches++
+    try {
+      return await operation()
+    } finally {
+      this.activeFetches--
+      this.fetchWaiters.shift()?.()
+    }
   }
 
   private async doFetchDependencyFact(dependencyNumber: number): Promise<ResolvedDependencyFact> {
@@ -269,7 +286,8 @@ export class IssueReadinessResolver {
           issueNumber: dependencyNumber,
           state: 'open',
           reasonCode: 'queue.issue_dependency_open' as ReadinessReasonCode,
-          transitiveDependencyIssueNumbers: depControl.metadata.dependencies.filter((d) => d !== dependencyNumber),
+          transitiveDependencyIssueNumbers: depControl.metadata.dependencies,
+          controlDiagnostics: depControl.diagnostics,
         }
       }
 
@@ -403,8 +421,8 @@ export class IssueReadinessResolver {
     issueNumber: number,
     metadata: IssueControlMetadata,
     dependencyFacts: readonly ResolvedDependencyFact[],
-  ): Promise<{ hasCycle: boolean; limitExceeded: boolean }> {
-    if (metadata.dependencies.length === 0) return { hasCycle: false, limitExceeded: false }
+  ): Promise<{ hasCycle: boolean; limitExceeded: boolean; facts: readonly ResolvedDependencyFact[] }> {
+    if (metadata.dependencies.length === 0) return { hasCycle: false, limitExceeded: false, facts: dependencyFacts }
 
     // Build node map from resolved dependency facts
     const nodeMap = new Map<number, DependencyNode>()
@@ -417,6 +435,7 @@ export class IssueReadinessResolver {
 
     // Add resolved dependency nodes with their transitive deps
     // Only open dependencies are traversed; completed/terminal deps are leaves
+    const allFacts: ResolvedDependencyFact[] = [...dependencyFacts]
     for (const fact of dependencyFacts) {
       const transitive = fact.transitiveDependencyIssueNumbers ?? []
       nodeMap.set(fact.issueNumber, {
@@ -427,7 +446,7 @@ export class IssueReadinessResolver {
       // For open dependencies, also fetch their transitive dependencies' transitive deps
       // up to MAX_GRAPH_DEPTH to build a complete reachable graph
       if (fact.state === 'open' && transitive.length > 0) {
-        await this.expandGraphNode(fact.issueNumber, transitive, nodeMap, 1)
+        await this.expandGraphNode(fact.issueNumber, transitive, nodeMap, 1, allFacts)
       }
     }
 
@@ -435,14 +454,16 @@ export class IssueReadinessResolver {
 
     // Check graph limits
     const transitive = getTransitiveDependencies(issueNumber, nodeMap)
+    const limitExceeded = transitive.exceededLimit || cycleResult.limitExceeded
 
-    if (transitive.exceededLimit) {
+    if (limitExceeded) {
       this.graphLimitFailures++
     }
 
     return {
       hasCycle: cycleResult.hasCycle,
-      limitExceeded: transitive.exceededLimit,
+      limitExceeded,
+      facts: allFacts,
     }
   }
 
@@ -455,6 +476,7 @@ export class IssueReadinessResolver {
     transitiveDeps: readonly number[],
     nodeMap: Map<number, DependencyNode>,
     depth: number,
+    allFacts: ResolvedDependencyFact[],
   ): Promise<void> {
     if (depth > MAX_GRAPH_DEPTH || nodeMap.size > MAX_GRAPH_NODES) return
 
@@ -470,6 +492,7 @@ export class IssueReadinessResolver {
       }
 
       const childTransitive = fact.transitiveDependencyIssueNumbers ?? []
+      allFacts.push(fact)
       nodeMap.set(dep, {
         issueNumber: dep,
         dependencyIssueNumbers: childTransitive,
@@ -477,7 +500,7 @@ export class IssueReadinessResolver {
 
       // Only expand open deps further; completed/terminal/error deps are leaves
       if (fact.state === 'open' && childTransitive.length > 0 && depth < MAX_GRAPH_DEPTH && nodeMap.size < MAX_GRAPH_NODES) {
-        await this.expandGraphNode(dep, childTransitive, nodeMap, depth + 1)
+        await this.expandGraphNode(dep, childTransitive, nodeMap, depth + 1, allFacts)
       }
     }
   }

@@ -24,7 +24,7 @@ import { RestGitHubClient, type GitHubClient, type GitHubIssue } from './io/gith
 import { agentBranchNameSchema } from './contracts/branch-name'
 import type { AgentRunRecord } from './contracts/agent-run-record'
 import type { HandoffArtifacts, RunId } from './contracts/common'
-import { canTransitionToBlocked } from './shared/run-state-guard'
+import { canProjectBlockedRun } from './shared/run-state-guard'
 import { IssueReadinessResolver } from './shared/issue-readiness-resolver'
 
 export const HANDOFF_MARKER_PREFIX = '<!-- forge-agent-handoff -->'
@@ -449,7 +449,8 @@ export async function runHandoff(input: {
   const semantic = await semanticEligibility(issue, input.client)
   if (!semantic.eligible) {
     const latestRun = await findLatestRunForIssue(input.issueNumber, { repositoryRoot: input.runLogRepositoryRoot })
-    if (latestRun !== null && canTransitionToBlocked(latestRun.status)) {
+    const canProjectBlocked = canProjectBlockedRun(latestRun?.status ?? null)
+    if (canProjectBlocked && latestRun !== null) {
       await recordBlockedReason({
         issueNumber: issue.number,
         runId: latestRun.runId,
@@ -462,19 +463,21 @@ export async function runHandoff(input: {
       })
     }
     // Remove stale agent-requested before adding agent-blocked (only for blockable runs)
-    if (latestRun !== null && canTransitionToBlocked(latestRun.status)) {
-      await input.client.removeLabel(issue.number, 'agent-requested').catch(() => {})
+    if (canProjectBlocked) {
+      await input.client.removeLabel(issue.number, 'agent-requested')
     }
     // Only project agent-blocked for blockable runs; for active/terminal runs, skip label projection
-    if (latestRun === null || canTransitionToBlocked(latestRun.status)) {
+    if (canProjectBlocked) {
       await input.client.addLabel(issue.number, 'agent-blocked')
     }
     const commentBody = blockedComment({ issueNumber: issue.number, runId: latestRun?.runId ?? null, reason: semantic.reason! })
-    await input.client.upsertComment(issue.number, {
-      markerPrefix: HANDOFF_MARKER_PREFIX,
-      botLogin: input.botLogin,
-      body: commentBody,
-    })
+    if (canProjectBlocked) {
+      await input.client.upsertComment(issue.number, {
+        markerPrefix: HANDOFF_MARKER_PREFIX,
+        botLogin: input.botLogin,
+        body: commentBody,
+      })
+    }
     return {
       status: 'blocked',
       issueNumber: issue.number,
@@ -485,7 +488,7 @@ export async function runHandoff(input: {
       artifactName: null,
       metadata: null,
       blockedReason: semantic.reason,
-      commentBody,
+      commentBody: canProjectBlocked ? commentBody : null,
     }
   }
 
@@ -499,7 +502,8 @@ export async function runHandoff(input: {
   }
 
   if (failure !== null) {
-    if (latestRun !== null && canTransitionToBlocked(latestRun.status)) {
+    const canProjectBlocked = canProjectBlockedRun(latestRun?.status ?? null)
+    if (canProjectBlocked && latestRun !== null) {
       await recordBlockedReason({
         issueNumber: issue.number,
         runId: latestRun.runId,
@@ -507,19 +511,21 @@ export async function runHandoff(input: {
       }, runLogOptions)
     }
     // Remove stale agent-requested before adding agent-blocked (only for blockable runs)
-    if (latestRun !== null && canTransitionToBlocked(latestRun.status)) {
-      await input.client.removeLabel(issue.number, 'agent-requested').catch(() => {})
+    if (canProjectBlocked) {
+      await input.client.removeLabel(issue.number, 'agent-requested')
     }
     // Only project agent-blocked for blockable runs; for active/terminal runs, skip label projection
-    if (latestRun === null || canTransitionToBlocked(latestRun.status)) {
+    if (canProjectBlocked) {
       await input.client.addLabel(issue.number, 'agent-blocked')
     }
     const commentBody = blockedComment({ issueNumber: issue.number, runId: latestRun?.runId ?? null, reason: failure })
-    await input.client.upsertComment(issue.number, {
-      markerPrefix: HANDOFF_MARKER_PREFIX,
-      botLogin: input.botLogin,
-      body: commentBody,
-    })
+    if (canProjectBlocked) {
+      await input.client.upsertComment(issue.number, {
+        markerPrefix: HANDOFF_MARKER_PREFIX,
+        botLogin: input.botLogin,
+        body: commentBody,
+      })
+    }
     return {
       status: 'blocked',
       issueNumber: issue.number,
@@ -530,7 +536,7 @@ export async function runHandoff(input: {
       artifactName: null,
       metadata: null,
       blockedReason: failure,
-      commentBody,
+      commentBody: canProjectBlocked ? commentBody : null,
     }
   }
 

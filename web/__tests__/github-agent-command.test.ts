@@ -442,4 +442,21 @@ describe('GitHub agent command routing', () => {
     expect((await client.getIssue(143)).labels).not.toContain('agent-requested')
     expect(await client.listComments(143)).toEqual([])
   })
+
+  it('fails closed without a durable recorder and never reflects raw command text', async () => {
+    const client = seedClient(READY_ISSUE)
+    const result = await runAgentCommand({
+      client,
+      issue: READY_ISSUE,
+      comment: { id: 125, body: 'codex implement\n<!-- untrusted -->', authorLogin: 'Joncallim' },
+      botLogin: 'github-actions[bot]',
+      githubRunId: 1234567903,
+      githubRunAttempt: 1,
+    })
+
+    expect(result.command.accepted).toBe(false)
+    expect(result.command.rejectionReason).toContain('durable run record')
+    expect((await client.getIssue(143)).labels).not.toContain('agent-requested')
+    expect((await client.listComments(143))[0]?.body).not.toContain('<!-- untrusted -->')
+  })
 })

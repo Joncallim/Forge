@@ -9,7 +9,7 @@
  */
 
 import type { IssueType } from '../contracts/common'
-import type { IssueControlMetadata } from '../contracts/issue-control-metadata'
+import type { ControlDiagnostic, IssueControlMetadata } from '../contracts/issue-control-metadata'
 import { EMPTY_CONTROL_METADATA, MAX_DEPENDENCIES_PER_ISSUE, executionModeSchema } from '../contracts/issue-control-metadata'
 import { scanVisibleMarkdownLines } from './visible-markdown-scanner'
 
@@ -20,6 +20,8 @@ const NONE_VALUE = 'none'
 
 export type ControlParseResult = Readonly<{
   metadata: IssueControlMetadata
+  diagnostics: readonly ControlDiagnostic[]
+  /** @deprecated Diagnostics, not prose, are semantic authority. */
   errors: string[]
   /**
    * True if any duplicate or conflicting declaration was found.
@@ -39,6 +41,11 @@ export function parseControlMetadata(
   issueType: IssueType,
 ): ControlParseResult {
   const errors: string[] = []
+  const diagnostics: ControlDiagnostic[] = []
+  const diagnose = (reasonCode: ControlDiagnostic['reasonCode'], field: ControlDiagnostic['field'], message: string, dependencyIssueNumber?: number) => {
+    diagnostics.push({ reasonCode, field, ...(dependencyIssueNumber === undefined ? {} : { dependencyIssueNumber }) })
+    errors.push(message)
+  }
   const visible = scanVisibleMarkdownLines(body ?? '')
 
   if (visible.bodyTooLarge) {
@@ -47,6 +54,7 @@ export function parseControlMetadata(
         ...EMPTY_CONTROL_METADATA,
         explicit: false,
       },
+      diagnostics: [{ reasonCode: 'queue.issue_body_too_large', field: 'body' }],
       errors: ['Issue body exceeds maximum size.'],
       hasDuplicateDeclaration: false,
     }
@@ -83,10 +91,10 @@ export function parseControlMetadata(
     if (parsed.success) {
       executionMode = parsed.data
     } else {
-      errors.push(`Invalid execution mode: "${executionModeLines[0].value}". Supported modes: implementation, tracking.`)
+      diagnose('queue.issue_execution_mode_invalid', 'execution_mode', 'Invalid execution mode. Must be implementation or tracking.')
     }
   } else if (executionModeLines.length > 1) {
-    errors.push('Duplicate Execution mode declaration found.')
+    diagnose('queue.issue_control_duplicate', 'execution_mode', 'Duplicate Execution mode declaration found.')
   }
 
   // Legacy Epic default: if body has [EPIC] and no explicit execution mode, default to tracking
@@ -100,7 +108,7 @@ export function parseControlMetadata(
 
   // Check Epic cannot opt into implementation
   if (issueType === 'epic' && executionMode === 'implementation') {
-    errors.push('An Epic issue cannot have Execution mode: implementation.')
+    diagnose('queue.issue_execution_mode_invalid', 'execution_mode', 'An Epic issue cannot use implementation mode.')
     executionMode = null
   }
 
@@ -119,7 +127,7 @@ export function parseControlMetadata(
       dependsOnNone = false
       const trimmedValue = value.trim()
       if (trimmedValue === '' || trimmedValue === ',' || /^[,\s]+$/.test(trimmedValue)) {
-        errors.push('Depends on value is empty. Use "none" or a comma-separated list of issue references.')
+        diagnose('queue.issue_dependency_syntax_invalid', 'depends_on', 'Depends on value is empty.')
         dependencies = []
       } else {
         const parts = value.split(',').map((p) => p.trim()).filter((p) => p !== '')
@@ -132,10 +140,10 @@ export function parseControlMetadata(
             if (Number.isSafeInteger(num) && num > 0) {
               parsed.push(num)
             } else {
-              errors.push(`Invalid dependency reference: "${part}". Must be a positive integer issue number.`)
+              diagnose('queue.issue_dependency_syntax_invalid', 'depends_on', 'Dependency reference is invalid.')
             }
           } else {
-            errors.push(`Invalid dependency syntax: "${part}". Use #number format for same-repo issues.`)
+            diagnose('queue.issue_dependency_syntax_invalid', 'depends_on', 'Dependency syntax is invalid.')
           }
         }
 
@@ -143,19 +151,18 @@ export function parseControlMetadata(
       }
     }
   } else if (dependsOnLines.length > 1) {
-    errors.push('Duplicate Depends on declaration found.')
+    diagnose('queue.issue_control_duplicate', 'depends_on', 'Duplicate Depends on declaration found.')
   }
 
   // Bounds check
   if (dependencies.length > MAX_DEPENDENCIES_PER_ISSUE) {
-    errors.push(`Too many dependencies: ${dependencies.length} exceeds maximum of ${MAX_DEPENDENCIES_PER_ISSUE}.`)
-    dependencies = dependencies.slice(0, MAX_DEPENDENCIES_PER_ISSUE)
+    diagnose('queue.issue_dependency_graph_limit_exceeded', 'depends_on', 'Dependency count exceeds the supported limit.')
   }
 
   // Deduplicate dependencies
   const uniqueDeps = [...new Set(dependencies)]
   if (uniqueDeps.length < dependencies.length) {
-    errors.push('Duplicate dependency references found.')
+    diagnose('queue.issue_dependency_duplicate', 'depends_on', 'Duplicate dependency references found.')
   }
   dependencies = uniqueDeps
 
@@ -165,8 +172,11 @@ export function parseControlMetadata(
   const hasExecutionModeLine = executionModeLines.length > 0
   const hasDependsOnLine = dependsOnLines.length > 0
 
-  if (isImplementationIssue && hasExecutionModeLine && !hasDependsOnLine) {
-    errors.push('Feature/Bug/Other issues require both Execution mode and Depends on declarations.')
+  if (isImplementationIssue && !hasExecutionModeLine) {
+    diagnose('queue.issue_control_missing', 'execution_mode', 'Execution mode declaration is required.')
+  }
+  if (isImplementationIssue && !hasDependsOnLine) {
+    diagnose('queue.issue_control_missing', 'depends_on', 'Depends on declaration is required.')
   }
 
   // Override explicit: for non-Epic issues, both fields must be present
@@ -180,6 +190,7 @@ export function parseControlMetadata(
       explicit: resolvedExplicit,
       isLegacyTrackingEpic,
     },
+    diagnostics,
     errors,
     hasDuplicateDeclaration,
   }
