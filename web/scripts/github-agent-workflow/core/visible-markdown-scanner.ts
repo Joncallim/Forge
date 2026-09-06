@@ -136,18 +136,8 @@ export function scanVisibleMarkdownLines(
       }
     } else {
       // Closing fence: at least as many fence chars as opening, followed by ONLY whitespace
-      // Per CommonMark spec: "A closing fence may be preceded by up to three spaces of indent.
-      // Any characters after the closing fence are part of the (non-code) document."
-      // Wait - the spec actually says "A closing code fence may be preceded by up to three
-      // spaces of indentation. The closing code fence must be at the same indentation level
-      // or less than the opening fence. Any characters after the closing fence sequence,
-      // other than spaces, are part of the document content."
-      // Actually let me re-read: CommonMark spec says "A closing fence must be at least as
-      // long as the opening fence" and "The closing fence may be preceded by spaces only."
-      // But trailing characters after the closing fence are... part of the following paragraph,
-      // not the code block. So ```` ``` Depends on: none```` would close the fence and expose
-      // "Depends on: none" as visible text. But ```` ``` \nDepends on: none```` would keep
-      // it inside the fence.
+      // Per CommonMark spec, trailing non-whitespace after the closing fence sequence
+      // does NOT close the fence — it remains part of the code block.
       const trimmed = line.trim()
       const fenceChar = inFence.type === 'backtick' ? '`' : '~'
       // Match closing fence: at least as many fence chars as opening, followed by optional whitespace only
