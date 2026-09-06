@@ -15,17 +15,17 @@ export const GITHUB_AGENT_WORKFLOW_LABELS = Object.freeze<readonly GitHubWorkflo
   {
     name: 'ready-for-agent',
     color: '0e8a16',
-    description: 'READINESS PROJECTION — Issue is semantically ready. This label is a cache, not authority. Command/dispatch/handoff re-resolve current truth.',
+    description: 'READINESS PROJECTION — Issue is semantically ready. This label is a cache, not authority.',
   },
   {
     name: 'needs-clarification',
     color: 'd73a4a',
-    description: 'READINESS PROJECTION — Issue is missing required structure or decisions. The issue contract or graph needs author correction.',
+    description: 'READINESS PROJECTION — Issue is missing required structure or decisions. Author correction needed.',
   },
   {
     name: 'dependency-blocked',
     color: 'b60205',
-    description: 'READINESS PROJECTION — Issue is blocked by unresolved dependencies. This label is a cache, not authority.',
+    description: 'READINESS PROJECTION — Issue is blocked by unresolved dependencies. This label is a cache.',
   },
   {
     name: 'tracking-only',

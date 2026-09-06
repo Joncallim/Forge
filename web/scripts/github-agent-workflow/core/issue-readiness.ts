@@ -24,6 +24,12 @@ export type ResolvedDependencyFact = Readonly<{
   issueNumber: number
   state: 'open' | 'closed_completed' | 'closed_not_planned' | 'closed_duplicate' | 'closed_unknown' | 'not_found' | 'inaccessible' | 'lookup_failed' | 'is_pull_request' | 'tracking_only'
   reasonCode: ReadinessReasonCode
+  /**
+   * The dependency's own dependency issue numbers (for cycle detection).
+   * Empty for unresolved/API-error dependencies and terminal closed states.
+   * Parsed from the dependency's control metadata.
+   */
+  transitiveDependencyIssueNumbers?: readonly number[]
 }>
 
 /**
@@ -152,18 +158,22 @@ export function evaluateReadiness(input: ReadinessEvaluationInput): IssueReadine
     return buildResult(input.issueNumber, 'needs-clarification', input.controlMetadata, reasonCodes, blockers, false)
   }
 
-  // Add any remaining control parse errors as blockers
-  for (const err of input.controlParseErrors) {
-    // Skip errors already covered by duplicate/execution_mode checks
-    if (err.includes('Duplicate') || err.includes('Invalid execution mode')) continue
-    if (!reasonCodes.includes('queue.issue_template_invalid')) {
-      reasonCodes.push('queue.issue_template_invalid')
+  // Add any remaining control parse errors as blockers and TERMINATE
+  // Any parse error on an implementation issue must return needs-clarification,
+  // never continue toward ready with a silently truncated/fixed dependency set.
+  if (input.controlParseErrors.length > 0) {
+    for (const err of input.controlParseErrors) {
+      if (err.includes('Duplicate') || err.includes('Invalid execution mode')) continue
+      if (!reasonCodes.includes('queue.issue_template_invalid')) {
+        reasonCodes.push('queue.issue_template_invalid')
+      }
+      blockers.push({
+        reasonCode: 'queue.issue_template_invalid',
+        detail: err,
+        dependencyIssueNumber: null,
+      })
     }
-    blockers.push({
-      reasonCode: 'queue.issue_template_invalid',
-      detail: err,
-      dependencyIssueNumber: null,
-    })
+    return buildResult(input.issueNumber, 'needs-clarification', input.controlMetadata, reasonCodes, blockers, false)
   }
 
   // Tracking issues are never dispatchable

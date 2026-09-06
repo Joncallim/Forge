@@ -151,12 +151,25 @@ export function parseControlMetadata(
   }
   dependencies = uniqueDeps
 
+  // For non-legacy, non-Epic issues, both Execution mode and Depends on must be present
+  // to be considered fully explicit. Missing either field is a parse error.
+  const isImplementationIssue = !isLegacyTrackingEpic && issueType !== 'epic'
+  const hasExecutionModeLine = executionModeLines.length > 0
+  const hasDependsOnLine = dependsOnLines.length > 0
+
+  if (isImplementationIssue && hasExecutionModeLine && !hasDependsOnLine) {
+    errors.push('Feature/Bug/Other issues require both Execution mode and Depends on declarations.')
+  }
+
+  // Override explicit: for non-Epic issues, both fields must be present
+  const resolvedExplicit = isImplementationIssue ? (hasExecutionModeLine && hasDependsOnLine) : explicit
+
   return {
     metadata: {
       executionMode,
       dependencies,
       dependsOnNone,
-      explicit,
+      explicit: resolvedExplicit,
       isLegacyTrackingEpic,
     },
     errors,
