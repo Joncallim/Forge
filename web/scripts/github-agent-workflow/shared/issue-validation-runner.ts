@@ -16,6 +16,7 @@ import {
   validateIssue,
 } from '../core/issue-validation'
 import { IssueReadinessResolver } from './issue-readiness-resolver'
+import { syncReadinessLabels } from './readiness-projection'
 import type { IssueValidationResult } from '../contracts/issue-validation-result'
 import type { IssueReadinessResult } from '../contracts/issue-readiness-result'
 import { ISSUE_READINESS_MANAGED_LABELS } from '../contracts/common'
@@ -40,72 +41,6 @@ function markerCommentForIssue(comments: GitHubComment[], botLogin: string): Git
     comment.authorLogin.trim().toLowerCase() === normalized
     && comment.body.startsWith(ISSUE_VALIDATION_MARKER_PREFIX)
   )) ?? null
-}
-
-/**
- * Sync readiness projection labels for an issue.
- *
- * Safe ordering:
- * - ready → non-ready: remove ready-for-agent before adding blocking label
- * - non-ready → ready: remove blocking labels before adding ready-for-agent last
- * - GitHub write failure must never leave a false-positive ready label
- * - Labels are guaranteed mutually exclusive (exactly one readiness label at a time)
- */
-async function syncReadinessLabels(
-  client: GitHubClient,
-  issue: GitHubIssue,
-  readinessResult: IssueReadinessResult,
-): Promise<void> {
-  const currentLabels = issue.labels
-  const desiredLabels = readinessResult.desiredReadinessLabels
-
-  // Determine current readiness labels
-  const currentReadinessLabels = currentLabels.filter((l) =>
-    ISSUE_READINESS_MANAGED_LABELS.includes(l as typeof ISSUE_READINESS_MANAGED_LABELS[number]),
-  )
-
-  // If nothing to change, skip
-  if (setsEqual(new Set(currentReadinessLabels), new Set(desiredLabels))) return
-
-  // Determine what to remove and add
-  const toRemove = currentReadinessLabels.filter((l) => !desiredLabels.includes(l as typeof ISSUE_READINESS_MANAGED_LABELS[number]))
-  const toAdd = desiredLabels.filter((l) => !currentReadinessLabels.includes(l))
-
-  // Step 1: If transitioning ready to non-ready, remove ready-for-agent FIRST
-  if (currentReadinessLabels.includes('ready-for-agent') && !desiredLabels.includes('ready-for-agent')) {
-    await client.removeLabel(issue.number, 'ready-for-agent')
-  }
-
-  // Step 2: Remove ALL stale readiness labels (converge to exact set)
-  for (const label of toRemove) {
-    if (label !== 'ready-for-agent') {
-      await client.removeLabel(issue.number, label)
-    }
-  }
-
-  // Step 3: Add non-ready labels (blocking/clarification/tracking)
-  for (const label of toAdd) {
-    if (label !== 'ready-for-agent') {
-      await client.addLabel(issue.number, label)
-    }
-  }
-
-  // Step 4: For non-ready to ready, add ready-for-agent LAST
-  // If any blocker removal failed, we must NOT add ready-for-agent
-  if (!currentReadinessLabels.includes('ready-for-agent') && desiredLabels.includes('ready-for-agent')) {
-    // Verify no stale blocker labels remain before adding ready
-    const labelsAfter = (await client.getIssue(issue.number)).labels
-    const staleBlockers = ['needs-clarification', 'dependency-blocked', 'tracking-only'].filter(
-      (l) => labelsAfter.includes(l),
-    )
-    if (staleBlockers.length > 0) {
-      throw new Error(
-        `Cannot add ready-for-agent: stale blocker labels remain: ${staleBlockers.join(', ')}. ` +
-        `Reason: ${readinessResult.reasonCodes.join(', ')}`,
-      )
-    }
-    await client.addLabel(issue.number, 'ready-for-agent')
-  }
 }
 
 async function syncComment(
@@ -180,9 +115,30 @@ export async function runIssueValidation(
   const comments = await client.listComments(issue.number)
   const existingMarkerComment = markerCommentForIssue(comments, options.botLogin)
 
-  // Sync readiness labels (use readiness result if available, otherwise structural)
+  // Sync readiness labels
   if (readinessResult) {
-    await syncReadinessLabels(client, issue, readinessResult)
+    // Use shared projection writer
+    const projection = await syncReadinessLabels(client, issue, readinessResult)
+
+    // If projection failed for a ready promotion, try final fresh re-resolution
+    if (!projection.success && readinessResult.dispatchable) {
+      // A stale blocker may have been present; perform fresh re-resolution
+      try {
+        const freshResolver = new IssueReadinessResolver(client)
+        const freshIssue = await client.getIssue(issue.number)
+        const freshResult = await freshResolver.resolveFromIssue(freshIssue)
+
+        if (freshResult.dispatchable) {
+          // Re-attempt projection with fresh result
+          const retryProjection = await syncReadinessLabels(client, freshIssue, freshResult)
+          if (retryProjection.success && retryProjection.addedLabels.includes('ready-for-agent')) {
+            readinessResult = freshResult
+          }
+        }
+      } catch {
+        // Fresh re-resolution failed; keep original result
+      }
+    }
   } else {
     const diff = diffManagedLabels(issue.labels, result.recommendedLabels, ISSUE_READINESS_MANAGED_LABELS)
     for (const label of diff.toAdd) {
@@ -201,14 +157,6 @@ export async function runIssueValidation(
     result,
     readinessResult,
   }
-}
-
-function setsEqual(a: Set<string>, b: Set<string>): boolean {
-  if (a.size !== b.size) return false
-  for (const item of a) {
-    if (!b.has(item)) return false
-  }
-  return true
 }
 
 function buildReadinessComment(readinessResult: IssueReadinessResult, status: 'ready' | 'blocked'): string {

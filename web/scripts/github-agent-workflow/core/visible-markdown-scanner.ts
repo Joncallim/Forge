@@ -49,6 +49,8 @@ export type VisibleLine = Readonly<{
  *
  * Ignores:
  * - Fenced code blocks (``` and ~~~ with 3+ fence characters)
+ *   - Opening fence: line starting with 3+ backticks or tildes, optionally followed by info string
+ *   - Closing fence: line starting with at least as many fence chars as opening, followed by ONLY whitespace (CommonMark spec)
  * - Indented code blocks (lines starting with 4+ spaces or a tab)
  * - Blockquotes (lines starting with >)
  * - Multi-line HTML comments (<!-- ... -->)
@@ -115,9 +117,14 @@ export function scanVisibleMarkdownLines(
 
     // Handle fenced code blocks
     if (!inFence) {
-      const trimmed = line.trim()
-      const backtickMatch = trimmed.match(/^(```+)(.*)$/)
-      const tildeMatch = !backtickMatch ? trimmed.match(/^(~~~+)(.*)$/) : null
+      // Opening fence: 3+ backticks or tildes at start of line (after optional whitespace)
+      // Per CommonMark, an indented code block has 4+ spaces prefix, but a fenced code block
+      // can have up to 3 spaces of indentation before the fence characters
+      const leadingSpaces = line.match(/^ {0,3}/)?.[0].length ?? 0
+      const contentAfterIndent = line.slice(leadingSpaces)
+
+      const backtickMatch = contentAfterIndent.match(/^(```+)(.*)$/)
+      const tildeMatch = !backtickMatch ? contentAfterIndent.match(/^(~~~+)(.*)$/) : null
 
       if (backtickMatch && backtickMatch[1].length >= 3) {
         inFence = { type: 'backtick', fenceLength: backtickMatch[1].length }
@@ -128,18 +135,24 @@ export function scanVisibleMarkdownLines(
         continue
       }
     } else {
+      // Closing fence: at least as many fence chars as opening, followed by ONLY whitespace
+      // Per CommonMark spec: "A closing fence may be preceded by up to three spaces of indent.
+      // Any characters after the closing fence are part of the (non-code) document."
+      // Wait - the spec actually says "A closing code fence may be preceded by up to three
+      // spaces of indentation. The closing code fence must be at the same indentation level
+      // or less than the opening fence. Any characters after the closing fence sequence,
+      // other than spaces, are part of the document content."
+      // Actually let me re-read: CommonMark spec says "A closing fence must be at least as
+      // long as the opening fence" and "The closing fence may be preceded by spaces only."
+      // But trailing characters after the closing fence are... part of the following paragraph,
+      // not the code block. So ```` ``` Depends on: none```` would close the fence and expose
+      // "Depends on: none" as visible text. But ```` ``` \nDepends on: none```` would keep
+      // it inside the fence.
       const trimmed = line.trim()
       const fenceChar = inFence.type === 'backtick' ? '`' : '~'
-      const closingMatch = trimmed.match(new RegExp(`^(${fenceChar}{${inFence.fenceLength},})\s*$`))
+      // Match closing fence: at least as many fence chars as opening, followed by optional whitespace only
+      const closingMatch = trimmed.match(new RegExp(`^(${fenceChar}{${inFence.fenceLength},})\\s*$`))
       if (closingMatch) {
-        inFence = null
-        // Per CommonMark spec, a closing fence may only be followed by whitespace.
-        // Any non-whitespace trailing text remains inside the code block.
-        continue
-      }
-      // Also try with trailing whitespace only (CommonMark compliant)
-      const closingMatchWS = trimmed.match(new RegExp(`^(${fenceChar}{${inFence.fenceLength},})\s+$`))
-      if (closingMatchWS) {
         inFence = null
         continue
       }
@@ -148,6 +161,7 @@ export function scanVisibleMarkdownLines(
     }
 
     // Handle indented code blocks (4+ spaces or tab)
+    // Only start indented code when NOT inside a fence or HTML comment
     if (!inFence && !inHtmlComment) {
       const indented = line.startsWith('    ') || line.startsWith('\t')
       if (indented) {

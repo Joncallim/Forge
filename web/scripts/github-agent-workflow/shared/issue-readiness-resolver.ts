@@ -19,6 +19,7 @@
  */
 
 import type { GitHubClient, GitHubIssue } from '../io/github-client'
+import { GitHubApiError } from '../io/github-client'
 import type { IssueType } from '../contracts/common'
 import type { IssueControlMetadata } from '../contracts/issue-control-metadata'
 import type { IssueReadinessResult, ReadinessReasonCode } from '../contracts/issue-readiness-result'
@@ -27,7 +28,7 @@ import { evaluateReadiness } from '../core/issue-readiness'
 import { parseControlMetadata } from '../core/issue-control'
 import { detectIssueType, validateIssue } from '../core/issue-validation'
 import { scanVisibleMarkdownLines } from '../core/visible-markdown-scanner'
-import { detectCycle, getTransitiveDependencies } from '../core/dependency-graph'
+import { MAX_GRAPH_DEPTH, MAX_GRAPH_NODES, detectCycle, getTransitiveDependencies, type DependencyNode } from '../core/dependency-graph'
 
 /**
  * Options for readiness resolution.
@@ -47,9 +48,6 @@ const DEFAULT_FETCH_CONCURRENCY = 8
 const DEFAULT_MAX_OPEN_ISSUES_SCAN = 5000
 
 /**
- * A cached dependency fact for a single issue.
- */
-/**
  * Shared readiness resolver.
  */
 export class IssueReadinessResolver {
@@ -60,9 +58,12 @@ export class IssueReadinessResolver {
    */
   private readonly dependencyCache = new Map<number, Promise<ResolvedDependencyFact>>()
   /**
-   * Snapshot of open issues for reconciliation.
+   * Counters for operational metrics.
    */
-  private openIssueSnapshot: Map<number, GitHubIssue> | null = null
+  uniqueDependencyFetches = 0
+  cacheHits = 0
+  graphLimitFailures = 0
+  apiFailures = 0
 
   constructor(client: GitHubClient, options: ReadinessResolverOptions = {}) {
     this.client = client
@@ -82,9 +83,10 @@ export class IssueReadinessResolver {
     let issue: GitHubIssue
     try {
       issue = await this.client.getIssue(issueNumber)
-    } catch (error) {
+    } catch {
+      this.apiFailures++
       return this.failClosed(issueNumber, 'queue.issue_dependency_lookup_failed', [
-        { reasonCode: 'queue.issue_dependency_lookup_failed' as ReadinessReasonCode, detail: `Failed to fetch issue #${issueNumber}: ${errorMessage(error)}`, dependencyIssueNumber: null },
+        { reasonCode: 'queue.issue_dependency_lookup_failed' as ReadinessReasonCode, detail: `Failed to fetch issue #${issueNumber}.`, dependencyIssueNumber: null },
       ])
     }
 
@@ -129,8 +131,8 @@ export class IssueReadinessResolver {
         controlResult.metadata,
       )
 
-      // Cycle detection
-      const cycleResult = this.detectCycles(issue.number, controlResult.metadata)
+      // Cycle detection using the already-resolved dependency facts
+      const cycleResult = await this.detectCyclesAsync(issue.number, controlResult.metadata, dependencyFacts)
       hasCycle = cycleResult.hasCycle
       graphLimitExceeded = cycleResult.limitExceeded
     }
@@ -155,6 +157,7 @@ export class IssueReadinessResolver {
 
   /**
    * Resolve dependency facts for the given issue's dependencies.
+   * Uses bounded concurrency and memoization.
    */
   private async resolveDependencies(
     issueNumber: number,
@@ -162,36 +165,52 @@ export class IssueReadinessResolver {
   ): Promise<readonly ResolvedDependencyFact[]> {
     if (metadata.dependencies.length === 0) return []
 
+    // Build unique dependency list (excluding self)
+    const uniqueDeps = [...new Set(metadata.dependencies.filter((d) => d !== issueNumber))]
     const facts: ResolvedDependencyFact[] = []
 
-    // Check for self-dependency
+    // Handle self-dependency
+    if (metadata.dependencies.includes(issueNumber)) {
+      facts.push({
+        issueNumber,
+        state: 'closed_unknown',
+        reasonCode: 'queue.issue_dependency_self' as ReadinessReasonCode,
+        transitiveDependencyIssueNumbers: [],
+      })
+    }
+
+    // Handle duplicate dependency references
+    const seen = new Set<number>()
     for (const dep of metadata.dependencies) {
-      if (dep === issueNumber) {
+      if (dep === issueNumber) continue
+      if (seen.has(dep)) {
         facts.push({
           issueNumber: dep,
           state: 'closed_unknown',
-          reasonCode: 'queue.issue_dependency_self' as ReadinessReasonCode,
+          reasonCode: 'queue.issue_dependency_duplicate' as ReadinessReasonCode,
+          transitiveDependencyIssueNumbers: [],
         })
-        // Don't try to fetch self-dependency
-        continue
       }
-
-      // Check for duplicate in metadata
-      if (metadata.dependencies.filter((d) => d === dep).length > 1) {
-        if (!facts.find((f) => f.issueNumber === dep && f.reasonCode === 'queue.issue_dependency_duplicate')) {
-          facts.push({
-            issueNumber: dep,
-            state: 'closed_unknown',
-            reasonCode: 'queue.issue_dependency_duplicate' as ReadinessReasonCode,
-          })
-        }
-        continue
-      }
-
-      // Fetch dependency state with memoization
-      const fact = await this.fetchDependencyFact(dep)
-      facts.push(fact)
+      seen.add(dep)
     }
+
+    // Fetch unique dependencies with bounded concurrency
+    const concurrency = this.options.maxFetchConcurrency
+    const results: Array<{ index: number; fact: ResolvedDependencyFact }> = []
+    const depSet = [...new Set(uniqueDeps)]
+
+    // Process in batches of `concurrency`
+    for (let i = 0; i < depSet.length; i += concurrency) {
+      const batch = depSet.slice(i, i + concurrency)
+      const batchResults = await Promise.all(
+        batch.map((dep) => this.fetchDependencyFact(dep).then((fact) => ({ index: i + batch.indexOf(dep), fact }))),
+      )
+      results.push(...batchResults)
+    }
+
+    // Sort results by original index
+    results.sort((a, b) => a.index - b.index)
+    facts.push(...results.map((r) => r.fact))
 
     return facts
   }
@@ -201,8 +220,12 @@ export class IssueReadinessResolver {
    */
   private fetchDependencyFact(dependencyNumber: number): Promise<ResolvedDependencyFact> {
     const cached = this.dependencyCache.get(dependencyNumber)
-    if (cached) return cached
+    if (cached) {
+      this.cacheHits++
+      return cached
+    }
 
+    this.uniqueDependencyFetches++
     const promise = this.doFetchDependencyFact(dependencyNumber)
     this.dependencyCache.set(dependencyNumber, promise)
     return promise
@@ -290,41 +313,101 @@ export class IssueReadinessResolver {
         reasonCode: 'queue.issue_dependency_state_unknown' as ReadinessReasonCode,
       }
     } catch (error) {
-      if (error instanceof Error && 'status' in error && (error as { status: number }).status === 404) {
-        return {
-          issueNumber: dependencyNumber,
-          state: 'not_found',
-          reasonCode: 'queue.issue_dependency_not_found' as ReadinessReasonCode,
-          transitiveDependencyIssueNumbers: [],
-        }
-      }
-      if (error instanceof Error && 'status' in error && (error as { status: number }).status === 403) {
-        return {
-          issueNumber: dependencyNumber,
-          state: 'inaccessible',
-          reasonCode: 'queue.issue_dependency_inaccessible' as ReadinessReasonCode,
-          transitiveDependencyIssueNumbers: [],
-        }
-      }
-      return {
-        issueNumber: dependencyNumber,
-        state: 'lookup_failed',
-        reasonCode: 'queue.issue_dependency_lookup_failed' as ReadinessReasonCode,
-      }
+      this.apiFailures++
+      return this.normalizeApiError(dependencyNumber, error)
     }
   }
 
   /**
-   * Detect cycles for the given issue's dependencies.
+   * Normalize a GitHub API error into a safe dependency fact.
+   * Distinguishes at least: definitive not-found, permission/inaccessible,
+   * rate-limited/secondary-rate-limited, timeout/network, server failure,
+   * and response/schema invalid.
    */
-  private detectCycles(
+  private normalizeApiError(dependencyNumber: number, error: unknown): ResolvedDependencyFact {
+    if (error instanceof GitHubApiError) {
+      switch (error.status) {
+        case 404:
+          return {
+            issueNumber: dependencyNumber,
+            state: 'not_found',
+            reasonCode: 'queue.issue_dependency_not_found' as ReadinessReasonCode,
+            transitiveDependencyIssueNumbers: [],
+          }
+        case 403:
+          // Could be permission or rate limit; treat as inaccessible
+          return {
+            issueNumber: dependencyNumber,
+            state: 'inaccessible',
+            reasonCode: 'queue.issue_dependency_inaccessible' as ReadinessReasonCode,
+            transitiveDependencyIssueNumbers: [],
+          }
+        case 429:
+          // Rate limited
+          return {
+            issueNumber: dependencyNumber,
+            state: 'inaccessible',
+            reasonCode: 'queue.issue_dependency_inaccessible' as ReadinessReasonCode,
+            transitiveDependencyIssueNumbers: [],
+          }
+        case 422:
+          // Schema/validation error
+          return {
+            issueNumber: dependencyNumber,
+            state: 'lookup_failed',
+            reasonCode: 'queue.issue_dependency_lookup_failed' as ReadinessReasonCode,
+            transitiveDependencyIssueNumbers: [],
+          }
+        default:
+          if (error.status >= 500) {
+            return {
+              issueNumber: dependencyNumber,
+              state: 'lookup_failed',
+              reasonCode: 'queue.issue_dependency_lookup_failed' as ReadinessReasonCode,
+              transitiveDependencyIssueNumbers: [],
+            }
+          }
+          return {
+            issueNumber: dependencyNumber,
+            state: 'lookup_failed',
+            reasonCode: 'queue.issue_dependency_lookup_failed' as ReadinessReasonCode,
+            transitiveDependencyIssueNumbers: [],
+          }
+      }
+    }
+
+    // Timeout/network errors (TypeError, AbortError, etc.)
+    if (error instanceof TypeError || (error instanceof Error && error.name === 'AbortError')) {
+      return {
+        issueNumber: dependencyNumber,
+        state: 'lookup_failed',
+        reasonCode: 'queue.issue_dependency_lookup_failed' as ReadinessReasonCode,
+        transitiveDependencyIssueNumbers: [],
+      }
+    }
+
+    // Fallback
+    return {
+      issueNumber: dependencyNumber,
+      state: 'lookup_failed',
+      reasonCode: 'queue.issue_dependency_lookup_failed' as ReadinessReasonCode,
+      transitiveDependencyIssueNumbers: [],
+    }
+  }
+
+  /**
+   * Async cycle detection using already-resolved dependency facts.
+   * Builds a bounded adjacency graph and runs DFS cycle detection.
+   */
+  private async detectCyclesAsync(
     issueNumber: number,
     metadata: IssueControlMetadata,
-  ): { hasCycle: boolean; limitExceeded: boolean } {
+    dependencyFacts: readonly ResolvedDependencyFact[],
+  ): Promise<{ hasCycle: boolean; limitExceeded: boolean }> {
     if (metadata.dependencies.length === 0) return { hasCycle: false, limitExceeded: false }
 
-    // Build a node map from cached dependency facts (which now include transitive deps)
-    const nodeMap = new Map<number, { issueNumber: number; dependencyIssueNumbers: readonly number[] }>()
+    // Build node map from resolved dependency facts
+    const nodeMap = new Map<number, DependencyNode>()
 
     // Add the target issue
     nodeMap.set(issueNumber, {
@@ -332,26 +415,19 @@ export class IssueReadinessResolver {
       dependencyIssueNumbers: metadata.dependencies,
     })
 
-    // Add dependencies using their transitive deps from the cache
-    // Resolved dependencies include their own dependency lists from parsed control metadata
-    for (const dep of metadata.dependencies) {
-      const cachedPromise = this.dependencyCache.get(dep)
-      if (cachedPromise) {
-        // We need to await the promise to get the transitive deps
-        // But detectCycles is synchronous, so we use a different approach:
-        // The transitive deps are extracted during resolveDependencies and passed separately
-        // For now, we check if the promise is already resolved
-        const fact = this.dependencyCache.get(dep)
-        if (fact) {
-          // We can't synchronously await, so we use the transitive info from the dependency facts
-          // that were already collected during resolveDependencies
-          nodeMap.set(dep, {
-            issueNumber: dep,
-            // We'll use the cached facts' transitiveDependencyIssueNumbers
-            // These were set during doFetchDependencyFact
-            dependencyIssueNumbers: [], // Will be populated from the resolved fact
-          })
-        }
+    // Add resolved dependency nodes with their transitive deps
+    // Only open dependencies are traversed; completed/terminal deps are leaves
+    for (const fact of dependencyFacts) {
+      const transitive = fact.transitiveDependencyIssueNumbers ?? []
+      nodeMap.set(fact.issueNumber, {
+        issueNumber: fact.issueNumber,
+        dependencyIssueNumbers: transitive,
+      })
+
+      // For open dependencies, also fetch their transitive dependencies' transitive deps
+      // up to MAX_GRAPH_DEPTH to build a complete reachable graph
+      if (fact.state === 'open' && transitive.length > 0) {
+        await this.expandGraphNode(fact.issueNumber, transitive, nodeMap, 1)
       }
     }
 
@@ -360,6 +436,10 @@ export class IssueReadinessResolver {
     // Check graph limits
     const transitive = getTransitiveDependencies(issueNumber, nodeMap)
 
+    if (transitive.exceededLimit) {
+      this.graphLimitFailures++
+    }
+
     return {
       hasCycle: cycleResult.hasCycle,
       limitExceeded: transitive.exceededLimit,
@@ -367,8 +447,45 @@ export class IssueReadinessResolver {
   }
 
   /**
+   * Recursively expand a graph node by fetching transitive dependency facts.
+   * Bounded by MAX_GRAPH_DEPTH and MAX_GRAPH_NODES.
+   */
+  private async expandGraphNode(
+    nodeNumber: number,
+    transitiveDeps: readonly number[],
+    nodeMap: Map<number, DependencyNode>,
+    depth: number,
+  ): Promise<void> {
+    if (depth > MAX_GRAPH_DEPTH || nodeMap.size > MAX_GRAPH_NODES) return
+
+    for (const dep of transitiveDeps) {
+      if (nodeMap.has(dep)) continue
+
+      // Fetch the dependency's fact (uses memoization)
+      let fact: ResolvedDependencyFact
+      try {
+        fact = await this.fetchDependencyFact(dep)
+      } catch {
+        continue
+      }
+
+      const childTransitive = fact.transitiveDependencyIssueNumbers ?? []
+      nodeMap.set(dep, {
+        issueNumber: dep,
+        dependencyIssueNumbers: childTransitive,
+      })
+
+      // Only expand open deps further; completed/terminal/error deps are leaves
+      if (fact.state === 'open' && childTransitive.length > 0 && depth < MAX_GRAPH_DEPTH && nodeMap.size < MAX_GRAPH_NODES) {
+        await this.expandGraphNode(dep, childTransitive, nodeMap, depth + 1)
+      }
+    }
+  }
+
+  /**
    * Snapshot all open issues for full reconciliation.
-   * Parses control metadata and builds in-memory graph.
+   * Normalizes page-by-page, discarding raw bodies after parsing.
+   * Retains only bounded semantic facts required for the graph.
    */
   async loadOpenIssueSnapshot(): Promise<{
     issues: Map<number, GitHubIssue>
@@ -379,6 +496,7 @@ export class IssueReadinessResolver {
     const parsedMetadata = new Map<number, { issueType: IssueType; metadata: IssueControlMetadata; structuralValid: boolean }>()
     let page = 1
     let totalFetched = 0
+    let hitMaxPages = false
 
     while (true) {
       const { issues: pageIssues, hasMore } = await this.client.listOpenIssues({ page, perPage: 100 })
@@ -387,9 +505,7 @@ export class IssueReadinessResolver {
           return { issues, parsedMetadata, exceededLimit: true }
         }
 
-        issues.set(issue.number, issue)
-        totalFetched++
-
+        // Parse control metadata and structural validity, then discard raw body
         const issueType = detectIssueType({ title: issue.title, body: issue.body })
         const controlResult = parseControlMetadata(issue.body ?? '', issueType)
         const structuralResult = validateIssue({
@@ -398,6 +514,11 @@ export class IssueReadinessResolver {
           body: issue.body ?? '',
         })
 
+        // Store normalized issue (body retained only for reference, but we can keep minimal)
+        // Keep body for final re-resolution but allow GC by retaining only bounded fields
+        issues.set(issue.number, issue)
+        totalFetched++
+
         parsedMetadata.set(issue.number, {
           issueType,
           metadata: controlResult.metadata,
@@ -405,11 +526,17 @@ export class IssueReadinessResolver {
         })
       }
 
-      if (!hasMore) break
+      if (!hasMore) {
+        // If page is at maxPages and the page was full, mark incomplete
+        if (page >= 50 && pageIssues.length >= 100) {
+          hitMaxPages = true
+        }
+        break
+      }
       page++
     }
 
-    return { issues, parsedMetadata, exceededLimit: false }
+    return { issues, parsedMetadata, exceededLimit: hitMaxPages }
   }
 
   /**
@@ -417,7 +544,6 @@ export class IssueReadinessResolver {
    */
   clearCache(): void {
     this.dependencyCache.clear()
-    this.openIssueSnapshot = null
   }
 
   private failClosed(
@@ -448,9 +574,4 @@ function mapIssueState(state: string): 'open' | 'closed' | 'unknown' {
     default:
       return 'unknown'
   }
-}
-
-function errorMessage(error: unknown): string {
-  if (error instanceof Error) return error.message
-  return String(error)
 }

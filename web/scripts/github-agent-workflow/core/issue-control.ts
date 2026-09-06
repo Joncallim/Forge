@@ -114,25 +114,33 @@ export function parseControlMetadata(
       dependencies = []
       dependsOnNone = true
     } else {
+      // A present Depends on line must be exactly 'none' or a non-empty comma-separated list
+      // Empty value or separator-only (',', ' , ') is invalid and must fail closed
       dependsOnNone = false
-      const parts = value.split(',').map((p) => p.trim()).filter((p) => p !== '')
-      const parsed: number[] = []
+      const trimmedValue = value.trim()
+      if (trimmedValue === '' || trimmedValue === ',' || /^[,\s]+$/.test(trimmedValue)) {
+        errors.push('Depends on value is empty. Use "none" or a comma-separated list of issue references.')
+        dependencies = []
+      } else {
+        const parts = value.split(',').map((p) => p.trim()).filter((p) => p !== '')
+        const parsed: number[] = []
 
-      for (const part of parts) {
-        const match = ISSUE_REFERENCE_PATTERN.exec(part)
-        if (match) {
-          const num = parseInt(match[1], 10)
-          if (Number.isSafeInteger(num) && num > 0) {
-            parsed.push(num)
+        for (const part of parts) {
+          const match = ISSUE_REFERENCE_PATTERN.exec(part)
+          if (match) {
+            const num = parseInt(match[1], 10)
+            if (Number.isSafeInteger(num) && num > 0) {
+              parsed.push(num)
+            } else {
+              errors.push(`Invalid dependency reference: "${part}". Must be a positive integer issue number.`)
+            }
           } else {
-            errors.push(`Invalid dependency reference: "${part}". Must be a positive integer issue number.`)
+            errors.push(`Invalid dependency syntax: "${part}". Use #number format for same-repo issues.`)
           }
-        } else {
-          errors.push(`Invalid dependency syntax: "${part}". Use #number format for same-repo issues.`)
         }
-      }
 
-      dependencies = parsed
+        dependencies = parsed
+      }
     }
   } else if (dependsOnLines.length > 1) {
     errors.push('Duplicate Depends on declaration found.')

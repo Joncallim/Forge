@@ -56,6 +56,14 @@ export interface GitHubClient {
     issues: GitHubIssue[]
     hasMore: boolean
   }>
+  /**
+   * List closed issues in the repository, paginated.
+   * Used by closed-issue cleanup lane during full reconciliation.
+   */
+  listClosedIssues(options?: { page?: number; perPage?: number; maxPages?: number }): Promise<{
+    issues: GitHubIssue[]
+    hasMore: boolean
+  }>
 }
 
 type RestGitHubClientOptions = {
@@ -290,9 +298,38 @@ export class RestGitHubClient implements GitHubClient {
     const raw = await this.readJson<Array<Record<string, unknown>>>(response)
     const issues = raw.filter((item) => item.pull_request === undefined).map(mapIssue)
 
+    // A full final page at the page cap must mark the scan incomplete
+    const atPageCap = page >= maxPages
+    const pageFull = raw.length >= perPage
     return {
       issues,
-      hasMore: raw.length >= perPage && page < maxPages,
+      hasMore: !atPageCap && pageFull,
+    }
+  }
+
+  async listClosedIssues(options: { page?: number; perPage?: number; maxPages?: number } = {}): Promise<{
+    issues: GitHubIssue[]
+    hasMore: boolean
+  }> {
+    const page = options.page ?? 1
+    const perPage = options.perPage ?? LIST_ISSUES_PAGE_SIZE
+    const maxPages = options.maxPages ?? 50
+
+    if (page > maxPages) {
+      return { issues: [], hasMore: false }
+    }
+
+    const response = await this.request(
+      `/repos/${this.repo}/issues?state=closed&per_page=${perPage}&page=${page}&filter=all`,
+    )
+    const raw = await this.readJson<Array<Record<string, unknown>>>(response)
+    const issues = raw.filter((item) => item.pull_request === undefined).map(mapIssue)
+
+    const atPageCap = page >= maxPages
+    const pageFull = raw.length >= perPage
+    return {
+      issues,
+      hasMore: !atPageCap && pageFull,
     }
   }
 
