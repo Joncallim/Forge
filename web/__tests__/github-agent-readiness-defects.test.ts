@@ -683,6 +683,39 @@ describe('syncReadinessLabels safe ordering', () => {
     expect(result.removedLabels).toEqual(['needs-clarification'])
     expect((await client.getIssue(1)).labels).toEqual([])
   })
+
+  it('switches to cleanup when the issue closes between entry and the first label mutation', async () => {
+    class ClosingAfterEntryClient extends FakeGitHubClient {
+      private getIssueCalls = 0
+
+      override async getIssue(issueNumber: number) {
+        const current = await super.getIssue(issueNumber)
+        this.getIssueCalls += 1
+        return this.getIssueCalls >= 2 ? { ...current, state: 'closed' } : current
+      }
+    }
+
+    const issue = { ...READY_ISSUE, labels: ['needs-clarification'] }
+    const client = new ClosingAfterEntryClient({ issues: [issue] })
+
+    const result = await syncReadinessLabels(client, issue, {
+      issueNumber: 1,
+      state: 'ready',
+      dispatchable: true,
+      executionMode: 'implementation',
+      dependencies: [],
+      reasonCodes: [],
+      blockers: [],
+      desiredReadinessLabels: ['ready-for-agent'],
+      partial: false,
+    })
+
+    expect(result.success).toBe(true)
+    expect(result.addedLabels).toEqual([])
+    expect(result.removedLabels).toContain('needs-clarification')
+    expect(client.addLabelCalls).toEqual([])
+    expect((await client.getIssue(1)).labels).toEqual([])
+  })
 })
 
 describe('reconcile apply freshness', () => {

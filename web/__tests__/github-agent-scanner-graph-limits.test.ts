@@ -192,6 +192,22 @@ describe('authority scanner and bounded resolver graph', () => {
     expect(visible).toEqual([])
   })
 
+  it('suppresses 2-space continuation after bare unordered and ordered list markers', () => {
+    const unordered = scanVisibleMarkdownLines([
+      '-',
+      '  Execution mode: implementation',
+      '  Depends on: none',
+    ].join('\n')).lines.map((line) => line.text)
+    const ordered = scanVisibleMarkdownLines([
+      '1.',
+      '   Execution mode: implementation',
+      '   Depends on: none',
+    ].join('\n')).lines.map((line) => line.text)
+
+    expect(unordered).toEqual(['-'])
+    expect(ordered).toEqual(['1.'])
+  })
+
   it('does not accept control lines in a lazy blockquote continuation', async () => {
     const lazyBody = [
       body('none').replace('Execution mode: implementation\nDepends on: none', ''),

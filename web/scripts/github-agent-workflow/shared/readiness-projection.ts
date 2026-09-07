@@ -80,31 +80,48 @@ export async function syncReadinessLabels(
   }
 
   const currentLabels = liveIssue.labels
-  const desiredLabels: readonly string[] = liveIssue.state.toLowerCase() === 'closed'
+  let desiredLabels: readonly string[] = liveIssue.state.toLowerCase() === 'closed'
     ? []
     : readinessResult.desiredReadinessLabels
+
+  // A label operation can be delayed behind another GitHub call. Re-check
+  // immediately before every write so a just-closed issue becomes cleanup-only
+  // rather than receiving a stale readiness label.
+  const preflightLabelMutation = async (): Promise<ProjectionResult | null> => {
+    try {
+      const currentIssue = await client.getIssue(issue.number)
+      if (currentIssue.state.toLowerCase() === 'closed') desiredLabels = []
+      return null
+    } catch {
+      return {
+        success: false,
+        error: `Failed to verify current issue state for #${issue.number} before readiness label mutation.`,
+        addedLabels,
+        removedLabels,
+      }
+    }
+  }
 
   // Determine current readiness labels
   const currentReadinessLabels = currentLabels.filter((l) =>
     ISSUE_READINESS_MANAGED_LABELS.includes(l as typeof ISSUE_READINESS_MANAGED_LABELS[number]),
   )
 
-  // If nothing to change, skip
-  if (setsEqual(new Set(currentReadinessLabels), new Set(desiredLabels))) {
-    return { success: true, error: null, addedLabels: [], removedLabels: [] }
-  }
-
   // Step 1: If transitioning ready to non-ready, remove ready-for-agent FIRST
   if (currentReadinessLabels.includes('ready-for-agent') && !desiredLabels.includes('ready-for-agent')) {
-    try {
-      await client.removeLabel(liveIssue.number, 'ready-for-agent')
-      removedLabels.push('ready-for-agent')
-    } catch {
-      return {
-        success: false,
-        error: `Failed to remove ready-for-agent from #${issue.number}. Cannot safely project non-ready state.`,
-        addedLabels: [],
-        removedLabels: [],
+    const preflightFailure = await preflightLabelMutation()
+    if (preflightFailure) return preflightFailure
+    if (!desiredLabels.includes('ready-for-agent')) {
+      try {
+        await client.removeLabel(liveIssue.number, 'ready-for-agent')
+        removedLabels.push('ready-for-agent')
+      } catch {
+        return {
+          success: false,
+          error: `Failed to remove ready-for-agent from #${issue.number}. Cannot safely project non-ready state.`,
+          addedLabels: [],
+          removedLabels: [],
+        }
       }
     }
   }
@@ -115,6 +132,9 @@ export async function syncReadinessLabels(
   for (const label of currentReadinessLabels) {
     if (label === 'ready-for-agent' && removedLabels.includes(label)) continue
     if (!desiredLabels.includes(label as typeof ISSUE_READINESS_MANAGED_LABELS[number])) {
+      const preflightFailure = await preflightLabelMutation()
+      if (preflightFailure) return preflightFailure
+      if (desiredLabels.includes(label)) continue
       try {
         await client.removeLabel(liveIssue.number, label)
         removedLabels.push(label)
@@ -132,6 +152,9 @@ export async function syncReadinessLabels(
   // Step 3: Add non-ready labels (blocking/clarification/tracking)
   for (const label of desiredLabels) {
     if (label !== 'ready-for-agent' && !currentReadinessLabels.includes(label)) {
+      const preflightFailure = await preflightLabelMutation()
+      if (preflightFailure) return preflightFailure
+      if (!desiredLabels.includes(label)) continue
       try {
         await client.addLabel(liveIssue.number, label)
         addedLabels.push(label)
@@ -172,16 +195,53 @@ export async function syncReadinessLabels(
       }
     }
 
-    try {
-      await client.addLabel(liveIssue.number, 'ready-for-agent')
-      addedLabels.push('ready-for-agent')
-    } catch {
-      return {
-        success: false,
-        error: `Failed to add ready-for-agent to #${issue.number}.`,
-        addedLabels,
-        removedLabels,
+    const preflightFailure = await preflightLabelMutation()
+    if (preflightFailure) return preflightFailure
+    if (desiredLabels.includes('ready-for-agent')) {
+      try {
+        await client.addLabel(liveIssue.number, 'ready-for-agent')
+        addedLabels.push('ready-for-agent')
+      } catch {
+        return {
+          success: false,
+          error: `Failed to add ready-for-agent to #${issue.number}.`,
+          addedLabels,
+          removedLabels,
+        }
       }
+    }
+  }
+
+  // Catch a close that arrived after all planned writes (including the
+  // no-op case) and clean managed labels rather than reporting a stale target.
+  try {
+    const currentIssue = await client.getIssue(liveIssue.number)
+    if (currentIssue.state.toLowerCase() === 'closed') {
+      desiredLabels = []
+      for (const label of currentIssue.labels.filter((candidate) => (
+        ISSUE_READINESS_MANAGED_LABELS.includes(candidate as typeof ISSUE_READINESS_MANAGED_LABELS[number])
+      ))) {
+        const preflightFailure = await preflightLabelMutation()
+        if (preflightFailure) return preflightFailure
+        try {
+          await client.removeLabel(liveIssue.number, label)
+          if (!removedLabels.includes(label)) removedLabels.push(label)
+        } catch {
+          return {
+            success: false,
+            error: `Failed to remove readiness label ${label} from closed issue #${issue.number}.`,
+            addedLabels,
+            removedLabels,
+          }
+        }
+      }
+    }
+  } catch {
+    return {
+      success: false,
+      error: `Failed to verify current issue state for #${issue.number} before final readiness projection verification.`,
+      addedLabels,
+      removedLabels,
     }
   }
 

@@ -131,7 +131,7 @@ export function scanVisibleMarkdownLines(
       // early-return path. A marker with an inline comment still starts the
       // same CommonMark paragraph context.
       if (/^ {0,3}>/.test(line)) inLazyBlockQuoteContinuation = true
-      if (/^ {0,3}(?:[-+*]\s+|\d{1,9}[.)]\s+)/.test(line)) inLazyListContinuation = true
+      if (/^ {0,3}(?:[-+*](?:\s+|$)|\d{1,9}[.)](?:\s+|$))/.test(line)) inLazyListContinuation = true
 
       if (inDetailsOpener) {
         if (line.includes('>')) {
@@ -236,7 +236,7 @@ export function scanVisibleMarkdownLines(
     // List paragraphs also support lazy continuation. Keep a conservative
     // boundary through the next blank line so an unmarked line after a list
     // item cannot become authority-bearing control metadata.
-    const isListItemLine = /^ {0,3}(?:[-+*]\s+|\d{1,9}[.)]\s+)/.test(line)
+    const isListItemLine = /^ {0,3}(?:[-+*](?:\s+|$)|\d{1,9}[.)](?:\s+|$))/.test(line)
     if (inLazyListContinuation && !isListItemLine) {
       // A top-level ATX heading interrupts the list paragraph; preserve
       // normal template section recognition after numbered instructions.
