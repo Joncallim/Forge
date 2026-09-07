@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import { READINESS_REASON_CODES, type IssueReadinessResult } from '@/scripts/github-agent-workflow/contracts/issue-readiness-result'
 import { renderReadinessBlocker, renderReadinessReason } from '@/scripts/github-agent-workflow/core/readiness-reason-renderer'
+import { buildReadinessMachineOutput } from '@/scripts/github-agent-workflow/cli/check-readiness'
 import { buildReadinessComment } from '@/scripts/github-agent-workflow/shared/issue-validation-runner'
 import { reconcileWorkflowRef } from '@/scripts/github-agent-workflow/validate-issue'
 
@@ -14,7 +15,7 @@ describe('readiness output trust boundary', () => {
     }
   })
 
-  it('never renders arbitrary blocker detail into human-facing readiness text', () => {
+  it('never renders arbitrary blocker detail into human-facing or machine readiness output', () => {
     const maliciousDetail = '<script>alert("untrusted")</script> TOKEN=secret-like-text'
     const blocker = {
       reasonCode: 'queue.issue_dependency_open' as const,
@@ -37,10 +38,15 @@ describe('readiness output trust boundary', () => {
       partial: false,
     }
     const comment = buildReadinessComment(readiness, 'blocked')
+    const machineOutput = buildReadinessMachineOutput(readiness)
 
     expect(comment).toContain('queue.issue_dependency_open')
     expect(comment).toContain('Dependency: #42.')
     expect(comment).not.toContain(maliciousDetail)
+    expect(JSON.stringify(machineOutput)).not.toContain(maliciousDetail)
+    expect(machineOutput.blockers).toEqual([
+      { reasonCode: 'queue.issue_dependency_open', dependencyIssueNumber: 42 },
+    ])
   })
 })
 
