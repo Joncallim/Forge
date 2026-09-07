@@ -63,7 +63,14 @@ describe('authority scanner and bounded resolver graph', () => {
 
     expect(visible).toContain('Execution mode: implementation')
     expect(visible).toContain('Depends on: none')
-    expect(splitVisible).toEqual(['Execution mode: imple', 'mentation'])
+    expect(splitVisible).toEqual(['Execution mode: imple'])
+  })
+
+  it('does not mint a control line from a post-comment segment with visible-line prefix text', () => {
+    const visible = scanVisibleMarkdownLines('Example: <!-- note -->Execution mode: implementation')
+      .lines.map((line) => line.text)
+
+    expect(visible).toEqual(['Example: '])
   })
 
   it('does not accept control lines in a lazy blockquote continuation', async () => {

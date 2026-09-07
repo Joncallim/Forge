@@ -86,15 +86,21 @@ export function scanVisibleMarkdownLines(
 
   const emitCommentFreeSegments = (line: string, lineNumber: number, startAt = 0): boolean => {
     let cursor = startAt
+    let sawComment = startAt > 0
+    let hasVisiblePrefix = false
     while (true) {
       const commentStart = line.indexOf('<!--', cursor)
       if (commentStart === -1) {
-        appendVisibleSegment(line, lineNumber, line.slice(cursor))
+        const segment = line.slice(cursor)
+        if (!sawComment || !hasVisiblePrefix) appendVisibleSegment(line, lineNumber, segment)
         return false
       }
-      appendVisibleSegment(line, lineNumber, line.slice(cursor, commentStart))
+      const segment = line.slice(cursor, commentStart)
+      if (!sawComment || !hasVisiblePrefix) appendVisibleSegment(line, lineNumber, segment)
+      if (segment.trim() !== '') hasVisiblePrefix = true
       const commentEnd = line.indexOf('-->', commentStart + 4)
       if (commentEnd === -1) return true
+      sawComment = true
       cursor = commentEnd + 3
     }
   }
