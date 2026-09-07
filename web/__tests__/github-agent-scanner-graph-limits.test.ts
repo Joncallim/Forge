@@ -53,7 +53,7 @@ describe('authority scanner and bounded resolver graph', () => {
     expect(visible).toEqual(['Execution mode: implementation', 'Depends on: none'])
   })
 
-  it('keeps post-comment visible control text authoritative without synthesizing fragments', () => {
+  it('keeps every comment-bearing physical line non-authoritative', () => {
     const visible = scanVisibleMarkdownLines([
       '<!-- explanatory text -->Execution mode: implementation',
       'Depends on: none',
@@ -61,16 +61,15 @@ describe('authority scanner and bounded resolver graph', () => {
 
     const splitVisible = scanVisibleMarkdownLines('Execution mode: imple<!-- split -->mentation').lines.map((line) => line.text)
 
-    expect(visible).toContain('Execution mode: implementation')
-    expect(visible).toContain('Depends on: none')
-    expect(splitVisible).toEqual(['Execution mode: imple'])
+    expect(visible).toEqual(['Depends on: none'])
+    expect(splitVisible).toEqual([])
   })
 
   it('does not mint a control line from a post-comment segment with visible-line prefix text', () => {
     const visible = scanVisibleMarkdownLines('Example: <!-- note -->Execution mode: implementation')
       .lines.map((line) => line.text)
 
-    expect(visible).toEqual(['Example: '])
+    expect(visible).toEqual([])
   })
 
   it('does not authorize a multiline-comment suffix when the opener had visible prefix text', async () => {
