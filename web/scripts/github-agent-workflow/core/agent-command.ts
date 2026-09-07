@@ -158,7 +158,12 @@ async function rejectionFor(command: AgentCommand, issue: GitHubIssue, client: G
   }
 
   // Check durable run-log state first (authority, not labels)
-  const latestRun = await findLatestRunForIssue(issue.number, { repositoryRoot: runLogRepositoryRoot })
+  let latestRun: Awaited<ReturnType<typeof findLatestRunForIssue>>
+  try {
+    latestRun = await findLatestRunForIssue(issue.number, { repositoryRoot: runLogRepositoryRoot })
+  } catch {
+    return 'Implementation request could not be accepted because Forge could not verify the durable run-log state. Ask a maintainer to repair the run log and retry.'
+  }
   if (latestRun) {
     const activeStatuses = ['requested', 'handed-off', 'running', 'pr-opened']
     if (activeStatuses.includes(latestRun.status)) {

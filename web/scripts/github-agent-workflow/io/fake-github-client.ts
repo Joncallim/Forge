@@ -232,7 +232,7 @@ export class FakeGitHubClient implements GitHubClient {
     return { issues: pageIssues, hasMore: !atPageCap && (pageFull || start + perPage < allIssues.length) }
   }
 
-  async listClosedIssues(options: { page?: number; perPage?: number; maxPages?: number } = {}): Promise<{
+  async listClosedIssues(options: { page?: number; perPage?: number; maxPages?: number; label?: string } = {}): Promise<{
     issues: GitHubIssue[]
     hasMore: boolean
   }> {
@@ -241,7 +241,7 @@ export class FakeGitHubClient implements GitHubClient {
 
     const allIssues: GitHubIssue[] = []
     for (const issue of this.issues.values()) {
-      if (issue.state === 'closed' && !issue.isPullRequest) {
+      if (issue.state === 'closed' && !issue.isPullRequest && (options.label === undefined || issue.labels.includes(options.label))) {
         allIssues.push(cloneIssue(issue))
       }
     }

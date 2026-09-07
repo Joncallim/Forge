@@ -17,13 +17,19 @@ function managedLabels(labels: readonly string[]): string[] {
 function sameLabels(left: readonly string[], right: readonly string[]): boolean { return JSON.stringify([...left].sort()) === JSON.stringify([...right].sort()) }
 
 async function discoverClosedIssues(client: GitHubClient): Promise<{ issues: GitHubIssue[]; incomplete: boolean }> {
-  const issues: GitHubIssue[] = []
-  for (let page = 1; page <= CLOSED_SCAN_MAX_PAGES; page += 1) {
-    const result = await client.listClosedIssues({ page, perPage: ISSUE_PAGE_SIZE, maxPages: CLOSED_SCAN_MAX_PAGES })
-    issues.push(...result.issues)
-    if (!result.hasMore) return { issues, incomplete: false }
+  const issues = new Map<number, GitHubIssue>()
+  for (const label of ISSUE_READINESS_MANAGED_LABELS) {
+    let complete = false
+    for (let page = 1; page <= CLOSED_SCAN_MAX_PAGES; page += 1) {
+      const result = await client.listClosedIssues({ page, perPage: ISSUE_PAGE_SIZE, maxPages: CLOSED_SCAN_MAX_PAGES, label })
+      for (const issue of result.issues) issues.set(issue.number, issue)
+      if (!result.hasMore) { complete = true; break }
+    }
+    // Each label is a distinct bounded inventory. A cap in any one of them
+    // makes cleanup unsafe to claim complete, even if other labels completed.
+    if (!complete) return { issues: [...issues.values()], incomplete: true }
   }
-  return { issues, incomplete: true }
+  return { issues: [...issues.values()], incomplete: false }
 }
 
 async function applyClosedCleanup(client: GitHubClient, issue: GitHubIssue): Promise<number> {
@@ -35,10 +41,23 @@ async function applyClosedCleanup(client: GitHubClient, issue: GitHubIssue): Pro
 
 async function applyOpenProjection(client: GitHubClient, planned: PlannedIssue): Promise<number> {
   if (!planned.readiness) throw new Error(`Open issue #${planned.issue.number} has no readiness plan.`)
-  const projected = await syncReadinessLabels(client, planned.issue, planned.readiness)
+  // A planned-ready result is only a candidate for authority. Re-resolve it
+  // immediately before its ready projection so a dependency or metadata change
+  // during the bounded plan phase cannot promote stale readiness. If it became
+  // non-ready, the same shared writer projects that fresh blocked state.
+  let issue = planned.issue
+  let readiness = planned.readiness
+  if (planned.readiness.dispatchable) {
+    issue = await client.getIssue(planned.issue.number)
+    const freshResolver = new IssueReadinessResolver(client)
+    readiness = await freshResolver.resolveFromIssue(issue)
+    if (readiness.partial) throw new Error(`Fresh readiness result for #${issue.number} is partial.`)
+  }
+
+  const projected = await syncReadinessLabels(client, issue, readiness)
   if (!projected.success) throw new Error(projected.error ?? `Failed to project readiness for #${planned.issue.number}.`)
   // Require exact convergence: writer errors must never be a silent partial bulk run.
-  if (!sameLabels(managedLabels((await client.getIssue(planned.issue.number)).labels), planned.readiness.desiredReadinessLabels)) {
+  if (!sameLabels(managedLabels((await client.getIssue(issue.number)).labels), readiness.desiredReadinessLabels)) {
     throw new Error(`Readiness projection for #${planned.issue.number} did not converge to the planned labels.`)
   }
   return projected.addedLabels.length + projected.removedLabels.length

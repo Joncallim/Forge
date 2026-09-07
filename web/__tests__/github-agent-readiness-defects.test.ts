@@ -527,6 +527,20 @@ describe('FakeGitHubClient pagination', () => {
     expect(result.hasMore).toBe(false)
   })
 
+  it('discovers closed issues by a managed label only', async () => {
+    const client = new FakeGitHubClient({
+      issues: [
+        { ...READY_ISSUE, number: 1, state: 'closed', labels: ['ready-for-agent'] },
+        { ...READY_ISSUE, number: 2, state: 'closed', labels: ['unrelated'] },
+        { ...READY_ISSUE, number: 3, state: 'open', labels: ['ready-for-agent'] },
+      ],
+    })
+
+    const result = await client.listClosedIssues({ label: 'ready-for-agent' })
+    expect(result.issues.map((issue) => issue.number)).toEqual([1])
+    expect(result.hasMore).toBe(false)
+  })
+
   it('reports hasMore correctly at page cap', async () => {
     // Create more than 50*100 = 5000 issues to test page cap
     const issues: GitHubIssue[] = []

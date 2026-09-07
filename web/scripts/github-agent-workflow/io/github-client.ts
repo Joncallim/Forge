@@ -60,7 +60,7 @@ export interface GitHubClient {
    * List closed issues in the repository, paginated.
    * Used by closed-issue cleanup lane during full reconciliation.
    */
-  listClosedIssues(options?: { page?: number; perPage?: number; maxPages?: number }): Promise<{
+  listClosedIssues(options?: { page?: number; perPage?: number; maxPages?: number; label?: string }): Promise<{
     issues: GitHubIssue[]
     hasMore: boolean
   }>
@@ -317,7 +317,7 @@ export class RestGitHubClient implements GitHubClient {
     return { issues, hasMore: !atPageCap && pageFull }
   }
 
-  async listClosedIssues(options: { page?: number; perPage?: number; maxPages?: number } = {}): Promise<{
+  async listClosedIssues(options: { page?: number; perPage?: number; maxPages?: number; label?: string } = {}): Promise<{
     issues: GitHubIssue[]
     hasMore: boolean
   }> {
@@ -329,9 +329,9 @@ export class RestGitHubClient implements GitHubClient {
       return { issues: [], hasMore: false }
     }
 
-    const response = await this.request(
-      `/repos/${this.repo}/issues?state=closed&per_page=${perPage}&page=${page}&filter=all`,
-    )
+    const label = options.label === undefined ? null : nonEmptyTrimmedStringSchema.parse(options.label)
+    const labelQuery = label === null ? '' : `&labels=${encodeURIComponent(label)}`
+    const response = await this.request(`/repos/${this.repo}/issues?state=closed&per_page=${perPage}&page=${page}&filter=all${labelQuery}`)
     const raw = await this.readArray(response, 'issues')
     const issues = raw.filter((item) => item.pull_request === undefined).map(mapIssue)
 

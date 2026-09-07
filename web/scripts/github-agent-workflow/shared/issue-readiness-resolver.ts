@@ -436,6 +436,7 @@ export class IssueReadinessResolver {
     // Add resolved dependency nodes with their transitive deps
     // Only open dependencies are traversed; completed/terminal deps are leaves
     const allFacts: ResolvedDependencyFact[] = [...dependencyFacts]
+    let expansionLimitExceeded = false
     for (const fact of dependencyFacts) {
       const transitive = fact.transitiveDependencyIssueNumbers ?? []
       nodeMap.set(fact.issueNumber, {
@@ -445,8 +446,8 @@ export class IssueReadinessResolver {
 
       // For open dependencies, also fetch their transitive dependencies' transitive deps
       // up to MAX_GRAPH_DEPTH to build a complete reachable graph
-      if (fact.state === 'open' && transitive.length > 0) {
-        await this.expandGraphNode(fact.issueNumber, transitive, nodeMap, 1, allFacts)
+      if (!expansionLimitExceeded && fact.state === 'open' && transitive.length > 0) {
+        expansionLimitExceeded = await this.expandGraphNode(fact.issueNumber, transitive, nodeMap, 1, allFacts)
       }
     }
 
@@ -454,7 +455,7 @@ export class IssueReadinessResolver {
 
     // Check graph limits
     const transitive = getTransitiveDependencies(issueNumber, nodeMap)
-    const limitExceeded = transitive.exceededLimit || cycleResult.limitExceeded
+    const limitExceeded = expansionLimitExceeded || transitive.exceededLimit || cycleResult.limitExceeded
 
     if (limitExceeded) {
       this.graphLimitFailures++
@@ -477,11 +478,16 @@ export class IssueReadinessResolver {
     nodeMap: Map<number, DependencyNode>,
     depth: number,
     allFacts: ResolvedDependencyFact[],
-  ): Promise<void> {
-    if (depth > MAX_GRAPH_DEPTH || nodeMap.size > MAX_GRAPH_NODES) return
+  ): Promise<boolean> {
+    // This node is already at the permitted depth. Any unvisited child would
+    // be outside the complete bounded graph, so report the cap explicitly.
+    if (depth >= MAX_GRAPH_DEPTH) return transitiveDeps.some((dep) => !nodeMap.has(dep))
+    if (nodeMap.size >= MAX_GRAPH_NODES) return transitiveDeps.some((dep) => !nodeMap.has(dep))
 
     for (const dep of transitiveDeps) {
       if (nodeMap.has(dep)) continue
+
+      if (nodeMap.size >= MAX_GRAPH_NODES) return true
 
       // Fetch the dependency's fact (uses memoization)
       let fact: ResolvedDependencyFact
@@ -499,10 +505,11 @@ export class IssueReadinessResolver {
       })
 
       // Only expand open deps further; completed/terminal/error deps are leaves
-      if (fact.state === 'open' && childTransitive.length > 0 && depth < MAX_GRAPH_DEPTH && nodeMap.size < MAX_GRAPH_NODES) {
-        await this.expandGraphNode(dep, childTransitive, nodeMap, depth + 1, allFacts)
+      if (fact.state === 'open' && childTransitive.length > 0) {
+        if (await this.expandGraphNode(dep, childTransitive, nodeMap, depth + 1, allFacts)) return true
       }
     }
+    return false
   }
 
   /**

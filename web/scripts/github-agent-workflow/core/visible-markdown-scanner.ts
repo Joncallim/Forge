@@ -72,9 +72,23 @@ export function scanVisibleMarkdownLines(
 
   let inFence: { type: 'backtick' | 'tilde'; fenceLength: number } | null = null
   let inHtmlComment = false
+  // CommonMark permits a paragraph in a blockquote to continue lazily on
+  // following non-quoted lines. Treat that continuation as non-authoritative
+  // until a blank line ends the paragraph.
+  let inLazyBlockQuoteContinuation = false
 
   for (let i = 0; i < rawLines.length; i++) {
     const line = rawLines[i]
+
+    const isBlockQuoteLine = /^ {0,3}>/.test(line)
+    if (inLazyBlockQuoteContinuation && !isBlockQuoteLine) {
+      if (line.trim() !== '') continue
+      inLazyBlockQuoteContinuation = false
+    }
+    if (isBlockQuoteLine) {
+      inLazyBlockQuoteContinuation = true
+      continue
+    }
 
     // Handle HTML comments (multi-line)
     if (!inHtmlComment && !inFence) {
@@ -145,11 +159,6 @@ export function scanVisibleMarkdownLines(
     }
 
     // Handle blockquotes
-    if (!inFence && !inHtmlComment && line.trimStart().startsWith('>')) {
-      // Blockquotes are ignored for metadata parsing
-      continue
-    }
-
     // Visible line
     if (!inFence && !inHtmlComment) {
       result.push({ lineNumber: i, text: line })

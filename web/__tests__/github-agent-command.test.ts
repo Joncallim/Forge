@@ -1,3 +1,6 @@
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
 import { describe, expect, it } from 'vitest'
 import {
   parseAgentCommand,
@@ -458,5 +461,33 @@ describe('GitHub agent command routing', () => {
     expect(result.command.rejectionReason).toContain('durable run record')
     expect((await client.getIssue(143)).labels).not.toContain('agent-requested')
     expect((await client.listComments(143))[0]?.body).not.toContain('<!-- untrusted -->')
+  })
+
+  it('fails closed when the durable run log is unreadable', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'forge-command-run-log-'))
+    try {
+      await mkdir(path.join(root, '.forge', 'runs', '143'), { recursive: true })
+      await writeFile(path.join(root, '.forge', 'runs', '143', 'corrupt.json'), '{not-json', 'utf8')
+      const client = seedClient(READY_ISSUE)
+      const recorder = new CollectingRunRecorder()
+
+      const result = await runAgentCommand({
+        client,
+        issue: READY_ISSUE,
+        comment: { id: 126, body: 'codex implement', authorLogin: 'Joncallim' },
+        botLogin: 'github-actions[bot]',
+        recorder,
+        runLogRepositoryRoot: root,
+        githubRunId: 1234567904,
+        githubRunAttempt: 1,
+      })
+
+      expect(result.command.accepted).toBe(false)
+      expect(result.command.rejectionReason).toBe('Implementation request could not be accepted because Forge could not verify the durable run-log state. Ask a maintainer to repair the run log and retry.')
+      expect(recorder.records).toEqual([])
+      expect((await client.getIssue(143)).labels).not.toContain('agent-requested')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
   })
 })
