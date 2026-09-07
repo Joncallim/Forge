@@ -221,7 +221,14 @@ export function evaluateReadiness(input: ReadinessEvaluationInput): IssueReadine
         dependencyIssueNumber: fact.issueNumber,
       })
     }
-    return buildResult(input.issueNumber, 'needs-clarification', input.controlMetadata, reasonCodes, blockers, false)
+    return buildResult(
+      input.issueNumber,
+      'needs-clarification',
+      input.controlMetadata,
+      reasonCodes,
+      blockers,
+      downstreamDiagnostics.some(({ diagnostic }) => diagnostic.reasonCode === 'queue.issue_dependency_graph_limit_exceeded'),
+    )
   }
 
   // Check dependency syntax errors
