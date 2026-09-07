@@ -84,7 +84,13 @@ export function scanVisibleMarkdownLines(
   const appendVisibleSegment = (line: string, lineNumber: number, segment: string): void => {
     // A comment within quoted or indented source remains non-authoritative;
     // do not accidentally make one of its visible fragments authoritative.
-    if (line.startsWith('    ') || line.startsWith('\t') || line.trimStart().startsWith('>')) return
+    if (
+      inLazyBlockQuoteContinuation ||
+      inLazyListContinuation ||
+      line.startsWith('    ') ||
+      line.startsWith('\t') ||
+      line.trimStart().startsWith('>')
+    ) return
     if (segment.trim() !== '') result.push({ lineNumber, text: segment })
   }
 

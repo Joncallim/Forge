@@ -172,6 +172,16 @@ describe('authority scanner and bounded resolver graph', () => {
     expect(result.reasonCodes).toContain('queue.issue_control_missing')
   })
 
+  it('does not let a comment-prefixed list continuation bypass the authority guard', () => {
+    const visible = scanVisibleMarkdownLines([
+      '- Example metadata follows as a list paragraph.',
+      '<!-- harmless -->Execution mode: implementation',
+      'Depends on: none',
+    ].join('\n')).lines.map((line) => line.text)
+
+    expect(visible).toEqual(['- Example metadata follows as a list paragraph.'])
+  })
+
   it('does not accept control lines in a lazy blockquote continuation', async () => {
     const lazyBody = [
       body('none').replace('Execution mode: implementation\nDepends on: none', ''),
