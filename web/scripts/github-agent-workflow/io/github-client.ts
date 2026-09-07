@@ -79,6 +79,8 @@ export class GitHubApiError extends Error {
     message: string,
     readonly status: number,
     readonly path: string,
+    /** Non-sensitive HTTP evidence retained for operational classification. */
+    readonly rateLimitEvidence: Readonly<{ retryAfter: boolean; remainingZero: boolean }> = { retryAfter: false, remainingZero: false },
   ) {
     super(message)
     this.name = 'GitHubApiError'
@@ -382,7 +384,17 @@ export class RestGitHubClient implements GitHubClient {
       })
 
       if (!response.ok && !(init?.allow404 && response.status === 404)) {
-        throw new GitHubApiError(`GitHub API returned ${response.status} for ${path}.`, response.status, path)
+        throw new GitHubApiError(
+          `GitHub API returned ${response.status} for ${path}.`,
+          response.status,
+          path,
+          {
+            // Do not retain or expose raw header values: their presence/zero
+            // state is sufficient to distinguish rate limiting from 403 ACLs.
+            retryAfter: response.headers.has('retry-after'),
+            remainingZero: response.headers.get('x-ratelimit-remaining') === '0',
+          },
+        )
       }
 
       return response

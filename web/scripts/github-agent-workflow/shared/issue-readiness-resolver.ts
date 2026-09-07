@@ -151,6 +151,14 @@ export class IssueReadinessResolver {
 
   private async resolveFromFacts(issue: GitHubIssue, facts: SnapshotIssueReadinessFacts): Promise<IssueReadinessResult> {
 
+    // /issues also returns pull requests. A target PR is never a dispatchable
+    // work item, even if it happens to contain an otherwise valid issue body.
+    if (issue.isPullRequest) {
+      return this.failClosed(issue.number, 'queue.issue_dependency_is_pull_request', [
+        { reasonCode: 'queue.issue_dependency_is_pull_request', detail: `Target #${issue.number} is a pull request, not an issue.`, dependencyIssueNumber: null },
+      ])
+    }
+
     // Determine issue state
     const issueState = mapIssueState(issue.state)
     const stateUnknown = issueState === 'unknown'
@@ -297,14 +305,26 @@ export class IssueReadinessResolver {
         }
       }
 
-      // Derive tracking semantics from body/control contract, NOT from labels
-      // Labels are projections only; a closed tracking Epic can lose its label
+      // Completed dependencies are terminal satisfied leaves regardless of
+      // their historical type or control metadata.
+      if (issue.state === 'closed' && issue.stateReason === 'completed') {
+        return {
+          issueNumber: dependencyNumber,
+          state: 'closed_completed',
+          reasonCode: 'queue.issue_dependency_open' as ReadinessReasonCode,
+          transitiveDependencyIssueNumbers: [],
+        }
+      }
+
+      // Derive tracking semantics from body/control contract, NOT from labels.
+      // Only an open tracking issue is invalid as a dependency; completed
+      // tracking issues were handled above as terminal satisfied leaves.
       const depBody = issue.body ?? ''
       const depIssueType = detectIssueType({ title: issue.title, body: depBody })
       const depControl = parseControlMetadata(depBody, depIssueType)
       const isTracking = depControl.metadata.executionMode === 'tracking' || depIssueType === 'epic'
 
-      if (isTracking) {
+      if (issue.state === 'open' && isTracking) {
         return {
           issueNumber: dependencyNumber,
           state: 'tracking_only',
@@ -328,14 +348,6 @@ export class IssueReadinessResolver {
 
       if (issue.state === 'closed') {
         switch (issue.stateReason) {
-          case 'completed':
-            return {
-              issueNumber: dependencyNumber,
-              state: 'closed_completed',
-              reasonCode: 'queue.issue_dependency_open' as ReadinessReasonCode,
-              // Completed dependencies are terminal leaves for traversal
-              transitiveDependencyIssueNumbers: [],
-            }
           case 'not_planned':
             return {
               issueNumber: dependencyNumber,
@@ -389,7 +401,8 @@ export class IssueReadinessResolver {
             transitiveDependencyIssueNumbers: [],
           }
         case 403:
-          this.apiFailureClasses.permission++
+          if (isRateLimitError(error)) this.apiFailureClasses['rate-limit']++
+          else this.apiFailureClasses.permission++
           return {
             issueNumber: dependencyNumber,
             state: 'inaccessible',
@@ -665,4 +678,12 @@ function mapIssueState(state: string): 'open' | 'closed' | 'unknown' {
     default:
       return 'unknown'
   }
+}
+
+function isRateLimitError(error: GitHubApiError): boolean {
+  return error.rateLimitEvidence.retryAfter
+    || error.rateLimitEvidence.remainingZero
+    // Test doubles and older callers may not have response evidence. This is
+    // deliberately only a fallback; RestGitHubClient supplies header facts.
+    || /(?:secondary\s+)?rate\s*limit|rate[_ -]?limited/i.test(error.message)
 }

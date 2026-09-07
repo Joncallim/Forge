@@ -17,6 +17,11 @@ function managedLabels(labels: readonly string[]): string[] {
 }
 function sameLabels(left: readonly string[], right: readonly string[]): boolean { return JSON.stringify([...left].sort()) === JSON.stringify([...right].sort()) }
 
+/** Reject a non-atomic open/closed inventory before the apply phase. */
+export function inventoryOverlap(openIssues: ReadonlyMap<number, GitHubIssue>, closedIssues: readonly GitHubIssue[]): number[] {
+  return closedIssues.filter((issue) => openIssues.has(issue.number)).map((issue) => issue.number)
+}
+
 async function discoverClosedIssues(client: GitHubClient): Promise<{ issues: GitHubIssue[]; incomplete: boolean }> {
   const issues = new Map<number, GitHubIssue>()
   for (const label of ISSUE_READINESS_MANAGED_LABELS) {
@@ -85,18 +90,18 @@ export async function applyOpenProjection(client: GitHubClient, planned: Planned
   })
   if (!projected.success) throw new Error(projected.error ?? `Failed to project readiness for #${planned.issue.number}.`)
   // Require exact convergence: writer errors must never be a silent partial bulk run.
-  if (!sameLabels(managedLabels((await client.getIssue(issue.number)).labels), readiness.desiredReadinessLabels)) {
-    throw new Error(`Readiness projection for #${planned.issue.number} did not converge to the planned labels.`)
+  if (!sameLabels(managedLabels((await client.getIssue(issue.number)).labels), projected.desiredLabels ?? readiness.desiredReadinessLabels)) {
+    throw new Error(`Readiness projection for #${planned.issue.number} did not converge to the effective labels.`)
   }
   return projected.addedLabels.length + projected.removedLabels.length
 }
 
-export async function main(argv: string[] = process.argv.slice(2), env: NodeJS.ProcessEnv = process.env): Promise<void> {
+export async function main(argv: string[] = process.argv.slice(2), env: NodeJS.ProcessEnv = process.env, clientOverride?: GitHubClient): Promise<void> {
   const value = (env.DRY_RUN || env.FORGE_RECONCILE_DRY_RUN || '').trim().toLowerCase()
   const dryRun = argv.includes('--dry-run') || value === 'true' || value === '1'
   const start = Date.now()
   const plan: ReconcilePlan = { scannedIssues: 0, closedIssuesScanned: 0, readyCount: 0, blockedCount: 0, clarificationCount: 0, trackingOnlyCount: 0, plannedLabelMutations: [], labelTransitions: 0, apiFailures: 0, uniqueDependencyFetches: 0, dependencyCacheHits: 0, graphLimitFailures: 0, apiFailureClasses: {}, elapsedMs: 0, errors: [] }
-  const client = RestGitHubClient.fromEnv(env)
+  const client = clientOverride ?? RestGitHubClient.fromEnv(env)
   const resolver = new IssueReadinessResolver(client)
   const planned: PlannedIssue[] = []
 
@@ -134,6 +139,10 @@ export async function main(argv: string[] = process.argv.slice(2), env: NodeJS.P
 
   console.info(JSON.stringify({ phase: 'validate', plannedIssues: planned.length }))
   if (planned.length !== plan.scannedIssues + plan.closedIssuesScanned) plan.errors.push('Discovery and plan counts do not match.')
+  const overlappingInventory = inventoryOverlap(snapshot.issues, closed.issues)
+  if (overlappingInventory.length > 0) {
+    plan.errors.push(`Open and closed inventories overlap for issue(s): ${overlappingInventory.map((number) => `#${number}`).join(', ')}.`)
+  }
   for (const item of planned) {
     const current = managedLabels(item.issue.labels)
     const desired = item.closedCleanup ? [] : item.readiness?.desiredReadinessLabels ?? []

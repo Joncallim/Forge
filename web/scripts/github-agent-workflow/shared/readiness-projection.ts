@@ -42,6 +42,8 @@ export type ProjectionResult = Readonly<{
    * Which labels were removed.
    */
   removedLabels: readonly string[]
+  /** The effective target set after any last-moment ready confirmation. */
+  desiredLabels?: readonly string[]
 }>
 
 /**
@@ -190,7 +192,16 @@ export async function syncReadinessLabels(
       // We have already removed stale labels above. Re-enter the non-ready
       // convergence path without ever emitting a false-ready projection.
       for (const label of desiredLabels) {
-        if (!currentReadinessLabels.includes(label)) {
+        // Labels removed earlier may have existed in the entry snapshot.  Use
+        // the live set here, otherwise ready→blocked confirmation can skip
+        // re-adding the blocker and leave an empty projection.
+        let present = false
+        try {
+          present = (await client.getIssue(liveIssue.number)).labels.includes(label)
+        } catch {
+          return { success: false, error: `Failed to verify fresh readiness labels for #${issue.number}.`, addedLabels, removedLabels }
+        }
+        if (!present) {
           const preflightFailure = await preflightLabelMutation()
           if (preflightFailure) return preflightFailure
           try { await client.addLabel(liveIssue.number, label); addedLabels.push(label) }
@@ -298,7 +309,7 @@ export async function syncReadinessLabels(
     }
   }
 
-  return { success: true, error: null, addedLabels, removedLabels }
+  return { success: true, error: null, addedLabels, removedLabels, desiredLabels }
 }
 
 function setsEqual(a: Set<string>, b: Set<string>): boolean {

@@ -130,10 +130,17 @@ export function parseControlMetadata(
         diagnose('queue.issue_dependency_syntax_invalid', 'depends_on', 'Depends on value is empty.')
         dependencies = []
       } else {
-        const parts = value.split(',').map((p) => p.trim()).filter((p) => p !== '')
+        // Do not silently normalize malformed separators. `#1,,#2` is not
+        // equivalent to `#1,#2`: every comma-separated position is part of
+        // the external control contract and an empty position fails closed.
+        const parts = value.split(',').map((p) => p.trim())
         const parsed: number[] = []
 
         for (const part of parts) {
+          if (part === '') {
+            diagnose('queue.issue_dependency_syntax_invalid', 'depends_on', 'Dependency syntax contains an empty reference.')
+            continue
+          }
           const match = ISSUE_REFERENCE_PATTERN.exec(part)
           if (match) {
             const num = parseInt(match[1], 10)

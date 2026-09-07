@@ -29,7 +29,7 @@ import {
 } from '@/scripts/github-agent-workflow/io/agent-run-log'
 import { FakeGitHubClient } from '@/scripts/github-agent-workflow/io/fake-github-client'
 import type { GitHubIssue } from '@/scripts/github-agent-workflow/io/github-client'
-import { applyClosedCleanup, applyOpenProjection } from '@/scripts/github-agent-workflow/cli/reconcile-readiness'
+import { applyClosedCleanup, applyOpenProjection, inventoryOverlap, main as reconcileReadiness } from '@/scripts/github-agent-workflow/cli/reconcile-readiness'
 
 const tempRoots: string[] = []
 
@@ -160,6 +160,18 @@ describe('empty Depends on: fails closed', () => {
     expect(result.errors.length).toBe(0)
     expect(result.metadata.dependencies).toEqual([1])
     expect(result.metadata.dependsOnNone).toBe(false)
+  })
+
+  it.each(['#1,,#2', '#1,, ,#1', ',#1', '#1,'])('rejects empty comma-separated dependency positions: %s', (dependsOn) => {
+    const result = parseControlMetadata(READY_BODY.replace('Depends on: none', `Depends on: ${dependsOn}`), 'bug')
+    expect(result.diagnostics.map((diagnostic) => diagnostic.reasonCode)).toContain('queue.issue_dependency_syntax_invalid')
+  })
+
+  it('fails closed at the resolver boundary rather than normalizing malformed dependency tokens', async () => {
+    const target = { ...READY_ISSUE, labels: [], body: READY_BODY.replace('Depends on: none', 'Depends on: #2,,#3') }
+    const result = await new IssueReadinessResolver(new FakeGitHubClient({ issues: [target] })).resolveReadiness(1)
+    expect(result).toMatchObject({ dispatchable: false, state: 'needs-clarification' })
+    expect(result.reasonCodes).toContain('queue.issue_dependency_syntax_invalid')
   })
 
   it('Depends on: none works correctly', () => {
@@ -654,7 +666,9 @@ describe('syncReadinessLabels safe ordering', () => {
   })
 
   it('re-resolves dependency semantics immediately before ready promotion', async () => {
-    const target = { ...READY_ISSUE, labels: [] }
+    // Regression: dependency-blocked was present at entry, removed while
+    // transitioning to ready, then the confirmation discovers it reopened.
+    const target = { ...READY_ISSUE, labels: ['dependency-blocked'] }
     const client = new FakeGitHubClient({ issues: [target] })
     const result = await syncReadinessLabels(client, target, {
       issueNumber: 1, state: 'ready', dispatchable: true, executionMode: 'implementation', dependencies: [], reasonCodes: [], blockers: [], desiredReadinessLabels: ['ready-for-agent'], partial: false,
@@ -749,6 +763,57 @@ describe('syncReadinessLabels safe ordering', () => {
 })
 
 describe('reconcile apply freshness', () => {
+  it('rejects an overlapping open/closed discovery inventory before mutation planning', () => {
+    const open = new Map([[1, { ...READY_ISSUE, labels: [] }]])
+    expect(inventoryOverlap(open, [{ ...READY_ISSUE, state: 'closed', labels: [] }])).toEqual([1])
+  })
+
+  it('aborts full reconciliation before writes when an open dependency has an API failure sibling', async () => {
+    const target = { ...READY_ISSUE, labels: ['ready-for-agent'], body: READY_BODY.replace('Depends on: none', 'Depends on: #2, #3') }
+    const open = { ...READY_ISSUE, number: 2, labels: [] }
+    const client = new FakeGitHubClient({ issues: [target, open] })
+    client.setFailures({ getIssueFailures: { 3: 'server_error' } })
+    await expect(reconcileReadiness([], process.env, client)).rejects.toThrow('validation failed')
+    expect(client.addLabelCalls).toEqual([])
+    expect(client.removeLabelCalls).toEqual([])
+  })
+
+  it('aborts full reconciliation before writes on an overlapping open/closed inventory', async () => {
+    class OverlappingInventoryClient extends FakeGitHubClient {
+      override async listClosedIssues() {
+        return { issues: [{ ...READY_ISSUE, state: 'closed', labels: ['ready-for-agent'] }], hasMore: false }
+      }
+    }
+    const client = new OverlappingInventoryClient({ issues: [{ ...READY_ISSUE, labels: ['ready-for-agent'] }] })
+    await expect(reconcileReadiness([], process.env, client)).rejects.toThrow('validation failed')
+    expect(client.addLabelCalls).toEqual([])
+    expect(client.removeLabelCalls).toEqual([])
+  })
+
+  it('converges to the confirmed blocked labels when a dependency reopens at the ready boundary', async () => {
+    class ReopeningDependencyClient extends FakeGitHubClient {
+      private dependencyReads = 0
+
+      override async getIssue(number: number) {
+        const issue = await super.getIssue(number)
+        if (number !== 2) return issue
+        this.dependencyReads += 1
+        // applyOpenProjection's fresh read sees completion, while confirmReady
+        // sees the dependency reopen after stale dependency-blocked was removed.
+        return this.dependencyReads === 1 ? { ...issue, state: 'closed', stateReason: 'completed' } : issue
+      }
+    }
+    const target = { ...READY_ISSUE, labels: ['dependency-blocked'], body: READY_BODY.replace('Depends on: none', 'Depends on: #2') }
+    const dependency = { ...READY_ISSUE, number: 2, labels: [] }
+    const client = new ReopeningDependencyClient({ issues: [target, dependency] })
+    const staleReady = { issueNumber: 1, state: 'ready' as const, dispatchable: true, executionMode: 'implementation' as const, dependencies: [2], reasonCodes: [], blockers: [], desiredReadinessLabels: ['ready-for-agent' as const], partial: false }
+
+    await applyOpenProjection(client, { issue: target, readiness: staleReady, closedCleanup: false })
+
+    expect((await client.getIssue(1)).labels).toEqual(['dependency-blocked'])
+    expect(client.addLabelCalls).not.toContainEqual({ issueNumber: 1, label: 'ready-for-agent' })
+  })
+
   it('projects fresh ready state when a planned blocked issue changes before apply', async () => {
     const latest = { ...READY_ISSUE, labels: ['dependency-blocked'] }
     const client = new FakeGitHubClient({ issues: [latest] })
@@ -789,6 +854,49 @@ describe('reconcile apply freshness', () => {
 // Resolver concurrency and metrics
 // ============================================================
 describe('resolver concurrency and metrics', () => {
+  it('treats a completed tracking dependency as a satisfied terminal leaf', async () => {
+    const target = { ...READY_ISSUE, body: READY_BODY.replace('Depends on: none', 'Depends on: #2'), labels: [] }
+    const completedEpic = { ...READY_ISSUE, number: 2, title: '[EPIC] Done', body: 'Execution mode: tracking\nDepends on: #not-a-number', state: 'closed', stateReason: 'completed', labels: [] }
+    const result = await new IssueReadinessResolver(new FakeGitHubClient({ issues: [target, completedEpic] })).resolveFromIssue(target)
+    expect(result).toMatchObject({ dispatchable: true, state: 'ready', partial: false })
+  })
+
+  it('rejects an open tracking dependency while allowing no tracking exception for completed malformed leaves', async () => {
+    const target = { ...READY_ISSUE, body: READY_BODY.replace('Depends on: none', 'Depends on: #2'), labels: [] }
+    const openEpic = { ...READY_ISSUE, number: 2, title: '[EPIC] Open tracker', body: 'malformed historic epic', labels: [] }
+    const result = await new IssueReadinessResolver(new FakeGitHubClient({ issues: [target, openEpic] })).resolveFromIssue(target)
+    expect(result.reasonCodes).toContain('queue.issue_dependency_tracking')
+    expect(result.dispatchable).toBe(false)
+  })
+
+  it('fails closed for a pull request target even when its body is otherwise valid', async () => {
+    const pullRequestTarget = { ...READY_ISSUE, isPullRequest: true, labels: [] }
+    const result = await new IssueReadinessResolver(new FakeGitHubClient({ issues: [pullRequestTarget] })).resolveReadiness(1)
+    expect(result).toMatchObject({ dispatchable: false, partial: true, state: 'needs-clarification' })
+    expect(result.reasonCodes).toContain('queue.issue_dependency_is_pull_request')
+  })
+
+  it('prioritizes incomplete dependency evidence over ordinary open dependencies', async () => {
+    const target = { ...READY_ISSUE, body: READY_BODY.replace('Depends on: none', 'Depends on: #2, #3'), labels: [] }
+    const open = { ...READY_ISSUE, number: 2, labels: [] }
+    const client = new FakeGitHubClient({ issues: [target, open] })
+    client.setFailures({ getIssueFailures: { 3: 'server_error' } })
+    const result = await new IssueReadinessResolver(client).resolveFromIssue(target)
+    expect(result).toMatchObject({ state: 'dependency-blocked', partial: true, dispatchable: false })
+    expect(result.reasonCodes).toContain('queue.issue_dependency_lookup_failed')
+    expect(result.reasonCodes).not.toContain('queue.issue_dependency_open')
+  })
+
+  it.each(['not_found', 'server_error'] as const)('does not let an open dependency mask %s evidence', async (failure) => {
+    const target = { ...READY_ISSUE, body: READY_BODY.replace('Depends on: none', 'Depends on: #2, #3'), labels: [] }
+    const open = { ...READY_ISSUE, number: 2, labels: [] }
+    const client = new FakeGitHubClient({ issues: [target, open] })
+    client.setFailures({ getIssueFailures: { 3: failure } })
+    const result = await new IssueReadinessResolver(client).resolveFromIssue(target)
+    expect(result.reasonCodes).not.toContain('queue.issue_dependency_open')
+    expect(result.partial).toBe(failure === 'server_error')
+  })
+
   it('drops raw issue bodies from reconciliation snapshots without changing readiness', async () => {
     const client = new FakeGitHubClient({ issues: [{ ...READY_ISSUE, labels: [] }] })
     const resolver = new IssueReadinessResolver(client)
@@ -860,6 +968,19 @@ describe('resolver concurrency and metrics', () => {
     const result = await resolver.resolveFromIssue(issue)
     expect(result.reasonCodes).toContain('queue.issue_dependency_not_found')
     expect(resolver.apiFailureClasses).toMatchObject({ 'not-found': 1, permission: 1, 'rate-limit': 1, server: 1 })
+  })
+
+  it('classifies a 403 secondary-rate-limit response as rate limiting rather than permission denial', async () => {
+    class SecondaryRateLimitClient extends FakeGitHubClient {
+      override async getIssue(number: number) {
+        if (number === 2) throw new (await import('@/scripts/github-agent-workflow/io/github-client')).GitHubApiError('Forbidden.', 403, '/issues/2', { retryAfter: true, remainingZero: false })
+        return await super.getIssue(number)
+      }
+    }
+    const target = { ...READY_ISSUE, body: READY_BODY.replace('Depends on: none', 'Depends on: #2'), labels: [] }
+    const resolver = new IssueReadinessResolver(new SecondaryRateLimitClient({ issues: [target] }))
+    await resolver.resolveFromIssue(target)
+    expect(resolver.apiFailureClasses).toMatchObject({ 'rate-limit': 1, permission: 0 })
   })
 
   it('uses bounded concurrency for dependency fetching', async () => {

@@ -271,23 +271,12 @@ export function evaluateReadiness(input: ReadinessEvaluationInput): IssueReadine
     return buildResult(input.issueNumber, 'needs-clarification', input.controlMetadata, reasonCodes, blockers, input.graphLimitExceeded)
   }
 
-  // Check dependency states
-  const openDeps = input.dependencyFacts.filter((f) => f.state === 'open')
+  // Check dependency states. Incomplete or terminal-invalid graph evidence
+  // outranks an ordinary open dependency: reconciliation must not mutate from
+  // a graph that was only partially observed.
   const unsatisfiedDeps = input.dependencyFacts.filter(
     (f) => f.state === 'closed_not_planned' || f.state === 'closed_duplicate',
   )
-  if (openDeps.length > 0) {
-    reasonCodes.push('queue.issue_dependency_open')
-    for (const dep of openDeps) {
-      blockers.push({
-        reasonCode: 'queue.issue_dependency_open',
-        detail: `Dependency #${dep.issueNumber} is open.`,
-        dependencyIssueNumber: dep.issueNumber,
-      })
-    }
-    return buildResult(input.issueNumber, 'dependency-blocked', input.controlMetadata, reasonCodes, blockers, false)
-  }
-
   if (unsatisfiedDeps.length > 0) {
     reasonCodes.push('queue.issue_dependency_terminal_unsatisfied')
     for (const dep of unsatisfiedDeps) {
@@ -328,6 +317,19 @@ export function evaluateReadiness(input: ReadinessEvaluationInput): IssueReadine
       })
     }
     return buildResult(input.issueNumber, 'dependency-blocked', input.controlMetadata, reasonCodes, blockers, true)
+  }
+
+  const openDeps = input.dependencyFacts.filter((f) => f.state === 'open')
+  if (openDeps.length > 0) {
+    reasonCodes.push('queue.issue_dependency_open')
+    for (const dep of openDeps) {
+      blockers.push({
+        reasonCode: 'queue.issue_dependency_open',
+        detail: `Dependency #${dep.issueNumber} is open.`,
+        dependencyIssueNumber: dep.issueNumber,
+      })
+    }
+    return buildResult(input.issueNumber, 'dependency-blocked', input.controlMetadata, reasonCodes, blockers, false)
   }
 
   // All dependencies satisfied (or none) → ready
