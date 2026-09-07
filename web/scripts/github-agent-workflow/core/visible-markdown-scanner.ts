@@ -36,6 +36,11 @@ type BacktickRun = Readonly<{
   length: number
 }>
 
+type FenceState = Readonly<{
+  type: 'backtick' | 'tilde'
+  fenceLength: number
+}>
+
 function startsInlineBlockBoundary(line: string): boolean {
   if (line.trim() === '') return true
   if (line.startsWith('    ') || line.startsWith('\t')) return true
@@ -108,7 +113,7 @@ export function scanVisibleMarkdownLines(
     if (isBoundary) inlineRegion += 1
   }
 
-  let inFence: { type: 'backtick' | 'tilde'; fenceLength: number } | null = null
+  let inFence: FenceState | null = null
   let inHtmlComment = false
   let inlineCodeDelimiterLength: number | null = null
   let detailsDepth = 0
@@ -142,7 +147,7 @@ export function scanVisibleMarkdownLines(
     return null
   }
 
-  const tryOpenFence = (candidate: string): boolean => {
+  const parseFenceStart = (candidate: string): FenceState | null => {
     const leadingSpaces = candidate.match(/^ {0,3}/)?.[0].length ?? 0
     const contentAfterIndent = candidate.slice(leadingSpaces)
     const backtickMatch = contentAfterIndent.match(/^(```+)(.*)$/)
@@ -151,14 +156,12 @@ export function scanVisibleMarkdownLines(
     // CommonMark forbids backticks in a backtick-fence info string. Such a
     // line can still contain a code span, handled separately below.
     if (backtickMatch && backtickMatch[1].length >= 3 && !backtickMatch[2].includes('`')) {
-      inFence = { type: 'backtick', fenceLength: backtickMatch[1].length }
-      return true
+      return { type: 'backtick', fenceLength: backtickMatch[1].length }
     }
     if (tildeMatch && tildeMatch[1].length >= 3) {
-      inFence = { type: 'tilde', fenceLength: tildeMatch[1].length }
-      return true
+      return { type: 'tilde', fenceLength: tildeMatch[1].length }
     }
-    return false
+    return null
   }
 
   const processDetailsTokens = (segment: string): boolean => {
@@ -200,7 +203,8 @@ export function scanVisibleMarkdownLines(
     }
 
     if (processDetailsTokens(segment)) return
-    tryOpenFence(segment)
+    const openedFence = parseFenceStart(segment)
+    if (openedFence) inFence = openedFence
   }
 
   /**
@@ -298,7 +302,11 @@ export function scanVisibleMarkdownLines(
     // A genuine block fence can exist inside a details container. Detect it
     // before details token scanning so a literal </details> inside the fenced
     // code cannot prematurely escape the collapsed container.
-    if (tryOpenFence(line)) continue
+    const openedFence = parseFenceStart(line)
+    if (openedFence) {
+      inFence = openedFence
+      continue
+    }
 
     // Inline HTML comments and code spans are non-authoritative. Their visible
     // surrounding segments can still open/close persistent containers.

@@ -37,7 +37,10 @@ export function markerCommentPolicyForAction(action: string | undefined): 'alway
   return GRAPH_CHANGING_EVENTS.has(action ?? '') ? 'always' : 'on-projection-change'
 }
 
-export function reconcileWorkflowRef(event: GitHubIssuesEvent, env: NodeJS.ProcessEnv): string {
+export function reconcileWorkflowRef(
+  event: GitHubIssuesEvent,
+  env: Readonly<{ GITHUB_REF_NAME?: string }>,
+): string {
   const defaultBranch = event.repository?.default_branch?.trim()
   if (defaultBranch) return defaultBranch
 
