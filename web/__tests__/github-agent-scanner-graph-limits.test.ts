@@ -41,6 +41,19 @@ describe('authority scanner and bounded resolver graph', () => {
     expect(visible.lines.map((line) => line.text)).toContain('Depends on: none')
   })
 
+  it('keeps post-comment visible control text authoritative without synthesizing fragments', () => {
+    const visible = scanVisibleMarkdownLines([
+      '<!-- explanatory text -->Execution mode: implementation',
+      'Depends on: none',
+    ].join('\n')).lines.map((line) => line.text)
+
+    const splitVisible = scanVisibleMarkdownLines('Execution mode: imple<!-- split -->mentation').lines.map((line) => line.text)
+
+    expect(visible).toContain('Execution mode: implementation')
+    expect(visible).toContain('Depends on: none')
+    expect(splitVisible).toEqual(['Execution mode: imple', 'mentation'])
+  })
+
   it('does not accept control lines in a lazy blockquote continuation', async () => {
     const lazyBody = [
       body('none').replace('Execution mode: implementation\nDepends on: none', ''),

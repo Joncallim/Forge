@@ -46,14 +46,18 @@ async function applyClosedCleanup(client: GitHubClient, issue: GitHubIssue): Pro
 
 async function applyOpenProjection(client: GitHubClient, planned: PlannedIssue): Promise<number> {
   if (!planned.readiness) throw new Error(`Open issue #${planned.issue.number} has no readiness plan.`)
+  // Every open-plan item is re-read immediately before writes. In particular,
+  // a close event between discovery and apply must use terminal cleanup, never
+  // project a stale blocked/ready label set onto a closed issue.
+  const issue = await client.getIssue(planned.issue.number)
+  if (issue.state === 'closed') return await applyClosedCleanup(client, issue)
+
   // A planned-ready result is only a candidate for authority. Re-resolve it
   // immediately before its ready projection so a dependency or metadata change
   // during the bounded plan phase cannot promote stale readiness. If it became
   // non-ready, the same shared writer projects that fresh blocked state.
-  let issue = planned.issue
   let readiness = planned.readiness
   if (planned.readiness.dispatchable) {
-    issue = await client.getIssue(planned.issue.number)
     const freshResolver = new IssueReadinessResolver(client)
     readiness = await freshResolver.resolveFromIssue(issue)
     if (readiness.partial) throw new Error(`Fresh readiness result for #${issue.number} is partial.`)

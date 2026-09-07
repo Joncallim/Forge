@@ -77,6 +77,28 @@ export function scanVisibleMarkdownLines(
   // until a blank line ends the paragraph.
   let inLazyBlockQuoteContinuation = false
 
+  const appendVisibleSegment = (line: string, lineNumber: number, segment: string): void => {
+    // A comment within quoted or indented source remains non-authoritative;
+    // do not accidentally make one of its visible fragments authoritative.
+    if (line.startsWith('    ') || line.startsWith('\t') || line.trimStart().startsWith('>')) return
+    if (segment.trim() !== '') result.push({ lineNumber, text: segment })
+  }
+
+  const emitCommentFreeSegments = (line: string, lineNumber: number, startAt = 0): boolean => {
+    let cursor = startAt
+    while (true) {
+      const commentStart = line.indexOf('<!--', cursor)
+      if (commentStart === -1) {
+        appendVisibleSegment(line, lineNumber, line.slice(cursor))
+        return false
+      }
+      appendVisibleSegment(line, lineNumber, line.slice(cursor, commentStart))
+      const commentEnd = line.indexOf('-->', commentStart + 4)
+      if (commentEnd === -1) return true
+      cursor = commentEnd + 3
+    }
+  }
+
   for (let i = 0; i < rawLines.length; i++) {
     const line = rawLines[i]
 
@@ -94,15 +116,9 @@ export function scanVisibleMarkdownLines(
     if (!inHtmlComment && !inFence) {
       const commentStart = line.indexOf('<!--')
       if (commentStart !== -1) {
-        const commentEnd = line.indexOf('-->', commentStart + 4)
-        if (commentEnd === -1) {
-          // Multi-line HTML comment started
-          inHtmlComment = true
-          // Never join text across a comment boundary: doing so could turn
-          // untrusted fragments into a canonical control/header line.
-          continue
-        }
-        // A line containing comment elision is never authority-bearing.
+        // Keep each visible segment separate: comment elision must not join
+        // untrusted fragments into a synthetic control/header declaration.
+        inHtmlComment = emitCommentFreeSegments(line, i)
         continue
       }
     }
@@ -111,6 +127,7 @@ export function scanVisibleMarkdownLines(
       const commentEnd = line.indexOf('-->')
       if (commentEnd !== -1) {
         inHtmlComment = false
+        inHtmlComment = emitCommentFreeSegments(line, i, commentEnd + 3)
       }
       continue
     }
