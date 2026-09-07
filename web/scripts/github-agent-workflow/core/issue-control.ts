@@ -127,7 +127,7 @@ export function parseControlMetadata(
 
   if (dependsOnLines.length === 1) {
     const value = dependsOnLines[0].value
-    if (value.toLowerCase() === NONE_VALUE) {
+    if (value === NONE_VALUE) {
       dependencies = []
       dependsOnNone = true
     } else {
