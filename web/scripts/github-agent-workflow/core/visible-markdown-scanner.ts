@@ -115,6 +115,18 @@ export function scanVisibleMarkdownLines(
   for (let i = 0; i < rawLines.length; i++) {
     const line = rawLines[i]
 
+    // Detect collapsible containers before a same-line HTML comment can take
+    // the early-return path. Fenced code and multiline comment contents are
+    // intentionally excluded from this authority boundary.
+    if (!inFence && !inHtmlComment) {
+      const detailsOpenCount = (line.match(/<details\b[^>]*>/gi) ?? []).length
+      const detailsCloseCount = (line.match(/<\/details\s*>/gi) ?? []).length
+      if (detailsDepth > 0 || detailsOpenCount > 0 || detailsCloseCount > 0) {
+        detailsDepth = Math.max(0, detailsDepth + detailsOpenCount - detailsCloseCount)
+        continue
+      }
+    }
+
     // Handle HTML comments (multi-line)
     if (!inHtmlComment && !inFence) {
       const commentStart = line.indexOf('<!--')
@@ -172,16 +184,6 @@ export function scanVisibleMarkdownLines(
         continue
       }
       // Inside fence — skip entirely
-      continue
-    }
-
-    // Collapsible raw HTML is presentation content, not issue authority. A
-    // whole physical line containing a details tag is suppressed as well, so
-    // inline open/close tags cannot expose a synthetic control fragment.
-    const detailsOpenCount = (line.match(/<details\b[^>]*>/gi) ?? []).length
-    const detailsCloseCount = (line.match(/<\/details\s*>/gi) ?? []).length
-    if (detailsDepth > 0 || detailsOpenCount > 0 || detailsCloseCount > 0) {
-      detailsDepth = Math.max(0, detailsDepth + detailsOpenCount - detailsCloseCount)
       continue
     }
 

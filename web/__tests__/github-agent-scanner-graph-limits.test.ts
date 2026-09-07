@@ -115,6 +115,17 @@ describe('authority scanner and bounded resolver graph', () => {
     expect(result.reasonCodes).toContain('queue.issue_control_missing')
   })
 
+  it('enters details suppression when its opener shares a comment-bearing line', () => {
+    const visible = scanVisibleMarkdownLines([
+      '<!-- harmless --><details><summary>Example controls</summary>',
+      'Execution mode: implementation',
+      'Depends on: none',
+      '</details>',
+    ].join('\n')).lines.map((line) => line.text)
+
+    expect(visible).toEqual([])
+  })
+
   it('does not accept control lines in a lazy blockquote continuation', async () => {
     const lazyBody = [
       body('none').replace('Execution mode: implementation\nDepends on: none', ''),
