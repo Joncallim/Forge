@@ -138,10 +138,14 @@ export function scanVisibleMarkdownLines(
         continue
       }
 
-      const detailsOpenCount = (line.match(/<details\b[^>]*>/gi) ?? []).length
-      const detailsCloseCount = (line.match(/<\/details\s*>/gi) ?? []).length
-      if (detailsDepth > 0 || detailsOpenCount > 0 || detailsCloseCount > 0) {
-        detailsDepth = Math.max(0, detailsDepth + detailsOpenCount - detailsCloseCount)
+      const detailsTokens = line.match(/<details\b[^>]*>|<\/details\s*>/gi) ?? []
+      if (detailsDepth > 0 || detailsTokens.length > 0) {
+        // Process in source order: a stray close at depth zero is a no-op and
+        // must not cancel a later same-line opener.
+        for (const token of detailsTokens) {
+          if (token.startsWith('</')) detailsDepth = Math.max(0, detailsDepth - 1)
+          else detailsDepth++
+        }
         continue
       }
     }
