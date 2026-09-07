@@ -115,10 +115,22 @@ export async function runIssueValidation(
   // blocked event payloads that have become ready since delivery.
   const readinessResult = await new IssueReadinessResolver(client).resolveFromIssue(projectionIssue)
 
-  const projection = await syncReadinessLabels(client, projectionIssue, readinessResult)
+  // A ready promotion performs its own last-moment semantic confirmation.
+  // Preserve that result so the returned authority and marker comment cannot
+  // describe the earlier, now-stale ready calculation.
+  let confirmedReadinessResult: IssueReadinessResult | null = null
+  const projection = await syncReadinessLabels(client, projectionIssue, readinessResult, {
+    confirmReady: async () => {
+      const fresh = await new IssueReadinessResolver(client).resolveReadiness(issue.number)
+      confirmedReadinessResult = fresh
+      return fresh
+    },
+  })
   if (!projection.success) {
     throw new Error(projection.error ?? `Failed to project readiness labels for #${issue.number}.`)
   }
+
+  const effectiveReadinessResult = confirmedReadinessResult ?? readinessResult
 
   const projectionChanged = projection.addedLabels.length > 0 || projection.removedLabels.length > 0
   const shouldSyncMarkerComment = options.markerCommentPolicy !== 'on-projection-change' || projectionChanged
@@ -126,13 +138,13 @@ export async function runIssueValidation(
   if (shouldSyncMarkerComment) {
     const comments = await client.listComments(issue.number)
     existingMarkerComment = markerCommentForIssue(comments, options.botLogin)
-    await syncComment(client, projectionIssue, result, readinessResult, existingMarkerComment, options.botLogin)
+    await syncComment(client, projectionIssue, result, effectiveReadinessResult, existingMarkerComment, options.botLogin)
   }
 
   return {
     existingMarkerComment,
     result,
-    readinessResult,
+    readinessResult: effectiveReadinessResult,
   }
 }
 

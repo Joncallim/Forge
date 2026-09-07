@@ -18,6 +18,21 @@ class CommentCountingClient extends FakeGitHubClient {
   }
 }
 
+class DependencyReopensBeforeReadyConfirmationClient extends FakeGitHubClient {
+  private dependencyReads = 0
+
+  override async getIssue(issueNumber: number) {
+    const issue = await super.getIssue(issueNumber)
+    if (issueNumber !== 147) return issue
+
+    this.dependencyReads += 1
+    return {
+      ...issue,
+      state: this.dependencyReads === 1 ? 'closed' : 'open',
+    }
+  }
+}
+
 const FIXTURE_DIR = path.join(process.cwd(), '__tests__', '__fixtures__', 'github-agent-workflow')
 
 const READY_BODY = [
@@ -213,5 +228,46 @@ describe('GitHub issue validation', () => {
     expect(result.readinessResult?.dispatchable).toBe(true)
     expect((await client.getIssue(145)).labels).toContain('ready-for-agent')
     expect((await client.getIssue(145)).labels).not.toContain('needs-clarification')
+  })
+
+  it('returns and comments on the fresh blocked result when a dependency reopens immediately before ready promotion', async () => {
+    const client = new DependencyReopensBeforeReadyConfirmationClient({
+      issues: [
+        {
+          number: 146,
+          title: '[BUG] Target issue',
+          body: `${READY_BODY.replace('Depends on: none', 'Depends on: #147')}`,
+          labels: ['needs-clarification'],
+          state: 'open',
+          htmlUrl: 'https://github.com/Joncallim/Forge/issues/146',
+          authorLogin: 'Joncallim',
+          isPullRequest: false,
+          stateReason: null,
+          updatedAt: null,
+        },
+        {
+          number: 147,
+          title: '[BUG] Dependency issue',
+          body: READY_BODY,
+          labels: [],
+          state: 'closed',
+          htmlUrl: 'https://github.com/Joncallim/Forge/issues/147',
+          authorLogin: 'Joncallim',
+          isPullRequest: false,
+          stateReason: 'completed',
+          updatedAt: null,
+        },
+      ],
+    })
+
+    const result = await runIssueValidation(client, await client.getIssue(146), { botLogin: 'github-actions[bot]' })
+
+    expect(result.readinessResult?.dispatchable).toBe(false)
+    expect(result.readinessResult?.blockers).toEqual(expect.arrayContaining([
+      expect.objectContaining({ reasonCode: 'queue.issue_dependency_open', dependencyIssueNumber: 147 }),
+    ]))
+    expect((await client.getIssue(146)).labels).toContain('dependency-blocked')
+    expect((await client.getIssue(146)).labels).not.toContain('ready-for-agent')
+    expect((await client.listComments(146))[0]?.body).toContain('This issue is not semantically dispatchable.')
   })
 })
