@@ -20,6 +20,26 @@ class CommentCountingClient extends FakeGitHubClient {
 
 const FIXTURE_DIR = path.join(process.cwd(), '__tests__', '__fixtures__', 'github-agent-workflow')
 
+const READY_BODY = [
+  '## Bug Summary',
+  'Fresh issue state',
+  '## Current Behaviour',
+  'Broken',
+  '## Expected Behaviour',
+  'Fixed',
+  '## Reproduction Steps',
+  '1. Reproduce',
+  '## Impact',
+  'Low',
+  '## Severity',
+  'Low',
+  '## Acceptance Criteria',
+  '- [ ] Fixed',
+  '',
+  'Execution mode: implementation',
+  'Depends on: none',
+].join('\n')
+
 async function readFixture(name: string): Promise<string> {
   return await readFile(path.join(FIXTURE_DIR, name), 'utf8')
 }
@@ -165,5 +185,33 @@ describe('GitHub issue validation', () => {
 
     expect(client.listCommentCalls).toBe(1)
     expect(await client.listComments(144)).toHaveLength(1)
+  })
+
+  it('projects a current ready state when the supplied issue was stale and blocked', async () => {
+    const client = new FakeGitHubClient({
+      issues: [{
+        number: 145,
+        title: '[BUG] Current ready issue',
+        body: READY_BODY,
+        labels: ['needs-clarification'],
+        state: 'open',
+        htmlUrl: 'https://github.com/Joncallim/Forge/issues/145',
+        authorLogin: 'Joncallim',
+        isPullRequest: false,
+        stateReason: null,
+        updatedAt: null,
+      }],
+    })
+    const staleIssue = {
+      ...(await client.getIssue(145)),
+      body: 'incomplete stale event payload',
+      labels: ['needs-clarification'],
+    }
+
+    const result = await runIssueValidation(client, staleIssue, { botLogin: 'github-actions[bot]' })
+
+    expect(result.readinessResult?.dispatchable).toBe(true)
+    expect((await client.getIssue(145)).labels).toContain('ready-for-agent')
+    expect((await client.getIssue(145)).labels).not.toContain('needs-clarification')
   })
 })

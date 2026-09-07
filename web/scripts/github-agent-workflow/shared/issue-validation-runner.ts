@@ -100,25 +100,20 @@ export async function runIssueValidation(
   issue: GitHubIssue,
   options: RunIssueValidationOptions,
 ): Promise<ValidationExecutionResult> {
+  // The event payload is only a routing hint. Always obtain the live issue
+  // before calculating semantic authority or mutating its label projection.
+  const projectionIssue = await client.getIssue(issue.number)
+
   // Structural validation
   const result = validateIssue({
-    number: issue.number,
-    title: issue.title,
-    body: issue.body,
+    number: projectionIssue.number,
+    title: projectionIssue.title,
+    body: projectionIssue.body,
   })
 
-  // Semantic readiness resolution
-  const resolver = new IssueReadinessResolver(client)
-  let readinessResult = await resolver.resolveFromIssue(issue)
-
-  // Sync readiness labels
-  // Ready promotion must be based on a fresh semantic read immediately
-  // before the shared writer can add ready-for-agent.
-  let projectionIssue = issue
-  if (readinessResult.dispatchable) {
-    projectionIssue = await client.getIssue(issue.number)
-    readinessResult = await new IssueReadinessResolver(client).resolveFromIssue(projectionIssue)
-  }
+  // Resolve the same freshly fetched issue for every state, including stale
+  // blocked event payloads that have become ready since delivery.
+  const readinessResult = await new IssueReadinessResolver(client).resolveFromIssue(projectionIssue)
 
   const projection = await syncReadinessLabels(client, projectionIssue, readinessResult)
   if (!projection.success) {
@@ -131,7 +126,7 @@ export async function runIssueValidation(
   if (shouldSyncMarkerComment) {
     const comments = await client.listComments(issue.number)
     existingMarkerComment = markerCommentForIssue(comments, options.botLogin)
-    await syncComment(client, issue, result, readinessResult, existingMarkerComment, options.botLogin)
+    await syncComment(client, projectionIssue, result, readinessResult, existingMarkerComment, options.botLogin)
   }
 
   return {
