@@ -9,8 +9,31 @@
  */
 
 import { runMain } from './entrypoint'
+import type { IssueReadinessResult } from '../contracts/issue-readiness-result'
 import { RestGitHubClient } from '../io/github-client'
 import { IssueReadinessResolver } from '../shared/issue-readiness-resolver'
+
+/**
+ * Stable machine output for the pre-runtime gate.
+ *
+ * Blocker.detail is intentionally excluded: machine consumers decide from
+ * typed queue.* reason codes and bounded numeric dependency identifiers only.
+ */
+export function buildReadinessMachineOutput(readiness: IssueReadinessResult) {
+  return {
+    issueNumber: readiness.issueNumber,
+    state: readiness.state,
+    dispatchable: readiness.dispatchable,
+    executionMode: readiness.executionMode,
+    dependencies: readiness.dependencies,
+    reasonCodes: readiness.reasonCodes,
+    blockers: readiness.blockers.map((blocker) => ({
+      reasonCode: blocker.reasonCode,
+      dependencyIssueNumber: blocker.dependencyIssueNumber,
+    })),
+    desiredReadinessLabels: readiness.desiredReadinessLabels,
+  }
+}
 
 export async function main(argv: string[] = process.argv.slice(2), env: NodeJS.ProcessEnv = process.env): Promise<void> {
   const issueNumberArg = argv.find((v) => v === '--issue-number')
@@ -30,34 +53,18 @@ export async function main(argv: string[] = process.argv.slice(2), env: NodeJS.P
 
   try {
     const readiness = await resolver.resolveReadiness(issueNumber)
-
-    const output = {
-      issueNumber: readiness.issueNumber,
-      state: readiness.state,
-      dispatchable: readiness.dispatchable,
-      executionMode: readiness.executionMode,
-      dependencies: readiness.dependencies,
-      reasonCodes: readiness.reasonCodes,
-      blockers: readiness.blockers.map((b) => ({
-        reasonCode: b.reasonCode,
-        detail: b.detail,
-        dependencyIssueNumber: b.dependencyIssueNumber,
-      })),
-      desiredReadinessLabels: readiness.desiredReadinessLabels,
-    }
-
-    console.log(JSON.stringify(output, null, 2))
+    console.log(JSON.stringify(buildReadinessMachineOutput(readiness), null, 2))
 
     if (readiness.dispatchable) {
       process.exit(0)
     } else {
       process.exit(1)
     }
-  } catch (error) {
+  } catch {
     console.error(JSON.stringify({
-      error: error instanceof Error ? error.message : String(error),
       issueNumber,
       dispatchable: false,
+      reasonCodes: ['queue.issue_dependency_lookup_failed'],
     }, null, 2))
     process.exit(1)
   }
