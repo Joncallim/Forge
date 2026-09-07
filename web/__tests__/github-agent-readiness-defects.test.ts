@@ -29,7 +29,7 @@ import {
 } from '@/scripts/github-agent-workflow/io/agent-run-log'
 import { FakeGitHubClient } from '@/scripts/github-agent-workflow/io/fake-github-client'
 import type { GitHubIssue } from '@/scripts/github-agent-workflow/io/github-client'
-import { applyOpenProjection } from '@/scripts/github-agent-workflow/cli/reconcile-readiness'
+import { applyClosedCleanup, applyOpenProjection } from '@/scripts/github-agent-workflow/cli/reconcile-readiness'
 
 const tempRoots: string[] = []
 
@@ -678,6 +678,19 @@ describe('reconcile apply freshness', () => {
     }
 
     await applyOpenProjection(client, { issue: latest, readiness: staleBlockedResult, closedCleanup: false })
+
+    expect((await client.getIssue(1)).labels).toEqual(['ready-for-agent'])
+    expect(client.removeLabelCalls).toContainEqual({ issueNumber: 1, label: 'dependency-blocked' })
+    expect(client.addLabelCalls).toContainEqual({ issueNumber: 1, label: 'ready-for-agent' })
+  })
+
+  it('reclassifies a reopened closed-lane issue through fresh open projection', async () => {
+    const closedSnapshot = { ...READY_ISSUE, state: 'closed', labels: ['dependency-blocked'] }
+    const client = new FakeGitHubClient({
+      issues: [{ ...READY_ISSUE, state: 'open', labels: ['dependency-blocked'] }],
+    })
+
+    await applyClosedCleanup(client, closedSnapshot)
 
     expect((await client.getIssue(1)).labels).toEqual(['ready-for-agent'])
     expect(client.removeLabelCalls).toContainEqual({ issueNumber: 1, label: 'dependency-blocked' })

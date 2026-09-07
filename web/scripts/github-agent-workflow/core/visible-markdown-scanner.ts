@@ -79,6 +79,7 @@ export function scanVisibleMarkdownLines(
   // following non-quoted lines. Treat that continuation as non-authoritative
   // until a blank line ends the paragraph.
   let inLazyBlockQuoteContinuation = false
+  let inLazyListContinuation = false
 
   const appendVisibleSegment = (line: string, lineNumber: number, segment: string): void => {
     // A comment within quoted or indented source remains non-authoritative;
@@ -219,6 +220,22 @@ export function scanVisibleMarkdownLines(
       inLazyBlockQuoteContinuation = true
       continue
     }
+
+    // List paragraphs also support lazy continuation. Keep a conservative
+    // boundary through the next blank line so an unmarked line after a list
+    // item cannot become authority-bearing control metadata.
+    const isListItemLine = /^ {0,3}(?:[-+*]\s+|\d{1,9}[.)]\s+)/.test(line)
+    if (inLazyListContinuation && !isListItemLine) {
+      // A top-level ATX heading interrupts the list paragraph; preserve
+      // normal template section recognition after numbered instructions.
+      if (/^ {0,3}#{1,6}\s/.test(line)) {
+        inLazyListContinuation = false
+      } else {
+      if (line.trim() !== '') continue
+      inLazyListContinuation = false
+      }
+    }
+    if (isListItemLine) inLazyListContinuation = true
 
     // Handle indented code blocks (4+ spaces or tab)
     // Only start indented code when NOT inside a fence or HTML comment

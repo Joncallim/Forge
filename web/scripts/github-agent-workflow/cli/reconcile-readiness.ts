@@ -33,11 +33,18 @@ async function discoverClosedIssues(client: GitHubClient): Promise<{ issues: Git
   return { issues: [...issues.values()], incomplete: false }
 }
 
-async function applyClosedCleanup(client: GitHubClient, issue: GitHubIssue): Promise<number> {
+export async function applyClosedCleanup(client: GitHubClient, issue: GitHubIssue): Promise<number> {
   // The bounded discovery snapshot can be stale. A reopened issue belongs to
   // the open semantic plan, never closed-label cleanup.
   const current = await client.getIssue(issue.number)
-  if (current.state !== 'closed') return 0
+  if (current.state !== 'closed') {
+    // The closed-lane snapshot is stale. Re-enter the current open semantic
+    // path rather than silently leaving labels unprojected after a reopen.
+    const freshResolver = new IssueReadinessResolver(client)
+    const readiness = await freshResolver.resolveFromIssue(current)
+    if (readiness.partial) throw new Error(`Fresh readiness result for reopened #${current.number} is partial.`)
+    return await applyOpenProjection(client, { issue: current, readiness, closedCleanup: false })
+  }
   const labels = managedLabels(current.labels)
   for (const label of labels) await client.removeLabel(issue.number, label)
   if (managedLabels((await client.getIssue(issue.number)).labels).length !== 0) throw new Error(`Closed issue #${issue.number} still has managed readiness labels after cleanup.`)

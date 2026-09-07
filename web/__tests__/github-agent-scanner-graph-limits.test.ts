@@ -149,6 +149,29 @@ describe('authority scanner and bounded resolver graph', () => {
     expect(visible).toEqual([])
   })
 
+  it('does not accept control lines in a lazy list continuation', async () => {
+    const visible = scanVisibleMarkdownLines([
+      '- Example metadata follows as a list paragraph.',
+      'Execution mode: implementation',
+      'Depends on: none',
+    ].join('\n')).lines.map((line) => line.text)
+    expect(visible).toEqual(['- Example metadata follows as a list paragraph.'])
+
+    const target = {
+      ...issue(1, 'none'),
+      body: [
+        body('none').replace('Execution mode: implementation\nDepends on: none', ''),
+        '- Example metadata follows as a list paragraph.',
+        'Execution mode: implementation',
+        'Depends on: none',
+      ].join('\n'),
+    }
+    const result = await new IssueReadinessResolver(new FakeGitHubClient({ issues: [target] })).resolveFromIssue(target)
+
+    expect(result.dispatchable).toBe(false)
+    expect(result.reasonCodes).toContain('queue.issue_control_missing')
+  })
+
   it('does not accept control lines in a lazy blockquote continuation', async () => {
     const lazyBody = [
       body('none').replace('Execution mode: implementation\nDepends on: none', ''),
