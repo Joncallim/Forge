@@ -1,10 +1,10 @@
 /**
  * Bounded visible-Markdown scanner.
  *
- * Extracts only the "visible" lines of a Markdown document — ignoring fenced
- * code blocks, indented code, blockquotes, and HTML comments — so that
- * structural section detection and control-metadata parsing cannot be spoofed
- * by examples or hidden content.
+ * Extracts only the authority-bearing lines of a Markdown document — ignoring
+ * fenced/indented code, multiline code spans, blockquotes, HTML comments, and
+ * collapsed details content — so structural sections and control metadata
+ * cannot be spoofed by examples or hidden representations.
  *
  * This scanner is used by both:
  *   - sections.ts (required template section detection)
@@ -13,29 +13,15 @@
  * No GitHub calls, no model calls, no unbounded regex.
  */
 
-/**
- * Options for scanning visible Markdown lines.
- */
 export type VisibleMarkdownScannerOptions = Readonly<{
-  /**
-   * Maximum body bytes to accept. Bodies exceeding this bound fail closed.
-   */
+  /** Maximum body bytes to accept. Bodies exceeding this bound fail closed. */
   maxBodyBytes?: number
 }>
 
 const DEFAULT_MAX_BODY_BYTES = 256 * 1024 // 256 KiB
 
-/**
- * Result of scanning visible Markdown lines.
- */
 export type VisibleMarkdownLines = Readonly<{
-  /**
-   * The visible lines (0-indexed line numbers, original text).
-   */
   lines: readonly VisibleLine[]
-  /**
-   * Whether the body exceeded the maximum allowed size.
-   */
   bodyTooLarge: boolean
 }>
 
@@ -44,18 +30,24 @@ export type VisibleLine = Readonly<{
   text: string
 }>
 
+type BacktickRun = Readonly<{
+  index: number
+  end: number
+  length: number
+}>
+
 /**
- * Scan a Markdown body and return only visible lines.
+ * Scan a Markdown body and return only authority-bearing visible lines.
  *
- * Ignores:
- * - Fenced code blocks (``` and ~~~ with 3+ fence characters)
- *   - Opening fence: line starting with 3+ backticks or tildes, optionally followed by info string
- *   - Closing fence: line starting with at least as many fence chars as opening, followed by ONLY whitespace (CommonMark spec)
- * - Indented code blocks (lines starting with 4+ spaces or a tab)
- * - Blockquotes (lines starting with >)
- * - Multi-line HTML comments (<!-- ... -->)
+ * The scanner is deliberately conservative at representation boundaries: a
+ * physical line containing HTML-comment elision or a real inline-code span is
+ * never authority-bearing. Persistent suppression state is nevertheless
+ * tracked so later lines cannot escape a fence/comment/code/details container.
  *
- * The scanner is linear/O(n) and does not use catastrophic backtracking.
+ * The implementation is O(n). Backtick-run suffix availability is precomputed
+ * once so unmatched literal backticks do not spuriously suppress the remainder
+ * of the document and attacker-controlled backtick bombs cannot cause O(n²)
+ * lookahead.
  */
 export function scanVisibleMarkdownLines(
   body: string,
@@ -70,15 +62,51 @@ export function scanVisibleMarkdownLines(
   const rawLines = body.split(/\r?\n/)
   const result: VisibleLine[] = []
 
+  // Absolute line offsets plus the final occurrence of each maximal backtick
+  // run length let us decide in O(1) whether a run can open a code span.
+  const lineOffsets: number[] = []
+  const lastBacktickRunPosition = new Map<number, number>()
+  let absoluteOffset = 0
+  for (const line of rawLines) {
+    lineOffsets.push(absoluteOffset)
+    for (let cursor = 0; cursor < line.length;) {
+      const index = line.indexOf('`', cursor)
+      if (index === -1) break
+      let end = index + 1
+      while (end < line.length && line[end] === '`') end++
+      lastBacktickRunPosition.set(end - index, absoluteOffset + index)
+      cursor = end
+    }
+    absoluteOffset += line.length + 1
+  }
+
   let inFence: { type: 'backtick' | 'tilde'; fenceLength: number } | null = null
   let inHtmlComment = false
+  let inlineCodeDelimiterLength: number | null = null
   let detailsDepth = 0
   let inDetailsOpener = false
-  // CommonMark permits a paragraph in a blockquote to continue lazily on
-  // following non-quoted lines. Treat that continuation as non-authoritative
-  // until a blank line ends the paragraph.
   let inLazyBlockQuoteContinuation = false
   let inLazyListContinuation = false
+
+  const findBacktickRun = (line: string, startAt: number): BacktickRun | null => {
+    const index = line.indexOf('`', startAt)
+    if (index === -1) return null
+    let end = index + 1
+    while (end < line.length && line[end] === '`') end++
+    return { index, end, length: end - index }
+  }
+
+  const findOpenableBacktickRun = (line: string, lineOffset: number, startAt: number): BacktickRun | null => {
+    let cursor = startAt
+    while (cursor < line.length) {
+      const run = findBacktickRun(line, cursor)
+      if (!run) return null
+      const absolutePosition = lineOffset + run.index
+      if ((lastBacktickRunPosition.get(run.length) ?? absolutePosition) > absolutePosition) return run
+      cursor = run.end
+    }
+    return null
+  }
 
   const tryOpenFence = (candidate: string): boolean => {
     const leadingSpaces = candidate.match(/^ {0,3}/)?.[0].length ?? 0
@@ -87,7 +115,7 @@ export function scanVisibleMarkdownLines(
     const tildeMatch = !backtickMatch ? contentAfterIndent.match(/^(~~~+)(.*)$/) : null
 
     // CommonMark forbids backticks in a backtick-fence info string. Such a
-    // line is ordinary visible text, not a fence that can hide authority.
+    // line can still contain a code span, handled separately below.
     if (backtickMatch && backtickMatch[1].length >= 3 && !backtickMatch[2].includes('`')) {
       inFence = { type: 'backtick', fenceLength: backtickMatch[1].length }
       return true
@@ -99,13 +127,26 @@ export function scanVisibleMarkdownLines(
     return false
   }
 
-  const observeNonAuthoritativeLeadingSegment = (segment: string, hasVisiblePrefix: boolean): void => {
-    if (hasVisiblePrefix || segment.trim() === '') return
+  const processDetailsTokens = (segment: string): boolean => {
+    const detailsTokens = segment.match(/<details\b[^>]*>|<\/details\s*>/gi) ?? []
+    if (detailsTokens.length === 0) return false
+    for (const token of detailsTokens) {
+      if (token.startsWith('</')) detailsDepth = Math.max(0, detailsDepth - 1)
+      else detailsDepth++
+    }
+    return true
+  }
 
-    // A comment-bearing physical line is never authority-bearing, but visible
-    // Markdown before/after the comment can still open a container that hides
-    // later lines. Preserve those suppression states so comment elision cannot
-    // bypass fenced-code, details, blockquote, or list boundaries.
+  const observeNonAuthoritativeSegment = (segment: string, hasVisiblePrefix: boolean): void => {
+    if (segment.trim() === '') return
+
+    // While already inside details, a real close/open token in a visible
+    // segment remains structurally meaningful even if the physical line also
+    // contains an ignored comment/code span elsewhere.
+    if (detailsDepth > 0 && processDetailsTokens(segment)) return
+
+    if (hasVisiblePrefix) return
+
     if (/^ {0,3}>/.test(segment)) inLazyBlockQuoteContinuation = true
     if (/^ {0,3}(?:[-+*](?:\s+|$)|\d{1,9}[.)](?:\s+|$))/.test(segment)) inLazyListContinuation = true
 
@@ -124,50 +165,85 @@ export function scanVisibleMarkdownLines(
       return
     }
 
-    const detailsTokens = segment.match(/<details\b[^>]*>|<\/details\s*>/gi) ?? []
-    if (detailsDepth > 0 || detailsTokens.length > 0) {
-      for (const token of detailsTokens) {
-        if (token.startsWith('</')) detailsDepth = Math.max(0, detailsDepth - 1)
-        else detailsDepth++
-      }
-      return
-    }
-
+    if (processDetailsTokens(segment)) return
     tryOpenFence(segment)
   }
 
-  const consumeCommentedLine = (
+  /**
+   * Consume comments and real inline-code spans on one physical line.
+   * Returns true when the line contains/continues either representation and is
+   * therefore non-authoritative. Normal visible segments are observed only to
+   * preserve container state for following lines.
+   */
+  const consumeSuppressedInlineLine = (
     line: string,
+    lineOffset: number,
     startAt = 0,
     initialVisiblePrefix = false,
-  ): { inComment: boolean } => {
+  ): boolean => {
     let cursor = startAt
-    let hasVisiblePrefix = initialVisiblePrefix
+    let suppressed = inHtmlComment || inlineCodeDelimiterLength !== null
+    let hasVisiblePrefix = initialVisiblePrefix || inlineCodeDelimiterLength !== null
 
-    while (true) {
-      const commentStart = line.indexOf('<!--', cursor)
-      if (commentStart === -1) {
-        const segment = line.slice(cursor)
-        observeNonAuthoritativeLeadingSegment(segment, hasVisiblePrefix)
-        return { inComment: false }
+    while (cursor < line.length) {
+      if (inHtmlComment) {
+        suppressed = true
+        const commentEnd = line.indexOf('-->', cursor)
+        if (commentEnd === -1) return true
+        inHtmlComment = false
+        cursor = commentEnd + 3
+        continue
       }
 
-      const segment = line.slice(cursor, commentStart)
-      observeNonAuthoritativeLeadingSegment(segment, hasVisiblePrefix)
+      if (inlineCodeDelimiterLength !== null) {
+        suppressed = true
+        const run = findBacktickRun(line, cursor)
+        if (!run) return true
+        cursor = run.end
+        if (run.length === inlineCodeDelimiterLength) {
+          inlineCodeDelimiterLength = null
+          hasVisiblePrefix = true
+        }
+        continue
+      }
+
+      const commentStart = line.indexOf('<!--', cursor)
+      const backtickRun = findOpenableBacktickRun(line, lineOffset, cursor)
+      const nextIsComment = commentStart !== -1 && (!backtickRun || commentStart < backtickRun.index)
+      const tokenStart = nextIsComment ? commentStart : backtickRun?.index ?? -1
+
+      if (tokenStart === -1) {
+        if (suppressed) observeNonAuthoritativeSegment(line.slice(cursor), hasVisiblePrefix)
+        return suppressed
+      }
+
+      const segment = line.slice(cursor, tokenStart)
+      observeNonAuthoritativeSegment(segment, hasVisiblePrefix)
       if (segment.trim() !== '') hasVisiblePrefix = true
 
-      const commentEnd = line.indexOf('-->', commentStart + 4)
-      if (commentEnd === -1) return { inComment: true }
-      cursor = commentEnd + 3
+      // A visible segment before the suppression token may itself have opened
+      // a fence; the rest of this physical line is then fence info/content.
+      if (inFence) return true
+
+      suppressed = true
+      if (nextIsComment) {
+        inHtmlComment = true
+        cursor = commentStart + 4
+      } else if (backtickRun) {
+        inlineCodeDelimiterLength = backtickRun.length
+        hasVisiblePrefix = true
+        cursor = backtickRun.end
+      }
     }
+
+    return suppressed
   }
 
   for (let i = 0; i < rawLines.length; i++) {
     const line = rawLines[i]
 
-    // Fenced code has precedence over HTML comment syntax. A comment marker in
-    // a code block is plain code, and a would-be closing fence with trailing
-    // comment text must not close the fence.
+    // Fenced code has highest precedence: comment/backtick syntax inside the
+    // fence is literal code and cannot mutate any other suppression state.
     if (inFence) {
       const fenceChar = inFence.type === 'backtick' ? '`' : '~'
       const closingMatch = line.match(new RegExp(`^ {0,3}(${fenceChar}{${inFence.fenceLength},})\\s*$`))
@@ -175,31 +251,24 @@ export function scanVisibleMarkdownLines(
       continue
     }
 
-    // While inside an HTML comment, ignore comment contents completely. If the
-    // comment closes on this physical line, observe only the suffix after -->
-    // for suppression/container state. The entire physical line remains
-    // non-authoritative by contract.
-    if (inHtmlComment) {
-      const commentEnd = line.indexOf('-->')
-      if (commentEnd !== -1) {
-        inHtmlComment = false
-        const emission = consumeCommentedLine(line, commentEnd + 3)
-        inHtmlComment = emission.inComment
-      }
+    // Continue an already-open comment/code span before considering block
+    // constructs. A matching closer may update state for later physical lines,
+    // but this line itself remains non-authoritative.
+    if (inHtmlComment || inlineCodeDelimiterLength !== null) {
+      consumeSuppressedInlineLine(line, lineOffsets[i])
       continue
     }
 
-    // A physical line containing HTML-comment elision is never returned as an
-    // authority-bearing line. Process only the visible segments around comments
-    // so those segments can still establish fence/details/list/blockquote state;
-    // comment contents themselves must never mutate scanner state.
-    if (line.includes('<!--')) {
-      const emission = consumeCommentedLine(line)
-      inHtmlComment = emission.inComment
-      continue
-    }
+    // A genuine block fence can exist inside a details container. Detect it
+    // before details token scanning so a literal </details> inside the fenced
+    // code cannot prematurely escape the collapsed container.
+    if (tryOpenFence(line)) continue
 
-    // Handle collapsible details containers on comment-free lines.
+    // Inline HTML comments and code spans are non-authoritative. Their visible
+    // surrounding segments can still open/close persistent containers.
+    if (consumeSuppressedInlineLine(line, lineOffsets[i])) continue
+
+    // Handle collapsible details containers on lines with no comment/code span.
     if (inDetailsOpener) {
       if (line.includes('>')) {
         inDetailsOpener = false
@@ -208,8 +277,6 @@ export function scanVisibleMarkdownLines(
       continue
     }
 
-    // A raw HTML opener may span physical lines. Treat every line through its
-    // terminating `>` as non-authoritative rather than exposing hidden content.
     const hasDetailsStart = /<details\b/i.test(line)
     const hasCompleteDetailsOpen = /<details\b[^>]*>/i.test(line)
     if (hasDetailsStart && !hasCompleteDetailsOpen) {
@@ -217,19 +284,10 @@ export function scanVisibleMarkdownLines(
       continue
     }
 
-    const detailsTokens = line.match(/<details\b[^>]*>|<\/details\s*>/gi) ?? []
-    if (detailsDepth > 0 || detailsTokens.length > 0) {
-      // Process in source order: a stray close at depth zero is a no-op and
-      // must not cancel a later same-line opener.
-      for (const token of detailsTokens) {
-        if (token.startsWith('</')) detailsDepth = Math.max(0, detailsDepth - 1)
-        else detailsDepth++
-      }
+    if (detailsDepth > 0 || /<details\b[^>]*>|<\/details\s*>/i.test(line)) {
+      processDetailsTokens(line)
       continue
     }
-
-    // Handle fenced code block opening after comment/details handling.
-    if (tryOpenFence(line)) continue
 
     const isBlockQuoteLine = /^ {0,3}>/.test(line)
     if (inLazyBlockQuoteContinuation && !isBlockQuoteLine) {
@@ -246,8 +304,6 @@ export function scanVisibleMarkdownLines(
     // item cannot become authority-bearing control metadata.
     const isListItemLine = /^ {0,3}(?:[-+*](?:\s+|$)|\d{1,9}[.)](?:\s+|$))/.test(line)
     if (inLazyListContinuation && !isListItemLine) {
-      // A top-level ATX heading interrupts the list paragraph; preserve normal
-      // template section recognition after numbered instructions.
       if (/^ {0,3}#{1,6}\s/.test(line)) {
         inLazyListContinuation = false
       } else {
