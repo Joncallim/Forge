@@ -114,7 +114,14 @@ export function evaluateReadiness(input: ReadinessEvaluationInput): IssueReadine
   const reasonCodes: ReadinessReasonCode[] = []
   const incompleteDependencyEvidence = hasIncompleteDependencyEvidence(input)
 
-  // Check body size first
+  // Closed target state is terminal and does not depend on historical body or
+  // dependency validity. Closed issues are cleanup-only and never dispatchable.
+  if (input.issueState === 'closed') {
+    reasonCodes.push('queue.issue_closed')
+    return buildResult(input.issueNumber, 'closed', input.controlMetadata, reasonCodes, blockers, false)
+  }
+
+  // Check body size for open/unknown targets.
   if (input.bodyTooLarge) {
     reasonCodes.push('queue.issue_body_too_large')
     return buildResult(input.issueNumber, 'needs-clarification', input.controlMetadata, reasonCodes, blockers, true)
@@ -129,12 +136,6 @@ export function evaluateReadiness(input: ReadinessEvaluationInput): IssueReadine
       dependencyIssueNumber: null,
     })
     return buildResult(input.issueNumber, 'needs-clarification', input.controlMetadata, reasonCodes, blockers, true)
-  }
-
-  // Check if issue is closed
-  if (input.issueState === 'closed') {
-    reasonCodes.push('queue.issue_closed')
-    return buildResult(input.issueNumber, 'closed', input.controlMetadata, reasonCodes, blockers, false)
   }
 
   // Check structural validity
