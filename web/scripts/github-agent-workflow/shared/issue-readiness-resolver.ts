@@ -21,7 +21,7 @@
 import type { GitHubClient, GitHubIssue } from '../io/github-client'
 import { GitHubApiError } from '../io/github-client'
 import type { IssueType } from '../contracts/common'
-import type { IssueControlMetadata } from '../contracts/issue-control-metadata'
+import type { ControlDiagnostic, IssueControlMetadata } from '../contracts/issue-control-metadata'
 import type { IssueReadinessResult, ReadinessReasonCode } from '../contracts/issue-readiness-result'
 import type { ResolvedDependencyFact } from '../core/issue-readiness'
 import { evaluateReadiness } from '../core/issue-readiness'
@@ -42,6 +42,18 @@ export type ReadinessResolverOptions = Readonly<{
    * Maximum open issues to scan during full reconciliation.
    */
   maxOpenIssuesScan?: number
+}>
+
+/** Bounded, body-free facts retained by a full-reconcile snapshot. */
+export type SnapshotIssueReadinessFacts = Readonly<{
+  issueType: IssueType
+  metadata: IssueControlMetadata
+  structuralValid: boolean
+  structuralErrors: readonly string[]
+  bodyTooLarge: boolean
+  controlParseErrors: readonly string[]
+  controlDiagnostics: readonly ControlDiagnostic[]
+  hasDuplicateDeclaration: boolean
 }>
 
 const DEFAULT_FETCH_CONCURRENCY = 8
@@ -116,7 +128,24 @@ export class IssueReadinessResolver {
     // Control metadata
     const controlResult = parseControlMetadata(body, issueType)
 
-    const structuralValid = structuralResult.valid
+    return await this.resolveFromFacts(issue, {
+      issueType,
+      metadata: controlResult.metadata,
+      structuralValid: structuralResult.valid,
+      structuralErrors: structuralResult.missingSections,
+      bodyTooLarge,
+      controlParseErrors: controlResult.errors,
+      controlDiagnostics: controlResult.diagnostics,
+      hasDuplicateDeclaration: controlResult.hasDuplicateDeclaration,
+    })
+  }
+
+  /** Resolve a body-free issue retained by the bounded reconciliation snapshot. */
+  async resolveFromSnapshot(issue: GitHubIssue, facts: SnapshotIssueReadinessFacts): Promise<IssueReadinessResult> {
+    return await this.resolveFromFacts(issue, facts)
+  }
+
+  private async resolveFromFacts(issue: GitHubIssue, facts: SnapshotIssueReadinessFacts): Promise<IssueReadinessResult> {
 
     // Determine issue state
     const issueState = mapIssueState(issue.state)
@@ -127,14 +156,14 @@ export class IssueReadinessResolver {
     let hasCycle = false
     let graphLimitExceeded = false
 
-    if (!bodyTooLarge && !stateUnknown && controlResult.diagnostics.length === 0) {
+    if (!facts.bodyTooLarge && !stateUnknown && facts.controlDiagnostics.length === 0) {
       dependencyFacts = await this.resolveDependencies(
         issue.number,
-        controlResult.metadata,
+        facts.metadata,
       )
 
       // Cycle detection using the already-resolved dependency facts
-      const cycleResult = await this.detectCyclesAsync(issue.number, controlResult.metadata, dependencyFacts)
+      const cycleResult = await this.detectCyclesAsync(issue.number, facts.metadata, dependencyFacts)
       hasCycle = cycleResult.hasCycle
       graphLimitExceeded = cycleResult.limitExceeded
       dependencyFacts = cycleResult.facts
@@ -144,17 +173,17 @@ export class IssueReadinessResolver {
     return evaluateReadiness({
       issueNumber: issue.number,
       issueState,
-      issueType,
-      controlMetadata: controlResult.metadata,
-      structuralValid,
-      structuralErrors: structuralResult.missingSections,
+      issueType: facts.issueType,
+      controlMetadata: facts.metadata,
+      structuralValid: facts.structuralValid,
+      structuralErrors: facts.structuralErrors,
       dependencyFacts,
       hasCycle,
       graphLimitExceeded,
-      bodyTooLarge,
-      controlParseErrors: controlResult.errors,
-      controlDiagnostics: controlResult.diagnostics,
-      hasDuplicateDeclaration: controlResult.hasDuplicateDeclaration,
+      bodyTooLarge: facts.bodyTooLarge,
+      controlParseErrors: facts.controlParseErrors,
+      controlDiagnostics: facts.controlDiagnostics,
+      hasDuplicateDeclaration: facts.hasDuplicateDeclaration,
       stateUnknown,
     })
   }
@@ -519,11 +548,11 @@ export class IssueReadinessResolver {
    */
   async loadOpenIssueSnapshot(): Promise<{
     issues: Map<number, GitHubIssue>
-    parsedMetadata: Map<number, { issueType: IssueType; metadata: IssueControlMetadata; structuralValid: boolean }>
+    parsedMetadata: Map<number, SnapshotIssueReadinessFacts>
     exceededLimit: boolean
   }> {
     const issues = new Map<number, GitHubIssue>()
-    const parsedMetadata = new Map<number, { issueType: IssueType; metadata: IssueControlMetadata; structuralValid: boolean }>()
+    const parsedMetadata = new Map<number, SnapshotIssueReadinessFacts>()
     let page = 1
     let totalFetched = 0
     let hitMaxPages = false
@@ -537,22 +566,29 @@ export class IssueReadinessResolver {
 
         // Parse control metadata and structural validity, then discard raw body
         const issueType = detectIssueType({ title: issue.title, body: issue.body })
-        const controlResult = parseControlMetadata(issue.body ?? '', issueType)
+        const body = issue.body ?? ''
+        const scanResult = scanVisibleMarkdownLines(body)
+        const controlResult = parseControlMetadata(body, issueType)
         const structuralResult = validateIssue({
           number: issue.number,
           title: issue.title,
-          body: issue.body ?? '',
+          body,
         })
 
-        // Store normalized issue (body retained only for reference, but we can keep minimal)
-        // Keep body for final re-resolution but allow GC by retaining only bounded fields
-        issues.set(issue.number, issue)
+        // Do not retain raw issue bodies beyond this page. Planning consumes
+        // these parsed facts; ready promotion always fetches current GitHub truth.
+        issues.set(issue.number, { ...issue, body: null })
         totalFetched++
 
         parsedMetadata.set(issue.number, {
           issueType,
           metadata: controlResult.metadata,
           structuralValid: structuralResult.valid,
+          structuralErrors: structuralResult.missingSections,
+          bodyTooLarge: scanResult.bodyTooLarge,
+          controlParseErrors: controlResult.errors,
+          controlDiagnostics: controlResult.diagnostics,
+          hasDuplicateDeclaration: controlResult.hasDuplicateDeclaration,
         })
       }
 

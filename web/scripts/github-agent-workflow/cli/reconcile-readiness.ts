@@ -9,7 +9,8 @@ import { ISSUE_READINESS_MANAGED_LABELS } from '../contracts/common'
 const CLOSED_SCAN_MAX_PAGES = 50
 const ISSUE_PAGE_SIZE = 100
 type PlannedIssue = Readonly<{ issue: GitHubIssue; readiness: IssueReadinessResult | null; closedCleanup: boolean }>
-type ReconcilePlan = { scannedIssues: number; closedIssuesScanned: number; readyCount: number; blockedCount: number; clarificationCount: number; trackingOnlyCount: number; labelTransitions: number; apiFailures: number; elapsedMs: number; errors: string[] }
+type PlannedLabelMutation = Readonly<{ issueNumber: number; add: readonly string[]; remove: readonly string[] }>
+type ReconcilePlan = { scannedIssues: number; closedIssuesScanned: number; readyCount: number; blockedCount: number; clarificationCount: number; trackingOnlyCount: number; plannedLabelMutations: PlannedLabelMutation[]; labelTransitions: number; apiFailures: number; elapsedMs: number; errors: string[] }
 
 function managedLabels(labels: readonly string[]): string[] {
   return labels.filter((label) => ISSUE_READINESS_MANAGED_LABELS.includes(label as typeof ISSUE_READINESS_MANAGED_LABELS[number])).sort()
@@ -33,7 +34,11 @@ async function discoverClosedIssues(client: GitHubClient): Promise<{ issues: Git
 }
 
 async function applyClosedCleanup(client: GitHubClient, issue: GitHubIssue): Promise<number> {
-  const labels = managedLabels(issue.labels)
+  // The bounded discovery snapshot can be stale. A reopened issue belongs to
+  // the open semantic plan, never closed-label cleanup.
+  const current = await client.getIssue(issue.number)
+  if (current.state !== 'closed') return 0
+  const labels = managedLabels(current.labels)
   for (const label of labels) await client.removeLabel(issue.number, label)
   if (managedLabels((await client.getIssue(issue.number)).labels).length !== 0) throw new Error(`Closed issue #${issue.number} still has managed readiness labels after cleanup.`)
   return labels.length
@@ -67,7 +72,7 @@ export async function main(argv: string[] = process.argv.slice(2), env: NodeJS.P
   const value = (env.DRY_RUN || env.FORGE_RECONCILE_DRY_RUN || '').trim().toLowerCase()
   const dryRun = argv.includes('--dry-run') || value === 'true' || value === '1'
   const start = Date.now()
-  const plan: ReconcilePlan = { scannedIssues: 0, closedIssuesScanned: 0, readyCount: 0, blockedCount: 0, clarificationCount: 0, trackingOnlyCount: 0, labelTransitions: 0, apiFailures: 0, elapsedMs: 0, errors: [] }
+  const plan: ReconcilePlan = { scannedIssues: 0, closedIssuesScanned: 0, readyCount: 0, blockedCount: 0, clarificationCount: 0, trackingOnlyCount: 0, plannedLabelMutations: [], labelTransitions: 0, apiFailures: 0, elapsedMs: 0, errors: [] }
   const client = RestGitHubClient.fromEnv(env)
   const resolver = new IssueReadinessResolver(client)
   const planned: PlannedIssue[] = []
@@ -85,7 +90,9 @@ export async function main(argv: string[] = process.argv.slice(2), env: NodeJS.P
   console.info(JSON.stringify({ phase: 'plan', openIssues: plan.scannedIssues, closedIssues: plan.closedIssuesScanned }))
   for (const issue of snapshot.issues.values()) {
     try {
-      const readiness = await resolver.resolveFromIssue(issue)
+      const facts = snapshot.parsedMetadata.get(issue.number)
+      if (!facts) throw new Error(`Normalized readiness facts are missing for #${issue.number}.`)
+      const readiness = await resolver.resolveFromSnapshot(issue, facts)
       if (readiness.partial) plan.errors.push(`Readiness plan for #${issue.number} is partial.`)
       planned.push({ issue, readiness, closedCleanup: false })
       if (readiness.state === 'ready') plan.readyCount += 1
@@ -100,6 +107,13 @@ export async function main(argv: string[] = process.argv.slice(2), env: NodeJS.P
 
   console.info(JSON.stringify({ phase: 'validate', plannedIssues: planned.length }))
   if (planned.length !== plan.scannedIssues + plan.closedIssuesScanned) plan.errors.push('Discovery and plan counts do not match.')
+  for (const item of planned) {
+    const current = managedLabels(item.issue.labels)
+    const desired = item.closedCleanup ? [] : item.readiness?.desiredReadinessLabels ?? []
+    const add = desired.filter((label) => !current.includes(label))
+    const remove = current.filter((label) => !desired.includes(label as typeof ISSUE_READINESS_MANAGED_LABELS[number]))
+    if (add.length > 0 || remove.length > 0) plan.plannedLabelMutations.push({ issueNumber: item.issue.number, add, remove })
+  }
   if (plan.errors.length > 0) {
     plan.elapsedMs = Date.now() - start
     console.error(JSON.stringify({ phase: 'aborted', ...plan }))

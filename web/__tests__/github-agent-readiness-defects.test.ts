@@ -664,6 +664,21 @@ describe('syncReadinessLabels safe ordering', () => {
 // Resolver concurrency and metrics
 // ============================================================
 describe('resolver concurrency and metrics', () => {
+  it('drops raw issue bodies from reconciliation snapshots without changing readiness', async () => {
+    const client = new FakeGitHubClient({ issues: [{ ...READY_ISSUE, labels: [] }] })
+    const resolver = new IssueReadinessResolver(client)
+    const snapshot = await resolver.loadOpenIssueSnapshot()
+    const issue = snapshot.issues.get(1)
+    const facts = snapshot.parsedMetadata.get(1)
+
+    expect(issue?.body).toBeNull()
+    expect(facts).toBeDefined()
+    await expect(resolver.resolveFromSnapshot(issue!, facts!)).resolves.toMatchObject({
+      state: 'ready',
+      desiredReadinessLabels: ['ready-for-agent'],
+    })
+  })
+
   it('tracks unique dependency fetches and cache hits', async () => {
     // Create issues: A depends on B and C
     const issueA = { ...READY_ISSUE, number: 1, title: 'Issue A', body: READY_BODY.replace('Depends on: none', 'Depends on: #2, #3') }

@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest'
 import { IssueReadinessResolver } from '@/scripts/github-agent-workflow/shared/issue-readiness-resolver'
 import { FakeGitHubClient } from '@/scripts/github-agent-workflow/io/fake-github-client'
 import type { GitHubIssue } from '@/scripts/github-agent-workflow/io/github-client'
+import { scanVisibleMarkdownLines } from '@/scripts/github-agent-workflow/core/visible-markdown-scanner'
 
 function body(dependsOn: string, prefix = ''): string {
   return [
@@ -29,6 +30,17 @@ function issue(number: number, dependsOn: string): GitHubIssue {
 }
 
 describe('authority scanner and bounded resolver graph', () => {
+  it('does not treat a backtick-bearing info string as a fence opener', () => {
+    const visible = scanVisibleMarkdownLines([
+      '```language`invalid',
+      'Execution mode: implementation',
+      'Depends on: none',
+    ].join('\n'))
+
+    expect(visible.lines.map((line) => line.text)).toContain('Execution mode: implementation')
+    expect(visible.lines.map((line) => line.text)).toContain('Depends on: none')
+  })
+
   it('does not accept control lines in a lazy blockquote continuation', async () => {
     const lazyBody = [
       body('none').replace('Execution mode: implementation\nDepends on: none', ''),

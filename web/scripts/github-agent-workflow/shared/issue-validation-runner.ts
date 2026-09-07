@@ -21,6 +21,12 @@ import type { IssueReadinessResult } from '../contracts/issue-readiness-result'
 
 type RunIssueValidationOptions = {
   botLogin: string
+  /**
+   * Graph-changing issue events need a marker refresh even if labels are
+   * already correct. Label self-heal events can avoid a full comment-history
+   * scan unless this run actually changed the readiness projection.
+   */
+  markerCommentPolicy?: 'always' | 'on-projection-change'
 }
 
 type ValidationExecutionResult = {
@@ -105,9 +111,6 @@ export async function runIssueValidation(
   const resolver = new IssueReadinessResolver(client)
   let readinessResult = await resolver.resolveFromIssue(issue)
 
-  const comments = await client.listComments(issue.number)
-  const existingMarkerComment = markerCommentForIssue(comments, options.botLogin)
-
   // Sync readiness labels
   // Ready promotion must be based on a fresh semantic read immediately
   // before the shared writer can add ready-for-agent.
@@ -122,8 +125,14 @@ export async function runIssueValidation(
     throw new Error(projection.error ?? `Failed to project readiness labels for #${issue.number}.`)
   }
 
-  // Sync marker comment
-  await syncComment(client, issue, result, readinessResult, existingMarkerComment, options.botLogin)
+  const projectionChanged = projection.addedLabels.length > 0 || projection.removedLabels.length > 0
+  const shouldSyncMarkerComment = options.markerCommentPolicy !== 'on-projection-change' || projectionChanged
+  let existingMarkerComment: GitHubComment | null = null
+  if (shouldSyncMarkerComment) {
+    const comments = await client.listComments(issue.number)
+    existingMarkerComment = markerCommentForIssue(comments, options.botLogin)
+    await syncComment(client, issue, result, readinessResult, existingMarkerComment, options.botLogin)
+  }
 
   return {
     existingMarkerComment,

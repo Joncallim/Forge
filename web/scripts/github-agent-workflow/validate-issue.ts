@@ -32,6 +32,10 @@ type GitHubIssuesEvent = {
 const GRAPH_CHANGING_EVENTS = new Set(['opened', 'edited', 'closed', 'reopened'])
 const WRITE_LEVEL_PERMISSIONS = new Set(['admin', 'maintain', 'write'])
 
+export function markerCommentPolicyForAction(action: string | undefined): 'always' | 'on-projection-change' {
+  return GRAPH_CHANGING_EVENTS.has(action ?? '') ? 'always' : 'on-projection-change'
+}
+
 function issueNumberFromEvent(event: GitHubIssuesEvent, env: NodeJS.ProcessEnv): number {
   const eventNumber = event.issue?.number
   if (typeof eventNumber === 'number' && Number.isInteger(eventNumber) && eventNumber > 0) return eventNumber
@@ -108,7 +112,11 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<void> 
   const client = RestGitHubClient.fromEnv(env)
   const issueNumber = issueNumberFromEvent(event, env)
   const issue = await client.getIssue(issueNumber)
-  const { result, readinessResult } = await runIssueValidation(client, issue, { botLogin: botLoginFromEnv(env) })
+  const action = event.action ?? ''
+  const { result, readinessResult } = await runIssueValidation(client, issue, {
+    botLogin: botLoginFromEnv(env),
+    markerCommentPolicy: markerCommentPolicyForAction(action),
+  })
 
   console.info(JSON.stringify({
     structuralValidation: result,
@@ -116,7 +124,6 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<void> 
   }, null, 2))
 
   // Graph-changing events from trusted actors trigger full reconciliation
-  const action = event.action ?? ''
   if (GRAPH_CHANGING_EVENTS.has(action)) {
     if (await canActorTriggerFullReconcile(client, event)) {
       console.info('Graph-changing event from trusted actor. Dispatching full reconciliation.')

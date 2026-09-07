@@ -126,7 +126,9 @@ export function scanVisibleMarkdownLines(
       const backtickMatch = contentAfterIndent.match(/^(```+)(.*)$/)
       const tildeMatch = !backtickMatch ? contentAfterIndent.match(/^(~~~+)(.*)$/) : null
 
-      if (backtickMatch && backtickMatch[1].length >= 3) {
+      // CommonMark forbids backticks in a backtick-fence info string.  Such a
+      // line is ordinary visible text, not a fence that can hide authority.
+      if (backtickMatch && backtickMatch[1].length >= 3 && !backtickMatch[2].includes('`')) {
         inFence = { type: 'backtick', fenceLength: backtickMatch[1].length }
         continue
       }

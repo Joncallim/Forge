@@ -7,6 +7,16 @@ import {
   validateIssue,
 } from '@/scripts/github-agent-workflow/core/issue-validation'
 import { runIssueValidation } from '@/scripts/github-agent-workflow/shared/issue-validation-runner'
+import { markerCommentPolicyForAction } from '@/scripts/github-agent-workflow/validate-issue'
+
+class CommentCountingClient extends FakeGitHubClient {
+  listCommentCalls = 0
+
+  override async listComments(issueNumber: number) {
+    this.listCommentCalls += 1
+    return await super.listComments(issueNumber)
+  }
+}
 
 const FIXTURE_DIR = path.join(process.cwd(), '__tests__', '__fixtures__', 'github-agent-workflow')
 
@@ -15,6 +25,18 @@ async function readFixture(name: string): Promise<string> {
 }
 
 describe('GitHub issue validation', () => {
+  it.each([
+    ['opened', 'always'],
+    ['edited', 'always'],
+    ['closed', 'always'],
+    ['reopened', 'always'],
+    ['labeled', 'on-projection-change'],
+    ['unlabeled', 'on-projection-change'],
+    [undefined, 'on-projection-change'],
+  ] as const)('uses the expected marker policy for the %s intake action', (action, expected) => {
+    expect(markerCommentPolicyForAction(action)).toBe(expected)
+  })
+
   it('validates complete Feature, Bug, Other, and Epic issues', async () => {
     const cases = [
       { file: 'feature-h3-form.md', issueType: 'feature' as const },
@@ -94,5 +116,54 @@ describe('GitHub issue validation', () => {
     const secondRun = await runIssueValidation(client, await client.getIssue(142), { botLogin: 'github-actions[bot]' })
     expect(secondRun.result.valid).toBe(false)
     expect(await client.listComments(142)).toHaveLength(1)
+  })
+
+  it('skips comment history for unchanged label self-heal projections', async () => {
+    const body = await readFixture('bug-invalid.md')
+    const client = new CommentCountingClient({
+      issues: [{
+        number: 143,
+        title: '[BUG] Already projected validation issue',
+        body,
+        labels: ['needs-clarification'],
+        state: 'open',
+        htmlUrl: 'https://github.com/Joncallim/Forge/issues/143',
+        authorLogin: 'Joncallim',
+        isPullRequest: false,
+        stateReason: null,
+        updatedAt: null,
+      }],
+    })
+
+    const result = await runIssueValidation(client, await client.getIssue(143), {
+      botLogin: 'github-actions[bot]',
+      markerCommentPolicy: 'on-projection-change',
+    })
+
+    expect(result.existingMarkerComment).toBeNull()
+    expect(client.listCommentCalls).toBe(0)
+  })
+
+  it('refreshes the marker for normal validation events even when labels are unchanged', async () => {
+    const body = await readFixture('bug-invalid.md')
+    const client = new CommentCountingClient({
+      issues: [{
+        number: 144,
+        title: '[BUG] Normal validation issue',
+        body,
+        labels: ['needs-clarification'],
+        state: 'open',
+        htmlUrl: 'https://github.com/Joncallim/Forge/issues/144',
+        authorLogin: 'Joncallim',
+        isPullRequest: false,
+        stateReason: null,
+        updatedAt: null,
+      }],
+    })
+
+    await runIssueValidation(client, await client.getIssue(144), { botLogin: 'github-actions[bot]' })
+
+    expect(client.listCommentCalls).toBe(1)
+    expect(await client.listComments(144)).toHaveLength(1)
   })
 })
