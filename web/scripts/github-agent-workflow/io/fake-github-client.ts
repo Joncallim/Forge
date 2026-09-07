@@ -208,6 +208,7 @@ export class FakeGitHubClient implements GitHubClient {
   async listOpenIssues(options: { page?: number; perPage?: number; maxPages?: number } = {}): Promise<{
     issues: GitHubIssue[]
     hasMore: boolean
+    rawPageFullAtCap?: boolean
   }> {
     const page = options.page ?? 1
     const perPage = options.perPage ?? 100
@@ -229,7 +230,7 @@ export class FakeGitHubClient implements GitHubClient {
     const atPageCap = page >= maxPages
     const pageFull = pageIssues.length >= perPage && start + perPage < allIssues.length
 
-    return { issues: pageIssues, hasMore: !atPageCap && (pageFull || start + perPage < allIssues.length) }
+    return { issues: pageIssues, hasMore: !atPageCap && (pageFull || start + perPage < allIssues.length), rawPageFullAtCap: atPageCap && pageIssues.length >= perPage }
   }
 
   async listClosedIssues(options: { page?: number; perPage?: number; maxPages?: number; label?: string } = {}): Promise<{

@@ -321,6 +321,9 @@ export async function runDispatch(input: {
       })
     }
     if (!input.dryRun && canProjectBlocked) {
+      // The durable transition above is authoritative; project its labels in
+      // the same safe order used by handoff.
+      await input.client.removeLabel(input.issueNumber, 'agent-requested')
       await input.client.addLabel(input.issueNumber, 'agent-blocked')
     }
     const commentBody = dispatchBlockedComment({ issueNumber: input.issueNumber, runId: null, reason: semantic.reason! })
@@ -388,6 +391,7 @@ export async function runDispatch(input: {
       })
     }
     if (!input.dryRun && canProjectBlocked) {
+      await input.client.removeLabel(input.issueNumber, 'agent-requested')
       await input.client.addLabel(input.issueNumber, 'agent-blocked')
     }
     const commentBody = dispatchBlockedComment({ issueNumber: input.issueNumber, runId: latestRun?.runId ?? null, reason: blockedReason })

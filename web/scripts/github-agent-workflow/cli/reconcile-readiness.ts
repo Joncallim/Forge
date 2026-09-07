@@ -10,7 +10,7 @@ const CLOSED_SCAN_MAX_PAGES = 50
 const ISSUE_PAGE_SIZE = 100
 export type PlannedIssue = Readonly<{ issue: GitHubIssue; readiness: IssueReadinessResult | null; closedCleanup: boolean }>
 type PlannedLabelMutation = Readonly<{ issueNumber: number; add: readonly string[]; remove: readonly string[] }>
-type ReconcilePlan = { scannedIssues: number; closedIssuesScanned: number; readyCount: number; blockedCount: number; clarificationCount: number; trackingOnlyCount: number; plannedLabelMutations: PlannedLabelMutation[]; labelTransitions: number; apiFailures: number; elapsedMs: number; errors: string[] }
+type ReconcilePlan = { scannedIssues: number; closedIssuesScanned: number; readyCount: number; blockedCount: number; clarificationCount: number; trackingOnlyCount: number; plannedLabelMutations: PlannedLabelMutation[]; labelTransitions: number; apiFailures: number; uniqueDependencyFetches: number; dependencyCacheHits: number; graphLimitFailures: number; apiFailureClasses: Record<string, number>; elapsedMs: number; errors: string[] }
 
 function managedLabels(labels: readonly string[]): string[] {
   return labels.filter((label) => ISSUE_READINESS_MANAGED_LABELS.includes(label as typeof ISSUE_READINESS_MANAGED_LABELS[number])).sort()
@@ -51,6 +51,18 @@ export async function applyClosedCleanup(client: GitHubClient, issue: GitHubIssu
   return labels.length
 }
 
+/** First frozen apply lane: never add a non-ready projection while another
+ * planned non-ready target still advertises ready-for-agent. */
+async function removePlannedStaleReady(client: GitHubClient, item: PlannedIssue): Promise<number> {
+  if (!item.closedCleanup && item.readiness?.state === 'ready') return 0
+  const current = await client.getIssue(item.issue.number)
+  if (current.labels.includes('ready-for-agent')) {
+    await client.removeLabel(item.issue.number, 'ready-for-agent')
+    return 1
+  }
+  return 0
+}
+
 export async function applyOpenProjection(client: GitHubClient, planned: PlannedIssue): Promise<number> {
   if (!planned.readiness) throw new Error(`Open issue #${planned.issue.number} has no readiness plan.`)
   // Every open-plan item is re-read immediately before writes. In particular,
@@ -66,7 +78,11 @@ export async function applyOpenProjection(client: GitHubClient, planned: Planned
   const readiness = await freshResolver.resolveFromIssue(issue)
   if (readiness.partial) throw new Error(`Fresh readiness result for #${issue.number} is partial.`)
 
-  const projected = await syncReadinessLabels(client, issue, readiness)
+  const projected = await syncReadinessLabels(client, issue, readiness, {
+    // This callback is deliberately no-cache: it is the final semantic gate
+    // immediately before ready-for-agent can be added.
+    confirmReady: async () => await new IssueReadinessResolver(client).resolveReadiness(issue.number),
+  })
   if (!projected.success) throw new Error(projected.error ?? `Failed to project readiness for #${planned.issue.number}.`)
   // Require exact convergence: writer errors must never be a silent partial bulk run.
   if (!sameLabels(managedLabels((await client.getIssue(issue.number)).labels), readiness.desiredReadinessLabels)) {
@@ -79,7 +95,7 @@ export async function main(argv: string[] = process.argv.slice(2), env: NodeJS.P
   const value = (env.DRY_RUN || env.FORGE_RECONCILE_DRY_RUN || '').trim().toLowerCase()
   const dryRun = argv.includes('--dry-run') || value === 'true' || value === '1'
   const start = Date.now()
-  const plan: ReconcilePlan = { scannedIssues: 0, closedIssuesScanned: 0, readyCount: 0, blockedCount: 0, clarificationCount: 0, trackingOnlyCount: 0, plannedLabelMutations: [], labelTransitions: 0, apiFailures: 0, elapsedMs: 0, errors: [] }
+  const plan: ReconcilePlan = { scannedIssues: 0, closedIssuesScanned: 0, readyCount: 0, blockedCount: 0, clarificationCount: 0, trackingOnlyCount: 0, plannedLabelMutations: [], labelTransitions: 0, apiFailures: 0, uniqueDependencyFetches: 0, dependencyCacheHits: 0, graphLimitFailures: 0, apiFailureClasses: {}, elapsedMs: 0, errors: [] }
   const client = RestGitHubClient.fromEnv(env)
   const resolver = new IssueReadinessResolver(client)
   const planned: PlannedIssue[] = []
@@ -110,6 +126,10 @@ export async function main(argv: string[] = process.argv.slice(2), env: NodeJS.P
   }
   for (const issue of closed.issues) planned.push({ issue, readiness: null, closedCleanup: true })
   plan.apiFailures += resolver.apiFailures
+  plan.uniqueDependencyFetches = resolver.uniqueDependencyFetches
+  plan.dependencyCacheHits = resolver.cacheHits
+  plan.graphLimitFailures = resolver.graphLimitFailures
+  plan.apiFailureClasses = { ...resolver.apiFailureClasses }
   if (resolver.graphLimitFailures > 0) plan.errors.push(`Dependency graph limits were reached for ${resolver.graphLimitFailures} issue(s).`)
 
   console.info(JSON.stringify({ phase: 'validate', plannedIssues: planned.length }))
@@ -128,7 +148,22 @@ export async function main(argv: string[] = process.argv.slice(2), env: NodeJS.P
   }
   if (!dryRun) {
     console.info(JSON.stringify({ phase: 'apply', plannedIssues: planned.length }))
-    for (const item of planned) {
+    // Freeze globally: clear every stale ready label before any target can be
+    // promoted. Only targets with a planned mutation need a fresh apply; this
+    // keeps unchanged backlog items out of the per-target GET amplification.
+    const changed = new Set(plan.plannedLabelMutations.map((mutation) => mutation.issueNumber))
+    const nonReady = planned.filter((item) => item.closedCleanup || item.readiness?.state !== 'ready')
+    const ready = planned.filter((item) => !item.closedCleanup && item.readiness?.state === 'ready')
+    try {
+      for (const item of nonReady) {
+        if (changed.has(item.issue.number)) plan.labelTransitions += await removePlannedStaleReady(client, item)
+      }
+    } catch (error) {
+      plan.errors.push(`Apply failed while removing stale ready labels: ${error instanceof Error ? error.message : String(error)}`)
+    }
+    for (const item of [...nonReady, ...ready]) {
+      if (plan.errors.length > 0) break
+      if (!changed.has(item.issue.number)) continue
       try { plan.labelTransitions += item.closedCleanup ? await applyClosedCleanup(client, item.issue) : await applyOpenProjection(client, item) }
       catch (error) { plan.errors.push(`Apply failed for #${item.issue.number}: ${error instanceof Error ? error.message : String(error)}`); break }
     }

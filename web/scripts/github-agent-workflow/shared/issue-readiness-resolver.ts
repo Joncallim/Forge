@@ -78,6 +78,10 @@ export class IssueReadinessResolver {
   cacheHits = 0
   graphLimitFailures = 0
   apiFailures = 0
+  /** Bounded internal failure classifications for reconcile observability. */
+  readonly apiFailureClasses: Record<'not-found' | 'permission' | 'rate-limit' | 'network-timeout' | 'server' | 'invalid-response', number> = {
+    'not-found': 0, permission: 0, 'rate-limit': 0, 'network-timeout': 0, server: 0, 'invalid-response': 0,
+  }
 
   constructor(client: GitHubClient, options: ReadinessResolverOptions = {}) {
     this.client = client
@@ -156,7 +160,9 @@ export class IssueReadinessResolver {
     let hasCycle = false
     let graphLimitExceeded = false
 
-    if (!facts.bodyTooLarge && !stateUnknown && facts.controlDiagnostics.length === 0) {
+    // Closed targets are terminal projection cleanup.  They must not consume
+    // dependency graph/API budget merely because their historic body was valid.
+    if (issueState !== 'closed' && !facts.bodyTooLarge && !stateUnknown && facts.controlDiagnostics.length === 0) {
       dependencyFacts = await this.resolveDependencies(
         issue.number,
         facts.metadata,
@@ -375,6 +381,7 @@ export class IssueReadinessResolver {
     if (error instanceof GitHubApiError) {
       switch (error.status) {
         case 404:
+          this.apiFailureClasses['not-found']++
           return {
             issueNumber: dependencyNumber,
             state: 'not_found',
@@ -382,7 +389,7 @@ export class IssueReadinessResolver {
             transitiveDependencyIssueNumbers: [],
           }
         case 403:
-          // Could be permission or rate limit; treat as inaccessible
+          this.apiFailureClasses.permission++
           return {
             issueNumber: dependencyNumber,
             state: 'inaccessible',
@@ -390,7 +397,7 @@ export class IssueReadinessResolver {
             transitiveDependencyIssueNumbers: [],
           }
         case 429:
-          // Rate limited
+          this.apiFailureClasses['rate-limit']++
           return {
             issueNumber: dependencyNumber,
             state: 'inaccessible',
@@ -398,7 +405,7 @@ export class IssueReadinessResolver {
             transitiveDependencyIssueNumbers: [],
           }
         case 422:
-          // Schema/validation error
+          this.apiFailureClasses['invalid-response']++
           return {
             issueNumber: dependencyNumber,
             state: 'lookup_failed',
@@ -407,6 +414,7 @@ export class IssueReadinessResolver {
           }
         default:
           if (error.status >= 500) {
+            this.apiFailureClasses.server++
             return {
               issueNumber: dependencyNumber,
               state: 'lookup_failed',
@@ -414,6 +422,7 @@ export class IssueReadinessResolver {
               transitiveDependencyIssueNumbers: [],
             }
           }
+          this.apiFailureClasses['invalid-response']++
           return {
             issueNumber: dependencyNumber,
             state: 'lookup_failed',
@@ -425,6 +434,7 @@ export class IssueReadinessResolver {
 
     // Timeout/network errors (TypeError, AbortError, etc.)
     if (error instanceof TypeError || (error instanceof Error && error.name === 'AbortError')) {
+      this.apiFailureClasses['network-timeout']++
       return {
         issueNumber: dependencyNumber,
         state: 'lookup_failed',
@@ -433,6 +443,7 @@ export class IssueReadinessResolver {
       }
     }
 
+    this.apiFailureClasses['invalid-response']++
     // Fallback
     return {
       issueNumber: dependencyNumber,
@@ -558,7 +569,7 @@ export class IssueReadinessResolver {
     let hitMaxPages = false
 
     while (true) {
-      const { issues: pageIssues, hasMore } = await this.client.listOpenIssues({ page, perPage: 100 })
+      const { issues: pageIssues, hasMore, rawPageFullAtCap = false } = await this.client.listOpenIssues({ page, perPage: 100 })
       for (const issue of pageIssues) {
         if (totalFetched >= this.options.maxOpenIssuesScan) {
           return { issues, parsedMetadata, exceededLimit: true }
@@ -594,7 +605,7 @@ export class IssueReadinessResolver {
 
       if (!hasMore) {
         // If page is at maxPages and the page was full, mark incomplete
-        if (page >= 50 && pageIssues.length >= 100) {
+        if (rawPageFullAtCap) {
           hitMaxPages = true
         }
         break
@@ -602,7 +613,21 @@ export class IssueReadinessResolver {
       page++
     }
 
+    // Populate the same dependency cache used by graph resolution with
+    // normalized, body-free facts.  Full reconcile therefore reuses open
+    // inventory and fetches only references absent from it.
+    for (const [number, issue] of issues) {
+      const facts = parsedMetadata.get(number)
+      if (facts) this.dependencyCache.set(number, Promise.resolve(this.snapshotDependencyFact(issue, facts)))
+    }
     return { issues, parsedMetadata, exceededLimit: hitMaxPages }
+  }
+
+  private snapshotDependencyFact(issue: GitHubIssue, facts: SnapshotIssueReadinessFacts): ResolvedDependencyFact {
+    if (issue.isPullRequest) return { issueNumber: issue.number, state: 'is_pull_request', reasonCode: 'queue.issue_dependency_is_pull_request' as ReadinessReasonCode, transitiveDependencyIssueNumbers: [] }
+    if (facts.metadata.executionMode === 'tracking' || facts.issueType === 'epic') return { issueNumber: issue.number, state: 'tracking_only', reasonCode: 'queue.issue_dependency_tracking' as ReadinessReasonCode, transitiveDependencyIssueNumbers: [] }
+    if (issue.state === 'open') return { issueNumber: issue.number, state: 'open', reasonCode: 'queue.issue_dependency_open' as ReadinessReasonCode, transitiveDependencyIssueNumbers: facts.metadata.dependencies, controlDiagnostics: facts.controlDiagnostics }
+    return { issueNumber: issue.number, state: 'closed_unknown', reasonCode: 'queue.issue_dependency_state_unknown' as ReadinessReasonCode, transitiveDependencyIssueNumbers: [] }
   }
 
   /**

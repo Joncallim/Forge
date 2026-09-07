@@ -60,6 +60,7 @@ export async function syncReadinessLabels(
   client: GitHubClient,
   issue: GitHubIssue,
   readinessResult: IssueReadinessResult,
+  options: { confirmReady?: () => Promise<IssueReadinessResult> } = {},
 ): Promise<ProjectionResult> {
   const addedLabels: string[] = []
   const removedLabels: string[] = []
@@ -171,6 +172,34 @@ export async function syncReadinessLabels(
 
   // Step 4: For non-ready to ready, add ready-for-agent LAST
   if (!currentReadinessLabels.includes('ready-for-agent') && desiredLabels.includes('ready-for-agent')) {
+    // Target state preflights alone cannot see a dependency reopening after
+    // planning. Re-resolve the complete semantic graph at the exact ready
+    // promotion boundary and converge to its fresh non-ready result instead.
+    if (options.confirmReady) {
+      try {
+        const fresh = await options.confirmReady()
+        if (fresh.partial) {
+          return { success: false, error: `Fresh readiness confirmation for #${issue.number} is partial.`, addedLabels, removedLabels }
+        }
+        desiredLabels = fresh.desiredReadinessLabels
+      } catch {
+        return { success: false, error: `Failed to confirm fresh readiness for #${issue.number} before adding ready-for-agent.`, addedLabels, removedLabels }
+      }
+    }
+    if (!desiredLabels.includes('ready-for-agent')) {
+      // We have already removed stale labels above. Re-enter the non-ready
+      // convergence path without ever emitting a false-ready projection.
+      for (const label of desiredLabels) {
+        if (!currentReadinessLabels.includes(label)) {
+          const preflightFailure = await preflightLabelMutation()
+          if (preflightFailure) return preflightFailure
+          try { await client.addLabel(liveIssue.number, label); addedLabels.push(label) }
+          catch { return { success: false, error: `Failed to add fresh readiness label ${label} to #${issue.number}.`, addedLabels, removedLabels } }
+        }
+      }
+    }
+
+    if (desiredLabels.includes('ready-for-agent')) {
     // Verify no stale blocker labels remain before adding ready
     try {
       const labelsAfter = (await client.getIssue(liveIssue.number)).labels
@@ -209,6 +238,7 @@ export async function syncReadinessLabels(
           removedLabels,
         }
       }
+    }
     }
   }
 

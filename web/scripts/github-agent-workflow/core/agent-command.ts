@@ -309,6 +309,9 @@ export async function runAgentCommand(input: {
         commentId: command.commentId,
       },
     })
+    // The durable requested record is authoritative.  Only after it exists may
+    // the UX projection recover from a prior blocked run.
+    await input.client.removeLabel(input.issue.number, 'agent-blocked')
     await input.client.addLabel(input.issue.number, 'agent-requested')
   }
 

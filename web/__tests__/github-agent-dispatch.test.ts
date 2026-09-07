@@ -77,6 +77,19 @@ afterEach(async () => {
 })
 
 describe('agent dispatch', () => {
+  it('durably blocks before removing requested and adding blocked, preserving the run on label failure', async () => {
+    const root = await tempRepositoryRoot()
+    const blockedIssue = { ...READY_ISSUE, body: READY_ISSUE_BODY.replace('Depends on: none', 'Depends on: #999') }
+    await seedRequestedRun(root, blockedIssue)
+    const client = new FakeGitHubClient({ issues: [{ ...blockedIssue, labels: ['agent-requested'] }] })
+    client.setFailures({ addLabelFailures: ['agent-blocked'] })
+
+    await expect(runDispatch({ client, issueNumber: blockedIssue.number, runLogRepositoryRoot: root, botLogin: 'github-actions[bot]' })).rejects.toThrow()
+    expect((await findLatestRunForIssue(blockedIssue.number, { repositoryRoot: root }))?.status).toBe('blocked')
+    expect(client.removeLabelCalls).toContainEqual({ issueNumber: blockedIssue.number, label: 'agent-requested' })
+    expect((await client.getIssue(blockedIssue.number)).labels).not.toContain('agent-requested')
+  })
+
   it('dispatches a ready issue with a requested run without starting a runtime', async () => {
     const root = await tempRepositoryRoot()
     await seedRequestedRun(root)

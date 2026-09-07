@@ -75,6 +75,18 @@ function seedClient(
 }
 
 describe('GitHub agent command routing', () => {
+  it('persists a recovered requested run before clearing stale blocked label and surfaces label failure', async () => {
+    const client = seedClient({ ...READY_ISSUE, labels: ['ready-for-agent', 'agent-blocked'] })
+    client.setFailures({ removeLabelFailures: ['agent-blocked'] })
+    const recorder = new CollectingRunRecorder()
+    await expect(runAgentCommand({
+      client, issue: { ...READY_ISSUE, labels: ['ready-for-agent', 'agent-blocked'] }, comment: { id: 110, body: 'codex implement', authorLogin: 'Joncallim' }, botLogin: 'github-actions[bot]', recorder, githubRunId: 1234567888, githubRunAttempt: 1,
+    })).rejects.toThrow()
+    expect(recorder.records).toHaveLength(1)
+    expect(client.addLabelCalls).not.toContainEqual({ issueNumber: 143, label: 'agent-requested' })
+    expect((await client.getIssue(143)).labels).toContain('agent-blocked')
+  })
+
   it('accepts a Claude implementation request on a ready issue', async () => {
     const client = seedClient(READY_ISSUE)
     const recorder = new CollectingRunRecorder()

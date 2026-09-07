@@ -55,6 +55,8 @@ export interface GitHubClient {
   listOpenIssues(options?: { page?: number; perPage?: number; maxPages?: number }): Promise<{
     issues: GitHubIssue[]
     hasMore: boolean
+    /** True when the unfiltered REST page filled the configured scan cap. */
+    rawPageFullAtCap?: boolean
   }>
   /**
    * List closed issues in the repository, paginated.
@@ -296,6 +298,7 @@ export class RestGitHubClient implements GitHubClient {
   async listOpenIssues(options: { page?: number; perPage?: number; maxPages?: number } = {}): Promise<{
     issues: GitHubIssue[]
     hasMore: boolean
+    rawPageFullAtCap?: boolean
   }> {
     const page = options.page ?? 1
     const perPage = options.perPage ?? LIST_ISSUES_PAGE_SIZE
@@ -314,7 +317,7 @@ export class RestGitHubClient implements GitHubClient {
     // A full final page at the page cap must mark the scan incomplete
     const atPageCap = page >= maxPages
     const pageFull = raw.length >= perPage
-    return { issues, hasMore: !atPageCap && pageFull }
+    return { issues, hasMore: !atPageCap && pageFull, rawPageFullAtCap: atPageCap && pageFull }
   }
 
   async listClosedIssues(options: { page?: number; perPage?: number; maxPages?: number; label?: string } = {}): Promise<{

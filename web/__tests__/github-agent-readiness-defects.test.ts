@@ -556,6 +556,21 @@ describe('FakeGitHubClient pagination', () => {
     expect(page50.issues.length).toBe(100)
     // At page cap, hasMore should be false even though more data exists
     expect(page50.hasMore).toBe(false)
+    expect(page50.rawPageFullAtCap).toBe(true)
+  })
+
+  it('treats a raw full capped /issues page containing PRs as incomplete', async () => {
+    class RawCappedPageClient extends FakeGitHubClient {
+      override async listOpenIssues() {
+        const page = await super.listOpenIssues({ page: 1, perPage: 100 })
+        // The REST endpoint returns PRs too. The post-filter issue count is
+        // deliberately below 100, but rawPageFullAtCap remains authoritative.
+        return { ...page, issues: page.issues.slice(0, 99), hasMore: false, rawPageFullAtCap: true }
+      }
+    }
+    const issues = Array.from({ length: 100 }, (_, index) => ({ ...READY_ISSUE, number: index + 1, title: `Issue ${index + 1}` }))
+    const snapshot = await new IssueReadinessResolver(new RawCappedPageClient({ issues })).loadOpenIssueSnapshot()
+    expect(snapshot.exceededLimit).toBe(true)
   })
 
   it('failure injection works', async () => {
@@ -636,6 +651,21 @@ describe('syncReadinessLabels safe ordering', () => {
 
     expect(result.success).toBe(true)
     expect(result.addedLabels).toContain('ready-for-agent')
+  })
+
+  it('re-resolves dependency semantics immediately before ready promotion', async () => {
+    const target = { ...READY_ISSUE, labels: [] }
+    const client = new FakeGitHubClient({ issues: [target] })
+    const result = await syncReadinessLabels(client, target, {
+      issueNumber: 1, state: 'ready', dispatchable: true, executionMode: 'implementation', dependencies: [], reasonCodes: [], blockers: [], desiredReadinessLabels: ['ready-for-agent'], partial: false,
+    }, {
+      confirmReady: async () => ({
+        issueNumber: 1, state: 'dependency-blocked', dispatchable: false, executionMode: 'implementation', dependencies: [2], reasonCodes: ['queue.issue_dependency_open'], blockers: [{ reasonCode: 'queue.issue_dependency_open', detail: 'Dependency reopened.', dependencyIssueNumber: 2 }], desiredReadinessLabels: ['dependency-blocked'], partial: false,
+      }),
+    })
+    expect(result.success).toBe(true)
+    expect((await client.getIssue(1)).labels).toEqual(['dependency-blocked'])
+    expect(client.addLabelCalls).not.toContainEqual({ issueNumber: 1, label: 'ready-for-agent' })
   })
 
   it('refuses to add ready-for-agent when blocker labels remain', async () => {
@@ -790,6 +820,46 @@ describe('resolver concurrency and metrics', () => {
     // Resolve again - should hit cache
     await resolver.resolveFromIssue(issueA)
     expect(resolver.cacheHits).toBeGreaterThanOrEqual(2)
+  })
+
+  it('reuses normalized open snapshot facts for fan-in without dependency GETs', async () => {
+    class CountingClient extends FakeGitHubClient {
+      getCalls = 0
+      override async getIssue(number: number) { this.getCalls += 1; return await super.getIssue(number) }
+    }
+    const dependency = { ...READY_ISSUE, number: 1, labels: [], title: 'Dependency' }
+    const targets = Array.from({ length: 250 }, (_, index) => ({
+      ...READY_ISSUE, number: index + 2, labels: [], title: `Target ${index + 2}`,
+      body: READY_BODY.replace('Depends on: none', 'Depends on: #1'),
+    }))
+    const client = new CountingClient({ issues: [dependency, ...targets] })
+    const resolver = new IssueReadinessResolver(client)
+    const snapshot = await resolver.loadOpenIssueSnapshot()
+    await Promise.all([...snapshot.issues.values()].map(async (issue) => await resolver.resolveFromSnapshot(issue, snapshot.parsedMetadata.get(issue.number)!)))
+    // Snapshot planning is O(issues + unique absent edges): the shared open
+    // dependency was never refetched once per target (or even once at all).
+    expect(resolver.uniqueDependencyFetches).toBe(0)
+    expect(client.getCalls).toBe(0)
+    expect(resolver.cacheHits).toBeGreaterThanOrEqual(250)
+  })
+
+  it('short-circuits closed targets before dependency traversal', async () => {
+    const closed = { ...READY_ISSUE, state: 'closed', body: READY_BODY.replace('Depends on: none', 'Depends on: #99') }
+    const client = new FakeGitHubClient({ issues: [closed] })
+    const resolver = new IssueReadinessResolver(client)
+    const result = await resolver.resolveFromIssue(closed)
+    expect(result.dispatchable).toBe(false)
+    expect(resolver.uniqueDependencyFetches).toBe(0)
+  })
+
+  it('keeps public readiness codes stable while exposing typed API failure metrics', async () => {
+    const issue = { ...READY_ISSUE, body: READY_BODY.replace('Depends on: none', 'Depends on: #2, #3, #4, #5') }
+    const client = new FakeGitHubClient({ issues: [issue] })
+    client.setFailures({ getIssueFailures: { 2: 'not_found', 3: 'forbidden', 4: 'rate_limited', 5: 'server_error' } })
+    const resolver = new IssueReadinessResolver(client)
+    const result = await resolver.resolveFromIssue(issue)
+    expect(result.reasonCodes).toContain('queue.issue_dependency_not_found')
+    expect(resolver.apiFailureClasses).toMatchObject({ 'not-found': 1, permission: 1, 'rate-limit': 1, server: 1 })
   })
 
   it('uses bounded concurrency for dependency fetching', async () => {
