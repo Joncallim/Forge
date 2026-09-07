@@ -81,41 +81,85 @@ export function scanVisibleMarkdownLines(
   let inLazyBlockQuoteContinuation = false
   let inLazyListContinuation = false
 
-  const appendVisibleSegment = (line: string, lineNumber: number, segment: string): void => {
-    // A comment within quoted or indented source remains non-authoritative;
-    // do not accidentally make one of its visible fragments authoritative.
-    if (
-      inLazyBlockQuoteContinuation ||
-      inLazyListContinuation ||
-      line.startsWith('    ') ||
-      line.startsWith('\t') ||
-      line.trimStart().startsWith('>')
-    ) return
-    if (segment.trim() !== '') result.push({ lineNumber, text: segment })
+  const tryOpenFence = (candidate: string): boolean => {
+    const leadingSpaces = candidate.match(/^ {0,3}/)?.[0].length ?? 0
+    const contentAfterIndent = candidate.slice(leadingSpaces)
+    const backtickMatch = contentAfterIndent.match(/^(```+)(.*)$/)
+    const tildeMatch = !backtickMatch ? contentAfterIndent.match(/^(~~~+)(.*)$/) : null
+
+    // CommonMark forbids backticks in a backtick-fence info string. Such a
+    // line is ordinary visible text, not a fence that can hide authority.
+    if (backtickMatch && backtickMatch[1].length >= 3 && !backtickMatch[2].includes('`')) {
+      inFence = { type: 'backtick', fenceLength: backtickMatch[1].length }
+      return true
+    }
+    if (tildeMatch && tildeMatch[1].length >= 3) {
+      inFence = { type: 'tilde', fenceLength: tildeMatch[1].length }
+      return true
+    }
+    return false
   }
 
-  const emitCommentFreeSegments = (
+  const observeNonAuthoritativeLeadingSegment = (segment: string, hasVisiblePrefix: boolean): void => {
+    if (hasVisiblePrefix || segment.trim() === '') return
+
+    // A comment-bearing physical line is never authority-bearing, but visible
+    // Markdown before/after the comment can still open a container that hides
+    // later lines. Preserve those suppression states so comment elision cannot
+    // bypass fenced-code, details, blockquote, or list boundaries.
+    if (/^ {0,3}>/.test(segment)) inLazyBlockQuoteContinuation = true
+    if (/^ {0,3}(?:[-+*](?:\s+|$)|\d{1,9}[.)](?:\s+|$))/.test(segment)) inLazyListContinuation = true
+
+    if (inDetailsOpener) {
+      if (segment.includes('>')) {
+        inDetailsOpener = false
+        detailsDepth = 1
+      }
+      return
+    }
+
+    const hasDetailsStart = /<details\b/i.test(segment)
+    const hasCompleteDetailsOpen = /<details\b[^>]*>/i.test(segment)
+    if (hasDetailsStart && !hasCompleteDetailsOpen) {
+      inDetailsOpener = true
+      return
+    }
+
+    const detailsTokens = segment.match(/<details\b[^>]*>|<\/details\s*>/gi) ?? []
+    if (detailsDepth > 0 || detailsTokens.length > 0) {
+      for (const token of detailsTokens) {
+        if (token.startsWith('</')) detailsDepth = Math.max(0, detailsDepth - 1)
+        else detailsDepth++
+      }
+      return
+    }
+
+    tryOpenFence(segment)
+  }
+
+  const consumeCommentedLine = (
     line: string,
-    lineNumber: number,
     startAt = 0,
     initialVisiblePrefix = false,
   ): { inComment: boolean; hasVisiblePrefix: boolean } => {
     let cursor = startAt
-    let sawComment = startAt > 0
     let hasVisiblePrefix = initialVisiblePrefix
+
     while (true) {
       const commentStart = line.indexOf('<!--', cursor)
       if (commentStart === -1) {
         const segment = line.slice(cursor)
-        if (!sawComment || !hasVisiblePrefix) appendVisibleSegment(line, lineNumber, segment)
+        observeNonAuthoritativeLeadingSegment(segment, hasVisiblePrefix)
+        if (segment.trim() !== '') hasVisiblePrefix = true
         return { inComment: false, hasVisiblePrefix }
       }
+
       const segment = line.slice(cursor, commentStart)
-      if (!sawComment || !hasVisiblePrefix) appendVisibleSegment(line, lineNumber, segment)
+      observeNonAuthoritativeLeadingSegment(segment, hasVisiblePrefix)
       if (segment.trim() !== '') hasVisiblePrefix = true
+
       const commentEnd = line.indexOf('-->', commentStart + 4)
       if (commentEnd === -1) return { inComment: true, hasVisiblePrefix }
-      sawComment = true
       cursor = commentEnd + 3
     }
   }
@@ -163,13 +207,14 @@ export function scanVisibleMarkdownLines(
       }
     }
 
-    // Handle HTML comments (multi-line)
+    // Handle HTML comments (multi-line). A physical line containing comment
+    // elision is never returned as authority-bearing visible text. We still
+    // observe any leading visible segments for container-open state so a
+    // comment cannot hide the start of a fence/details/list/blockquote.
     if (!inHtmlComment && !inFence) {
       const commentStart = line.indexOf('<!--')
       if (commentStart !== -1) {
-        // Keep each visible segment separate: comment elision must not join
-        // untrusted fragments into a synthetic control/header declaration.
-        const emission = emitCommentFreeSegments(line, i)
+        const emission = consumeCommentedLine(line)
         inHtmlComment = emission.inComment
         htmlCommentHasVisiblePrefix = emission.hasVisiblePrefix
         continue
@@ -180,7 +225,7 @@ export function scanVisibleMarkdownLines(
       const commentEnd = line.indexOf('-->')
       if (commentEnd !== -1) {
         inHtmlComment = false
-        const emission = emitCommentFreeSegments(line, i, commentEnd + 3, htmlCommentHasVisiblePrefix)
+        const emission = consumeCommentedLine(line, commentEnd + 3, htmlCommentHasVisiblePrefix)
         inHtmlComment = emission.inComment
         htmlCommentHasVisiblePrefix = emission.hasVisiblePrefix
       }
@@ -189,25 +234,7 @@ export function scanVisibleMarkdownLines(
 
     // Handle fenced code blocks
     if (!inFence) {
-      // Opening fence: 3+ backticks or tildes at start of line (after optional whitespace)
-      // Per CommonMark, an indented code block has 4+ spaces prefix, but a fenced code block
-      // can have up to 3 spaces of indentation before the fence characters
-      const leadingSpaces = line.match(/^ {0,3}/)?.[0].length ?? 0
-      const contentAfterIndent = line.slice(leadingSpaces)
-
-      const backtickMatch = contentAfterIndent.match(/^(```+)(.*)$/)
-      const tildeMatch = !backtickMatch ? contentAfterIndent.match(/^(~~~+)(.*)$/) : null
-
-      // CommonMark forbids backticks in a backtick-fence info string.  Such a
-      // line is ordinary visible text, not a fence that can hide authority.
-      if (backtickMatch && backtickMatch[1].length >= 3 && !backtickMatch[2].includes('`')) {
-        inFence = { type: 'backtick', fenceLength: backtickMatch[1].length }
-        continue
-      }
-      if (tildeMatch && tildeMatch[1].length >= 3) {
-        inFence = { type: 'tilde', fenceLength: tildeMatch[1].length }
-        continue
-      }
+      if (tryOpenFence(line)) continue
     } else {
       // Closing fence: at least as many fence chars as opening, followed by ONLY whitespace
       // Per CommonMark spec, trailing non-whitespace after the closing fence sequence
@@ -243,8 +270,8 @@ export function scanVisibleMarkdownLines(
       if (/^ {0,3}#{1,6}\s/.test(line)) {
         inLazyListContinuation = false
       } else {
-      if (line.trim() !== '') continue
-      inLazyListContinuation = false
+        if (line.trim() !== '') continue
+        inLazyListContinuation = false
       }
     }
     if (isListItemLine) inLazyListContinuation = true
@@ -258,7 +285,6 @@ export function scanVisibleMarkdownLines(
       }
     }
 
-    // Handle blockquotes
     // Visible line
     if (!inFence && !inHtmlComment) {
       result.push({ lineNumber: i, text: line })
