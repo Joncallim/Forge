@@ -182,6 +182,16 @@ describe('authority scanner and bounded resolver graph', () => {
     expect(visible).toEqual(['- Example metadata follows as a list paragraph.'])
   })
 
+  it('does not let a comment on the list marker bypass continuation suppression', () => {
+    const visible = scanVisibleMarkdownLines([
+      '- Example metadata <!-- harmless -->',
+      'Execution mode: implementation',
+      'Depends on: none',
+    ].join('\n')).lines.map((line) => line.text)
+
+    expect(visible).toEqual([])
+  })
+
   it('does not accept control lines in a lazy blockquote continuation', async () => {
     const lazyBody = [
       body('none').replace('Execution mode: implementation\nDepends on: none', ''),

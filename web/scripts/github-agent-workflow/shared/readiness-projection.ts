@@ -61,10 +61,28 @@ export async function syncReadinessLabels(
   issue: GitHubIssue,
   readinessResult: IssueReadinessResult,
 ): Promise<ProjectionResult> {
-  const currentLabels = issue.labels
-  const desiredLabels = readinessResult.desiredReadinessLabels
   const addedLabels: string[] = []
   const removedLabels: string[] = []
+
+  // Re-check live state before the first mutation. The semantic result may
+  // have been computed from an issue that was closed in the intervening
+  // interval; closed issues must only have managed labels cleaned up.
+  let liveIssue: GitHubIssue
+  try {
+    liveIssue = await client.getIssue(issue.number)
+  } catch {
+    return {
+      success: false,
+      error: `Failed to verify current issue state for #${issue.number} before readiness projection.`,
+      addedLabels,
+      removedLabels,
+    }
+  }
+
+  const currentLabels = liveIssue.labels
+  const desiredLabels: readonly string[] = liveIssue.state.toLowerCase() === 'closed'
+    ? []
+    : readinessResult.desiredReadinessLabels
 
   // Determine current readiness labels
   const currentReadinessLabels = currentLabels.filter((l) =>
@@ -79,7 +97,7 @@ export async function syncReadinessLabels(
   // Step 1: If transitioning ready to non-ready, remove ready-for-agent FIRST
   if (currentReadinessLabels.includes('ready-for-agent') && !desiredLabels.includes('ready-for-agent')) {
     try {
-      await client.removeLabel(issue.number, 'ready-for-agent')
+      await client.removeLabel(liveIssue.number, 'ready-for-agent')
       removedLabels.push('ready-for-agent')
     } catch {
       return {
@@ -98,7 +116,7 @@ export async function syncReadinessLabels(
     if (label === 'ready-for-agent' && removedLabels.includes(label)) continue
     if (!desiredLabels.includes(label as typeof ISSUE_READINESS_MANAGED_LABELS[number])) {
       try {
-        await client.removeLabel(issue.number, label)
+        await client.removeLabel(liveIssue.number, label)
         removedLabels.push(label)
       } catch {
         return {
@@ -115,7 +133,7 @@ export async function syncReadinessLabels(
   for (const label of desiredLabels) {
     if (label !== 'ready-for-agent' && !currentReadinessLabels.includes(label)) {
       try {
-        await client.addLabel(issue.number, label)
+        await client.addLabel(liveIssue.number, label)
         addedLabels.push(label)
       } catch {
         return {
@@ -132,7 +150,7 @@ export async function syncReadinessLabels(
   if (!currentReadinessLabels.includes('ready-for-agent') && desiredLabels.includes('ready-for-agent')) {
     // Verify no stale blocker labels remain before adding ready
     try {
-      const labelsAfter = (await client.getIssue(issue.number)).labels
+      const labelsAfter = (await client.getIssue(liveIssue.number)).labels
       const staleLabels = labelsAfter.filter((label) => (
         ISSUE_READINESS_MANAGED_LABELS.includes(label as typeof ISSUE_READINESS_MANAGED_LABELS[number])
         && !desiredLabels.includes(label as typeof ISSUE_READINESS_MANAGED_LABELS[number])
@@ -155,7 +173,7 @@ export async function syncReadinessLabels(
     }
 
     try {
-      await client.addLabel(issue.number, 'ready-for-agent')
+      await client.addLabel(liveIssue.number, 'ready-for-agent')
       addedLabels.push('ready-for-agent')
     } catch {
       return {
@@ -170,7 +188,7 @@ export async function syncReadinessLabels(
   // Verify the exact managed-label projection, including labels that GitHub
   // accepted but did not persist as expected.
   try {
-    const finalLabels = (await client.getIssue(issue.number)).labels.filter((label) => (
+    const finalLabels = (await client.getIssue(liveIssue.number)).labels.filter((label) => (
       ISSUE_READINESS_MANAGED_LABELS.includes(label as typeof ISSUE_READINESS_MANAGED_LABELS[number])
     ))
     if (!setsEqual(new Set(finalLabels), new Set(desiredLabels))) {

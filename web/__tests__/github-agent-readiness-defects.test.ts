@@ -659,6 +659,30 @@ describe('syncReadinessLabels safe ordering', () => {
     expect(result.success).toBe(true)
     expect(result.addedLabels).toContain('ready-for-agent')
   })
+
+  it('uses the live closed state for cleanup instead of adding stale readiness labels', async () => {
+    const staleOpenIssue = { ...READY_ISSUE, state: 'open', labels: ['needs-clarification'] }
+    const client = new FakeGitHubClient({
+      issues: [{ ...READY_ISSUE, state: 'closed', labels: ['needs-clarification'] }],
+    })
+
+    const result = await syncReadinessLabels(client, staleOpenIssue, {
+      issueNumber: 1,
+      state: 'ready',
+      dispatchable: true,
+      executionMode: 'implementation',
+      dependencies: [],
+      reasonCodes: [],
+      blockers: [],
+      desiredReadinessLabels: ['ready-for-agent'],
+      partial: false,
+    })
+
+    expect(result.success).toBe(true)
+    expect(result.addedLabels).toEqual([])
+    expect(result.removedLabels).toEqual(['needs-clarification'])
+    expect((await client.getIssue(1)).labels).toEqual([])
+  })
 })
 
 describe('reconcile apply freshness', () => {

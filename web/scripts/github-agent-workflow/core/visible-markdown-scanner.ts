@@ -127,6 +127,12 @@ export function scanVisibleMarkdownLines(
     // the early-return path. Fenced code and multiline comment contents are
     // intentionally excluded from this authority boundary.
     if (!inFence && !inHtmlComment) {
+      // Establish lazy-container context before comment handling can take its
+      // early-return path. A marker with an inline comment still starts the
+      // same CommonMark paragraph context.
+      if (/^ {0,3}>/.test(line)) inLazyBlockQuoteContinuation = true
+      if (/^ {0,3}(?:[-+*]\s+|\d{1,9}[.)]\s+)/.test(line)) inLazyListContinuation = true
+
       if (inDetailsOpener) {
         if (line.includes('>')) {
           inDetailsOpener = false
