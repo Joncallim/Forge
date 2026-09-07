@@ -62,6 +62,8 @@ describe('exact control metadata grammar', () => {
     ['same-line comment before fence', ['<!-- harmless -->```', 'Execution mode: implementation', 'Depends on: none', '```']],
     ['multiline comment close before fence', ['<!-- comment begins', '-->```', 'Execution mode: implementation', 'Depends on: none', '```']],
     ['multiline comment close before details', ['<!-- comment begins', '--><details>', 'Execution mode: implementation', 'Depends on: none', '</details>']],
+    ['multiline inline-code span', ['`example metadata', 'Execution mode: implementation', 'Depends on: none', '`']],
+    ['multiline triple-backtick code span', ['```language`invalid', 'Execution mode: implementation', 'Depends on: none', '```']],
   ])('does not authorize controls hidden by %s', async (_name, hiddenControls) => {
     const target = {
       ...issue('none'),
@@ -107,5 +109,27 @@ describe('exact control metadata grammar', () => {
       state: 'ready',
       reasonCodes: [],
     })
+  })
+
+  it.each([
+    ['fenced code', ['```', '</details>', '```']],
+    ['inline code span', ['`', '</details>', '`']],
+    ['HTML comment', ['<!-- </details> -->']],
+  ])('does not let %s inside details escape the collapsed authority boundary', async (_name, falseCloser) => {
+    const target = {
+      ...issue('none'),
+      body: [
+        withoutControlBlock(validBugBody('none')),
+        '<details>',
+        ...falseCloser,
+        'Execution mode: implementation',
+        'Depends on: none',
+        '</details>',
+      ].join('\n'),
+    }
+    const result = await new IssueReadinessResolver(new FakeGitHubClient({ issues: [target] })).resolveFromIssue(target)
+
+    expect(result.dispatchable).toBe(false)
+    expect(result.reasonCodes).toContain('queue.issue_control_missing')
   })
 })
