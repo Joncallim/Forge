@@ -15,7 +15,7 @@ import { readGitHubEvent } from './io/event'
 import { RestGitHubClient, type GitHubClient } from './io/github-client'
 import { runIssueValidation } from './shared/issue-validation-runner'
 
-type GitHubIssuesEvent = {
+export type GitHubIssuesEvent = {
   issue?: {
     number?: unknown
     pull_request?: unknown
@@ -26,6 +26,7 @@ type GitHubIssuesEvent = {
   }
   repository?: {
     full_name?: string
+    default_branch?: string
   }
 }
 
@@ -34,6 +35,16 @@ const WRITE_LEVEL_PERMISSIONS = new Set(['admin', 'maintain', 'write'])
 
 export function markerCommentPolicyForAction(action: string | undefined): 'always' | 'on-projection-change' {
   return GRAPH_CHANGING_EVENTS.has(action ?? '') ? 'always' : 'on-projection-change'
+}
+
+export function reconcileWorkflowRef(event: GitHubIssuesEvent, env: NodeJS.ProcessEnv): string {
+  const defaultBranch = event.repository?.default_branch?.trim()
+  if (defaultBranch) return defaultBranch
+
+  const envRef = env.GITHUB_REF_NAME?.trim()
+  if (envRef) return envRef
+
+  throw new Error('Cannot dispatch reconcile workflow: repository default branch is unavailable.')
 }
 
 function issueNumberFromEvent(event: GitHubIssuesEvent, env: NodeJS.ProcessEnv): number {
@@ -69,7 +80,7 @@ async function canActorTriggerFullReconcile(
  * Dispatch the reconcile-readiness workflow via GitHub API.
  * Uses the same GITHUB_TOKEN for authentication.
  */
-async function dispatchReconcileWorkflow(env: NodeJS.ProcessEnv): Promise<void> {
+async function dispatchReconcileWorkflow(env: NodeJS.ProcessEnv, event: GitHubIssuesEvent): Promise<void> {
   const token = env.GITHUB_TOKEN
   const repo = env.GITHUB_REPOSITORY
   if (!token || !repo) {
@@ -78,6 +89,7 @@ async function dispatchReconcileWorkflow(env: NodeJS.ProcessEnv): Promise<void> 
 
   const apiUrl = (env.GITHUB_API_URL || 'https://api.github.com').replace(/\/+$/, '')
   const url = `${apiUrl}/repos/${repo}/actions/workflows/reconcile-readiness.yml/dispatches`
+  const ref = reconcileWorkflowRef(event, env)
 
   let response: Response
   try {
@@ -90,15 +102,14 @@ async function dispatchReconcileWorkflow(env: NodeJS.ProcessEnv): Promise<void> 
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        ref: env.GITHUB_REF_NAME || 'main',
+        ref,
         inputs: { dry_run: 'false' },
       }),
     })
-
-  } catch (error) {
-    throw new Error(`Failed to dispatch reconcile workflow: ${error instanceof Error ? error.message : String(error)}`)
+  } catch {
+    throw new Error('Failed to dispatch reconcile workflow due to a network or transport error.')
   }
-  if (!response.ok) throw new Error(`Failed to dispatch reconcile workflow: ${response.status} ${response.statusText}`)
+  if (!response.ok) throw new Error(`Failed to dispatch reconcile workflow: GitHub returned status ${response.status}.`)
   console.info('Dispatched reconcile-readiness workflow for full repository reconciliation.')
 }
 
@@ -127,7 +138,7 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<void> 
   if (GRAPH_CHANGING_EVENTS.has(action)) {
     if (await canActorTriggerFullReconcile(client, event)) {
       console.info('Graph-changing event from trusted actor. Dispatching full reconciliation.')
-      await dispatchReconcileWorkflow(env)
+      await dispatchReconcileWorkflow(env, event)
     } else {
       console.info('Graph-changing event from untrusted actor. Target-only reconciliation applied.')
     }
