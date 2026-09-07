@@ -72,6 +72,7 @@ export function scanVisibleMarkdownLines(
 
   let inFence: { type: 'backtick' | 'tilde'; fenceLength: number } | null = null
   let inHtmlComment = false
+  let htmlCommentHasVisiblePrefix = false
   // CommonMark permits a paragraph in a blockquote to continue lazily on
   // following non-quoted lines. Treat that continuation as non-authoritative
   // until a blank line ends the paragraph.
@@ -84,22 +85,27 @@ export function scanVisibleMarkdownLines(
     if (segment.trim() !== '') result.push({ lineNumber, text: segment })
   }
 
-  const emitCommentFreeSegments = (line: string, lineNumber: number, startAt = 0): boolean => {
+  const emitCommentFreeSegments = (
+    line: string,
+    lineNumber: number,
+    startAt = 0,
+    initialVisiblePrefix = false,
+  ): { inComment: boolean; hasVisiblePrefix: boolean } => {
     let cursor = startAt
     let sawComment = startAt > 0
-    let hasVisiblePrefix = false
+    let hasVisiblePrefix = initialVisiblePrefix
     while (true) {
       const commentStart = line.indexOf('<!--', cursor)
       if (commentStart === -1) {
         const segment = line.slice(cursor)
         if (!sawComment || !hasVisiblePrefix) appendVisibleSegment(line, lineNumber, segment)
-        return false
+        return { inComment: false, hasVisiblePrefix }
       }
       const segment = line.slice(cursor, commentStart)
       if (!sawComment || !hasVisiblePrefix) appendVisibleSegment(line, lineNumber, segment)
       if (segment.trim() !== '') hasVisiblePrefix = true
       const commentEnd = line.indexOf('-->', commentStart + 4)
-      if (commentEnd === -1) return true
+      if (commentEnd === -1) return { inComment: true, hasVisiblePrefix }
       sawComment = true
       cursor = commentEnd + 3
     }
@@ -114,7 +120,9 @@ export function scanVisibleMarkdownLines(
       if (commentStart !== -1) {
         // Keep each visible segment separate: comment elision must not join
         // untrusted fragments into a synthetic control/header declaration.
-        inHtmlComment = emitCommentFreeSegments(line, i)
+        const emission = emitCommentFreeSegments(line, i)
+        inHtmlComment = emission.inComment
+        htmlCommentHasVisiblePrefix = emission.hasVisiblePrefix
         continue
       }
     }
@@ -123,7 +131,9 @@ export function scanVisibleMarkdownLines(
       const commentEnd = line.indexOf('-->')
       if (commentEnd !== -1) {
         inHtmlComment = false
-        inHtmlComment = emitCommentFreeSegments(line, i, commentEnd + 3)
+        const emission = emitCommentFreeSegments(line, i, commentEnd + 3, htmlCommentHasVisiblePrefix)
+        inHtmlComment = emission.inComment
+        htmlCommentHasVisiblePrefix = emission.hasVisiblePrefix
       }
       continue
     }
