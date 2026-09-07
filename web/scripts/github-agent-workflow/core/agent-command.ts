@@ -3,6 +3,7 @@ import { buildRunId, type AgentAction, type AgentRuntime, type RunId } from '../
 import type { GitHubClient, GitHubIssue } from '../io/github-client'
 import { IssueReadinessResolver } from '../shared/issue-readiness-resolver'
 import { findLatestRunForIssue } from '../io/agent-run-log'
+import { renderReadinessBlocker } from './readiness-reason-renderer'
 
 export const AGENT_COMMAND_MARKER_PREFIX = '<!-- forge-agent-command -->'
 
@@ -114,7 +115,6 @@ function commandLookupText(normalizedText: string, botLogin?: string): string {
     .trim()
 }
 
-
 function isPlausibleCommandAttempt(commandText: string, recognized: boolean): boolean {
   if (recognized) return true
   const firstToken = commandText.split(/\s+/)[0] ?? ''
@@ -182,7 +182,7 @@ async function rejectionFor(command: AgentCommand, issue: GitHubIssue, client: G
 
   if (!readiness.dispatchable) {
     const reasons = readiness.reasonCodes.join(', ')
-    const blockers = readiness.blockers.map((b: { detail: string }) => b.detail).join('; ')
+    const blockers = readiness.blockers.map(renderReadinessBlocker).join('; ')
     return `Implementation request rejected because the issue is not semantically dispatchable. Reasons: ${reasons}${blockers ? `. Blockers: ${blockers}` : ''}`
   }
 
