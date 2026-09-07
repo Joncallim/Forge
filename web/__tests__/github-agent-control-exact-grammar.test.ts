@@ -87,4 +87,25 @@ describe('exact control metadata grammar', () => {
     expect(result.dispatchable).toBe(false)
     expect(result.reasonCodes).toContain('queue.issue_control_missing')
   })
+
+  it.each([
+    '<!-- <details> -->',
+    '<!-- </details><details> -->',
+    '<!-- ``` -->',
+  ])('does not let HTML-comment contents suppress later canonical controls: %s', async (comment) => {
+    const target = {
+      ...issue('none'),
+      body: validBugBody('none').replace(
+        'Execution mode: implementation',
+        `${comment}\nExecution mode: implementation`,
+      ),
+    }
+    const result = await new IssueReadinessResolver(new FakeGitHubClient({ issues: [target] })).resolveFromIssue(target)
+
+    expect(result).toMatchObject({
+      dispatchable: true,
+      state: 'ready',
+      reasonCodes: [],
+    })
+  })
 })
