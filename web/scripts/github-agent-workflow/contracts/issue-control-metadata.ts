@@ -62,6 +62,13 @@ export const EMPTY_CONTROL_METADATA: IssueControlMetadata = Object.freeze({
 export const MAX_DEPENDENCIES_PER_ISSUE = 64
 
 /**
+ * Maximum distinct parser diagnostics retained for one untrusted issue body.
+ * Diagnostic prose follows the same bound so it cannot become an output-size
+ * amplifier separate from the machine-readable contract.
+ */
+export const MAX_CONTROL_DIAGNOSTICS = 64
+
+/**
  * Maximum visible body bytes we accept for parsing.
  */
 export const MAX_ISSUE_BODY_BYTES = 256 * 1024 // 256 KiB

@@ -10,7 +10,7 @@
 
 import type { IssueType } from '../contracts/common'
 import type { ControlDiagnostic, IssueControlMetadata } from '../contracts/issue-control-metadata'
-import { EMPTY_CONTROL_METADATA, MAX_DEPENDENCIES_PER_ISSUE, executionModeSchema } from '../contracts/issue-control-metadata'
+import { EMPTY_CONTROL_METADATA, MAX_CONTROL_DIAGNOSTICS, MAX_DEPENDENCIES_PER_ISSUE, executionModeSchema } from '../contracts/issue-control-metadata'
 import { scanVisibleMarkdownLines } from './visible-markdown-scanner'
 
 const EXECUTION_MODE_PREFIX = 'Execution mode:'
@@ -42,9 +42,18 @@ export function parseControlMetadata(
 ): ControlParseResult {
   const errors: string[] = []
   const diagnostics: ControlDiagnostic[] = []
+  const diagnosticKeys = new Set<string>()
+  const errorMessages = new Set<string>()
   const diagnose = (reasonCode: ControlDiagnostic['reasonCode'], field: ControlDiagnostic['field'], message: string, dependencyIssueNumber?: number) => {
-    diagnostics.push({ reasonCode, field, ...(dependencyIssueNumber === undefined ? {} : { dependencyIssueNumber }) })
-    errors.push(message)
+    const diagnosticKey = `${reasonCode}\u0000${field}\u0000${dependencyIssueNumber ?? ''}`
+    if (!diagnosticKeys.has(diagnosticKey) && diagnostics.length < MAX_CONTROL_DIAGNOSTICS) {
+      diagnosticKeys.add(diagnosticKey)
+      diagnostics.push({ reasonCode, field, ...(dependencyIssueNumber === undefined ? {} : { dependencyIssueNumber }) })
+    }
+    if (!errorMessages.has(message) && errors.length < MAX_CONTROL_DIAGNOSTICS) {
+      errorMessages.add(message)
+      errors.push(message)
+    }
   }
   const visible = scanVisibleMarkdownLines(body ?? '')
 
@@ -133,25 +142,40 @@ export function parseControlMetadata(
         // Do not silently normalize malformed separators. `#1,,#2` is not
         // equivalent to `#1,#2`: every comma-separated position is part of
         // the external control contract and an empty position fails closed.
-        const parts = value.split(',').map((p) => p.trim())
         const parsed: number[] = []
 
-        for (const part of parts) {
+        // Parse positions incrementally.  An untrusted 256 KiB separator
+        // bomb must not allocate one string/object per comma before this
+        // contract can reject it.
+        let positionStart = 0
+        for (let index = 0; ; index++) {
+          // Each comma-separated position is a declared dependency position.
+          // Do not scan an attacker-controlled separator bomb after the
+          // maximum legal dependency contract is already exceeded.
+          if (index >= MAX_DEPENDENCIES_PER_ISSUE) {
+            diagnose('queue.issue_dependency_graph_limit_exceeded', 'depends_on', 'Dependency count exceeds the supported limit.')
+            break
+          }
+          const separatorIndex = value.indexOf(',', positionStart)
+          const part = value.slice(positionStart, separatorIndex === -1 ? value.length : separatorIndex).trim()
           if (part === '') {
             diagnose('queue.issue_dependency_syntax_invalid', 'depends_on', 'Dependency syntax contains an empty reference.')
-            continue
-          }
-          const match = ISSUE_REFERENCE_PATTERN.exec(part)
-          if (match) {
-            const num = parseInt(match[1], 10)
-            if (Number.isSafeInteger(num) && num > 0) {
-              parsed.push(num)
-            } else {
-              diagnose('queue.issue_dependency_syntax_invalid', 'depends_on', 'Dependency reference is invalid.')
-            }
           } else {
-            diagnose('queue.issue_dependency_syntax_invalid', 'depends_on', 'Dependency syntax is invalid.')
+            const match = ISSUE_REFERENCE_PATTERN.exec(part)
+            if (match) {
+              const num = parseInt(match[1], 10)
+              if (Number.isSafeInteger(num) && num > 0) {
+                parsed.push(num)
+              } else {
+                diagnose('queue.issue_dependency_syntax_invalid', 'depends_on', 'Dependency reference is invalid.')
+              }
+            } else {
+              diagnose('queue.issue_dependency_syntax_invalid', 'depends_on', 'Dependency syntax is invalid.')
+            }
           }
+
+          if (separatorIndex === -1) break
+          positionStart = separatorIndex + 1
         }
 
         dependencies = parsed

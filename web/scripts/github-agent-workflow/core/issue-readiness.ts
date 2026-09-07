@@ -15,6 +15,7 @@ import {
   type BlockerRecord,
   type ReadinessReasonCode,
   type SemanticReadinessState,
+  MAX_READINESS_BLOCKERS,
   STATE_TO_LABEL,
 } from '../contracts/issue-readiness-result'
 
@@ -363,7 +364,7 @@ function buildResult(
     executionMode: controlMetadata.executionMode,
     dependencies: controlMetadata.dependencies,
     reasonCodes: deduplicateCodes(reasonCodes),
-    blockers,
+    blockers: deduplicateAndCapBlockers(blockers),
     desiredReadinessLabels: desiredLabel ? [desiredLabel] : [],
     partial,
   }
@@ -371,6 +372,19 @@ function buildResult(
 
 function deduplicateCodes(codes: ReadonlyArray<ReadinessReasonCode>): ReadinessReasonCode[] {
   return [...new Set(codes)]
+}
+
+function deduplicateAndCapBlockers(blockers: ReadonlyArray<BlockerRecord>): BlockerRecord[] {
+  const unique: BlockerRecord[] = []
+  const seen = new Set<string>()
+  for (const blocker of blockers) {
+    const key = `${blocker.reasonCode}\u0000${blocker.dependencyIssueNumber ?? ''}\u0000${blocker.detail}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    unique.push(blocker)
+    if (unique.length === MAX_READINESS_BLOCKERS) break
+  }
+  return unique
 }
 
 function detailForDependencyFact(fact: ResolvedDependencyFact): string {

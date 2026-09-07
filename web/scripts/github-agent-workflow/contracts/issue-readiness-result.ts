@@ -44,6 +44,13 @@ export const blockerRecordSchema = freezeSchema(z.object({
 export type BlockerRecord = z.infer<typeof blockerRecordSchema>
 
 /**
+ * Maximum distinct blockers emitted for one untrusted readiness evaluation.
+ * This bounds API/CLI output even when many dependencies carry malformed
+ * control metadata.
+ */
+export const MAX_READINESS_BLOCKERS = 64
+
+/**
  * Readiness label values that are mutually exclusive projections.
  */
 export const READINESS_LABEL_VALUES = Object.freeze([

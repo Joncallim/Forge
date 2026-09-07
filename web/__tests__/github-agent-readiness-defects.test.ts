@@ -17,6 +17,8 @@ import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 
 import { parseControlMetadata } from '@/scripts/github-agent-workflow/core/issue-control'
+import { MAX_ISSUE_BODY_BYTES } from '@/scripts/github-agent-workflow/contracts/issue-control-metadata'
+import { MAX_READINESS_BLOCKERS } from '@/scripts/github-agent-workflow/contracts/issue-readiness-result'
 import { scanVisibleMarkdownLines } from '@/scripts/github-agent-workflow/core/visible-markdown-scanner'
 import { IssueReadinessResolver } from '@/scripts/github-agent-workflow/shared/issue-readiness-resolver'
 import { runHandoff } from '@/scripts/github-agent-workflow/handoff'
@@ -80,6 +82,55 @@ const READY_ISSUE: GitHubIssue = {
 // P0 — Empty Depends on:
 // ============================================================
 describe('empty Depends on: fails closed', () => {
+  it('bounds separator-bomb parser diagnostics at the legal 256 KiB body boundary', async () => {
+    const separatorCount = MAX_ISSUE_BODY_BYTES - Buffer.byteLength(READY_BODY, 'utf8') + 2
+    const body = READY_BODY.replace('Depends on: none', `Depends on: #2${','.repeat(separatorCount)}`)
+    expect(Buffer.byteLength(body, 'utf8')).toBe(MAX_ISSUE_BODY_BYTES)
+
+    const parsed = parseControlMetadata(body, 'bug')
+    expect(parsed.diagnostics).toHaveLength(2)
+    expect(parsed.errors).toHaveLength(2)
+    expect(parsed.diagnostics.map((diagnostic) => diagnostic.reasonCode)).toEqual(expect.arrayContaining([
+      'queue.issue_dependency_syntax_invalid',
+      'queue.issue_dependency_graph_limit_exceeded',
+    ]))
+
+    // Production boundary: an untrusted issue body must retain only bounded
+    // diagnostics when semantic readiness is resolved.
+    const target = { ...READY_ISSUE, body, labels: [] }
+    const result = await new IssueReadinessResolver(new FakeGitHubClient({ issues: [target] })).resolveReadiness(1)
+    expect(result).toMatchObject({ dispatchable: false, state: 'needs-clarification' })
+    expect(result.blockers).toHaveLength(2)
+
+    // Full reconciliation retains parsed snapshot facts after discarding the
+    // raw body, so this boundary must stay bounded as well.
+    const snapshot = await new IssueReadinessResolver(new FakeGitHubClient({ issues: [target] })).loadOpenIssueSnapshot()
+    expect(snapshot.issues.get(1)?.body).toBeNull()
+    expect(snapshot.parsedMetadata.get(1)?.controlDiagnostics).toHaveLength(2)
+    expect(snapshot.parsedMetadata.get(1)?.controlParseErrors).toHaveLength(2)
+  })
+
+  it('bounds downstream blocker amplification across 64 malformed dependencies', async () => {
+    const dependencyNumbers = Array.from({ length: 64 }, (_, index) => index + 2)
+    const target = {
+      ...READY_ISSUE,
+      labels: [],
+      body: READY_BODY.replace('Depends on: none', `Depends on: ${dependencyNumbers.map((number) => `#${number}`).join(', ')}`),
+    }
+    const separatorBomb = READY_BODY.replace('Depends on: none', `Depends on: #999${','.repeat(4096)}`)
+    const dependencies = dependencyNumbers.map((number) => ({
+      ...READY_ISSUE,
+      number,
+      labels: [],
+      body: separatorBomb,
+    }))
+
+    const result = await new IssueReadinessResolver(new FakeGitHubClient({ issues: [target, ...dependencies] })).resolveReadiness(1)
+    expect(result).toMatchObject({ dispatchable: false, state: 'needs-clarification' })
+    expect(result.blockers).toHaveLength(MAX_READINESS_BLOCKERS)
+    expect(result.reasonCodes).toEqual(['queue.issue_dependency_syntax_invalid', 'queue.issue_dependency_graph_limit_exceeded'])
+  })
+
   it('Depends on: with empty value produces errors and no ready state', () => {
     const body = [
       '## Bug Summary',
