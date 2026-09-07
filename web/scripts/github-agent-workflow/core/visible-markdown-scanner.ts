@@ -36,6 +36,19 @@ type BacktickRun = Readonly<{
   length: number
 }>
 
+function startsInlineBlockBoundary(line: string): boolean {
+  if (line.trim() === '') return true
+  if (line.startsWith('    ') || line.startsWith('\t')) return true
+  if (/^ {0,3}#{1,6}(?:\s|$)/.test(line)) return true
+  if (/^ {0,3}>/.test(line)) return true
+  if (/^ {0,3}(?:`{3,}|~{3,})/.test(line)) return true
+  if (/^ {0,3}(?:[-+*](?:\s+|$)|\d{1,9}[.)](?:\s+|$))/.test(line)) return true
+  if (/^ {0,3}(?:={2,}|-{2,})\s*$/.test(line)) return true
+  if (/^ {0,3}(?:(?:\*\s*){3,}|(?:_\s*){3,}|(?:-\s*){3,})$/.test(line)) return true
+  if (/^ {0,3}<\/?details\b/i.test(line)) return true
+  return false
+}
+
 /**
  * Scan a Markdown body and return only authority-bearing visible lines.
  *
@@ -44,10 +57,10 @@ type BacktickRun = Readonly<{
  * never authority-bearing. Persistent suppression state is nevertheless
  * tracked so later lines cannot escape a fence/comment/code/details container.
  *
- * The implementation is O(n). Backtick-run suffix availability is precomputed
- * once so unmatched literal backticks do not spuriously suppress the remainder
- * of the document and attacker-controlled backtick bombs cannot cause O(n²)
- * lookahead.
+ * The implementation is O(n). Backtick-run availability is precomputed within
+ * paragraph-like inline regions, not globally: CommonMark block structure has
+ * precedence over inline code, so an unmatched backtick in one block cannot use
+ * a delimiter in a later heading/list/paragraph to suppress unrelated controls.
  */
 export function scanVisibleMarkdownLines(
   body: string,
@@ -62,22 +75,37 @@ export function scanVisibleMarkdownLines(
   const rawLines = body.split(/\r?\n/)
   const result: VisibleLine[] = []
 
-  // Absolute line offsets plus the final occurrence of each maximal backtick
-  // run length let us decide in O(1) whether a run can open a code span.
+  // Absolute offsets plus a conservative inline-region identifier let us decide
+  // in O(1) whether a backtick run has a matching delimiter in the same block.
   const lineOffsets: number[] = []
-  const lastBacktickRunPosition = new Map<number, number>()
+  const inlineRegionByLine: number[] = []
+  const lastBacktickRunPositionByRegion = new Map<number, Map<number, number>>()
   let absoluteOffset = 0
+  let inlineRegion = 0
+
   for (const line of rawLines) {
+    const isBoundary = startsInlineBlockBoundary(line)
+    if (isBoundary) inlineRegion += 1
+    const regionForLine = inlineRegion
     lineOffsets.push(absoluteOffset)
+    inlineRegionByLine.push(regionForLine)
+
+    let regionRuns = lastBacktickRunPositionByRegion.get(regionForLine)
+    if (!regionRuns) {
+      regionRuns = new Map<number, number>()
+      lastBacktickRunPositionByRegion.set(regionForLine, regionRuns)
+    }
     for (let cursor = 0; cursor < line.length;) {
       const index = line.indexOf('`', cursor)
       if (index === -1) break
       let end = index + 1
       while (end < line.length && line[end] === '`') end++
-      lastBacktickRunPosition.set(end - index, absoluteOffset + index)
+      regionRuns.set(end - index, absoluteOffset + index)
       cursor = end
     }
+
     absoluteOffset += line.length + 1
+    if (isBoundary) inlineRegion += 1
   }
 
   let inFence: { type: 'backtick' | 'tilde'; fenceLength: number } | null = null
@@ -96,13 +124,19 @@ export function scanVisibleMarkdownLines(
     return { index, end, length: end - index }
   }
 
-  const findOpenableBacktickRun = (line: string, lineOffset: number, startAt: number): BacktickRun | null => {
+  const findOpenableBacktickRun = (
+    line: string,
+    lineOffset: number,
+    region: number,
+    startAt: number,
+  ): BacktickRun | null => {
+    const regionRuns = lastBacktickRunPositionByRegion.get(region)
     let cursor = startAt
     while (cursor < line.length) {
       const run = findBacktickRun(line, cursor)
       if (!run) return null
       const absolutePosition = lineOffset + run.index
-      if ((lastBacktickRunPosition.get(run.length) ?? absolutePosition) > absolutePosition) return run
+      if ((regionRuns?.get(run.length) ?? absolutePosition) > absolutePosition) return run
       cursor = run.end
     }
     return null
@@ -178,6 +212,7 @@ export function scanVisibleMarkdownLines(
   const consumeSuppressedInlineLine = (
     line: string,
     lineOffset: number,
+    region: number,
     startAt = 0,
     initialVisiblePrefix = false,
   ): boolean => {
@@ -208,7 +243,7 @@ export function scanVisibleMarkdownLines(
       }
 
       const commentStart = line.indexOf('<!--', cursor)
-      const backtickRun = findOpenableBacktickRun(line, lineOffset, cursor)
+      const backtickRun = findOpenableBacktickRun(line, lineOffset, region, cursor)
       const nextIsComment = commentStart !== -1 && (!backtickRun || commentStart < backtickRun.index)
       const tokenStart = nextIsComment ? commentStart : backtickRun?.index ?? -1
 
@@ -241,6 +276,7 @@ export function scanVisibleMarkdownLines(
 
   for (let i = 0; i < rawLines.length; i++) {
     const line = rawLines[i]
+    const inlineRegionForLine = inlineRegionByLine[i]
 
     // Fenced code has highest precedence: comment/backtick syntax inside the
     // fence is literal code and cannot mutate any other suppression state.
@@ -255,7 +291,7 @@ export function scanVisibleMarkdownLines(
     // constructs. A matching closer may update state for later physical lines,
     // but this line itself remains non-authoritative.
     if (inHtmlComment || inlineCodeDelimiterLength !== null) {
-      consumeSuppressedInlineLine(line, lineOffsets[i])
+      consumeSuppressedInlineLine(line, lineOffsets[i], inlineRegionForLine)
       continue
     }
 
@@ -266,7 +302,7 @@ export function scanVisibleMarkdownLines(
 
     // Inline HTML comments and code spans are non-authoritative. Their visible
     // surrounding segments can still open/close persistent containers.
-    if (consumeSuppressedInlineLine(line, lineOffsets[i])) continue
+    if (consumeSuppressedInlineLine(line, lineOffsets[i], inlineRegionForLine)) continue
 
     // Handle collapsible details containers on lines with no comment/code span.
     if (inDetailsOpener) {
