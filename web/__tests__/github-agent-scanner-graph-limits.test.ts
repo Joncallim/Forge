@@ -90,6 +90,31 @@ describe('authority scanner and bounded resolver graph', () => {
     expect(result.reasonCodes).toContain('queue.issue_control_missing')
   })
 
+  it('keeps collapsible details content non-authoritative, including inline markup', async () => {
+    const visible = scanVisibleMarkdownLines([
+      '<details><summary>Example controls</summary>',
+      'Execution mode: implementation',
+      'Depends on: none',
+      '</details>',
+    ].join('\n')).lines.map((line) => line.text)
+    expect(visible).toEqual([])
+
+    const target = {
+      ...issue(1, 'none'),
+      body: [
+        body('none').replace('Execution mode: implementation\nDepends on: none', ''),
+        '<details><summary>Example controls</summary>',
+        'Execution mode: implementation',
+        'Depends on: none',
+        '</details>',
+      ].join('\n'),
+    }
+    const result = await new IssueReadinessResolver(new FakeGitHubClient({ issues: [target] })).resolveFromIssue(target)
+
+    expect(result.dispatchable).toBe(false)
+    expect(result.reasonCodes).toContain('queue.issue_control_missing')
+  })
+
   it('does not accept control lines in a lazy blockquote continuation', async () => {
     const lazyBody = [
       body('none').replace('Execution mode: implementation\nDepends on: none', ''),

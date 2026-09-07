@@ -29,6 +29,7 @@ import {
 } from '@/scripts/github-agent-workflow/io/agent-run-log'
 import { FakeGitHubClient } from '@/scripts/github-agent-workflow/io/fake-github-client'
 import type { GitHubIssue } from '@/scripts/github-agent-workflow/io/github-client'
+import { applyOpenProjection } from '@/scripts/github-agent-workflow/cli/reconcile-readiness'
 
 const tempRoots: string[] = []
 
@@ -657,6 +658,30 @@ describe('syncReadinessLabels safe ordering', () => {
     // But the projection checks labels after removal - needs-clarification should be gone
     expect(result.success).toBe(true)
     expect(result.addedLabels).toContain('ready-for-agent')
+  })
+})
+
+describe('reconcile apply freshness', () => {
+  it('projects fresh ready state when a planned blocked issue changes before apply', async () => {
+    const latest = { ...READY_ISSUE, labels: ['dependency-blocked'] }
+    const client = new FakeGitHubClient({ issues: [latest] })
+    const staleBlockedResult = {
+      issueNumber: 1,
+      state: 'dependency-blocked' as const,
+      dispatchable: false,
+      executionMode: 'implementation' as const,
+      dependencies: [2],
+      reasonCodes: ['queue.issue_dependency_open' as const],
+      blockers: [{ reasonCode: 'queue.issue_dependency_open' as const, detail: 'Dependency #2 was open during planning.', dependencyIssueNumber: 2 }],
+      desiredReadinessLabels: ['dependency-blocked' as const],
+      partial: false,
+    }
+
+    await applyOpenProjection(client, { issue: latest, readiness: staleBlockedResult, closedCleanup: false })
+
+    expect((await client.getIssue(1)).labels).toEqual(['ready-for-agent'])
+    expect(client.removeLabelCalls).toContainEqual({ issueNumber: 1, label: 'dependency-blocked' })
+    expect(client.addLabelCalls).toContainEqual({ issueNumber: 1, label: 'ready-for-agent' })
   })
 })
 

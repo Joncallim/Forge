@@ -73,6 +73,7 @@ export function scanVisibleMarkdownLines(
   let inFence: { type: 'backtick' | 'tilde'; fenceLength: number } | null = null
   let inHtmlComment = false
   let htmlCommentHasVisiblePrefix = false
+  let detailsDepth = 0
   // CommonMark permits a paragraph in a blockquote to continue lazily on
   // following non-quoted lines. Treat that continuation as non-authoritative
   // until a blank line ends the paragraph.
@@ -171,6 +172,16 @@ export function scanVisibleMarkdownLines(
         continue
       }
       // Inside fence — skip entirely
+      continue
+    }
+
+    // Collapsible raw HTML is presentation content, not issue authority. A
+    // whole physical line containing a details tag is suppressed as well, so
+    // inline open/close tags cannot expose a synthetic control fragment.
+    const detailsOpenCount = (line.match(/<details\b[^>]*>/gi) ?? []).length
+    const detailsCloseCount = (line.match(/<\/details\s*>/gi) ?? []).length
+    if (detailsDepth > 0 || detailsOpenCount > 0 || detailsCloseCount > 0) {
+      detailsDepth = Math.max(0, detailsDepth + detailsOpenCount - detailsCloseCount)
       continue
     }
 

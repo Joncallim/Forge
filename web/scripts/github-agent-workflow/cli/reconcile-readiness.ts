@@ -8,7 +8,7 @@ import { ISSUE_READINESS_MANAGED_LABELS } from '../contracts/common'
 
 const CLOSED_SCAN_MAX_PAGES = 50
 const ISSUE_PAGE_SIZE = 100
-type PlannedIssue = Readonly<{ issue: GitHubIssue; readiness: IssueReadinessResult | null; closedCleanup: boolean }>
+export type PlannedIssue = Readonly<{ issue: GitHubIssue; readiness: IssueReadinessResult | null; closedCleanup: boolean }>
 type PlannedLabelMutation = Readonly<{ issueNumber: number; add: readonly string[]; remove: readonly string[] }>
 type ReconcilePlan = { scannedIssues: number; closedIssuesScanned: number; readyCount: number; blockedCount: number; clarificationCount: number; trackingOnlyCount: number; plannedLabelMutations: PlannedLabelMutation[]; labelTransitions: number; apiFailures: number; elapsedMs: number; errors: string[] }
 
@@ -44,7 +44,7 @@ async function applyClosedCleanup(client: GitHubClient, issue: GitHubIssue): Pro
   return labels.length
 }
 
-async function applyOpenProjection(client: GitHubClient, planned: PlannedIssue): Promise<number> {
+export async function applyOpenProjection(client: GitHubClient, planned: PlannedIssue): Promise<number> {
   if (!planned.readiness) throw new Error(`Open issue #${planned.issue.number} has no readiness plan.`)
   // Every open-plan item is re-read immediately before writes. In particular,
   // a close event between discovery and apply must use terminal cleanup, never
@@ -52,16 +52,12 @@ async function applyOpenProjection(client: GitHubClient, planned: PlannedIssue):
   const issue = await client.getIssue(planned.issue.number)
   if (issue.state === 'closed') return await applyClosedCleanup(client, issue)
 
-  // A planned-ready result is only a candidate for authority. Re-resolve it
-  // immediately before its ready projection so a dependency or metadata change
-  // during the bounded plan phase cannot promote stale readiness. If it became
-  // non-ready, the same shared writer projects that fresh blocked state.
-  let readiness = planned.readiness
-  if (planned.readiness.dispatchable) {
-    const freshResolver = new IssueReadinessResolver(client)
-    readiness = await freshResolver.resolveFromIssue(issue)
-    if (readiness.partial) throw new Error(`Fresh readiness result for #${issue.number} is partial.`)
-  }
+  // The plan is advisory only: fresh semantics are authoritative for both
+  // planned-ready and planned-non-ready targets. This prevents a blocked plan
+  // from overwriting a newly-ready issue, and vice versa.
+  const freshResolver = new IssueReadinessResolver(client)
+  const readiness = await freshResolver.resolveFromIssue(issue)
+  if (readiness.partial) throw new Error(`Fresh readiness result for #${issue.number} is partial.`)
 
   const projected = await syncReadinessLabels(client, issue, readiness)
   if (!projected.success) throw new Error(projected.error ?? `Failed to project readiness for #${planned.issue.number}.`)
