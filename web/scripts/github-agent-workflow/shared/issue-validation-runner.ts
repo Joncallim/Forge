@@ -14,6 +14,7 @@ import {
   ISSUE_VALIDATION_MARKER_PREFIX,
   validateIssue,
 } from '../core/issue-validation'
+import { renderReadinessBlocker } from '../core/readiness-reason-renderer'
 import { IssueReadinessResolver } from './issue-readiness-resolver'
 import { syncReadinessLabels } from './readiness-projection'
 import type { IssueValidationResult } from '../contracts/issue-validation-result'
@@ -148,7 +149,7 @@ export async function runIssueValidation(
   }
 }
 
-function buildReadinessComment(readinessResult: IssueReadinessResult, status: 'ready' | 'blocked'): string {
+export function buildReadinessComment(readinessResult: IssueReadinessResult, status: 'ready' | 'blocked'): string {
   const lines = [
     ISSUE_VALIDATION_MARKER_PREFIX,
     '## FORGE issue validation',
@@ -163,7 +164,7 @@ function buildReadinessComment(readinessResult: IssueReadinessResult, status: 'r
     lines.push('| Reason | Detail |')
     lines.push('| --- | --- |')
     for (const blocker of readinessResult.blockers) {
-      lines.push(`| \`${blocker.reasonCode}\` | ${blocker.detail} |`)
+      lines.push(`| \`${blocker.reasonCode}\` | ${renderReadinessBlocker(blocker)} |`)
     }
   }
 
