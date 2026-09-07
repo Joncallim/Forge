@@ -74,6 +74,7 @@ export function scanVisibleMarkdownLines(
   let inHtmlComment = false
   let htmlCommentHasVisiblePrefix = false
   let detailsDepth = 0
+  let inDetailsOpener = false
   // CommonMark permits a paragraph in a blockquote to continue lazily on
   // following non-quoted lines. Treat that continuation as non-authoritative
   // until a blank line ends the paragraph.
@@ -119,6 +120,24 @@ export function scanVisibleMarkdownLines(
     // the early-return path. Fenced code and multiline comment contents are
     // intentionally excluded from this authority boundary.
     if (!inFence && !inHtmlComment) {
+      if (inDetailsOpener) {
+        if (line.includes('>')) {
+          inDetailsOpener = false
+          detailsDepth = 1
+        }
+        continue
+      }
+
+      // A raw HTML opener may span physical lines. Treat every line through
+      // its terminating `>` as non-authoritative rather than exposing a
+      // potentially hidden container body.
+      const hasDetailsStart = /<details\b/i.test(line)
+      const hasCompleteDetailsOpen = /<details\b[^>]*>/i.test(line)
+      if (hasDetailsStart && !hasCompleteDetailsOpen) {
+        inDetailsOpener = true
+        continue
+      }
+
       const detailsOpenCount = (line.match(/<details\b[^>]*>/gi) ?? []).length
       const detailsCloseCount = (line.match(/<\/details\s*>/gi) ?? []).length
       if (detailsDepth > 0 || detailsOpenCount > 0 || detailsCloseCount > 0) {

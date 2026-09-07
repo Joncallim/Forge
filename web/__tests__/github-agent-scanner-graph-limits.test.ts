@@ -126,6 +126,18 @@ describe('authority scanner and bounded resolver graph', () => {
     expect(visible).toEqual([])
   })
 
+  it('suppresses content after a details opener split across physical lines', () => {
+    const visible = scanVisibleMarkdownLines([
+      '<details',
+      'open>',
+      'Execution mode: implementation',
+      'Depends on: none',
+      '</details>',
+    ].join('\n')).lines.map((line) => line.text)
+
+    expect(visible).toEqual([])
+  })
+
   it('does not accept control lines in a lazy blockquote continuation', async () => {
     const lazyBody = [
       body('none').replace('Execution mode: implementation\nDepends on: none', ''),
