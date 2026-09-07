@@ -102,16 +102,6 @@ export function scanVisibleMarkdownLines(
   for (let i = 0; i < rawLines.length; i++) {
     const line = rawLines[i]
 
-    const isBlockQuoteLine = /^ {0,3}>/.test(line)
-    if (inLazyBlockQuoteContinuation && !isBlockQuoteLine) {
-      if (line.trim() !== '') continue
-      inLazyBlockQuoteContinuation = false
-    }
-    if (isBlockQuoteLine) {
-      inLazyBlockQuoteContinuation = true
-      continue
-    }
-
     // Handle HTML comments (multi-line)
     if (!inHtmlComment && !inFence) {
       const commentStart = line.indexOf('<!--')
@@ -165,6 +155,16 @@ export function scanVisibleMarkdownLines(
         continue
       }
       // Inside fence — skip entirely
+      continue
+    }
+
+    const isBlockQuoteLine = /^ {0,3}>/.test(line)
+    if (inLazyBlockQuoteContinuation && !isBlockQuoteLine) {
+      if (line.trim() !== '') continue
+      inLazyBlockQuoteContinuation = false
+    }
+    if (isBlockQuoteLine) {
+      inLazyBlockQuoteContinuation = true
       continue
     }
 

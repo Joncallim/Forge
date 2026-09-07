@@ -41,6 +41,18 @@ describe('authority scanner and bounded resolver graph', () => {
     expect(visible.lines.map((line) => line.text)).toContain('Depends on: none')
   })
 
+  it('does not let blockquote handling interfere with an active fence', () => {
+    const visible = scanVisibleMarkdownLines([
+      '```',
+      '> quoted text inside code',
+      '```',
+      'Execution mode: implementation',
+      'Depends on: none',
+    ].join('\n')).lines.map((line) => line.text)
+
+    expect(visible).toEqual(['Execution mode: implementation', 'Depends on: none'])
+  })
+
   it('keeps post-comment visible control text authoritative without synthesizing fragments', () => {
     const visible = scanVisibleMarkdownLines([
       '<!-- explanatory text -->Execution mode: implementation',
