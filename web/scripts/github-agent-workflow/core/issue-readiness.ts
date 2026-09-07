@@ -82,6 +82,27 @@ export type ReadinessEvaluationInput = Readonly<{
 }>
 
 /**
+ * Incompleteness is orthogonal to semantic-state precedence. A definitive
+ * author-correctable blocker (for example 404 or not-planned) may determine
+ * the displayed state, but a sibling timeout/permission/schema failure still
+ * means repository truth was only partially observed and bulk reconcile must
+ * abort before mutation.
+ */
+function hasIncompleteDependencyEvidence(input: ReadinessEvaluationInput): boolean {
+  if (input.graphLimitExceeded) return true
+
+  return input.dependencyFacts.some((fact) => {
+    if (fact.state === 'inaccessible' || fact.state === 'lookup_failed') return true
+    if (fact.state === 'closed_unknown' && fact.reasonCode === 'queue.issue_dependency_state_unknown') return true
+
+    return (fact.controlDiagnostics ?? []).some((diagnostic) => (
+      diagnostic.reasonCode === 'queue.issue_body_too_large'
+      || diagnostic.reasonCode === 'queue.issue_dependency_graph_limit_exceeded'
+    ))
+  })
+}
+
+/**
  * Evaluate semantic readiness from pre-resolved inputs.
  *
  * This function is pure: all GitHub I/O must be done before calling it.
@@ -91,6 +112,7 @@ export type ReadinessEvaluationInput = Readonly<{
 export function evaluateReadiness(input: ReadinessEvaluationInput): IssueReadinessResult {
   const blockers: BlockerRecord[] = []
   const reasonCodes: ReadinessReasonCode[] = []
+  const incompleteDependencyEvidence = hasIncompleteDependencyEvidence(input)
 
   // Check body size first
   if (input.bodyTooLarge) {
@@ -125,7 +147,7 @@ export function evaluateReadiness(input: ReadinessEvaluationInput): IssueReadine
         : 'Issue does not satisfy the required template structure.',
       dependencyIssueNumber: null,
     })
-    return buildResult(input.issueNumber, 'needs-clarification', input.controlMetadata, reasonCodes, blockers, false)
+    return buildResult(input.issueNumber, 'needs-clarification', input.controlMetadata, reasonCodes, blockers, incompleteDependencyEvidence)
   }
 
   // Check control metadata errors
@@ -139,7 +161,7 @@ export function evaluateReadiness(input: ReadinessEvaluationInput): IssueReadine
       detail: 'Duplicate or conflicting Execution mode or Depends on declarations found.',
       dependencyIssueNumber: null,
     })
-    return buildResult(input.issueNumber, 'needs-clarification', input.controlMetadata, reasonCodes, blockers, false)
+    return buildResult(input.issueNumber, 'needs-clarification', input.controlMetadata, reasonCodes, blockers, incompleteDependencyEvidence)
   }
 
   const diagnostics = input.controlDiagnostics ?? []
@@ -153,7 +175,7 @@ export function evaluateReadiness(input: ReadinessEvaluationInput): IssueReadine
   if (diagnostics.some((diagnostic) => diagnostic.reasonCode === 'queue.issue_control_duplicate')) {
     reasonCodes.push('queue.issue_control_duplicate')
     blockers.push({ reasonCode: 'queue.issue_control_duplicate', detail: 'Duplicate control declarations found.', dependencyIssueNumber: null })
-    return buildResult(input.issueNumber, 'needs-clarification', input.controlMetadata, reasonCodes, blockers, false)
+    return buildResult(input.issueNumber, 'needs-clarification', input.controlMetadata, reasonCodes, blockers, incompleteDependencyEvidence)
   }
 
   if (diagnostics.some((diagnostic) => diagnostic.reasonCode === 'queue.issue_control_missing') || (!cm.explicit && !cm.isLegacyTrackingEpic)) {
@@ -164,7 +186,7 @@ export function evaluateReadiness(input: ReadinessEvaluationInput): IssueReadine
       detail: 'Issue is missing required Execution mode and/or Depends on metadata.',
       dependencyIssueNumber: null,
     })
-    return buildResult(input.issueNumber, 'needs-clarification', input.controlMetadata, reasonCodes, blockers, false)
+    return buildResult(input.issueNumber, 'needs-clarification', input.controlMetadata, reasonCodes, blockers, incompleteDependencyEvidence)
   }
 
   if (diagnostics.some((diagnostic) => diagnostic.reasonCode === 'queue.issue_execution_mode_invalid') || (cm.executionMode === null && !cm.isLegacyTrackingEpic)) {
@@ -175,7 +197,7 @@ export function evaluateReadiness(input: ReadinessEvaluationInput): IssueReadine
       detail: 'Execution mode is missing or invalid. Must be "implementation" or "tracking".',
       dependencyIssueNumber: null,
     })
-    return buildResult(input.issueNumber, 'needs-clarification', input.controlMetadata, reasonCodes, blockers, false)
+    return buildResult(input.issueNumber, 'needs-clarification', input.controlMetadata, reasonCodes, blockers, incompleteDependencyEvidence)
   }
 
   // Add any remaining control parse errors as blockers and TERMINATE
@@ -197,14 +219,15 @@ export function evaluateReadiness(input: ReadinessEvaluationInput): IssueReadine
       input.controlMetadata,
       reasonCodes,
       blockers,
-      diagnostics.some((diagnostic) => diagnostic.reasonCode === 'queue.issue_dependency_graph_limit_exceeded'),
+      incompleteDependencyEvidence
+        || diagnostics.some((diagnostic) => diagnostic.reasonCode === 'queue.issue_dependency_graph_limit_exceeded'),
     )
   }
 
   // Tracking issues are never dispatchable
   if (cm.executionMode === 'tracking') {
     reasonCodes.push('queue.issue_tracking_only')
-    return buildResult(input.issueNumber, 'tracking-only', input.controlMetadata, reasonCodes, blockers, false)
+    return buildResult(input.issueNumber, 'tracking-only', input.controlMetadata, reasonCodes, blockers, incompleteDependencyEvidence)
   }
 
   // A malformed reachable dependency is just as authoritative as a malformed
@@ -227,7 +250,7 @@ export function evaluateReadiness(input: ReadinessEvaluationInput): IssueReadine
       input.controlMetadata,
       reasonCodes,
       blockers,
-      downstreamDiagnostics.some(({ diagnostic }) => diagnostic.reasonCode === 'queue.issue_dependency_graph_limit_exceeded'),
+      incompleteDependencyEvidence,
     )
   }
 
@@ -255,7 +278,7 @@ export function evaluateReadiness(input: ReadinessEvaluationInput): IssueReadine
         })
       }
     }
-    return buildResult(input.issueNumber, 'needs-clarification', input.controlMetadata, reasonCodes, blockers, false)
+    return buildResult(input.issueNumber, 'needs-clarification', input.controlMetadata, reasonCodes, blockers, incompleteDependencyEvidence)
   }
 
   // Check graph limits
@@ -276,7 +299,7 @@ export function evaluateReadiness(input: ReadinessEvaluationInput): IssueReadine
         dependencyIssueNumber: null,
       })
     }
-    return buildResult(input.issueNumber, 'needs-clarification', input.controlMetadata, reasonCodes, blockers, input.graphLimitExceeded)
+    return buildResult(input.issueNumber, 'needs-clarification', input.controlMetadata, reasonCodes, blockers, incompleteDependencyEvidence)
   }
 
   // Check dependency states. Incomplete or terminal-invalid graph evidence
@@ -294,7 +317,7 @@ export function evaluateReadiness(input: ReadinessEvaluationInput): IssueReadine
         dependencyIssueNumber: dep.issueNumber,
       })
     }
-    return buildResult(input.issueNumber, 'needs-clarification', input.controlMetadata, reasonCodes, blockers, false)
+    return buildResult(input.issueNumber, 'needs-clarification', input.controlMetadata, reasonCodes, blockers, incompleteDependencyEvidence)
   }
 
   // not_found is a definitive invalid graph → needs-clarification
@@ -308,7 +331,7 @@ export function evaluateReadiness(input: ReadinessEvaluationInput): IssueReadine
         dependencyIssueNumber: dep.issueNumber,
       })
     }
-    return buildResult(input.issueNumber, 'needs-clarification', input.controlMetadata, reasonCodes, blockers, false)
+    return buildResult(input.issueNumber, 'needs-clarification', input.controlMetadata, reasonCodes, blockers, incompleteDependencyEvidence)
   }
 
   // Other unknown/inaccessible/lookup-failed → dependency-blocked (may resolve)
@@ -337,7 +360,7 @@ export function evaluateReadiness(input: ReadinessEvaluationInput): IssueReadine
         dependencyIssueNumber: dep.issueNumber,
       })
     }
-    return buildResult(input.issueNumber, 'dependency-blocked', input.controlMetadata, reasonCodes, blockers, false)
+    return buildResult(input.issueNumber, 'dependency-blocked', input.controlMetadata, reasonCodes, blockers, incompleteDependencyEvidence)
   }
 
   // All dependencies satisfied (or none) → ready

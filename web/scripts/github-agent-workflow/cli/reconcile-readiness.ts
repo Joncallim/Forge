@@ -8,6 +8,13 @@ import { ISSUE_READINESS_MANAGED_LABELS } from '../contracts/common'
 
 const CLOSED_SCAN_MAX_PAGES = 50
 const ISSUE_PAGE_SIZE = 100
+const NON_DEFINITIVE_API_FAILURE_CLASSES = Object.freeze([
+  'permission',
+  'rate-limit',
+  'network-timeout',
+  'server',
+  'invalid-response',
+] as const)
 export type PlannedIssue = Readonly<{ issue: GitHubIssue; readiness: IssueReadinessResult | null; closedCleanup: boolean }>
 type PlannedLabelMutation = Readonly<{ issueNumber: number; add: readonly string[]; remove: readonly string[] }>
 type ReconcilePlan = { scannedIssues: number; closedIssuesScanned: number; readyCount: number; blockedCount: number; clarificationCount: number; trackingOnlyCount: number; plannedLabelMutations: PlannedLabelMutation[]; labelTransitions: number; apiFailures: number; uniqueDependencyFetches: number; dependencyCacheHits: number; graphLimitFailures: number; apiFailureClasses: Record<string, number>; elapsedMs: number; errors: string[] }
@@ -16,6 +23,12 @@ function managedLabels(labels: readonly string[]): string[] {
   return labels.filter((label) => ISSUE_READINESS_MANAGED_LABELS.includes(label as typeof ISSUE_READINESS_MANAGED_LABELS[number])).sort()
 }
 function sameLabels(left: readonly string[], right: readonly string[]): boolean { return JSON.stringify([...left].sort()) === JSON.stringify([...right].sort()) }
+
+function nonDefinitiveApiFailures(apiFailureClasses: Readonly<Record<string, number>>): string[] {
+  return NON_DEFINITIVE_API_FAILURE_CLASSES
+    .filter((failureClass) => (apiFailureClasses[failureClass] ?? 0) > 0)
+    .map((failureClass) => `${failureClass}=${apiFailureClasses[failureClass]}`)
+}
 
 /** Reject a non-atomic open/closed inventory before the apply phase. */
 export function inventoryOverlap(openIssues: ReadonlyMap<number, GitHubIssue>, closedIssues: readonly GitHubIssue[]): number[] {
@@ -136,6 +149,10 @@ export async function main(argv: string[] = process.argv.slice(2), env: NodeJS.P
   plan.graphLimitFailures = resolver.graphLimitFailures
   plan.apiFailureClasses = { ...resolver.apiFailureClasses }
   if (resolver.graphLimitFailures > 0) plan.errors.push(`Dependency graph limits were reached for ${resolver.graphLimitFailures} issue(s).`)
+  const incompleteApiFailures = nonDefinitiveApiFailures(plan.apiFailureClasses)
+  if (incompleteApiFailures.length > 0) {
+    plan.errors.push(`Non-definitive GitHub API failures were observed during planning: ${incompleteApiFailures.join(', ')}.`)
+  }
 
   console.info(JSON.stringify({ phase: 'validate', plannedIssues: planned.length }))
   if (planned.length !== plan.scannedIssues + plan.closedIssuesScanned) plan.errors.push('Discovery and plan counts do not match.')

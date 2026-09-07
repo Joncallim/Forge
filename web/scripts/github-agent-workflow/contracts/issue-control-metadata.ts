@@ -11,6 +11,11 @@ export const executionModeSchema = freezeSchema(z.enum(EXECUTION_MODE_VALUES))
 export type ExecutionMode = z.infer<typeof executionModeSchema>
 
 /**
+ * Maximum dependencies allowed per issue.
+ */
+export const MAX_DEPENDENCIES_PER_ISSUE = 64
+
+/**
  * Parsed control metadata from an issue body.
  *
  * This represents the canonical "Execution mode: ..." and "Depends on: ..."
@@ -18,7 +23,7 @@ export type ExecutionMode = z.infer<typeof executionModeSchema>
  */
 export const issueControlMetadataSchema = freezeSchema(z.object({
   executionMode: executionModeSchema.nullable(),
-  dependencies: z.array(positiveIntSchema),
+  dependencies: z.array(positiveIntSchema).max(MAX_DEPENDENCIES_PER_ISSUE),
   /**
    * Whether the Depends on value was "none" (semantically empty).
    */
@@ -55,11 +60,6 @@ export const EMPTY_CONTROL_METADATA: IssueControlMetadata = Object.freeze({
   explicit: false,
   isLegacyTrackingEpic: false,
 })
-
-/**
- * Maximum dependencies allowed per issue.
- */
-export const MAX_DEPENDENCIES_PER_ISSUE = 64
 
 /**
  * Maximum distinct parser diagnostics retained for one untrusted issue body.

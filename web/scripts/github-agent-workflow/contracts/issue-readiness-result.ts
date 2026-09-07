@@ -1,6 +1,6 @@
 import { z } from 'zod'
 import { freezeSchema, positiveIntSchema, nonEmptyTrimmedStringSchema } from './common'
-import { executionModeSchema } from './issue-control-metadata'
+import { executionModeSchema, MAX_DEPENDENCIES_PER_ISSUE } from './issue-control-metadata'
 
 /**
  * Stable readiness reason codes following SPEC-0007 queue.* namespace.
@@ -99,9 +99,9 @@ export const issueReadinessResultSchema = freezeSchema(z.object({
   state: semanticReadinessStateSchema,
   dispatchable: z.boolean(),
   executionMode: executionModeSchema.nullable(),
-  dependencies: z.array(positiveIntSchema),
+  dependencies: z.array(positiveIntSchema).max(MAX_DEPENDENCIES_PER_ISSUE),
   reasonCodes: z.array(readinessReasonCodeSchema),
-  blockers: z.array(blockerRecordSchema),
+  blockers: z.array(blockerRecordSchema).max(MAX_READINESS_BLOCKERS),
   desiredReadinessLabels: z.array(readinessLabelSchema),
   /**
    * Whether the readiness result could not be fully computed (e.g. API error,
