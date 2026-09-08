@@ -71,6 +71,18 @@ describe('exact control metadata grammar', () => {
     expect(result.reasonCodes).not.toHaveLength(0)
   })
 
+  it.each([
+    'Execution mode:implementation',
+    'Execution mode:\u00a0tracking',
+    'Execution mode:\timplementation',
+  ])('fails closed when malformed Execution mode syntax coexists with canonical controls: %s', async (executionMode) => {
+    const target = { ...issue('none'), body: `${validBugBody('none')}\n${executionMode}` }
+    const result = await new IssueReadinessResolver(new FakeGitHubClient({ issues: [target] })).resolveFromIssue(target)
+
+    expect(result.dispatchable).toBe(false)
+    expect(result.reasonCodes).toContain('queue.issue_execution_mode_invalid')
+  })
+
   it('does not authorize controls inside nested HTML blocks', async () => {
     const target = {
       ...issue('none'),

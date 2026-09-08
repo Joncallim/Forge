@@ -86,11 +86,13 @@ export function parseControlMetadata(
   // Extract lines that look like metadata declarations
   const executionModeLines: Array<{ lineNumber: number; value: string }> = []
   const dependsOnLines: Array<{ lineNumber: number; value: string }> = []
+  let hasMalformedExecutionModeDeclaration = false
   let hasMalformedDependsOnDeclaration = false
 
   for (const line of visible.lines) {
     const executionModeValue = controlValue(line.text, EXECUTION_MODE_PREFIX)
     if (executionModeValue !== null) executionModeLines.push({ lineNumber: line.lineNumber, value: executionModeValue })
+    else if (/^ {0,3}Execution mode:/.test(line.text)) hasMalformedExecutionModeDeclaration = true
 
     const dependsOnValue = controlValue(line.text, DEPENDS_ON_PREFIX)
     if (dependsOnValue !== null) dependsOnLines.push({ lineNumber: line.lineNumber, value: dependsOnValue })
@@ -103,9 +105,12 @@ export function parseControlMetadata(
 
   // Resolve execution mode
   let executionMode: 'implementation' | 'tracking' | null = null
-  const explicit = executionModeLines.length > 0 || dependsOnLines.length > 0 || hasMalformedDependsOnDeclaration
+  const explicit = executionModeLines.length > 0 || dependsOnLines.length > 0
+    || hasMalformedExecutionModeDeclaration || hasMalformedDependsOnDeclaration
 
-  if (executionModeLines.length === 1) {
+  if (hasMalformedExecutionModeDeclaration) {
+    diagnose('queue.issue_execution_mode_invalid', 'execution_mode', 'Execution mode declaration does not use the canonical syntax.')
+  } else if (executionModeLines.length === 1) {
     const parsed = executionModeSchema.safeParse(executionModeLines[0].value)
     if (parsed.success) {
       executionMode = parsed.data
@@ -213,7 +218,7 @@ export function parseControlMetadata(
   // For non-legacy, non-Epic issues, both Execution mode and Depends on must be present
   // to be considered fully explicit. Missing either field is a parse error.
   const isImplementationIssue = !isLegacyTrackingEpic && issueType !== 'epic'
-  const hasExecutionModeLine = executionModeLines.length > 0
+  const hasExecutionModeLine = executionModeLines.length > 0 || hasMalformedExecutionModeDeclaration
   const hasDependsOnLine = dependsOnLines.length > 0 || hasMalformedDependsOnDeclaration
 
   if (isImplementationIssue && !hasExecutionModeLine) {
