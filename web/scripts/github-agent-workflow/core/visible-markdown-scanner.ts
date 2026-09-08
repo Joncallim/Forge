@@ -46,9 +46,10 @@ const HTML_BLOCK_TAGS = new Set([
   'div', 'dl', 'dt', 'fieldset', 'figcaption', 'figure', 'footer', 'form',
   'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'header', 'hr', 'html', 'iframe', 'li',
   'main', 'menu', 'nav', 'ol', 'p', 'plaintext', 'pre', 'script', 'search',
-  'section', 'style', 'summary', 'table', 'tbody', 'td', 'tfoot', 'th', 'thead',
+  'section', 'style', 'table', 'tbody', 'td', 'tfoot', 'th', 'thead',
   'title', 'tr', 'ul',
 ])
+const MAX_HTML_BLOCK_DEPTH = 64
 
 function startsInlineBlockBoundary(line: string): boolean {
   if (line.trim() === '') return true
@@ -128,7 +129,8 @@ export function scanVisibleMarkdownLines(
   let inHtmlComment = false
   let inlineCodeDelimiterLength: number | null = null
   let detailsDepth = 0
-  let htmlBlockDepth = 0
+  const htmlBlockStack: string[] = []
+  let htmlBlockOverflow = false
   let inDetailsOpener = false
   let inLazyBlockQuoteContinuation = false
   let inLazyListContinuation = false
@@ -191,16 +193,28 @@ export function scanVisibleMarkdownLines(
     let found = false
     for (const token of tokens) {
       const match = token.match(/^<\s*(\/)?\s*([A-Za-z][A-Za-z0-9-]*)\b/i)
-      if (!match || !HTML_BLOCK_TAGS.has(match[2].toLowerCase())) continue
+      const tagName = match?.[2].toLowerCase()
+      if (!match || !tagName || !HTML_BLOCK_TAGS.has(tagName)) continue
       found = true
-      if (match[1]) htmlBlockDepth = Math.max(0, htmlBlockDepth - 1)
-      else if (!/\/\s*>$/.test(token) && !/^<(?:hr)\b/i.test(token)) htmlBlockDepth++
+      if (match[1]) {
+        // A mismatched closer is not permission to escape its still-open
+        // container. Only the matching top-of-stack closes authority hiding.
+        if (htmlBlockStack.at(-1) === tagName) htmlBlockStack.pop()
+      } else if (!/\/\s*>$/.test(token) && !/^<(?:hr)\b/i.test(token)) {
+        if (htmlBlockStack.length < MAX_HTML_BLOCK_DEPTH) htmlBlockStack.push(tagName)
+        else htmlBlockOverflow = true
+      }
     }
     return found
   }
 
   const observeNonAuthoritativeSegment = (segment: string, hasVisiblePrefix: boolean): void => {
     if (segment.trim() === '') return
+
+    // The visible prefix before an inline comment/code span can still open or
+    // close an HTML container. Process it before returning for the suppressed
+    // representation so `<div><!-- note -->` cannot leak following controls.
+    if (processHtmlBlockTokens(segment)) return
 
     // While already inside details, a real close/open token in a visible
     // segment remains structurally meaningful even if the physical line also
@@ -370,7 +384,7 @@ export function scanVisibleMarkdownLines(
     // HTML block containers are presentation, not control authority. Keep a
     // bounded nesting count so metadata in examples such as nested <div>s
     // cannot escape into the semantic parser.
-    if (htmlBlockDepth > 0) {
+    if (htmlBlockOverflow || htmlBlockStack.length > 0) {
       processHtmlBlockTokens(line)
       continue
     }

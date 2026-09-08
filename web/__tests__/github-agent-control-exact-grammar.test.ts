@@ -95,6 +95,22 @@ describe('exact control metadata grammar', () => {
   })
 
   it.each([
+    ['mismatched closer', ['<div>', '</section>']],
+    ['crossed nested closer', ['<div>', '<section>', '</div>', '</section>']],
+    ['opener before HTML comment', ['<div><!-- note -->']],
+    ['opener before inline code', ['<div>`example`']],
+  ])('does not let %s escape an HTML authority boundary', async (_name, boundary) => {
+    const target = {
+      ...issue('none'),
+      body: [withoutControlBlock(validBugBody('none')), ...boundary, 'Execution mode: implementation', 'Depends on: none', '</div>'].join('\n'),
+    }
+    const result = await new IssueReadinessResolver(new FakeGitHubClient({ issues: [target] })).resolveFromIssue(target)
+
+    expect(result.dispatchable).toBe(false)
+    expect(result.reasonCodes).toContain('queue.issue_control_missing')
+  })
+
+  it.each([
     ['same-line comment before fence', ['<!-- harmless -->```', 'Execution mode: implementation', 'Depends on: none', '```']],
     ['multiline comment close before fence', ['<!-- comment begins', '-->```', 'Execution mode: implementation', 'Depends on: none', '```']],
     ['multiline comment close before details', ['<!-- comment begins', '--><details>', 'Execution mode: implementation', 'Depends on: none', '</details>']],
