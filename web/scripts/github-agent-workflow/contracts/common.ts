@@ -16,6 +16,8 @@ export const GITHUB_AGENT_WORKFLOW_LABEL_NAMES = Object.freeze([
   'needs-triage',
   'ready-for-agent',
   'needs-clarification',
+  'dependency-blocked',
+  'tracking-only',
   'agent-requested',
   'agent-running',
   'agent-blocked',
@@ -24,6 +26,16 @@ export const GITHUB_AGENT_WORKFLOW_LABEL_NAMES = Object.freeze([
 
 export const githubAgentWorkflowLabelNameSchema = freezeSchema(z.enum(GITHUB_AGENT_WORKFLOW_LABEL_NAMES))
 export type GitHubAgentWorkflowLabelName = z.infer<typeof githubAgentWorkflowLabelNameSchema>
+
+/**
+ * Readiness-managed labels (mutually exclusive projections).
+ */
+export const ISSUE_READINESS_MANAGED_LABELS = Object.freeze([
+  'ready-for-agent',
+  'needs-clarification',
+  'dependency-blocked',
+  'tracking-only',
+] as const)
 
 export const ISSUE_TYPE_VALUES = Object.freeze(['feature', 'bug', 'other', 'epic', 'unknown'] as const)
 export const issueTypeSchema = freezeSchema(z.enum(ISSUE_TYPE_VALUES))

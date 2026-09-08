@@ -24,6 +24,8 @@ import { RestGitHubClient, type GitHubClient, type GitHubIssue } from './io/gith
 import { agentBranchNameSchema } from './contracts/branch-name'
 import type { AgentRunRecord } from './contracts/agent-run-record'
 import type { HandoffArtifacts, RunId } from './contracts/common'
+import { canProjectBlockedRun } from './shared/run-state-guard'
+import { IssueReadinessResolver } from './shared/issue-readiness-resolver'
 
 export const HANDOFF_MARKER_PREFIX = '<!-- forge-agent-handoff -->'
 const HANDOFF_CRITERIA_TRUNCATION_MARKER = ' […]'
@@ -56,11 +58,6 @@ type BoundedHandoffAcceptanceCriteria = Readonly<{
   criteria: string[]
   omitted: boolean
 }>
-
-function hasLabel(issue: GitHubIssue, label: string): boolean {
-  const normalized = label.trim().toLowerCase()
-  return issue.labels.some((issueLabel) => issueLabel.trim().toLowerCase() === normalized)
-}
 
 function parsePositiveIssueNumber(value: unknown): number | null {
   if (typeof value === 'number' && Number.isInteger(value) && value > 0) return value
@@ -168,11 +165,35 @@ function boundHandoffAcceptanceCriteria(criteria: readonly string[]): BoundedHan
   }
 }
 
+/**
+ * Semantic eligibility check using the shared readiness resolver.
+ */
+async function semanticEligibility(
+  issue: GitHubIssue,
+  client: GitHubClient,
+): Promise<{ eligible: boolean; reason: string | null }> {
+  if (issue.isPullRequest) return { eligible: false, reason: 'Source reference is a pull request, not an issue.' }
+  if (issue.state !== 'open') return { eligible: false, reason: 'Source issue is not open.' }
+
+  const resolver = new IssueReadinessResolver(client)
+  let readiness
+  try {
+    readiness = await resolver.resolveFromIssue(issue)
+  } catch {
+    return { eligible: false, reason: 'Could not verify issue readiness due to an internal error.' }
+  }
+
+  if (!readiness.dispatchable) {
+    const reasons = readiness.reasonCodes.join(', ')
+    return { eligible: false, reason: `Issue is not semantically dispatchable: ${reasons}` }
+  }
+
+  return { eligible: true, reason: null }
+}
+
 function eligibilityFailure(issue: GitHubIssue, run: AgentRunRecord | null): string | null {
   if (issue.isPullRequest) return 'Source reference is a pull request, not an issue.'
   if (issue.state !== 'open') return 'Source issue is not open.'
-  if (!hasLabel(issue, 'ready-for-agent')) return 'Source issue does not have `ready-for-agent`.'
-  if (hasLabel(issue, 'needs-clarification')) return 'Source issue has `needs-clarification`.'
   if (run === null) return 'No run record exists for this issue.'
   if (!['requested', 'handed-off'].includes(run.status)) {
     return `Latest run status is \`${run.status}\`, not \`requested\` or \`handed-off\`.`
@@ -237,7 +258,9 @@ function renderHandoffMarkdown(input: {
     '',
     '## Stop Conditions',
     '',
-    '- Stop if the issue is closed, loses ready-for-agent, or gains needs-clarification.',
+    '- Stop if the issue is closed or no longer semantically dispatchable.',
+    '- BEFORE starting, run `npm run forge:check-readiness -- --issue-number <n>` to confirm the issue is still dispatchable.',
+    '- If check-readiness exits non-zero, do NOT start work. Rerun the handoff/admission path so the run can be durably blocked.',
     '- Stop if the implementation requires secrets, credentials, unrestricted filesystem access, or executing untrusted pull request code.',
     '- Stop if tests fail in a way that cannot be fixed without weakening existing safety guarantees.',
     '- Stop rather than claiming validation that was not run.',
@@ -275,6 +298,12 @@ function renderPromptMarkdown(input: {
     'You are implementing a Forge GitHub issue from a bounded handoff package.',
     '',
     'Do not execute code from pull requests or comments in GitHub Actions. Do not store secrets, credentials, model transcripts, or local auth material in the durable run log.',
+    '',
+    '## Pre-Start Requirement',
+    '',
+    'BEFORE starting implementation, run: `npm run forge:check-readiness -- --issue-number <n>`',
+    'If this exits non-zero, do NOT start work. The issue is no longer dispatchable.',
+    'Rerun the handoff/admission workflow so the run can be durably blocked.',
     '',
     '## Source Issue Summary',
     '',
@@ -415,6 +444,54 @@ export async function runHandoff(input: {
       reason: 'Skipping agent handoff because the source reference is a pull request, not an issue.',
     })
   }
+
+  // First, check semantic readiness (authority check)
+  const semantic = await semanticEligibility(issue, input.client)
+  if (!semantic.eligible) {
+    const latestRun = await findLatestRunForIssue(input.issueNumber, { repositoryRoot: input.runLogRepositoryRoot })
+    const canProjectBlocked = canProjectBlockedRun(latestRun?.status ?? null)
+    if (canProjectBlocked && latestRun !== null) {
+      await recordBlockedReason({
+        issueNumber: issue.number,
+        runId: latestRun.runId,
+        blockedReason: semantic.reason!,
+      }, {
+        repositoryRoot: input.runLogRepositoryRoot,
+        now: input.now,
+        persistRecord: input.persistRunLog ? persistRunRecordToGit : undefined,
+        targetBranch: input.targetBranch,
+      })
+    }
+    // Remove stale agent-requested before adding agent-blocked (only for blockable runs)
+    if (canProjectBlocked) {
+      await input.client.removeLabel(issue.number, 'agent-requested')
+    }
+    // Only project agent-blocked for blockable runs; for active/terminal runs, skip label projection
+    if (canProjectBlocked) {
+      await input.client.addLabel(issue.number, 'agent-blocked')
+    }
+    const commentBody = blockedComment({ issueNumber: issue.number, runId: latestRun?.runId ?? null, reason: semantic.reason! })
+    if (canProjectBlocked) {
+      await input.client.upsertComment(issue.number, {
+        markerPrefix: HANDOFF_MARKER_PREFIX,
+        botLogin: input.botLogin,
+        body: commentBody,
+      })
+    }
+    return {
+      status: 'blocked',
+      issueNumber: issue.number,
+      runId: latestRun?.runId ?? null,
+      runtime: latestRun?.runtime ?? null,
+      branchName: latestRun?.branchName ?? null,
+      artifacts: null,
+      artifactName: null,
+      metadata: null,
+      blockedReason: semantic.reason,
+      commentBody: canProjectBlocked ? commentBody : null,
+    }
+  }
+
   const latestRun = await findLatestRunForIssue(input.issueNumber, { repositoryRoot: input.runLogRepositoryRoot })
   const failure = eligibilityFailure(issue, latestRun)
   const runLogOptions = {
@@ -425,20 +502,30 @@ export async function runHandoff(input: {
   }
 
   if (failure !== null) {
-    if (latestRun !== null) {
+    const canProjectBlocked = canProjectBlockedRun(latestRun?.status ?? null)
+    if (canProjectBlocked && latestRun !== null) {
       await recordBlockedReason({
         issueNumber: issue.number,
         runId: latestRun.runId,
         blockedReason: failure,
       }, runLogOptions)
     }
-    await input.client.addLabel(issue.number, 'agent-blocked')
+    // Remove stale agent-requested before adding agent-blocked (only for blockable runs)
+    if (canProjectBlocked) {
+      await input.client.removeLabel(issue.number, 'agent-requested')
+    }
+    // Only project agent-blocked for blockable runs; for active/terminal runs, skip label projection
+    if (canProjectBlocked) {
+      await input.client.addLabel(issue.number, 'agent-blocked')
+    }
     const commentBody = blockedComment({ issueNumber: issue.number, runId: latestRun?.runId ?? null, reason: failure })
-    await input.client.upsertComment(issue.number, {
-      markerPrefix: HANDOFF_MARKER_PREFIX,
-      botLogin: input.botLogin,
-      body: commentBody,
-    })
+    if (canProjectBlocked) {
+      await input.client.upsertComment(issue.number, {
+        markerPrefix: HANDOFF_MARKER_PREFIX,
+        botLogin: input.botLogin,
+        body: commentBody,
+      })
+    }
     return {
       status: 'blocked',
       issueNumber: issue.number,
@@ -449,7 +536,7 @@ export async function runHandoff(input: {
       artifactName: null,
       metadata: null,
       blockedReason: failure,
-      commentBody,
+      commentBody: canProjectBlocked ? commentBody : null,
     }
   }
 

@@ -1,3 +1,13 @@
+/**
+ * Structural issue validation.
+ *
+ * Validates whether an issue body satisfies the required template structure
+ * (sections, title prefix). This is PURE structural validation only.
+ *
+ * It MUST NOT recommend or authorize `ready-for-agent`. Semantic readiness
+ * is computed by the shared readiness resolver in issue-readiness.ts.
+ */
+
 import type { GitHubIssue } from '../io/github-client'
 import { issueValidationResultSchema, type IssueValidationResult } from '../contracts/issue-validation-result'
 import type { IssueType } from '../contracts/common'
@@ -5,9 +15,16 @@ import { parseSections } from './sections'
 
 export const ISSUE_VALIDATION_MARKER_PREFIX = '<!-- forge-issue-validation -->'
 
+/**
+ * Labels managed by structural validation.
+ * Note: structural validation only manages `needs-clarification`.
+ * The readiness projection runner manages all readiness labels.
+ */
 export const ISSUE_INTAKE_MANAGED_LABELS = Object.freeze([
   'ready-for-agent',
   'needs-clarification',
+  'dependency-blocked',
+  'tracking-only',
 ] as const)
 
 type IssueTemplateDefinition = Readonly<{
@@ -158,16 +175,12 @@ export function buildNeedsClarificationComment(result: IssueValidationResult): s
   return lines.join('\n')
 }
 
-export function buildReadyForAgentComment(result: IssueValidationResult): string {
-  return [
-    ISSUE_VALIDATION_MARKER_PREFIX,
-    '## FORGE issue validation',
-    '',
-    `This ${displayName(result.issueType)} issue now matches the required FORGE template structure.`,
-    'The validator applied `ready-for-agent` and removed `needs-clarification` if it was present.',
-  ].join('\n')
-}
-
+/**
+ * Validate the structural validity of an issue.
+ *
+ * Returns only structural validity — does NOT compute semantic readiness.
+ * The caller must use the shared readiness resolver for that.
+ */
 export function validateIssue(input: ValidationInput): IssueValidationResult {
   const body = input.body ?? ''
   const sections = parseSections(body)
@@ -176,6 +189,9 @@ export function validateIssue(input: ValidationInput): IssueValidationResult {
   const missingSections = requiredSections.filter((section) => !(section in sections) || sections[section] === '')
   const valid = issueType !== 'unknown' && missingSections.length === 0
 
+  // Structural validation no longer recommends ready-for-agent.
+  // It only flags needs-clarification. Readiness projection is done by the
+  // shared readiness resolver.
   return issueValidationResultSchema.parse({
     issueNumber: input.number,
     issueTitle: input.title.trim(),
@@ -183,7 +199,7 @@ export function validateIssue(input: ValidationInput): IssueValidationResult {
     valid,
     missingSections,
     detectedSections: Object.keys(sections),
-    recommendedLabels: valid ? ['ready-for-agent'] : ['needs-clarification'],
+    recommendedLabels: valid ? [] : ['needs-clarification'],
     markerPrefix: ISSUE_VALIDATION_MARKER_PREFIX,
     commentBody: valid ? null : buildNeedsClarificationComment(issueValidationResultSchema.parse({
       issueNumber: input.number,
@@ -192,7 +208,7 @@ export function validateIssue(input: ValidationInput): IssueValidationResult {
       valid,
       missingSections,
       detectedSections: Object.keys(sections),
-      recommendedLabels: valid ? ['ready-for-agent'] : ['needs-clarification'],
+      recommendedLabels: valid ? [] : ['needs-clarification'],
       markerPrefix: ISSUE_VALIDATION_MARKER_PREFIX,
       commentBody: null,
     })),

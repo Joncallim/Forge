@@ -4,6 +4,7 @@ const GITHUB_TIMEOUT_MS = 8000
 const DEFAULT_GITHUB_API_URL = 'https://api.github.com'
 const GITHUB_API_VERSION = '2022-11-28'
 const LIST_COMMENTS_PAGE_SIZE = 100
+const LIST_ISSUES_PAGE_SIZE = 100
 
 export type GitHubIssue = Readonly<{
   number: number
@@ -11,9 +12,11 @@ export type GitHubIssue = Readonly<{
   body: string | null
   labels: string[]
   state: string
+  stateReason: string | null
   htmlUrl: string
   authorLogin: string
   isPullRequest: boolean
+  updatedAt: string | null
 }>
 
 export type GitHubComment = Readonly<{
@@ -45,6 +48,24 @@ export interface GitHubClient {
   upsertComment(issueNumber: number, input: { markerPrefix: string; botLogin: string; body: string }): Promise<GitHubComment>
   getPullRequest(pullRequestNumber: number): Promise<GitHubPullRequest>
   getCollaboratorPermission(username: string): Promise<GitHubCollaboratorPermission>
+  /**
+   * List open issues in the repository, paginated.
+   * Filters out pull requests.
+   */
+  listOpenIssues(options?: { page?: number; perPage?: number; maxPages?: number }): Promise<{
+    issues: GitHubIssue[]
+    hasMore: boolean
+    /** True when the unfiltered REST page filled the configured scan cap. */
+    rawPageFullAtCap?: boolean
+  }>
+  /**
+   * List closed issues in the repository, paginated.
+   * Used by closed-issue cleanup lane during full reconciliation.
+   */
+  listClosedIssues(options?: { page?: number; perPage?: number; maxPages?: number; label?: string }): Promise<{
+    issues: GitHubIssue[]
+    hasMore: boolean
+  }>
 }
 
 type RestGitHubClientOptions = {
@@ -58,6 +79,8 @@ export class GitHubApiError extends Error {
     message: string,
     readonly status: number,
     readonly path: string,
+    /** Non-sensitive HTTP evidence retained for operational classification. */
+    readonly rateLimitEvidence: Readonly<{ retryAfter: boolean; remainingZero: boolean }> = { retryAfter: false, remainingZero: false },
   ) {
     super(message)
     this.name = 'GitHubApiError'
@@ -104,35 +127,50 @@ function githubHeaders(token: string, initHeaders?: HeadersInit): HeadersInit {
   }
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+function responseError(message: string): Error {
+  return new Error(`Invalid GitHub API response: ${message}`)
+}
+
+function requirePositiveNumber(value: unknown, field: string): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0) throw responseError(`${field} must be a positive integer.`)
+  return value
+}
+
+function requireString(value: unknown, field: string): string {
+  if (typeof value !== 'string') throw responseError(`${field} must be a string.`)
+  return value
+}
+
 function mapIssue(raw: Record<string, unknown>): GitHubIssue {
+  if (!Array.isArray(raw.labels)) throw responseError('issue.labels must be an array.')
   return {
-    number: typeof raw.number === 'number' ? raw.number : 0,
-    title: typeof raw.title === 'string' ? raw.title : '',
+    number: requirePositiveNumber(raw.number, 'issue.number'),
+    title: requireString(raw.title, 'issue.title'),
     body: typeof raw.body === 'string' ? raw.body : null,
-    labels: Array.isArray(raw.labels)
-      ? raw.labels
-          .map((label) => {
-            if (typeof label === 'string') return label
-            if (label && typeof label === 'object' && typeof (label as { name?: unknown }).name === 'string') {
-              return (label as { name: string }).name
-            }
-            return ''
-          })
-          .filter((label) => label !== '')
-      : [],
-    state: typeof raw.state === 'string' ? raw.state : '',
-    htmlUrl: typeof raw.html_url === 'string' ? raw.html_url : '',
+    labels: raw.labels.map((label) => {
+      if (typeof label === 'string' && label.trim() !== '') return label
+      if (isRecord(label) && typeof label.name === 'string' && label.name.trim() !== '') return label.name
+      throw responseError('issue.labels contains an invalid label.')
+    }),
+    state: requireString(raw.state, 'issue.state'),
+    stateReason: typeof raw.state_reason === 'string' ? raw.state_reason : null,
+    htmlUrl: requireString(raw.html_url, 'issue.html_url'),
     authorLogin: raw.user && typeof raw.user === 'object' && typeof (raw.user as { login?: unknown }).login === 'string'
       ? (raw.user as { login: string }).login
       : '',
     isPullRequest: raw.pull_request !== undefined,
+    updatedAt: typeof raw.updated_at === 'string' ? raw.updated_at : null,
   }
 }
 
 function mapComment(raw: Record<string, unknown>): GitHubComment {
   return {
-    id: typeof raw.id === 'number' ? raw.id : 0,
-    body: typeof raw.body === 'string' ? raw.body : '',
+    id: requirePositiveNumber(raw.id, 'comment.id'),
+    body: requireString(raw.body, 'comment.body'),
     authorLogin: raw.user && typeof raw.user === 'object' && typeof (raw.user as { login?: unknown }).login === 'string'
       ? (raw.user as { login: string }).login
       : '',
@@ -148,14 +186,14 @@ function mapPullRequest(raw: Record<string, unknown>): GitHubPullRequest {
   const base = raw.base && typeof raw.base === 'object' ? raw.base as { ref?: unknown } : null
 
   return {
-    number: typeof raw.number === 'number' ? raw.number : 0,
-    title: typeof raw.title === 'string' ? raw.title : '',
+    number: requirePositiveNumber(raw.number, 'pull_request.number'),
+    title: requireString(raw.title, 'pull_request.title'),
     body: typeof raw.body === 'string' ? raw.body : null,
-    state: typeof raw.state === 'string' ? raw.state : '',
+    state: requireString(raw.state, 'pull_request.state'),
     draft: raw.draft === true,
-    htmlUrl: typeof raw.html_url === 'string' ? raw.html_url : '',
-    headRefName: typeof head?.ref === 'string' ? head.ref : '',
-    baseRefName: typeof base?.ref === 'string' ? base.ref : '',
+    htmlUrl: requireString(raw.html_url, 'pull_request.html_url'),
+    headRefName: head && typeof head.ref === 'string' ? head.ref : '',
+    baseRefName: base && typeof base.ref === 'string' ? base.ref : '',
   }
 }
 
@@ -180,7 +218,7 @@ export class RestGitHubClient implements GitHubClient {
 
   async getIssue(issueNumber: number): Promise<GitHubIssue> {
     const response = await this.request(`/repos/${this.repo}/issues/${normalizeIssueNumber(issueNumber)}`)
-    return mapIssue(await this.readJson<Record<string, unknown>>(response))
+    return mapIssue(await this.readObject(response, 'issue'))
   }
 
   async listComments(issueNumber: number): Promise<GitHubComment[]> {
@@ -222,7 +260,7 @@ export class RestGitHubClient implements GitHubClient {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ body: normalized.body }),
       })
-      return mapComment(await this.readJson<Record<string, unknown>>(response))
+      return mapComment(await this.readObject(response, 'comment'))
     }
 
     const response = await this.request(`/repos/${this.repo}/issues/${normalizeIssueNumber(issueNumber)}/comments`, {
@@ -230,12 +268,12 @@ export class RestGitHubClient implements GitHubClient {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ body: normalized.body }),
     })
-    return mapComment(await this.readJson<Record<string, unknown>>(response))
+    return mapComment(await this.readObject(response, 'comment'))
   }
 
   async getPullRequest(pullRequestNumber: number): Promise<GitHubPullRequest> {
     const response = await this.request(`/repos/${this.repo}/pulls/${normalizeIssueNumber(pullRequestNumber)}`)
-    return mapPullRequest(await this.readJson<Record<string, unknown>>(response))
+    return mapPullRequest(await this.readObject(response, 'pull request'))
   }
 
   async getCollaboratorPermission(username: string): Promise<GitHubCollaboratorPermission> {
@@ -246,7 +284,7 @@ export class RestGitHubClient implements GitHubClient {
 
     if (response.status === 404) return 'none'
 
-    const body = await this.readJson<{ permission?: unknown }>(response)
+    const body = await this.readObject(response, 'collaborator permission')
     switch (body.permission) {
       case 'admin':
       case 'maintain':
@@ -259,11 +297,60 @@ export class RestGitHubClient implements GitHubClient {
     }
   }
 
+  async listOpenIssues(options: { page?: number; perPage?: number; maxPages?: number } = {}): Promise<{
+    issues: GitHubIssue[]
+    hasMore: boolean
+    rawPageFullAtCap?: boolean
+  }> {
+    const page = options.page ?? 1
+    const perPage = options.perPage ?? LIST_ISSUES_PAGE_SIZE
+    const maxPages = options.maxPages ?? 50 // Max 5000 issues
+
+    if (page > maxPages) {
+      return { issues: [], hasMore: false }
+    }
+
+    const response = await this.request(
+      `/repos/${this.repo}/issues?state=open&per_page=${perPage}&page=${page}&filter=all`,
+    )
+    const raw = await this.readArray(response, 'issues')
+    const issues = raw.filter((item) => item.pull_request === undefined).map(mapIssue)
+
+    // A full final page at the page cap must mark the scan incomplete
+    const atPageCap = page >= maxPages
+    const pageFull = raw.length >= perPage
+    return { issues, hasMore: !atPageCap && pageFull, rawPageFullAtCap: atPageCap && pageFull }
+  }
+
+  async listClosedIssues(options: { page?: number; perPage?: number; maxPages?: number; label?: string } = {}): Promise<{
+    issues: GitHubIssue[]
+    hasMore: boolean
+  }> {
+    const page = options.page ?? 1
+    const perPage = options.perPage ?? LIST_ISSUES_PAGE_SIZE
+    const maxPages = options.maxPages ?? 50
+
+    if (page > maxPages) {
+      return { issues: [], hasMore: false }
+    }
+
+    const label = options.label === undefined ? null : nonEmptyTrimmedStringSchema.parse(options.label)
+    const labelQuery = label === null ? '' : `&labels=${encodeURIComponent(label)}`
+    const response = await this.request(`/repos/${this.repo}/issues?state=closed&per_page=${perPage}&page=${page}&filter=all${labelQuery}`)
+    const raw = await this.readArray(response, 'issues')
+    const issues = raw.filter((item) => item.pull_request === undefined).map(mapIssue)
+
+    const pageFull = raw.length >= perPage
+    // Unlike open scans, closed reconciliation has no resolver-side cap
+    // detector. Preserve this incompleteness signal for its caller.
+    return { issues, hasMore: pageFull }
+  }
+
   private async listCommentsPage(issueNumber: number, page: number): Promise<GitHubComment[]> {
     const response = await this.request(
       `/repos/${this.repo}/issues/${normalizeIssueNumber(issueNumber)}/comments?per_page=${LIST_COMMENTS_PAGE_SIZE}&page=${page}`,
     )
-    const body = await this.readJson<Array<Record<string, unknown>>>(response)
+    const body = await this.readArray(response, 'comments')
     return body.map(mapComment)
   }
 
@@ -297,7 +384,17 @@ export class RestGitHubClient implements GitHubClient {
       })
 
       if (!response.ok && !(init?.allow404 && response.status === 404)) {
-        throw new GitHubApiError(`GitHub API returned ${response.status} for ${path}.`, response.status, path)
+        throw new GitHubApiError(
+          `GitHub API returned ${response.status} for ${path}.`,
+          response.status,
+          path,
+          {
+            // Do not retain or expose raw header values: their presence/zero
+            // state is sufficient to distinguish rate limiting from 403 ACLs.
+            retryAfter: response.headers.has('retry-after'),
+            remainingZero: response.headers.get('x-ratelimit-remaining') === '0',
+          },
+        )
       }
 
       return response
@@ -306,8 +403,24 @@ export class RestGitHubClient implements GitHubClient {
     }
   }
 
-  private async readJson<T>(response: Response): Promise<T> {
-    return await response.json() as T
+  private async readObject(response: Response, name: string): Promise<Record<string, unknown>> {
+    const json = await this.readJson(response)
+    if (!isRecord(json)) throw responseError(`${name} must be an object.`)
+    return json
+  }
+
+  private async readArray(response: Response, name: string): Promise<Array<Record<string, unknown>>> {
+    const json = await this.readJson(response)
+    if (!Array.isArray(json) || !json.every(isRecord)) throw responseError(`${name} must be an array of objects.`)
+    return json
+  }
+
+  private async readJson(response: Response): Promise<unknown> {
+    try {
+      return await response.json()
+    } catch {
+      throw responseError('response body is not valid JSON.')
+    }
   }
 
   private async maybeDrainBody(response: Response): Promise<void> {

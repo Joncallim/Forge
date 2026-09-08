@@ -85,6 +85,7 @@ export async function runAgentCommandForEvent(input: {
   githubRunId?: number | string | null
   githubRunAttempt?: number | string | null
   shortSha?: string | null
+  runLogRepositoryRoot?: string
 }): Promise<AgentCommandEventResult> {
   if (input.event.issue?.pull_request !== undefined) {
     return {
@@ -113,6 +114,7 @@ export async function runAgentCommandForEvent(input: {
     githubRunId: input.githubRunId,
     githubRunAttempt: input.githubRunAttempt,
     shortSha: input.shortSha,
+    runLogRepositoryRoot: input.runLogRepositoryRoot,
   })
 }
 
@@ -130,6 +132,7 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<void> 
       persistRecord,
       targetBranch,
     }),
+    runLogRepositoryRoot: repositoryRoot,
     githubRunId: env.GITHUB_RUN_ID,
     githubRunAttempt: env.GITHUB_RUN_ATTEMPT,
     shortSha: shortShaFromEnv(env),

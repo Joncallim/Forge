@@ -9,6 +9,17 @@ body:
       value: |
         Use this when the work is not clearly a feature or bug. This includes documentation, technical debt, refactors, research, governance, project setup, and follow-up tasks.
 
+  - type: textarea
+    id: forge_control
+    attributes:
+      label: Forge Control Metadata
+      description: Execution mode and dependencies. Do not edit the format.
+      value: |
+        Execution mode: implementation
+        Depends on: none
+    validations:
+      required: true
+
   - type: dropdown
     id: issue_type
     attributes:

@@ -14,35 +14,85 @@ selected tool locally or in another controlled environment.
 ## Human Workflow
 
 1. Discuss the idea in ChatGPT or another planning surface.
-2. File a GitHub issue using the Feature, Bug, or Other template.
-3. Issue intake validates the issue and applies `ready-for-agent`, or applies
-   `needs-clarification` when required information is missing.
-4. A maintainer comments `claude implement` or `codex implement` on the issue.
-5. The command router creates a run record and applies `agent-requested`.
-6. A maintainer starts the `Agent Dispatch` workflow manually with the issue
-   number. Dispatch checks the issue and run record, then prepares a bounded
-   work order.
-7. Handoff generates `handoff.md`, `prompt.md`, and `metadata.json`.
-8. The user runs Claude Code or Codex locally, or in another controlled
-   environment, using the generated `prompt.md`.
-9. The implementation pull request follows the PR contract.
-10. The PR contract checker compares the pull request body with the source
+2. File a GitHub issue using the Feature, Bug, Other, or Epic template.
+3. The issue template includes a "Forge Control Metadata" section where you set
+   `Execution mode: implementation` (or `tracking`) and `Depends on: #numbers`
+   (or `none`).
+4. Issue intake validates the issue structure, parses the control metadata, and
+   computes **semantic readiness** — checking that all dependencies are resolved
+   and the issue is dispatchable.
+5. If the issue is ready, `ready-for-agent` is projected as a label. If
+   dependencies are blocking, `dependency-blocked` is projected. If the issue
+   is a tracking umbrella, `tracking-only` is projected.
+6. A maintainer comments `claude implement` or `codex implement` on the issue.
+7. The command router verifies semantic readiness via the shared resolver,
+   checks the durable run log for existing runs, verifies collaborator
+   permission, creates a run record, and applies `agent-requested`.
+8. A maintainer starts the `Agent Dispatch` workflow manually with the issue
+   number. Dispatch re-checks semantic readiness, then prepares a bounded work
+   order.
+9. Handoff generates `handoff.md`, `prompt.md`, and `metadata.json`.
+10. The user runs Claude Code or Codex locally, or in another controlled
+    environment, using the generated `prompt.md`. Before starting, run
+    `npm run forge:check-readiness -- --issue-number <n>` to confirm the issue
+    is still dispatchable.
+11. The implementation pull request follows the PR contract.
+12. The PR contract checker compares the pull request body with the source
     issue acceptance criteria and posts a review-support comment.
-11. The user reviews, tests, and merges when satisfied.
+13. The user reviews, tests, and merges when satisfied.
+
+## Readiness
+
+Semantic readiness is the authoritative gate for all agent operations. It is
+computed by the shared `IssueReadinessResolver` from current GitHub truth —
+never from labels alone.
+
+### Readiness states
+
+| State | Label | Meaning |
+| --- | --- | --- |
+| Ready | `ready-for-agent` | Issue is dispatchable: valid structure, explicit control metadata, all dependencies satisfied. |
+| Needs clarification | `needs-clarification` | Issue is missing required structure, control metadata, or has unresolvable dependency syntax. |
+| Dependency blocked | `dependency-blocked` | Issue has one or more open or unresolved dependencies. |
+| Tracking only | `tracking-only` | Issue is a tracking umbrella (Epic) and is not implementation-dispatchable. |
+| Closed | (none) | Issue is closed and cannot be dispatched. |
+
+**Labels are projections, not authority.** Command, dispatch, handoff, and the
+pre-runtime check always re-resolve current semantic truth from the shared
+resolver. A stale or manually spoofed `ready-for-agent` label cannot grant
+authority.
+
+### Control metadata
+
+Every issue (except legacy Epics) must include these lines in the body:
+
+```
+Execution mode: implementation
+Depends on: none
+```
+
+Or with dependencies:
+
+```
+Execution mode: implementation
+Depends on: #123, #456
+```
+
+Tracking issues use `Execution mode: tracking`. The issue forms include a
+prefilled "Forge Control Metadata" textarea that emits this canonical format.
 
 ## Labels
 
 Forge uses these labels to show workflow state:
 
-- `ready-for-agent` means the issue has enough detail for bounded agent work.
-- `needs-clarification` means a human must clarify the issue before agent work.
-- `agent-requested` means a maintainer asked for implementation and a run record
-  exists.
-- `agent-running` is reserved for a future runtime adapter that actually starts
-  work.
-- `agent-blocked` means Forge could not continue and posted the reason.
-- `agent-pr-opened` is reserved for a future step that links a pull request back
-  to the run log. The PR checker does not set it in this slice.
+- `ready-for-agent` — **Readiness projection**: issue is semantically ready.
+- `needs-clarification` — **Readiness projection**: issue needs author correction.
+- `dependency-blocked` — **Readiness projection**: issue is blocked by dependencies.
+- `tracking-only` — **Readiness projection**: issue is a tracking umbrella.
+- `agent-requested` — A maintainer asked for implementation and a run record exists.
+- `agent-running` — Reserved for a future runtime adapter.
+- `agent-blocked` — Forge could not continue and posted the reason.
+- `agent-pr-opened` — Reserved for a future step linking a PR to the run log.
 
 ## Supported Request Phrases
 
@@ -55,23 +105,23 @@ Put one supported phrase on the first non-empty line of an issue comment:
 - `handoff`
 
 Today, `claude implement` and `codex implement` create implementation run
-records. The other phrases are recognized so Forge can give a clear response,
-but they do not start implementation in this slice.
+records after verifying semantic readiness and collaborator permission. The
+other phrases are recognized so Forge can give a clear response, but they do
+not start implementation in this slice.
 
 ## Dispatch States
 
 The durable run log uses one status field:
 
 - `requested` means the command router accepted the request.
-- `handed-off` means dispatch or handoff prepared bounded work, but no runtime
-  started.
+- `handed-off` means dispatch or handoff prepared bounded work, but no runtime started.
 - `running` is reserved for a future controlled runtime adapter.
 - `blocked` means Forge refused to continue and recorded a reason.
 - `pr-opened` is reserved for a future step that links a pull request to the run.
 - `completed`, `failed`, and `cancelled` are terminal or administrative states.
 
-Issue #144 used the word `accepted` for dispatch. Forge maps that to
-`handed-off` in the run log so there is not a second status model.
+The durable run log is the single workflow-state truth. `agent-*` labels are
+projections and must not override contradictory run-log state.
 
 ## Run Log Location
 
@@ -158,6 +208,34 @@ Each criterion is reported as:
 The checker does not block merge by default. It helps reviewers find gaps; it
 does not prove the implementation is correct.
 
+## Pre-Runtime Readiness Check
+
+Before starting Claude Code or Codex locally, run:
+
+```bash
+npm run forge:check-readiness -- --issue-number <n>
+```
+
+This uses the same shared resolver as command, dispatch, and handoff. It exits
+0 only when `dispatchable=true`. It performs no label or comment mutations and
+makes no model calls.
+
+## Full Reconciliation
+
+To recompute readiness for all open issues (e.g., after rollout or recovery):
+
+```bash
+npm run forge:reconcile -- --dry-run   # Preview only
+npm run forge:reconcile                # Apply label projections
+```
+
+Or via GitHub Actions: run the `Reconcile Readiness` workflow with
+`workflow_dispatch`.
+
+Reconciliation uses plan → validate → apply phases. No bulk mutations are
+performed from an incomplete repository snapshot. Safe ordering ensures
+`ready-for-agent` is never left as a false positive.
+
 ## Safety Rules
 
 - Do not run Claude Code or Codex automatically from GitHub Actions.
@@ -168,14 +246,29 @@ does not prove the implementation is correct.
   material in the durable run log.
 - Keep workflow comments marker-based so reruns update one comment instead of
   creating duplicates.
+- Semantic readiness from the shared resolver is authority. Labels are
+  projections only.
+- No model call occurs anywhere in readiness evaluation, parsing, graph
+  resolution, projection, or admission.
+
+## Rollback
+
+If the readiness resolver has a production incident:
+1. **Fail closed**: disable agent admission workflows (agent-command, dispatch,
+   handoff) first.
+2. **Do not restore** the old `template-valid -> ready-for-agent` logic while
+   admission workflows are active.
+3. Repair or revert the resolver.
+4. Re-enable admission workflows only after the resolver is verified.
 
 ## Troubleshooting
 
 If dispatch says no run record exists, make sure a maintainer first commented
 `claude implement` or `codex implement` and that the command router completed.
 
-If dispatch blocks on labels, remove `needs-clarification` only after the issue
-has been clarified, and make sure `ready-for-agent` is present.
+If dispatch blocks on semantic readiness, check the issue's control metadata
+(`Execution mode` and `Depends on` lines) and verify all dependencies are
+closed as completed.
 
 If handoff artifacts are missing from a GitHub Actions run, check the
 `Agent Handoff` workflow summary and artifact upload step. The files are

@@ -1,0 +1,424 @@
+/**
+ * Bounded visible-Markdown scanner.
+ *
+ * Extracts only the authority-bearing lines of a Markdown document — ignoring
+ * fenced/indented code, multiline code spans, blockquotes, HTML comments, and
+ * collapsed details content — so structural sections and control metadata
+ * cannot be spoofed by examples or hidden representations.
+ *
+ * This scanner is used by both:
+ *   - sections.ts (required template section detection)
+ *   - issue-control.ts (Execution mode / Depends on parsing)
+ *
+ * No GitHub calls, no model calls, no unbounded regex.
+ */
+
+export type VisibleMarkdownScannerOptions = Readonly<{
+  /** Maximum body bytes to accept. Bodies exceeding this bound fail closed. */
+  maxBodyBytes?: number
+}>
+
+const DEFAULT_MAX_BODY_BYTES = 256 * 1024 // 256 KiB
+
+export type VisibleMarkdownLines = Readonly<{
+  lines: readonly VisibleLine[]
+  bodyTooLarge: boolean
+}>
+
+export type VisibleLine = Readonly<{
+  lineNumber: number
+  text: string
+}>
+
+type BacktickRun = Readonly<{
+  index: number
+  end: number
+  length: number
+}>
+
+type FenceState = Readonly<{
+  type: 'backtick' | 'tilde'
+  fenceLength: number
+}>
+
+const HTML_BLOCK_TAGS = new Set([
+  'address', 'article', 'aside', 'blockquote', 'center', 'dd', 'dialog', 'dir',
+  'div', 'dl', 'dt', 'fieldset', 'figcaption', 'figure', 'footer', 'form',
+  'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'header', 'hr', 'html', 'iframe', 'li',
+  'main', 'menu', 'nav', 'ol', 'p', 'plaintext', 'pre', 'script', 'search',
+  'section', 'style', 'table', 'tbody', 'td', 'tfoot', 'th', 'thead',
+  'title', 'tr', 'ul',
+])
+const MAX_HTML_BLOCK_DEPTH = 64
+
+function startsInlineBlockBoundary(line: string): boolean {
+  if (line.trim() === '') return true
+  if (line.startsWith('    ') || line.startsWith('\t')) return true
+  if (/^ {0,3}#{1,6}(?:\s|$)/.test(line)) return true
+  if (/^ {0,3}>/.test(line)) return true
+  // Fences and HTML containers are handled by the stateful scanner below.
+  // Treating fence-looking or details-looking text as a precomputed inline
+  // boundary would let an invalid fence or a close tag split a real multiline
+  // code span before that stateful pass has established its meaning.
+  if (/^ {0,3}(?:[-+*](?:\s+|$)|\d{1,9}[.)](?:\s+|$))/.test(line)) return true
+  if (/^ {0,3}(?:={2,}|-{2,})\s*$/.test(line)) return true
+  if (/^ {0,3}(?:(?:\*\s*){3,}|(?:_\s*){3,}|(?:-\s*){3,})$/.test(line)) return true
+  return false
+}
+
+/**
+ * Scan a Markdown body and return only authority-bearing visible lines.
+ *
+ * The scanner is deliberately conservative at representation boundaries: a
+ * physical line containing HTML-comment elision or a real inline-code span is
+ * never authority-bearing. Persistent suppression state is nevertheless
+ * tracked so later lines cannot escape a fence/comment/code/details container.
+ *
+ * The implementation is O(n). Backtick-run availability is precomputed within
+ * paragraph-like inline regions, not globally: CommonMark block structure has
+ * precedence over inline code, so an unmatched backtick in one block cannot use
+ * a delimiter in a later heading/list/paragraph to suppress unrelated controls.
+ */
+export function scanVisibleMarkdownLines(
+  body: string,
+  options: VisibleMarkdownScannerOptions = {},
+): VisibleMarkdownLines {
+  const maxBytes = options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES
+
+  if (Buffer.byteLength(body, 'utf8') > maxBytes) {
+    return { lines: [], bodyTooLarge: true }
+  }
+
+  const rawLines = body.split(/\r?\n/)
+  const result: VisibleLine[] = []
+
+  // Absolute offsets plus a conservative inline-region identifier let us decide
+  // in O(1) whether a backtick run has a matching delimiter in the same block.
+  const lineOffsets: number[] = []
+  const inlineRegionByLine: number[] = []
+  const lastBacktickRunPositionByRegion = new Map<number, Map<number, number>>()
+  let absoluteOffset = 0
+  let inlineRegion = 0
+
+  for (const line of rawLines) {
+    const isBoundary = startsInlineBlockBoundary(line)
+    if (isBoundary) inlineRegion += 1
+    const regionForLine = inlineRegion
+    lineOffsets.push(absoluteOffset)
+    inlineRegionByLine.push(regionForLine)
+
+    let regionRuns = lastBacktickRunPositionByRegion.get(regionForLine)
+    if (!regionRuns) {
+      regionRuns = new Map<number, number>()
+      lastBacktickRunPositionByRegion.set(regionForLine, regionRuns)
+    }
+    for (let cursor = 0; cursor < line.length;) {
+      const index = line.indexOf('`', cursor)
+      if (index === -1) break
+      let end = index + 1
+      while (end < line.length && line[end] === '`') end++
+      regionRuns.set(end - index, absoluteOffset + index)
+      cursor = end
+    }
+
+    absoluteOffset += line.length + 1
+    if (isBoundary) inlineRegion += 1
+  }
+
+  let inFence: FenceState | null = null
+  let inHtmlComment = false
+  let inlineCodeDelimiterLength: number | null = null
+  let detailsDepth = 0
+  const htmlBlockStack: string[] = []
+  let htmlBlockOverflow = false
+  let inDetailsOpener = false
+  let inLazyBlockQuoteContinuation = false
+  let inLazyListContinuation = false
+
+  const findBacktickRun = (line: string, startAt: number): BacktickRun | null => {
+    const index = line.indexOf('`', startAt)
+    if (index === -1) return null
+    let end = index + 1
+    while (end < line.length && line[end] === '`') end++
+    return { index, end, length: end - index }
+  }
+
+  const findOpenableBacktickRun = (
+    line: string,
+    lineOffset: number,
+    region: number,
+    startAt: number,
+  ): BacktickRun | null => {
+    const regionRuns = lastBacktickRunPositionByRegion.get(region)
+    let cursor = startAt
+    while (cursor < line.length) {
+      const run = findBacktickRun(line, cursor)
+      if (!run) return null
+      const absolutePosition = lineOffset + run.index
+      if ((regionRuns?.get(run.length) ?? absolutePosition) > absolutePosition) return run
+      cursor = run.end
+    }
+    return null
+  }
+
+  const parseFenceStart = (candidate: string): FenceState | null => {
+    const leadingSpaces = candidate.match(/^ {0,3}/)?.[0].length ?? 0
+    const contentAfterIndent = candidate.slice(leadingSpaces)
+    const backtickMatch = contentAfterIndent.match(/^(```+)(.*)$/)
+    const tildeMatch = !backtickMatch ? contentAfterIndent.match(/^(~~~+)(.*)$/) : null
+
+    // CommonMark forbids backticks in a backtick-fence info string. Such a
+    // line can still contain a code span, handled separately below.
+    if (backtickMatch && backtickMatch[1].length >= 3 && !backtickMatch[2].includes('`')) {
+      return { type: 'backtick', fenceLength: backtickMatch[1].length }
+    }
+    if (tildeMatch && tildeMatch[1].length >= 3) {
+      return { type: 'tilde', fenceLength: tildeMatch[1].length }
+    }
+    return null
+  }
+
+  const processDetailsTokens = (segment: string): boolean => {
+    const detailsTokens = segment.match(/<details\b[^>]*>|<\/details\s*>/gi) ?? []
+    if (detailsTokens.length === 0) return false
+    for (const token of detailsTokens) {
+      if (token.startsWith('</')) detailsDepth = Math.max(0, detailsDepth - 1)
+      else detailsDepth++
+    }
+    return true
+  }
+
+  const processHtmlBlockTokens = (segment: string): boolean => {
+    const tokens = segment.match(/<\/?[A-Za-z][A-Za-z0-9-]*\b[^>]*>/g) ?? []
+    let found = false
+    for (const token of tokens) {
+      const match = token.match(/^<\s*(\/)?\s*([A-Za-z][A-Za-z0-9-]*)\b/i)
+      const tagName = match?.[2].toLowerCase()
+      if (!match || !tagName || !HTML_BLOCK_TAGS.has(tagName)) continue
+      found = true
+      if (match[1]) {
+        // A mismatched closer is not permission to escape its still-open
+        // container. Only the matching top-of-stack closes authority hiding.
+        if (htmlBlockStack.at(-1) === tagName) htmlBlockStack.pop()
+      } else if (!/\/\s*>$/.test(token) && !/^<(?:hr)\b/i.test(token)) {
+        if (htmlBlockStack.length < MAX_HTML_BLOCK_DEPTH) htmlBlockStack.push(tagName)
+        else htmlBlockOverflow = true
+      }
+    }
+    return found
+  }
+
+  const observeNonAuthoritativeSegment = (segment: string, hasVisiblePrefix: boolean): void => {
+    if (segment.trim() === '') return
+
+    // The visible prefix before an inline comment/code span can still open or
+    // close an HTML container. Process it before returning for the suppressed
+    // representation so `<div><!-- note -->` cannot leak following controls.
+    if (processHtmlBlockTokens(segment)) return
+
+    // While already inside details, a real close/open token in a visible
+    // segment remains structurally meaningful even if the physical line also
+    // contains an ignored comment/code span elsewhere.
+    if (detailsDepth > 0 && processDetailsTokens(segment)) return
+
+    if (hasVisiblePrefix) return
+
+    if (/^ {0,3}>/.test(segment)) inLazyBlockQuoteContinuation = true
+    if (/^ {0,3}(?:[-+*](?:\s+|$)|\d{1,9}[.)](?:\s+|$))/.test(segment)) inLazyListContinuation = true
+
+    if (inDetailsOpener) {
+      if (segment.includes('>')) {
+        inDetailsOpener = false
+        detailsDepth = 1
+      }
+      return
+    }
+
+    const hasDetailsStart = /<details\b/i.test(segment)
+    const hasCompleteDetailsOpen = /<details\b[^>]*>/i.test(segment)
+    if (hasDetailsStart && !hasCompleteDetailsOpen) {
+      inDetailsOpener = true
+      return
+    }
+
+    if (processDetailsTokens(segment)) return
+    const openedFence = parseFenceStart(segment)
+    if (openedFence) inFence = openedFence
+  }
+
+  /**
+   * Consume comments and real inline-code spans on one physical line.
+   * Returns true when the line contains/continues either representation and is
+   * therefore non-authoritative. Normal visible segments are observed only to
+   * preserve container state for following lines.
+   */
+  const consumeSuppressedInlineLine = (
+    line: string,
+    lineOffset: number,
+    region: number,
+    startAt = 0,
+    initialVisiblePrefix = false,
+  ): boolean => {
+    let cursor = startAt
+    let suppressed = inHtmlComment || inlineCodeDelimiterLength !== null
+    let hasVisiblePrefix = initialVisiblePrefix || inlineCodeDelimiterLength !== null
+
+    while (cursor < line.length) {
+      if (inHtmlComment) {
+        suppressed = true
+        const commentEnd = line.indexOf('-->', cursor)
+        if (commentEnd === -1) return true
+        inHtmlComment = false
+        cursor = commentEnd + 3
+        continue
+      }
+
+      if (inlineCodeDelimiterLength !== null) {
+        suppressed = true
+        const run = findBacktickRun(line, cursor)
+        if (!run) return true
+        cursor = run.end
+        if (run.length === inlineCodeDelimiterLength) {
+          inlineCodeDelimiterLength = null
+          hasVisiblePrefix = true
+        }
+        continue
+      }
+
+      const commentStart = line.indexOf('<!--', cursor)
+      const backtickRun = findOpenableBacktickRun(line, lineOffset, region, cursor)
+      const nextIsComment = commentStart !== -1 && (!backtickRun || commentStart < backtickRun.index)
+      const tokenStart = nextIsComment ? commentStart : backtickRun?.index ?? -1
+
+      if (tokenStart === -1) {
+        if (suppressed) observeNonAuthoritativeSegment(line.slice(cursor), hasVisiblePrefix)
+        return suppressed
+      }
+
+      const segment = line.slice(cursor, tokenStart)
+      observeNonAuthoritativeSegment(segment, hasVisiblePrefix)
+      if (segment.trim() !== '') hasVisiblePrefix = true
+
+      // A visible segment before the suppression token may itself have opened
+      // a fence; the rest of this physical line is then fence info/content.
+      if (inFence) return true
+
+      suppressed = true
+      if (nextIsComment) {
+        inHtmlComment = true
+        cursor = commentStart + 4
+      } else if (backtickRun) {
+        inlineCodeDelimiterLength = backtickRun.length
+        hasVisiblePrefix = true
+        cursor = backtickRun.end
+      }
+    }
+
+    return suppressed
+  }
+
+  for (let i = 0; i < rawLines.length; i++) {
+    const line = rawLines[i]
+    const inlineRegionForLine = inlineRegionByLine[i]
+
+    // Fenced code has highest precedence: comment/backtick syntax inside the
+    // fence is literal code and cannot mutate any other suppression state.
+    if (inFence) {
+      const fenceChar = inFence.type === 'backtick' ? '`' : '~'
+      const closingMatch = line.match(new RegExp(`^ {0,3}(${fenceChar}{${inFence.fenceLength},})\\s*$`))
+      if (closingMatch) inFence = null
+      continue
+    }
+
+    // Continue an already-open comment/code span before considering block
+    // constructs. A matching closer may update state for later physical lines,
+    // but this line itself remains non-authoritative.
+    if (inHtmlComment || inlineCodeDelimiterLength !== null) {
+      consumeSuppressedInlineLine(line, lineOffsets[i], inlineRegionForLine)
+      continue
+    }
+
+    // A genuine block fence can exist inside a details container. Detect it
+    // before details token scanning so a literal </details> inside the fenced
+    // code cannot prematurely escape the collapsed container.
+    const openedFence = parseFenceStart(line)
+    if (openedFence) {
+      inFence = openedFence
+      continue
+    }
+
+    // Inline HTML comments and code spans are non-authoritative. Their visible
+    // surrounding segments can still open/close persistent containers.
+    if (consumeSuppressedInlineLine(line, lineOffsets[i], inlineRegionForLine)) {
+      // A completed inline code span does not make surrounding prose hidden.
+      // Retain that line for section parsing, while the exact control grammar
+      // still rejects any representation containing the backticks. Comments
+      // remain fully non-authoritative because they can splice control text.
+      if (inlineCodeDelimiterLength === null && !inHtmlComment && !line.includes('<!--')) {
+        result.push({ lineNumber: i, text: line })
+      }
+      continue
+    }
+
+    // Handle collapsible details containers on lines with no comment/code span.
+    if (inDetailsOpener) {
+      if (line.includes('>')) {
+        inDetailsOpener = false
+        detailsDepth = 1
+      }
+      continue
+    }
+
+    const hasDetailsStart = /<details\b/i.test(line)
+    const hasCompleteDetailsOpen = /<details\b[^>]*>/i.test(line)
+    if (hasDetailsStart && !hasCompleteDetailsOpen) {
+      inDetailsOpener = true
+      continue
+    }
+
+    if (detailsDepth > 0 || /<details\b[^>]*>|<\/details\s*>/i.test(line)) {
+      processDetailsTokens(line)
+      continue
+    }
+
+    // HTML block containers are presentation, not control authority. Keep a
+    // bounded nesting count so metadata in examples such as nested <div>s
+    // cannot escape into the semantic parser.
+    if (htmlBlockOverflow || htmlBlockStack.length > 0) {
+      processHtmlBlockTokens(line)
+      continue
+    }
+    if (processHtmlBlockTokens(line)) continue
+
+    const isBlockQuoteLine = /^ {0,3}>/.test(line)
+    if (inLazyBlockQuoteContinuation && !isBlockQuoteLine) {
+      if (line.trim() !== '') continue
+      inLazyBlockQuoteContinuation = false
+    }
+    if (isBlockQuoteLine) {
+      inLazyBlockQuoteContinuation = true
+      continue
+    }
+
+    // List paragraphs also support lazy continuation. Keep a conservative
+    // boundary through the next blank line so an unmarked line after a list
+    // item cannot become authority-bearing control metadata.
+    const isListItemLine = /^ {0,3}(?:[-+*](?:\s+|$)|\d{1,9}[.)](?:\s+|$))/.test(line)
+    if (inLazyListContinuation && !isListItemLine) {
+      if (/^ {0,3}#{1,6}\s/.test(line)) {
+        inLazyListContinuation = false
+      } else {
+        if (line.trim() !== '') continue
+        inLazyListContinuation = false
+      }
+    }
+    if (isListItemLine) inLazyListContinuation = true
+
+    // Handle indented code blocks (4+ spaces or tab).
+    if (line.startsWith('    ') || line.startsWith('\t')) continue
+
+    result.push({ lineNumber: i, text: line })
+  }
+
+  return { lines: result, bodyTooLarge: false }
+}

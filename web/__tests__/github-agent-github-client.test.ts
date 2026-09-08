@@ -1,12 +1,13 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { RestGitHubClient } from '@/scripts/github-agent-workflow/io/github-client'
+import { GitHubApiError, RestGitHubClient } from '@/scripts/github-agent-workflow/io/github-client'
 
-function jsonResponse(status: number, body: unknown): Response {
+function jsonResponse(status: number, body: unknown, headers: HeadersInit = {}): Response {
   return {
     ok: status >= 200 && status < 300,
     status,
     json: async () => body,
     text: async () => JSON.stringify(body),
+    headers: new Headers(headers),
   } as unknown as Response
 }
 
@@ -15,6 +16,15 @@ afterEach(() => {
 })
 
 describe('RestGitHubClient comment pagination', () => {
+  it('retains only safe rate-limit header evidence on a 403 error', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse(403, {}, { 'retry-after': '30', 'x-ratelimit-remaining': '0' })))
+    const client = new RestGitHubClient({ token: 'token', repo: 'owner/repo' })
+    await expect(client.getIssue(1)).rejects.toMatchObject({
+      status: 403,
+      rateLimitEvidence: { retryAfter: true, remainingZero: true },
+    } satisfies Partial<GitHubApiError>)
+  })
+
   it('updates an existing marker comment on a later page instead of creating a duplicate', async () => {
     const firstPage = Array.from({ length: 100 }, (_, index) => ({
       id: index + 1,

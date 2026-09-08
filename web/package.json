@@ -69,7 +69,9 @@
     "test:mcp:s5-postgres": "FORGE_S5_REQUIRE_POSTGRES_TEST=1 vitest run __tests__/epic-172-s5-postgres-routes.test.ts",
     "test:mcp:s4-redis": "node scripts/ci/run-mandatory-s4-redis-proof.mjs",
     "test:mcp:s4-redis-acl": "node scripts/ci/run-mandatory-s4-redis-acl-proof.mjs",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "forge:check-readiness": "tsx scripts/github-agent-workflow/cli/check-readiness.ts",
+    "forge:reconcile": "tsx scripts/github-agent-workflow/cli/reconcile-readiness.ts"
   },
   "dependencies": {
     "@agentclientprotocol/claude-agent-acp": "0.54.1",

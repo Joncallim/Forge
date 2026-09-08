@@ -1,0 +1,1098 @@
+/**
+ * Tests for the remaining P0/P1 defects identified in the residual review.
+ *
+ * Covers:
+ * - Empty Depends on: fails closed
+ * - Handoff cannot corrupt non-blockable run states
+ * - Cycle detection through resolver (multi-node)
+ * - Scanner fence closing (CommonMark compliance)
+ * - FakeGitHubClient pagination
+ * - Plan→validate→apply reconcile semantics
+ * - Fresh re-resolution before ready promotion
+ */
+
+import { mkdtemp, rm } from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
+import { afterEach, describe, expect, it } from 'vitest'
+
+import { parseControlMetadata } from '@/scripts/github-agent-workflow/core/issue-control'
+import { MAX_ISSUE_BODY_BYTES } from '@/scripts/github-agent-workflow/contracts/issue-control-metadata'
+import { MAX_READINESS_BLOCKERS } from '@/scripts/github-agent-workflow/contracts/issue-readiness-result'
+import { scanVisibleMarkdownLines } from '@/scripts/github-agent-workflow/core/visible-markdown-scanner'
+import { IssueReadinessResolver } from '@/scripts/github-agent-workflow/shared/issue-readiness-resolver'
+import { runHandoff } from '@/scripts/github-agent-workflow/handoff'
+import { syncReadinessLabels } from '@/scripts/github-agent-workflow/shared/readiness-projection'
+import { canTransitionToBlocked } from '@/scripts/github-agent-workflow/shared/run-state-guard'
+import {
+  recordRequested,
+  updateRunStatus,
+  findLatestRunForIssue,
+} from '@/scripts/github-agent-workflow/io/agent-run-log'
+import { FakeGitHubClient } from '@/scripts/github-agent-workflow/io/fake-github-client'
+import type { GitHubIssue } from '@/scripts/github-agent-workflow/io/github-client'
+import { applyClosedCleanup, applyOpenProjection, inventoryOverlap, main as reconcileReadiness } from '@/scripts/github-agent-workflow/cli/reconcile-readiness'
+
+const tempRoots: string[] = []
+
+async function tempRoot(): Promise<string> {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'forge-defect-'))
+  tempRoots.push(root)
+  return root
+}
+
+afterEach(async () => {
+  await Promise.all(tempRoots.splice(0).map((root) => rm(root, { recursive: true, force: true })))
+})
+
+const READY_BODY = [
+  '## Bug Summary',
+  'Test bug',
+  '## Current Behaviour',
+  'Bug',
+  '## Expected Behaviour',
+  'Fix',
+  '## Reproduction Steps',
+  '1. Do something',
+  '## Impact',
+  'Minor',
+  '## Severity',
+  'Minor',
+  '## Acceptance Criteria',
+  '- [ ] Fixed',
+  '',
+  'Execution mode: implementation',
+  'Depends on: none',
+].join('\n')
+
+const READY_ISSUE: GitHubIssue = {
+  number: 1,
+  title: '[BUG] Test',
+  body: READY_BODY,
+  labels: ['ready-for-agent'],
+  state: 'open',
+  stateReason: null,
+  htmlUrl: 'https://github.com/Joncallim/Forge/issues/1',
+  authorLogin: 'Joncallim',
+  isPullRequest: false,
+  updatedAt: null,
+}
+
+// ============================================================
+// P0 — Empty Depends on:
+// ============================================================
+describe('empty Depends on: fails closed', () => {
+  it('bounds separator-bomb parser diagnostics at the legal 256 KiB body boundary', async () => {
+    const separatorCount = MAX_ISSUE_BODY_BYTES - Buffer.byteLength(READY_BODY, 'utf8') + 2
+    const body = READY_BODY.replace('Depends on: none', `Depends on: #2${','.repeat(separatorCount)}`)
+    expect(Buffer.byteLength(body, 'utf8')).toBe(MAX_ISSUE_BODY_BYTES)
+
+    const parsed = parseControlMetadata(body, 'bug')
+    expect(parsed.diagnostics).toHaveLength(2)
+    expect(parsed.errors).toHaveLength(2)
+    expect(parsed.diagnostics.map((diagnostic) => diagnostic.reasonCode)).toEqual(expect.arrayContaining([
+      'queue.issue_dependency_syntax_invalid',
+      'queue.issue_dependency_graph_limit_exceeded',
+    ]))
+
+    // Production boundary: an untrusted issue body must retain only bounded
+    // diagnostics when semantic readiness is resolved.
+    const target = { ...READY_ISSUE, body, labels: [] }
+    const result = await new IssueReadinessResolver(new FakeGitHubClient({ issues: [target] })).resolveReadiness(1)
+    expect(result).toMatchObject({ dispatchable: false, state: 'needs-clarification' })
+    expect(result.blockers).toHaveLength(2)
+
+    // Full reconciliation retains parsed snapshot facts after discarding the
+    // raw body, so this boundary must stay bounded as well.
+    const snapshot = await new IssueReadinessResolver(new FakeGitHubClient({ issues: [target] })).loadOpenIssueSnapshot()
+    expect(snapshot.issues.get(1)?.body).toBeNull()
+    expect(snapshot.parsedMetadata.get(1)?.controlDiagnostics).toHaveLength(2)
+    expect(snapshot.parsedMetadata.get(1)?.controlParseErrors).toHaveLength(2)
+  })
+
+  it('bounds downstream blocker amplification across 64 malformed dependencies', async () => {
+    const dependencyNumbers = Array.from({ length: 64 }, (_, index) => index + 2)
+    const target = {
+      ...READY_ISSUE,
+      labels: [],
+      body: READY_BODY.replace('Depends on: none', `Depends on: ${dependencyNumbers.map((number) => `#${number}`).join(', ')}`),
+    }
+    const separatorBomb = READY_BODY.replace('Depends on: none', `Depends on: #999${','.repeat(4096)}`)
+    const dependencies = dependencyNumbers.map((number) => ({
+      ...READY_ISSUE,
+      number,
+      labels: [],
+      body: separatorBomb,
+    }))
+
+    const result = await new IssueReadinessResolver(new FakeGitHubClient({ issues: [target, ...dependencies] })).resolveReadiness(1)
+    expect(result).toMatchObject({ dispatchable: false, state: 'needs-clarification' })
+    expect(result.blockers).toHaveLength(MAX_READINESS_BLOCKERS)
+    expect(result.reasonCodes).toEqual(['queue.issue_dependency_syntax_invalid', 'queue.issue_dependency_graph_limit_exceeded'])
+  })
+
+  it('Depends on: with empty value produces errors and no ready state', () => {
+    const body = [
+      '## Bug Summary',
+      'Test',
+      '## Current Behaviour',
+      'Test',
+      '## Expected Behaviour',
+      'Test',
+      '## Reproduction Steps',
+      'Test',
+      '## Impact',
+      'Test',
+      '## Severity',
+      'Test',
+      '## Acceptance Criteria',
+      '- [ ] Test',
+      '',
+      'Execution mode: implementation',
+      'Depends on:',
+    ].join('\n')
+
+    const result = parseControlMetadata(body, 'bug')
+    expect(result.errors.length).toBeGreaterThan(0)
+    expect(result.errors[0]).toContain('canonical')
+    expect(result.metadata.dependsOnNone).toBe(false)
+    // The issue should not be dispatchable
+    expect(result.metadata.explicit).toBe(true)
+  })
+
+  it('Depends on: , (separator only) produces errors', () => {
+    const body = [
+      '## Bug Summary',
+      'Test',
+      '## Current Behaviour',
+      'Test',
+      '## Expected Behaviour',
+      'Test',
+      '## Reproduction Steps',
+      'Test',
+      '## Impact',
+      'Test',
+      '## Severity',
+      'Test',
+      '## Acceptance Criteria',
+      '- [ ] Test',
+      '',
+      'Execution mode: implementation',
+      'Depends on: ,',
+    ].join('\n')
+
+    const result = parseControlMetadata(body, 'bug')
+    expect(result.errors.length).toBeGreaterThan(0)
+    expect(result.errors[0]).toContain('empty')
+  })
+
+  it('Depends on: #1 (valid) works correctly', () => {
+    const body = [
+      '## Bug Summary',
+      'Test',
+      '## Current Behaviour',
+      'Test',
+      '## Expected Behaviour',
+      'Test',
+      '## Reproduction Steps',
+      'Test',
+      '## Impact',
+      'Test',
+      '## Severity',
+      'Test',
+      '## Acceptance Criteria',
+      '- [ ] Test',
+      '',
+      'Execution mode: implementation',
+      'Depends on: #1',
+    ].join('\n')
+
+    const result = parseControlMetadata(body, 'bug')
+    expect(result.errors.length).toBe(0)
+    expect(result.metadata.dependencies).toEqual([1])
+    expect(result.metadata.dependsOnNone).toBe(false)
+  })
+
+  it.each(['#1,,#2', '#1,, ,#1', ',#1', '#1,'])('rejects empty comma-separated dependency positions: %s', (dependsOn) => {
+    const result = parseControlMetadata(READY_BODY.replace('Depends on: none', `Depends on: ${dependsOn}`), 'bug')
+    expect(result.diagnostics.map((diagnostic) => diagnostic.reasonCode)).toContain('queue.issue_dependency_syntax_invalid')
+  })
+
+  it('fails closed at the resolver boundary rather than normalizing malformed dependency tokens', async () => {
+    const target = { ...READY_ISSUE, labels: [], body: READY_BODY.replace('Depends on: none', 'Depends on: #2,,#3') }
+    const result = await new IssueReadinessResolver(new FakeGitHubClient({ issues: [target] })).resolveReadiness(1)
+    expect(result).toMatchObject({ dispatchable: false, state: 'needs-clarification' })
+    expect(result.reasonCodes).toContain('queue.issue_dependency_syntax_invalid')
+  })
+
+  it('Depends on: none works correctly', () => {
+    const body = [
+      '## Bug Summary',
+      'Test',
+      '## Current Behaviour',
+      'Test',
+      '## Expected Behaviour',
+      'Test',
+      '## Reproduction Steps',
+      'Test',
+      '## Impact',
+      'Test',
+      '## Severity',
+      'Test',
+      '## Acceptance Criteria',
+      '- [ ] Test',
+      '',
+      'Execution mode: implementation',
+      'Depends on: none',
+    ].join('\n')
+
+    const result = parseControlMetadata(body, 'bug')
+    expect(result.errors.length).toBe(0)
+    expect(result.metadata.dependencies).toEqual([])
+    expect(result.metadata.dependsOnNone).toBe(true)
+  })
+})
+
+// ============================================================
+// P0 — Handoff run state corruption
+// ============================================================
+describe('handoff run-state guard', () => {
+  it('canTransitionToBlocked rejects non-blockable statuses', () => {
+    expect(canTransitionToBlocked('requested')).toBe(true)
+    expect(canTransitionToBlocked('handed-off')).toBe(true)
+    expect(canTransitionToBlocked('running')).toBe(false)
+    expect(canTransitionToBlocked('pr-opened')).toBe(false)
+    expect(canTransitionToBlocked('completed')).toBe(false)
+    expect(canTransitionToBlocked('failed')).toBe(false)
+    expect(canTransitionToBlocked('cancelled')).toBe(false)
+    expect(canTransitionToBlocked('blocked')).toBe(false)
+  })
+
+  it('handoff does not corrupt running/pr-opened/completed/failed/cancelled runs', async () => {
+    const root = await tempRoot()
+
+    for (const status of ['running', 'pr-opened', 'completed', 'failed', 'cancelled'] as const) {
+      const runId = `issue-1-100000000${status.charCodeAt(0)}-1`
+      await recordRequested({
+        runId,
+        issueNumber: 1,
+        issueTitle: READY_ISSUE.title,
+        runtime: 'codex',
+        action: 'implement',
+        requestedBy: 'Joncallim',
+        source: { type: 'issue_comment', commentId: 100 },
+      }, { repositoryRoot: root })
+      await updateRunStatus({
+        issueNumber: 1,
+        runId,
+        status,
+      }, { repositoryRoot: root })
+
+      const client = new FakeGitHubClient({
+        issues: [{ ...READY_ISSUE, body: 'Some text without proper sections', labels: [] }],
+      })
+
+      const result = await runHandoff({
+        client,
+        issueNumber: 1,
+        runLogRepositoryRoot: root,
+        artifactRepositoryRoot: root,
+        botLogin: 'github-actions[bot]',
+      })
+
+      // Handoff should block (not semantically ready) but NOT corrupt the run
+      expect(result.status).toBe('blocked')
+
+      // Verify run status was NOT changed
+      const run = await findLatestRunForIssue(1, { repositoryRoot: root })
+      expect(run).not.toBeNull()
+      expect(run!.status).toBe(status)
+    }
+  })
+})
+
+// ============================================================
+// P0/P1 — Cycle detection through resolver
+// ============================================================
+describe('cycle detection through resolver', () => {
+  it('detects 2-node cycle (A→B→A)', async () => {
+    // Issue A depends on B, B depends on A
+    const issueA = {
+      ...READY_ISSUE,
+      number: 1,
+      title: 'Issue A',
+      body: [
+        '## Bug Summary',
+        'Test',
+        '## Current Behaviour',
+        'Test',
+        '## Expected Behaviour',
+        'Test',
+        '## Reproduction Steps',
+        'Test',
+        '## Impact',
+        'Test',
+        '## Severity',
+        'Test',
+        '## Acceptance Criteria',
+        '- [ ] Test',
+        '',
+        'Execution mode: implementation',
+        'Depends on: #2',
+      ].join('\n'),
+    }
+    const issueB = {
+      ...READY_ISSUE,
+      number: 2,
+      title: 'Issue B',
+      body: [
+        '## Bug Summary',
+        'Test',
+        '## Current Behaviour',
+        'Test',
+        '## Expected Behaviour',
+        'Test',
+        '## Reproduction Steps',
+        'Test',
+        '## Impact',
+        'Test',
+        '## Severity',
+        'Test',
+        '## Acceptance Criteria',
+        '- [ ] Test',
+        '',
+        'Execution mode: implementation',
+        'Depends on: #1',
+      ].join('\n'),
+    }
+
+    const client = new FakeGitHubClient({ issues: [issueA, issueB] })
+    const resolver = new IssueReadinessResolver(client)
+    const result = await resolver.resolveFromIssue(issueA)
+
+    expect(result.dispatchable).toBe(false)
+    expect(result.reasonCodes).toContain('queue.issue_dependency_cycle')
+    expect(result.state).toBe('needs-clarification')
+  })
+
+  it('detects 3-node cycle (A→B→C→A)', async () => {
+    const issueA = { ...READY_ISSUE, number: 1, title: 'Issue A', body: READY_BODY.replace('Depends on: none', 'Depends on: #2') }
+    const issueB = { ...READY_ISSUE, number: 2, title: 'Issue B', body: READY_BODY.replace('Depends on: none', 'Depends on: #3').replace('Test', 'Test B') }
+    const issueC = { ...READY_ISSUE, number: 3, title: 'Issue C', body: READY_BODY.replace('Depends on: none', 'Depends on: #1').replace('Test', 'Test C') }
+
+    const client = new FakeGitHubClient({ issues: [issueA, issueB, issueC] })
+    const resolver = new IssueReadinessResolver(client)
+    const result = await resolver.resolveFromIssue(issueA)
+
+    expect(result.dispatchable).toBe(false)
+    expect(result.reasonCodes).toContain('queue.issue_dependency_cycle')
+  })
+
+  it('does not flag unrelated cycle', async () => {
+    // Issue A depends on B; issues C and D have a separate cycle
+    // A should not be blocked by C↔D cycle
+    const issueA = { ...READY_ISSUE, number: 1, title: 'Issue A', body: READY_BODY.replace('Depends on: none', 'Depends on: #2') }
+    const issueB = { ...READY_ISSUE, number: 2, title: 'Issue B', body: READY_BODY.replace('Test', 'Test B') }
+    const issueC = { ...READY_ISSUE, number: 3, title: 'Issue C', body: READY_BODY.replace('Depends on: none', 'Depends on: #4').replace('Test', 'Test C') }
+    const issueD = { ...READY_ISSUE, number: 4, title: 'Issue D', body: READY_BODY.replace('Depends on: none', 'Depends on: #3').replace('Test', 'Test D') }
+
+    const client = new FakeGitHubClient({ issues: [issueA, issueB, issueC, issueD] })
+    const resolver = new IssueReadinessResolver(client)
+    const result = await resolver.resolveFromIssue(issueA)
+
+    // A should be blocked because B is open, not because of C↔D
+    expect(result.dispatchable).toBe(false)
+    expect(result.reasonCodes).toContain('queue.issue_dependency_open')
+    expect(result.reasonCodes).not.toContain('queue.issue_dependency_cycle')
+  })
+
+  it('respects depth limit for graph traversal', async () => {
+    // Create a chain of dependencies A→B→C→D→... beyond depth limit
+    const issues: GitHubIssue[] = []
+    for (let i = 1; i <= 70; i++) {
+      const dep = i < 70 ? `#${i + 1}` : 'none'
+      issues.push({
+        ...READY_ISSUE,
+        number: i,
+        title: `Issue ${i}`,
+        body: READY_BODY.replace('Depends on: none', `Depends on: ${dep}`).replace('Test', `Test ${i}`),
+      })
+    }
+
+    const client = new FakeGitHubClient({ issues })
+    const resolver = new IssueReadinessResolver(client)
+    const result = await resolver.resolveFromIssue(issues[0])
+
+    // Should reach depth limit
+    expect(result.dispatchable).toBe(false)
+    expect(result.reasonCodes).toContain('queue.issue_dependency_graph_limit_exceeded')
+  })
+})
+
+// ============================================================
+// Scanner fence closing (CommonMark compliance)
+// ============================================================
+describe('visible-markdown-scanner fence closing', () => {
+  it('properly closed fence exposes subsequent visible lines', () => {
+    // A properly closed fence (no trailing non-whitespace) should expose
+    // lines after the closing fence as visible
+    const body = [
+      '```',
+      'Depends on: #999',
+      '```',
+      '',
+      'Execution mode: implementation',
+      'Depends on: none',
+    ].join('\n')
+
+    const result = scanVisibleMarkdownLines(body)
+    const visibleText = result.lines.map((l) => l.text).join('\n')
+    // The fenced Depends on: #999 should NOT be visible
+    expect(visibleText).not.toContain('#999')
+    // The real metadata should be visible (after properly closed fence)
+    expect(visibleText).toContain('Execution mode: implementation')
+    expect(visibleText).toContain('Depends on: none')
+  })
+
+  it('fence with trailing non-whitespace does not close the code block', () => {
+    // CommonMark: a closing fence may only be followed by whitespace.
+    // A line like "``` Depends on: none" has non-whitespace trailing text,
+    // so it does NOT close the fence. Everything remains inside the code block.
+    const body = [
+      '```',
+      'Depends on: #999',
+      '``` Depends on: none',
+      '',
+      'Execution mode: implementation',
+      'Depends on: none',
+    ].join('\n')
+
+    const result = scanVisibleMarkdownLines(body)
+    // Since the fence never properly closes (trailing non-whitespace),
+    // NO lines should be visible
+    const visibleText = result.lines.map((l) => l.text).join('\n')
+    expect(visibleText).toBe('')
+  })
+
+  it('fenced code with tildes works correctly', () => {
+    const body = [
+      '~~~',
+      'Depends on: #999',
+      '~~~',
+      '',
+      'Execution mode: implementation',
+      'Depends on: none',
+    ].join('\n')
+
+    const result = scanVisibleMarkdownLines(body)
+    const visibleText = result.lines.map((l) => l.text).join('\n')
+    expect(visibleText).not.toContain('#999')
+    expect(visibleText).toContain('Depends on: none')
+  })
+
+  it('indented code blocks are ignored', () => {
+    const body = [
+      '    Depends on: #999',
+      '',
+      'Execution mode: implementation',
+      'Depends on: none',
+    ].join('\n')
+
+    const result = scanVisibleMarkdownLines(body)
+    const visibleText = result.lines.map((l) => l.text).join('\n')
+    expect(visibleText).not.toContain('#999')
+    expect(visibleText).toContain('Depends on: none')
+  })
+
+  it('blockquotes are ignored', () => {
+    const body = [
+      '> Depends on: #999',
+      '',
+      'Execution mode: implementation',
+      'Depends on: none',
+    ].join('\n')
+
+    const result = scanVisibleMarkdownLines(body)
+    const visibleText = result.lines.map((l) => l.text).join('\n')
+    expect(visibleText).not.toContain('#999')
+    expect(visibleText).toContain('Depends on: none')
+  })
+
+  it('HTML comments hide metadata', () => {
+    const body = [
+      '<!--',
+      'Depends on: #999',
+      '-->',
+      '',
+      'Execution mode: implementation',
+      'Depends on: none',
+    ].join('\n')
+
+    const result = scanVisibleMarkdownLines(body)
+    const visibleText = result.lines.map((l) => l.text).join('\n')
+    expect(visibleText).not.toContain('#999')
+    expect(visibleText).toContain('Depends on: none')
+  })
+
+  it('inline-code spoofing does not expose metadata', () => {
+    const body = [
+      '`Execution mode: implementation`',
+      '`Depends on: none`',
+      '',
+      'Execution mode: tracking',
+      'Depends on: #1',
+    ].join('\n')
+
+    // Inline-code representations remain visible prose for section parsing,
+    // but exact control grammar prevents them from becoming metadata.
+    const result = scanVisibleMarkdownLines(body)
+    const visibleText = result.lines.map((l) => l.text).join('\n')
+    expect(visibleText).toContain('`Execution mode: implementation`')
+    expect(visibleText).toContain('`Depends on: none`')
+
+    // The parser must use only the visible literal control block.
+    const controlResult = parseControlMetadata(body, 'bug')
+    expect(controlResult.metadata.executionMode).toBe('tracking')
+    expect(controlResult.metadata.dependencies).toEqual([1])
+  })
+})
+
+// ============================================================
+// FakeGitHubClient pagination
+// ============================================================
+describe('FakeGitHubClient pagination', () => {
+  it('paginates correctly with perPage', async () => {
+    const issues: GitHubIssue[] = []
+    for (let i = 1; i <= 150; i++) {
+      issues.push({ ...READY_ISSUE, number: i, title: `Issue ${i}`, body: READY_BODY.replace('Test', `Test ${i}`) })
+    }
+
+    const client = new FakeGitHubClient({ issues })
+
+    // Page 1: 100 items
+    const page1 = await client.listOpenIssues({ page: 1, perPage: 100 })
+    expect(page1.issues.length).toBe(100)
+    expect(page1.hasMore).toBe(true)
+
+    // Page 2: 50 items
+    const page2 = await client.listOpenIssues({ page: 2, perPage: 100 })
+    expect(page2.issues.length).toBe(50)
+    expect(page2.hasMore).toBe(false)
+  })
+
+  it('handles empty results', async () => {
+    const client = new FakeGitHubClient()
+    const result = await client.listOpenIssues()
+    expect(result.issues.length).toBe(0)
+    expect(result.hasMore).toBe(false)
+  })
+
+  it('discovers closed issues by a managed label only', async () => {
+    const client = new FakeGitHubClient({
+      issues: [
+        { ...READY_ISSUE, number: 1, state: 'closed', labels: ['ready-for-agent'] },
+        { ...READY_ISSUE, number: 2, state: 'closed', labels: ['unrelated'] },
+        { ...READY_ISSUE, number: 3, state: 'open', labels: ['ready-for-agent'] },
+      ],
+    })
+
+    const result = await client.listClosedIssues({ label: 'ready-for-agent' })
+    expect(result.issues.map((issue) => issue.number)).toEqual([1])
+    expect(result.hasMore).toBe(false)
+  })
+
+  it('reports hasMore correctly at page cap', async () => {
+    // Create more than 50*100 = 5000 issues to test page cap
+    const issues: GitHubIssue[] = []
+    for (let i = 1; i <= 5010; i++) {
+      issues.push({ ...READY_ISSUE, number: i, title: `Issue ${i}`, body: READY_BODY.replace('Test', `Test ${i}`) })
+    }
+
+    const client = new FakeGitHubClient({ issues })
+
+    // Page 50 should be full and hasMore should be false due to page cap
+    const page50 = await client.listOpenIssues({ page: 50, perPage: 100, maxPages: 50 })
+    expect(page50.issues.length).toBe(100)
+    // At page cap, hasMore should be false even though more data exists
+    expect(page50.hasMore).toBe(false)
+    expect(page50.rawPageFullAtCap).toBe(true)
+  })
+
+  it('treats a raw full capped /issues page containing PRs as incomplete', async () => {
+    class RawCappedPageClient extends FakeGitHubClient {
+      override async listOpenIssues() {
+        const page = await super.listOpenIssues({ page: 1, perPage: 100 })
+        // The REST endpoint returns PRs too. The post-filter issue count is
+        // deliberately below 100, but rawPageFullAtCap remains authoritative.
+        return { ...page, issues: page.issues.slice(0, 99), hasMore: false, rawPageFullAtCap: true }
+      }
+    }
+    const issues = Array.from({ length: 100 }, (_, index) => ({ ...READY_ISSUE, number: index + 1, title: `Issue ${index + 1}` }))
+    const snapshot = await new IssueReadinessResolver(new RawCappedPageClient({ issues })).loadOpenIssueSnapshot()
+    expect(snapshot.exceededLimit).toBe(true)
+  })
+
+  it('failure injection works', async () => {
+    const client = new FakeGitHubClient({
+      issues: [{ ...READY_ISSUE, number: 1 }, { ...READY_ISSUE, number: 2 }],
+    })
+    client.setFailures({
+      getIssueFailures: { 1: 'not_found' },
+    })
+
+    await expect(client.getIssue(1)).rejects.toThrow()
+    const issue2 = await client.getIssue(2)
+    expect(issue2.number).toBe(2)
+  })
+})
+
+// ============================================================
+// syncReadinessLabels safe ordering
+// ============================================================
+describe('syncReadinessLabels safe ordering', () => {
+  it('removes ready-for-agent first when transitioning to non-ready', async () => {
+    const issue = { ...READY_ISSUE, labels: ['ready-for-agent'] }
+    const client = new FakeGitHubClient({ issues: [issue] })
+
+    const result = await syncReadinessLabels(client, issue, {
+      issueNumber: 1,
+      state: 'dependency-blocked',
+      dispatchable: false,
+      executionMode: 'implementation',
+      dependencies: [2],
+      reasonCodes: ['queue.issue_dependency_open'],
+      blockers: [{ reasonCode: 'queue.issue_dependency_open', detail: 'Dependency #2 is open.', dependencyIssueNumber: 2 }],
+      desiredReadinessLabels: ['dependency-blocked'],
+      partial: false,
+    })
+
+    expect(result.success).toBe(true)
+    expect(result.removedLabels).toContain('ready-for-agent')
+    expect(result.addedLabels).toContain('dependency-blocked')
+  })
+
+  it('reports failure when ready-for-agent cannot be removed', async () => {
+    const issue = { ...READY_ISSUE, labels: ['ready-for-agent'] }
+    const client = new FakeGitHubClient({ issues: [issue] })
+    client.setFailures({ removeLabelFailures: ['ready-for-agent'] })
+
+    const result = await syncReadinessLabels(client, issue, {
+      issueNumber: 1,
+      state: 'dependency-blocked',
+      dispatchable: false,
+      executionMode: 'implementation',
+      dependencies: [2],
+      reasonCodes: ['queue.issue_dependency_open'],
+      blockers: [{ reasonCode: 'queue.issue_dependency_open', detail: 'Dependency #2 is open.', dependencyIssueNumber: 2 }],
+      desiredReadinessLabels: ['dependency-blocked'],
+      partial: false,
+    })
+
+    expect(result.success).toBe(false)
+    expect(result.error).toContain('Failed to remove ready-for-agent')
+  })
+
+  it('adds ready-for-agent last with blocker verification', async () => {
+    const issue = { ...READY_ISSUE, labels: [] }
+    const client = new FakeGitHubClient({ issues: [issue] })
+
+    const result = await syncReadinessLabels(client, issue, {
+      issueNumber: 1,
+      state: 'ready',
+      dispatchable: true,
+      executionMode: 'implementation',
+      dependencies: [],
+      reasonCodes: [],
+      blockers: [],
+      desiredReadinessLabels: ['ready-for-agent'],
+      partial: false,
+    })
+
+    expect(result.success).toBe(true)
+    expect(result.addedLabels).toContain('ready-for-agent')
+  })
+
+  it('re-resolves dependency semantics immediately before ready promotion', async () => {
+    // Regression: dependency-blocked was present at entry, removed while
+    // transitioning to ready, then the confirmation discovers it reopened.
+    const target = { ...READY_ISSUE, labels: ['dependency-blocked'] }
+    const client = new FakeGitHubClient({ issues: [target] })
+    const result = await syncReadinessLabels(client, target, {
+      issueNumber: 1, state: 'ready', dispatchable: true, executionMode: 'implementation', dependencies: [], reasonCodes: [], blockers: [], desiredReadinessLabels: ['ready-for-agent'], partial: false,
+    }, {
+      confirmReady: async () => ({
+        issueNumber: 1, state: 'dependency-blocked', dispatchable: false, executionMode: 'implementation', dependencies: [2], reasonCodes: ['queue.issue_dependency_open'], blockers: [{ reasonCode: 'queue.issue_dependency_open', detail: 'Dependency reopened.', dependencyIssueNumber: 2 }], desiredReadinessLabels: ['dependency-blocked'], partial: false,
+      }),
+    })
+    expect(result.success).toBe(true)
+    expect((await client.getIssue(1)).labels).toEqual(['dependency-blocked'])
+    expect(client.addLabelCalls).not.toContainEqual({ issueNumber: 1, label: 'ready-for-agent' })
+  })
+
+  it('refuses to add ready-for-agent when blocker labels remain', async () => {
+    const issue = { ...READY_ISSUE, labels: ['needs-clarification'] }
+    const client = new FakeGitHubClient({ issues: [issue] })
+
+    const result = await syncReadinessLabels(client, issue, {
+      issueNumber: 1,
+      state: 'ready',
+      dispatchable: true,
+      executionMode: 'implementation',
+      dependencies: [],
+      reasonCodes: [],
+      blockers: [],
+      desiredReadinessLabels: ['ready-for-agent'],
+      partial: false,
+    })
+
+    // needs-clarification should be removed first, then ready added
+    // But the projection checks labels after removal - needs-clarification should be gone
+    expect(result.success).toBe(true)
+    expect(result.addedLabels).toContain('ready-for-agent')
+  })
+
+  it('uses the live closed state for cleanup instead of adding stale readiness labels', async () => {
+    const staleOpenIssue = { ...READY_ISSUE, state: 'open', labels: ['needs-clarification'] }
+    const client = new FakeGitHubClient({
+      issues: [{ ...READY_ISSUE, state: 'closed', labels: ['needs-clarification'] }],
+    })
+
+    const result = await syncReadinessLabels(client, staleOpenIssue, {
+      issueNumber: 1,
+      state: 'ready',
+      dispatchable: true,
+      executionMode: 'implementation',
+      dependencies: [],
+      reasonCodes: [],
+      blockers: [],
+      desiredReadinessLabels: ['ready-for-agent'],
+      partial: false,
+    })
+
+    expect(result.success).toBe(true)
+    expect(result.addedLabels).toEqual([])
+    expect(result.removedLabels).toEqual(['needs-clarification'])
+    expect((await client.getIssue(1)).labels).toEqual([])
+  })
+
+  it('switches to cleanup when the issue closes between entry and the first label mutation', async () => {
+    class ClosingAfterEntryClient extends FakeGitHubClient {
+      private getIssueCalls = 0
+
+      override async getIssue(issueNumber: number) {
+        const current = await super.getIssue(issueNumber)
+        this.getIssueCalls += 1
+        return this.getIssueCalls >= 2 ? { ...current, state: 'closed' } : current
+      }
+    }
+
+    const issue = { ...READY_ISSUE, labels: ['needs-clarification'] }
+    const client = new ClosingAfterEntryClient({ issues: [issue] })
+
+    const result = await syncReadinessLabels(client, issue, {
+      issueNumber: 1,
+      state: 'ready',
+      dispatchable: true,
+      executionMode: 'implementation',
+      dependencies: [],
+      reasonCodes: [],
+      blockers: [],
+      desiredReadinessLabels: ['ready-for-agent'],
+      partial: false,
+    })
+
+    expect(result.success).toBe(true)
+    expect(result.addedLabels).toEqual([])
+    expect(result.removedLabels).toContain('needs-clarification')
+    expect(client.addLabelCalls).toEqual([])
+    expect((await client.getIssue(1)).labels).toEqual([])
+  })
+})
+
+describe('reconcile apply freshness', () => {
+  it('rejects an overlapping open/closed discovery inventory before mutation planning', () => {
+    const open = new Map([[1, { ...READY_ISSUE, labels: [] }]])
+    expect(inventoryOverlap(open, [{ ...READY_ISSUE, state: 'closed', labels: [] }])).toEqual([1])
+  })
+
+  it('aborts full reconciliation before writes when an open dependency has an API failure sibling', async () => {
+    const target = { ...READY_ISSUE, labels: ['ready-for-agent'], body: READY_BODY.replace('Depends on: none', 'Depends on: #2, #3') }
+    const open = { ...READY_ISSUE, number: 2, labels: [] }
+    const client = new FakeGitHubClient({ issues: [target, open] })
+    client.setFailures({ getIssueFailures: { 3: 'server_error' } })
+    await expect(reconcileReadiness([], process.env, client)).rejects.toThrow('validation failed')
+    expect(client.addLabelCalls).toEqual([])
+    expect(client.removeLabelCalls).toEqual([])
+  })
+
+  it('aborts full reconciliation before writes on an overlapping open/closed inventory', async () => {
+    class OverlappingInventoryClient extends FakeGitHubClient {
+      override async listClosedIssues() {
+        return { issues: [{ ...READY_ISSUE, state: 'closed', labels: ['ready-for-agent'] }], hasMore: false }
+      }
+    }
+    const client = new OverlappingInventoryClient({ issues: [{ ...READY_ISSUE, labels: ['ready-for-agent'] }] })
+    await expect(reconcileReadiness([], process.env, client)).rejects.toThrow('validation failed')
+    expect(client.addLabelCalls).toEqual([])
+    expect(client.removeLabelCalls).toEqual([])
+  })
+
+  it('converges to the confirmed blocked labels when a dependency reopens at the ready boundary', async () => {
+    class ReopeningDependencyClient extends FakeGitHubClient {
+      private dependencyReads = 0
+
+      override async getIssue(number: number) {
+        const issue = await super.getIssue(number)
+        if (number !== 2) return issue
+        this.dependencyReads += 1
+        // applyOpenProjection's fresh read sees completion, while confirmReady
+        // sees the dependency reopen after stale dependency-blocked was removed.
+        return this.dependencyReads === 1 ? { ...issue, state: 'closed', stateReason: 'completed' } : issue
+      }
+    }
+    const target = { ...READY_ISSUE, labels: ['dependency-blocked'], body: READY_BODY.replace('Depends on: none', 'Depends on: #2') }
+    const dependency = { ...READY_ISSUE, number: 2, labels: [] }
+    const client = new ReopeningDependencyClient({ issues: [target, dependency] })
+    const staleReady = { issueNumber: 1, state: 'ready' as const, dispatchable: true, executionMode: 'implementation' as const, dependencies: [2], reasonCodes: [], blockers: [], desiredReadinessLabels: ['ready-for-agent' as const], partial: false }
+
+    await applyOpenProjection(client, { issue: target, readiness: staleReady, closedCleanup: false })
+
+    expect((await client.getIssue(1)).labels).toEqual(['dependency-blocked'])
+    expect(client.addLabelCalls).not.toContainEqual({ issueNumber: 1, label: 'ready-for-agent' })
+  })
+
+  it('projects fresh ready state when a planned blocked issue changes before apply', async () => {
+    const latest = { ...READY_ISSUE, labels: ['dependency-blocked'] }
+    const client = new FakeGitHubClient({ issues: [latest] })
+    const staleBlockedResult = {
+      issueNumber: 1,
+      state: 'dependency-blocked' as const,
+      dispatchable: false,
+      executionMode: 'implementation' as const,
+      dependencies: [2],
+      reasonCodes: ['queue.issue_dependency_open' as const],
+      blockers: [{ reasonCode: 'queue.issue_dependency_open' as const, detail: 'Dependency #2 was open during planning.', dependencyIssueNumber: 2 }],
+      desiredReadinessLabels: ['dependency-blocked' as const],
+      partial: false,
+    }
+
+    await applyOpenProjection(client, { issue: latest, readiness: staleBlockedResult, closedCleanup: false })
+
+    expect((await client.getIssue(1)).labels).toEqual(['ready-for-agent'])
+    expect(client.removeLabelCalls).toContainEqual({ issueNumber: 1, label: 'dependency-blocked' })
+    expect(client.addLabelCalls).toContainEqual({ issueNumber: 1, label: 'ready-for-agent' })
+  })
+
+  it('reclassifies a reopened closed-lane issue through fresh open projection', async () => {
+    const closedSnapshot = { ...READY_ISSUE, state: 'closed', labels: ['dependency-blocked'] }
+    const client = new FakeGitHubClient({
+      issues: [{ ...READY_ISSUE, state: 'open', labels: ['dependency-blocked'] }],
+    })
+
+    await applyClosedCleanup(client, closedSnapshot)
+
+    expect((await client.getIssue(1)).labels).toEqual(['ready-for-agent'])
+    expect(client.removeLabelCalls).toContainEqual({ issueNumber: 1, label: 'dependency-blocked' })
+    expect(client.addLabelCalls).toContainEqual({ issueNumber: 1, label: 'ready-for-agent' })
+  })
+})
+
+// ============================================================
+// Resolver concurrency and metrics
+// ============================================================
+describe('resolver concurrency and metrics', () => {
+  it('treats a completed tracking dependency as a satisfied terminal leaf', async () => {
+    const target = { ...READY_ISSUE, body: READY_BODY.replace('Depends on: none', 'Depends on: #2'), labels: [] }
+    const completedEpic = { ...READY_ISSUE, number: 2, title: '[EPIC] Done', body: 'Execution mode: tracking\nDepends on: #not-a-number', state: 'closed', stateReason: 'completed', labels: [] }
+    const result = await new IssueReadinessResolver(new FakeGitHubClient({ issues: [target, completedEpic] })).resolveFromIssue(target)
+    expect(result).toMatchObject({ dispatchable: true, state: 'ready', partial: false })
+  })
+
+  it('rejects an open tracking dependency while allowing no tracking exception for completed malformed leaves', async () => {
+    const target = { ...READY_ISSUE, body: READY_BODY.replace('Depends on: none', 'Depends on: #2'), labels: [] }
+    const openEpic = { ...READY_ISSUE, number: 2, title: '[EPIC] Open tracker', body: 'malformed historic epic', labels: [] }
+    const result = await new IssueReadinessResolver(new FakeGitHubClient({ issues: [target, openEpic] })).resolveFromIssue(target)
+    expect(result.reasonCodes).toContain('queue.issue_dependency_tracking')
+    expect(result.dispatchable).toBe(false)
+  })
+
+  it('fails closed for a pull request target even when its body is otherwise valid', async () => {
+    const pullRequestTarget = { ...READY_ISSUE, isPullRequest: true, labels: [] }
+    const result = await new IssueReadinessResolver(new FakeGitHubClient({ issues: [pullRequestTarget] })).resolveReadiness(1)
+    expect(result).toMatchObject({ dispatchable: false, partial: true, state: 'needs-clarification' })
+    expect(result.reasonCodes).toContain('queue.issue_dependency_is_pull_request')
+  })
+
+  it('prioritizes incomplete dependency evidence over ordinary open dependencies', async () => {
+    const target = { ...READY_ISSUE, body: READY_BODY.replace('Depends on: none', 'Depends on: #2, #3'), labels: [] }
+    const open = { ...READY_ISSUE, number: 2, labels: [] }
+    const client = new FakeGitHubClient({ issues: [target, open] })
+    client.setFailures({ getIssueFailures: { 3: 'server_error' } })
+    const result = await new IssueReadinessResolver(client).resolveFromIssue(target)
+    expect(result).toMatchObject({ state: 'dependency-blocked', partial: true, dispatchable: false })
+    expect(result.reasonCodes).toContain('queue.issue_dependency_lookup_failed')
+    expect(result.reasonCodes).not.toContain('queue.issue_dependency_open')
+  })
+
+  it.each(['not_found', 'server_error'] as const)('does not let an open dependency mask %s evidence', async (failure) => {
+    const target = { ...READY_ISSUE, body: READY_BODY.replace('Depends on: none', 'Depends on: #2, #3'), labels: [] }
+    const open = { ...READY_ISSUE, number: 2, labels: [] }
+    const client = new FakeGitHubClient({ issues: [target, open] })
+    client.setFailures({ getIssueFailures: { 3: failure } })
+    const result = await new IssueReadinessResolver(client).resolveFromIssue(target)
+    expect(result.reasonCodes).not.toContain('queue.issue_dependency_open')
+    expect(result.partial).toBe(failure === 'server_error')
+  })
+
+  it('drops raw issue bodies from reconciliation snapshots without changing readiness', async () => {
+    const client = new FakeGitHubClient({ issues: [{ ...READY_ISSUE, labels: [] }] })
+    const resolver = new IssueReadinessResolver(client)
+    const snapshot = await resolver.loadOpenIssueSnapshot()
+    const issue = snapshot.issues.get(1)
+    const facts = snapshot.parsedMetadata.get(1)
+
+    expect(issue?.body).toBeNull()
+    expect(facts).toBeDefined()
+    await expect(resolver.resolveFromSnapshot(issue!, facts!)).resolves.toMatchObject({
+      state: 'ready',
+      desiredReadinessLabels: ['ready-for-agent'],
+    })
+  })
+
+  it('tracks unique dependency fetches and cache hits', async () => {
+    // Create issues: A depends on B and C
+    const issueA = { ...READY_ISSUE, number: 1, title: 'Issue A', body: READY_BODY.replace('Depends on: none', 'Depends on: #2, #3') }
+    const issueB = { ...READY_ISSUE, number: 2, title: 'Issue B', body: READY_BODY.replace('Test', 'Test B') }
+    const issueC = { ...READY_ISSUE, number: 3, title: 'Issue C', body: READY_BODY.replace('Test', 'Test C') }
+
+    const client = new FakeGitHubClient({ issues: [issueA, issueB, issueC] })
+    const resolver = new IssueReadinessResolver(client)
+    await resolver.resolveFromIssue(issueA)
+
+    expect(resolver.uniqueDependencyFetches).toBe(2)
+    expect(resolver.cacheHits).toBe(0)
+
+    // Resolve again - should hit cache
+    await resolver.resolveFromIssue(issueA)
+    expect(resolver.cacheHits).toBeGreaterThanOrEqual(2)
+  })
+
+  it('reuses normalized open snapshot facts for fan-in without dependency GETs', async () => {
+    class CountingClient extends FakeGitHubClient {
+      getCalls = 0
+      override async getIssue(number: number) { this.getCalls += 1; return await super.getIssue(number) }
+    }
+    const dependency = { ...READY_ISSUE, number: 1, labels: [], title: 'Dependency' }
+    const targets = Array.from({ length: 250 }, (_, index) => ({
+      ...READY_ISSUE, number: index + 2, labels: [], title: `Target ${index + 2}`,
+      body: READY_BODY.replace('Depends on: none', 'Depends on: #1'),
+    }))
+    const client = new CountingClient({ issues: [dependency, ...targets] })
+    const resolver = new IssueReadinessResolver(client)
+    const snapshot = await resolver.loadOpenIssueSnapshot()
+    await Promise.all([...snapshot.issues.values()].map(async (issue) => await resolver.resolveFromSnapshot(issue, snapshot.parsedMetadata.get(issue.number)!)))
+    // Snapshot planning is O(issues + unique absent edges): the shared open
+    // dependency was never refetched once per target (or even once at all).
+    expect(resolver.uniqueDependencyFetches).toBe(0)
+    expect(client.getCalls).toBe(0)
+    expect(resolver.cacheHits).toBeGreaterThanOrEqual(250)
+  })
+
+  it('short-circuits closed targets before dependency traversal', async () => {
+    const closed = { ...READY_ISSUE, state: 'closed', body: READY_BODY.replace('Depends on: none', 'Depends on: #99') }
+    const client = new FakeGitHubClient({ issues: [closed] })
+    const resolver = new IssueReadinessResolver(client)
+    const result = await resolver.resolveFromIssue(closed)
+    expect(result.dispatchable).toBe(false)
+    expect(resolver.uniqueDependencyFetches).toBe(0)
+  })
+
+  it('keeps public readiness codes stable while exposing typed API failure metrics', async () => {
+    const issue = { ...READY_ISSUE, body: READY_BODY.replace('Depends on: none', 'Depends on: #2, #3, #4, #5') }
+    const client = new FakeGitHubClient({ issues: [issue] })
+    client.setFailures({ getIssueFailures: { 2: 'not_found', 3: 'forbidden', 4: 'rate_limited', 5: 'server_error' } })
+    const resolver = new IssueReadinessResolver(client)
+    const result = await resolver.resolveFromIssue(issue)
+    expect(result.reasonCodes).toContain('queue.issue_dependency_not_found')
+    expect(resolver.apiFailureClasses).toMatchObject({ 'not-found': 1, permission: 1, 'rate-limit': 1, server: 1 })
+  })
+
+  it('classifies a 403 secondary-rate-limit response as rate limiting rather than permission denial', async () => {
+    class SecondaryRateLimitClient extends FakeGitHubClient {
+      override async getIssue(number: number) {
+        if (number === 2) throw new (await import('@/scripts/github-agent-workflow/io/github-client')).GitHubApiError('Forbidden.', 403, '/issues/2', { retryAfter: true, remainingZero: false })
+        return await super.getIssue(number)
+      }
+    }
+    const target = { ...READY_ISSUE, body: READY_BODY.replace('Depends on: none', 'Depends on: #2'), labels: [] }
+    const resolver = new IssueReadinessResolver(new SecondaryRateLimitClient({ issues: [target] }))
+    await resolver.resolveFromIssue(target)
+    expect(resolver.apiFailureClasses).toMatchObject({ 'rate-limit': 1, permission: 0 })
+  })
+
+  it('uses bounded concurrency for dependency fetching', async () => {
+    // Create many dependencies
+    const issues: GitHubIssue[] = []
+    const depRefs: string[] = []
+    for (let i = 2; i <= 20; i++) {
+      issues.push({ ...READY_ISSUE, number: i, title: `Issue ${i}`, body: READY_BODY.replace('Test', `Test ${i}`) })
+      depRefs.push(`#${i}`)
+    }
+    issues.unshift({
+      ...READY_ISSUE,
+      number: 1,
+      title: 'Issue A',
+      body: READY_BODY.replace('Depends on: none', `Depends on: ${depRefs.join(', ')}`),
+    })
+
+    const client = new FakeGitHubClient({ issues })
+    const resolver = new IssueReadinessResolver(client, { maxFetchConcurrency: 4 })
+    const result = await resolver.resolveFromIssue(issues[0])
+
+    // Should resolve all dependencies
+    expect(resolver.uniqueDependencyFetches).toBe(19)
+    expect(result.dispatchable).toBe(false) // All are open
+    expect(result.reasonCodes).toContain('queue.issue_dependency_open')
+  })
+})
+
+// ============================================================
+// Handoff eligibility failure path
+// ============================================================
+describe('handoff eligibility failure run-state guard', () => {
+  it('does not block terminal runs when eligibility fails', async () => {
+    const root = await tempRoot()
+
+    // Create a completed run
+    await recordRequested({
+      runId: 'issue-1-9999999999-1',
+      issueNumber: 1,
+      issueTitle: READY_ISSUE.title,
+      runtime: 'codex',
+      action: 'implement',
+      requestedBy: 'Joncallim',
+      source: { type: 'issue_comment', commentId: 999 },
+    }, { repositoryRoot: root })
+    await updateRunStatus({
+      issueNumber: 1,
+      runId: 'issue-1-9999999999-1',
+      status: 'completed',
+    }, { repositoryRoot: root })
+
+    // Semantic readiness passes but eligibility (run status check) fails
+    const client = new FakeGitHubClient({ issues: [READY_ISSUE] })
+
+    const result = await runHandoff({
+      client,
+      issueNumber: 1,
+      runLogRepositoryRoot: root,
+      artifactRepositoryRoot: root,
+      botLogin: 'github-actions[bot]',
+    })
+
+    // Should be blocked but run should remain completed
+    expect(result.status).toBe('blocked')
+    const run = await findLatestRunForIssue(1, { repositoryRoot: root })
+    expect(run!.status).toBe('completed')
+  })
+})

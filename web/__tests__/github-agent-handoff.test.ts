@@ -19,23 +19,43 @@ const tempRoots: string[] = []
 const execFile = promisify(execFileCallback)
 
 const SECRET_TOKEN = `gho_${'a'.repeat(40)}`
+
+/**
+ * A semantically ready issue body with valid structure and control metadata.
+ */
+const READY_ISSUE_BODY = [
+  '## Problem Statement',
+  'Test problem',
+  '## Desired Outcome',
+  'Test outcome',
+  '## User Story',
+  'As a user I want this',
+  '## Requirements',
+  '- Requirement 1',
+  '## Acceptance Criteria',
+  '- [ ] Claude handoff can be generated.',
+  '- [ ] Codex handoff can be generated.',
+  `- [ ] Do not leak token=${SECRET_TOKEN}.`,
+  '## Implementation Scope',
+  'Small',
+  '',
+  `Do not leak token=${SECRET_TOKEN}`,
+  '',
+  'Execution mode: implementation',
+  'Depends on: none',
+].join('\n')
+
 const READY_ISSUE: GitHubIssue = {
   number: 153,
   title: `[FEATURE] Controlled handoff ${SECRET_TOKEN}`,
-  body: [
-    '## Acceptance Criteria',
-    '',
-    '- [ ] Claude handoff can be generated.',
-    '- [ ] Codex handoff can be generated.',
-    `- [ ] Do not leak token=${SECRET_TOKEN}.`,
-    '',
-    `Do not leak token=${SECRET_TOKEN}`,
-  ].join('\n'),
+  body: READY_ISSUE_BODY,
   labels: ['ready-for-agent'],
   state: 'open',
+  stateReason: null,
   htmlUrl: 'https://github.com/Joncallim/Forge/issues/153',
   authorLogin: 'Joncallim',
   isPullRequest: false,
+  updatedAt: null,
 }
 
 async function tempRepositoryRoot(): Promise<string> {
@@ -132,10 +152,11 @@ describe('agent handoff', () => {
     expect((await client.listComments(153))[0]?.body).toContain('will be uploaded by this workflow run')
   })
 
-  it('refuses handoff when the issue is not ready', async () => {
+  it('refuses handoff when the issue is not semantically ready', async () => {
     const root = await tempRepositoryRoot()
     await seedRun(root, 'codex', 'requested')
-    const issue = { ...READY_ISSUE, labels: [] }
+    // Issue without control metadata is not semantically dispatchable
+    const issue = { ...READY_ISSUE, body: 'Some text without proper sections', labels: [] }
     const client = new FakeGitHubClient({ issues: [issue] })
 
     const result = await runHandoff({
@@ -147,7 +168,7 @@ describe('agent handoff', () => {
     })
 
     expect(result.status).toBe('blocked')
-    expect(result.blockedReason).toContain('ready-for-agent')
+    expect(result.blockedReason).toContain('not semantically dispatchable')
     expect((await client.getIssue(153)).labels).toContain('agent-blocked')
     expect((await findLatestRunForIssue(153, { repositoryRoot: root }))?.status).toBe('blocked')
   })
@@ -185,9 +206,21 @@ describe('agent handoff', () => {
     const issue = {
       ...READY_ISSUE,
       body: [
+        '## Problem Statement',
+        'Test problem',
+        '## Desired Outcome',
+        'Test outcome',
+        '## User Story',
+        'As a user I want this',
+        '## Requirements',
+        '- Requirement 1',
         '## Acceptance Criteria',
-        '',
         ...Array.from({ length: 120 }, (_, index) => `- [ ] Criterion ${index + 1}: ${'long implementation detail '.repeat(25)}`),
+        '## Implementation Scope',
+        'Small',
+        '',
+        'Execution mode: implementation',
+        'Depends on: none',
       ].join('\n'),
     }
     await seedRun(root, 'codex')
@@ -225,9 +258,21 @@ describe('agent handoff', () => {
     const issue = {
       ...READY_ISSUE,
       body: [
+        '## Problem Statement',
+        'Test problem',
+        '## Desired Outcome',
+        'Test outcome',
+        '## User Story',
+        'As a user I want this',
+        '## Requirements',
+        '- Requirement 1',
         '## Acceptance Criteria',
-        '',
         `- [ ] ${'Keep this criterion bounded '.repeat(120)}tail-marker`,
+        '## Implementation Scope',
+        'Small',
+        '',
+        'Execution mode: implementation',
+        'Depends on: none',
       ].join('\n'),
     }
     await seedRun(root, 'codex')

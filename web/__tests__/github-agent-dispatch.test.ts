@@ -16,20 +16,39 @@ import type { GitHubIssue } from '@/scripts/github-agent-workflow/io/github-clie
 
 const tempRoots: string[] = []
 
+/**
+ * A semantically ready issue body with valid structure and control metadata.
+ */
+const READY_ISSUE_BODY = [
+  '## Problem Statement',
+  'Test problem',
+  '## Desired Outcome',
+  'Test outcome',
+  '## User Story',
+  'As a user I want this',
+  '## Requirements',
+  '- Requirement 1',
+  '## Acceptance Criteria',
+  '- [ ] Ready issue dispatches successfully.',
+  '- [ ] Bounded work order is generated.',
+  '## Implementation Scope',
+  'Small',
+  '',
+  'Execution mode: implementation',
+  'Depends on: none',
+].join('\n')
+
 const READY_ISSUE: GitHubIssue = {
   number: 144,
   title: '[FEATURE] Safe agent dispatch / bounded work-order generation',
-  body: [
-    '## Acceptance Criteria',
-    '',
-    '- [ ] Ready issue dispatches successfully.',
-    '- [ ] Bounded work order is generated.',
-  ].join('\n'),
+  body: READY_ISSUE_BODY,
   labels: ['ready-for-agent', 'agent-requested'],
   state: 'open',
+  stateReason: null,
   htmlUrl: 'https://github.com/Joncallim/Forge/issues/144',
   authorLogin: 'Joncallim',
   isPullRequest: false,
+  updatedAt: null,
 }
 
 async function tempRepositoryRoot(): Promise<string> {
@@ -58,6 +77,19 @@ afterEach(async () => {
 })
 
 describe('agent dispatch', () => {
+  it('durably blocks before removing requested and adding blocked, preserving the run on label failure', async () => {
+    const root = await tempRepositoryRoot()
+    const blockedIssue = { ...READY_ISSUE, body: READY_ISSUE_BODY.replace('Depends on: none', 'Depends on: #999') }
+    await seedRequestedRun(root, blockedIssue)
+    const client = new FakeGitHubClient({ issues: [{ ...blockedIssue, labels: ['agent-requested'] }] })
+    client.setFailures({ addLabelFailures: ['agent-blocked'] })
+
+    await expect(runDispatch({ client, issueNumber: blockedIssue.number, runLogRepositoryRoot: root, botLogin: 'github-actions[bot]' })).rejects.toThrow()
+    expect((await findLatestRunForIssue(blockedIssue.number, { repositoryRoot: root }))?.status).toBe('blocked')
+    expect(client.removeLabelCalls).toContainEqual({ issueNumber: blockedIssue.number, label: 'agent-requested' })
+    expect((await client.getIssue(blockedIssue.number)).labels).not.toContain('agent-requested')
+  })
+
   it('dispatches a ready issue with a requested run without starting a runtime', async () => {
     const root = await tempRepositoryRoot()
     await seedRequestedRun(root)
@@ -98,7 +130,7 @@ describe('agent dispatch', () => {
     expect(run?.events.at(-1)?.message).toContain('did not start a runtime')
   })
 
-  it('blocks when no run record exists', async () => {
+  it('does not project a blocked state when no durable run record exists', async () => {
     const root = await tempRepositoryRoot()
     const client = new FakeGitHubClient({ issues: [READY_ISSUE] })
 
@@ -111,8 +143,9 @@ describe('agent dispatch', () => {
 
     expect(result.status).toBe('blocked')
     expect(result.blockedReason).toContain('No run record')
-    expect((await client.getIssue(144)).labels).toContain('agent-blocked')
-    expect((await client.listComments(144))[0]?.body).toContain('No run record exists')
+    expect((await client.getIssue(144)).labels).not.toContain('agent-blocked')
+    expect(await client.listComments(144)).toEqual([])
+    expect(result.commentBody).toBeNull()
   })
 
   it('ignores pull request numbers without mutating labels, comments, or run logs', async () => {
@@ -162,7 +195,12 @@ describe('agent dispatch', () => {
 
   it('blocks issues with needs-clarification', async () => {
     const root = await tempRepositoryRoot()
-    const issue = { ...READY_ISSUE, labels: ['ready-for-agent', 'agent-requested', 'needs-clarification'] }
+    const issue = {
+      ...READY_ISSUE,
+      labels: ['ready-for-agent', 'agent-requested', 'needs-clarification'],
+      // Body lacks proper structure to trigger needs-clarification
+      body: 'Some text without proper sections',
+    }
     await seedRequestedRun(root, issue)
     const client = new FakeGitHubClient({ issues: [issue] })
 
@@ -174,10 +212,10 @@ describe('agent dispatch', () => {
     })
 
     expect(result.status).toBe('blocked')
-    expect(result.blockedReason).toContain('needs-clarification')
+    expect(result.blockedReason).toContain('not semantically dispatchable')
   })
 
-  it('blocks non-requested runs', async () => {
+  it('does not rewrite or project a blocked state for non-blockable runs', async () => {
     const root = await tempRepositoryRoot()
     await seedRequestedRun(root)
     await updateRunStatus({
@@ -196,7 +234,9 @@ describe('agent dispatch', () => {
 
     expect(result.status).toBe('blocked')
     expect(result.blockedReason).toContain('not `requested`')
-    expect((await findLatestRunForIssue(144, { repositoryRoot: root }))?.status).toBe('blocked')
+    expect((await findLatestRunForIssue(144, { repositoryRoot: root }))?.status).toBe('running')
+    expect((await client.getIssue(144)).labels).not.toContain('agent-blocked')
+    expect(await client.listComments(144)).toEqual([])
   })
 
   it('treats already-handed-off runs as idempotent instead of blocked', async () => {
@@ -229,10 +269,22 @@ describe('agent dispatch', () => {
     const issue = {
       ...READY_ISSUE,
       body: [
+        '## Problem Statement',
+        'Test problem',
+        '## Desired Outcome',
+        'Test outcome',
+        '## User Story',
+        'As a user I want this',
+        '## Requirements',
+        '- Requirement 1',
         '## Acceptance Criteria',
-        '',
         `- [ ] ${'A very long criterion '.repeat(400)}`,
-      ].join('\n'),
+        '## Implementation Scope',
+        'Small',
+        '',
+        'Execution mode: implementation',
+        'Depends on: none',
+].join('\n')
     }
     await seedRequestedRun(root, issue)
     const client = new FakeGitHubClient({ issues: [issue] })
@@ -257,10 +309,22 @@ describe('agent dispatch', () => {
     const issue = {
       ...READY_ISSUE,
       body: [
+        '## Problem Statement',
+        'Test problem',
+        '## Desired Outcome',
+        'Test outcome',
+        '## User Story',
+        'As a user I want this',
+        '## Requirements',
+        '- Requirement 1',
         '## Acceptance Criteria',
-        '',
         `- [ ] Do not leak token=${secret}.`,
-      ].join('\n'),
+        '## Implementation Scope',
+        'Small',
+        '',
+        'Execution mode: implementation',
+        'Depends on: none',
+].join('\n')
     }
     await seedRequestedRun(root, issue)
     const client = new FakeGitHubClient({ issues: [issue] })

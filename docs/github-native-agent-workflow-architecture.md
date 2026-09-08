@@ -6,9 +6,9 @@ guide. The plain-English workflow guide is owned by
 [#147](https://github.com/Joncallim/Forge/issues/147).
 
 Its job is to show how the implemented features
-(#144, #145, #147, #152, #153) build on **one** set of contracts, one status
-model, one prompt shape, and one file layout — instead of each feature inventing
-its own.
+(#142, #143, #144, #145, #146, #152, #153, #354) build on **one** set of
+contracts, one status model, one readiness resolver, and one file layout —
+instead of each feature inventing its own.
 
 All workflow code lives under `web/scripts/github-agent-workflow/`.
 
@@ -16,30 +16,163 @@ All workflow code lives under `web/scripts/github-agent-workflow/`.
 
 | Issue | Feature | Where |
 | --- | --- | --- |
-| #142 | Issue intake validation | `core/issue-validation.ts`, `shared/issue-validation-runner.ts`, `.github/workflows/issue-intake.yml` |
+| #142 | Issue intake structural validation | `core/issue-validation.ts`, `shared/issue-validation-runner.ts`, `.github/workflows/issue-intake.yml` |
 | #143 | Issue-comment agent command router | `core/agent-command.ts`, `agent-command.ts`, `.github/workflows/agent-command.yml` |
 | #146 | Durable agent run log | `io/agent-run-log.ts`, `contracts/agent-run-record.ts`, [`docs/github-agent-run-log.md`](./github-agent-run-log.md) |
+| #152 | Agent PR creation contract + PR body template | `.github/pull_request_template.md`, [`docs/github-agent-pr-contract.md`](./github-agent-pr-contract.md) |
+| #144 | Safe agent dispatch / bounded work-order generation | `dispatch.ts` (`forge:dispatch`), `.github/workflows/agent-dispatch.yml` |
+| #153 | Controlled Claude Code / Codex handoff adapter | `handoff.ts` (`forge:handoff`), `.github/workflows/agent-handoff.yml` |
+| #145 | PR acceptance-criteria contract checker | `pr-contract.ts` (`forge:pr-contract`), `.github/workflows/pr-contract-check.yml` |
+| #354 | Dependency-aware readiness + tracking isolation | See readiness architecture below |
 
 The run log at `.forge/runs/<issue-number>/<run-id>.json` is the **source of
 truth for workflow state**. Everything below reads and writes that record; it
 does not add a second status store.
 
-## What this PR completes
+## Readiness Architecture (#354)
 
-| Issue | Feature | Where |
+### Central invariant
+
+**Semantic readiness from the shared resolver is authority. Labels are
+projections only.**
+
+`ready-for-agent` is a cache of the computed readiness state, never an
+authoritative gate. Command admission, dispatch admission, handoff admission,
+and the pre-runtime readiness check all re-resolve current semantic truth from
+the shared resolver. A stale, missing, or manually spoofed label cannot grant
+authority.
+
+### Readiness concepts
+
+Forge distinguishes these concepts permanently:
+
+| Concept | Definition | Authority |
 | --- | --- | --- |
-| #152 | Agent PR creation contract + PR body template | `.github/pull_request_template.md`, [`docs/github-agent-pr-contract.md`](./github-agent-pr-contract.md) |
-| #144 | Safe agent dispatch / bounded work-order generation | `dispatch.ts` (`forge:dispatch`), `.github/workflows/agent-dispatch.yml` |
-| #153 | Controlled Claude Code / Codex handoff adapter | `handoff.ts` (`forge:handoff`), `.github/workflows/agent-handoff.yml` |
-| #145 | PR acceptance-criteria contract checker | `pr-contract.ts` (`forge:pr-contract`), `.github/workflows/pr-contract-check.yml` |
-| #147 | Plain-English workflow documentation | [`docs/workflows/github-native-agent-workflow.md`](./workflows/github-native-agent-workflow.md) |
+| **Structural validity** | Does the issue satisfy the Feature/Bug/Other/Epic template contract? | Pure deterministic check, no I/O |
+| **Control metadata validity** | Is `Execution mode` / `Depends on` present, unambiguous, and safe? | Pure parser via visible-Markdown scanner |
+| **Semantic readiness** | Is this issue actually dispatchable *now* after resolving current GitHub state? | Shared resolver (`IssueReadinessResolver`) |
+| **Projection** | Labels/comments that expose semantic readiness to humans | Never authority |
 
-The CLIs stay thin. They parse GitHub Actions input, call shared contract
-helpers, update GitHub comments or labels, and write the durable run log. Dispatch
-is started manually with `workflow_dispatch`; labels applied by `GITHUB_TOKEN`
-do not trigger follow-up workflow runs. The CLIs
-do not execute Claude Code, Codex, pull request code, issue comments, or code
-from the run-log branch.
+### Readiness states and labels
+
+| Semantic state | Required projection | Dispatchable |
+| --- | --- | --- |
+| `ready` | `ready-for-agent` | Yes |
+| `needs-clarification` | `needs-clarification` | No |
+| `dependency-blocked` | `dependency-blocked` | No |
+| `tracking-only` | `tracking-only` | No |
+| `closed` | (none) | No |
+
+Readiness labels are mutually exclusive. `needs-triage` and all `agent-*` labels
+remain outside the readiness projection set.
+
+### Canonical control metadata
+
+Issues use the following visible metadata lines:
+
+```
+Execution mode: implementation
+Depends on: none
+```
+
+or with dependencies:
+
+```
+Execution mode: implementation
+Depends on: #123, #456
+```
+
+Tracking issues use:
+
+```
+Execution mode: tracking
+Depends on: none
+```
+
+Supported execution modes are exactly `implementation | tracking`. Dependencies
+are same-repository positive GitHub issue numbers only. The `Depends on` value
+`none` cannot be mixed with references.
+
+### Stable readiness reason codes
+
+All readiness decisions use typed `queue.*` reason codes (see
+`contracts/issue-readiness-result.ts`). Machine consumers use these codes, not
+human-readable prose.
+
+### One shared resolver
+
+`shared/issue-readiness-resolver.ts` is the single I/O service that computes
+semantic readiness from current GitHub truth. It is used by:
+
+1. **Intake projection** — `shared/issue-validation-runner.ts` syncs labels
+2. **Agent command** — `core/agent-command.ts` before accepting a request
+3. **Dispatch** — `dispatch.ts` before handing off a work order
+4. **Handoff** — `handoff.ts` before generating a runtime package
+5. **Pre-runtime CLI** — `cli/check-readiness.ts` (read-only, exit 0 only when dispatchable)
+
+The resolver owns:
+- Fresh target issue/dependency resolution via `GitHubClient`
+- Repository snapshot for reconciliation runs
+- Graph limits (MAX_DEPENDENCIES_PER_ISSUE=64, MAX_GRAPH_DEPTH=64,
+  MAX_GRAPH_NODES=512, MAX_OPEN_ISSUES_SCAN=5000)
+- Cycle detection via `core/dependency-graph.ts`
+- Stable fail-closed result generation
+
+### Visible-Markdown scanner
+
+`core/visible-markdown-scanner.ts` is a bounded O(n) scanner used by both
+section detection and control-metadata parsing. It ignores:
+- Fenced code blocks (``` and ~~~ with 3+ fence characters)
+- Indented code blocks (4+ spaces or tab)
+- Blockquotes
+- Multi-line HTML comments
+
+No arbitrary text from an issue can mint authority or execute code. No model
+or provider call occurs anywhere in readiness evaluation.
+
+### Dependency semantics
+
+| Observed dependency | Result |
+| --- | --- |
+| Open / reopened issue | `dependency-blocked` |
+| Closed with `state_reason=completed` | Satisfied |
+| Closed `not_planned` / `duplicate` | Terminal unsatisfied; author must replace/remove |
+| Closed but missing/unknown reason | Fail closed (`state_unknown`) |
+| Dependency is a pull request | Invalid contract |
+| Dependency not found (404) | Invalid contract |
+| Permission/API error | Fail closed (`inaccessible` / `lookup_failed`) |
+| Self-dependency | Invalid contract |
+| Cycle participation | Invalid contract |
+
+### Run-log authority over labels
+
+The durable run log (`#146`) is the single workflow-state truth. `agent-requested`,
+`agent-running`, `agent-blocked`, and `agent-pr-opened` remain useful UX
+projections but command/dispatch/handoff must not use them to override
+contradictory durable run-log state.
+
+Run admission rules:
+- `requested`, `handed-off`, `running`, `pr-opened` latest runs block a new
+  implementation request
+- `blocked` permits a new explicit request only after fresh semantic readiness
+- `completed`, `failed`, `cancelled` permit a new explicit request subject to
+  fresh readiness
+- If latest-run state cannot be loaded/validated, fail closed
+
+### Event / Convergence design
+
+| Event | Action | Actor gate |
+| --- | --- | --- |
+| `labeled` | Target-only readiness self-heal | None |
+| `unlabeled` | Target-only readiness self-heal | None |
+| `opened` | Target-only + full reconcile if trusted | write/maintain/admin |
+| `edited` | Target-only + full reconcile if trusted | write/maintain/admin |
+| `closed` | Target-only + full reconcile if trusted | write/maintain/admin |
+| `reopened` | Target-only + full reconcile if trusted | write/maintain/admin |
+| `workflow_dispatch` (reconcile) | Full repository reconciliation | Always permitted |
+
+Full reconciliation uses plan → validate → apply phases. No bulk mutations
+are performed from an incomplete snapshot.
 
 ## Workflow states
 
@@ -84,7 +217,9 @@ Feature runners must import these, not re-derive them.
 
 | Contract file | Owns |
 | --- | --- |
-| `common.ts` | Primitives: run id, run status + dispatch-state mapping, runtime, action, PR criterion status, source ref, handoff-artifacts shape. |
+| `common.ts` | Primitives: run id, run status + dispatch-state mapping, runtime, action, PR criterion status, source ref, handoff-artifacts shape. Also defines `ISSUE_READINESS_MANAGED_LABELS` and full label name list including `dependency-blocked` and `tracking-only`. |
+| `issue-control-metadata.ts` | Canonical execution mode + dependency schemas, `MAX_DEPENDENCIES_PER_ISSUE`, `MAX_ISSUE_BODY_BYTES`. |
+| `issue-readiness-result.ts` | Shared readiness result contract, 21 stable `queue.*` reason codes, semantic state/label mapping. |
 | `agent-run-record.ts` | The durable run record schema (#146). |
 | `dispatch-request.ts` | The dispatch request shape (#144); its `branchName` is an `agentBranchNameSchema`. |
 | `branch-name.ts` | `AGENT_BRANCH_NAME_PATTERN` + `agentBranchNameSchema` (`agent/issue-<n>[-slug]`). |
@@ -107,6 +242,10 @@ execution** — those side effects belong to the feature CLIs.
 
 | Module | Provides | Consumed by |
 | --- | --- | --- |
+| `visible-markdown-scanner.ts` | Bounded O(n) scanner ignoring fenced/indented/blockquoted/HTML-commented content | `sections.ts`, `issue-control.ts` |
+| `issue-control.ts` | `parseControlMetadata` — canonical `Execution mode:` / `Depends on:` parser | `issue-readiness-resolver.ts` |
+| `issue-readiness.ts` | `evaluateReadiness` — pure classification from pre-resolved inputs | `issue-readiness-resolver.ts` |
+| `dependency-graph.ts` | `detectCycle`, `buildReverseIndex`, `getTransitiveDependencies` with bounded traversal | `issue-readiness-resolver.ts` |
 | `branch-names.ts` | `buildAgentBranchName` — deterministic, git-ref-safe. | #144, #153 |
 | `work-order.ts` | `buildWorkOrder` / `renderWorkOrder` — canonical, bounded sections. | #144, #153 |
 | `acceptance-criteria.ts` | `extractAcceptanceCriteria` — one checklist parser, reusing `core/sections.ts`. | #144, #145 |
@@ -118,12 +257,17 @@ execution** — those side effects belong to the feature CLIs.
 ## I/O and CLI
 
 - `io/github-client.ts` — `fetch`-based GitHub client (no Octokit) + `GitHubClient` interface.
+  Extended with `stateReason`, `updatedAt` on `GitHubIssue`, and `listOpenIssues()`.
 - `io/fake-github-client.ts` — in-memory test double.
 - `io/agent-run-log.ts` — the durable run log and its git-persistence path (#146).
 - `io/event.ts` — reads `GITHUB_EVENT_PATH`.
 - `cli/entrypoint.ts` — `runMain` (only executes when run directly).
-- `cli/bootstrap-labels.ts` — creates the six workflow labels + `needs-triage`.
-- Root CLIs (`agent-command.ts`, `dispatch.ts`, `pr-contract.ts`, `handoff.ts`) — thin wiring; `forge:*` npm scripts point here.
+- `cli/bootstrap-labels.ts` — creates the workflow labels including `dependency-blocked`
+  and `tracking-only`.
+- `cli/check-readiness.ts` — read-only preflight CLI, exit 0 only when `dispatchable=true`.
+- `cli/reconcile-readiness.ts` — full reconciliation CLI with plan → validate → apply phases.
+- Root CLIs (`agent-command.ts`, `dispatch.ts`, `pr-contract.ts`, `handoff.ts`,
+  `validate-issue.ts`) — thin wiring; `forge:*` npm scripts point here.
 
 ## Run-log branch sync strategy
 
@@ -171,12 +315,17 @@ model transcripts, or local auth material to the repository.
 
 ## Why dispatch is explicit, not automatic
 
-FORGE never runs a coding agent on every new issue. The workflow requires two
-human gates before any runtime could start:
+FORGE never runs a coding agent on every new issue. The workflow requires
+multiple gates before any runtime could start:
 
-1. **Readiness** — intake validation (#142) must have applied `ready-for-agent`.
-2. **Explicit request** — a maintainer with write access must comment a supported
-   command (#143), which is what writes the `requested` run record.
+1. **Structural validity** — intake validation (#142) verifies the template.
+2. **Control metadata** — `Execution mode` and `Depends on` must be present.
+3. **Semantic readiness** — the shared resolver verifies dependencies are
+   satisfied and the issue is dispatchable.
+4. **Explicit request** — a maintainer with write access must comment a supported
+   command (#143), which writes the `requested` run record.
+5. **Permission check** — collaborator permission is verified before expensive
+   semantic traversal.
 
 Dispatch (#144) then only produces a **bounded work order** and moves the run to
 `handed-off`. It does not execute Claude Code or Codex. This avoids an
@@ -188,41 +337,45 @@ workflow runs from events created by that token. A future GitHub App or personal
 access token integration could make label-driven dispatch possible, but that is
 outside this slice.
 
-There is also a hard operational reason automatic PR creation stays out of scope:
-GitHub's default `GITHUB_TOKEN` does not trigger downstream workflows, so an
-auto-created PR would silently skip `pr-contract-check` and the label-transition
-chain. Any future automation needs a PAT or GitHub App token and a separate
-security review.
+## Rollback safety
 
-## How #152, #144, #153, and #145 fit together
+If the readiness resolver has a production incident, the correct response is to
+**fail closed** — disable the agent admission workflows (agent-command, dispatch,
+handoff) first, then repair or revert. Emergency rollback MUST NOT restore the
+old condition `template-valid -> ready-for-agent` while agent
+command/dispatch/handoff remain active.
+
+## How #152, #144, #153, #145, and #354 fit together
 
 ```
-#152  PR body contract  ─┐  (defines the sections agents must write and #145 parses)
+#354  Readiness authority ──────►  shared resolver guards every admission gate
+                                    │
+#152  PR body contract  ─┐        │ (defines the sections agents must write
+                         │        │  and #145 parses)
+                         ▼        ▼
+#144  dispatch  ─────────┼────►  work order (bounded prompt + branch name +
+                         │        run record: handed-off)
                          │
-#144  dispatch  ─────────┼─►  work order (bounded prompt + branch name + run record: handed-off)
+#153  handoff   ─────────┼────►  runtime artifacts under .forge/runs/<issue>/<run-id>/
+                         │        (prompt embeds the #152 PR contract;
+                         │         run log records paths)
                          │
-#153  handoff   ─────────┼─►  runtime artifacts under .forge/runs/<issue>/<run-id>/
-                         │        (prompt embeds the #152 PR contract; run log records paths)
-                         │
-#145  PR checker ────────┘  reads the #152 sections + source-issue acceptance criteria,
-                            reports claimed / missing / needs-review per criterion.
+#145  PR checker ────────┘  reads the #152 sections + source-issue acceptance
+                            criteria, reports claimed / missing / needs-review
+                            per criterion.
 ```
 
+- **#354** establishes the readiness authority that all downstream gates use.
+  It adds the shared resolver, pure readiness evaluator, visible-Markdown
+  scanner, control-metadata parser, and dependency-graph cycle detection.
 - **#152 comes first (or alongside #145)** because it defines the predictable PR
-  body structure both #144/#153 instruct agents to produce and #145 parses. The
-  shared section constants (`pr-contract-sections.ts`) exist so the template and
-  the checker cannot drift.
+  body structure both #144/#153 instruct agents to produce and #145 parses.
 - **#144** turns a `requested` run into a bounded work order and moves it to
-  `handed-off`. It consumes `branch-names.ts`, `work-order.ts`, and
-  `acceptance-criteria.ts`.
+  `handed-off`.
 - **#153** consumes the #144 work order and emits runtime-specific handoff
-  artifacts, recording their paths on the run log via the existing
-  `handoffArtifacts` shape. It embeds the #152 PR contract in the generated
-  prompt.
+  artifacts.
 - **#145** consumes the #152 PR sections and the source issue's acceptance
-  criteria (via the shared parsers) to produce a review aid — **not** proof of
-  correctness, and it does not block merges by default. It does not yet transition
-  a run to `pr-opened`.
+  criteria to produce a review aid.
 
 ## Where future runtime execution plugs in
 
@@ -230,6 +383,9 @@ Everything above stops at **artifact generation**. The point where a real runtim
 would start is a single, isolated boundary:
 
 - The run status crosses from `handed-off` to `running`.
+- Before crossing, the runtime adapter MUST invoke the same shared readiness
+  resolver (`cli/check-readiness.ts`) and must not trust a stored handoff
+  snapshot.
 - A runtime adapter (`dry-run` | `claude-code` | `codex`, per
   `AGENT_RUNTIME_VALUES`) consumes the #153 handoff package.
 - For the MVP that adapter is a **human running the generated command locally**;
@@ -243,8 +399,12 @@ The prompt/metadata files themselves live in the git-ignored
 
 ## Implemented sequence
 
-1. **#152** — PR creation contract + PR body template (defines the shape #144/#153 emit and #145 parses).
-2. **#144** — safe dispatch / bounded work-order generation.
-3. **#153** — controlled local Claude Code / Codex handoff adapter.
-4. **#145** — PR acceptance-criteria contract checker.
-5. **#147** — plain-English operating guide.
+1. **#142** — Issue intake structural validation.
+2. **#143** — Issue-comment agent command router.
+3. **#146** — Durable agent run log.
+4. **#152** — PR creation contract + PR body template.
+5. **#144** — Safe dispatch / bounded work-order generation.
+6. **#153** — Controlled local Claude Code / Codex handoff adapter.
+7. **#145** — PR acceptance-criteria contract checker.
+8. **#354** — Dependency-aware readiness + tracking isolation + shared resolver.
+9. **#147** — Plain-English operating guide.

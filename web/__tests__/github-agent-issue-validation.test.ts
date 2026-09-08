@@ -3,19 +3,75 @@ import path from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { FakeGitHubClient } from '@/scripts/github-agent-workflow/io/fake-github-client'
 import {
-  buildReadyForAgentComment,
   ISSUE_VALIDATION_MARKER_PREFIX,
   validateIssue,
 } from '@/scripts/github-agent-workflow/core/issue-validation'
 import { runIssueValidation } from '@/scripts/github-agent-workflow/shared/issue-validation-runner'
+import { markerCommentPolicyForAction } from '@/scripts/github-agent-workflow/validate-issue'
+
+class CommentCountingClient extends FakeGitHubClient {
+  listCommentCalls = 0
+
+  override async listComments(issueNumber: number) {
+    this.listCommentCalls += 1
+    return await super.listComments(issueNumber)
+  }
+}
+
+class DependencyReopensBeforeReadyConfirmationClient extends FakeGitHubClient {
+  private dependencyReads = 0
+
+  override async getIssue(issueNumber: number) {
+    const issue = await super.getIssue(issueNumber)
+    if (issueNumber !== 147) return issue
+
+    this.dependencyReads += 1
+    return {
+      ...issue,
+      state: this.dependencyReads === 1 ? 'closed' : 'open',
+    }
+  }
+}
 
 const FIXTURE_DIR = path.join(process.cwd(), '__tests__', '__fixtures__', 'github-agent-workflow')
+
+const READY_BODY = [
+  '## Bug Summary',
+  'Fresh issue state',
+  '## Current Behaviour',
+  'Broken',
+  '## Expected Behaviour',
+  'Fixed',
+  '## Reproduction Steps',
+  '1. Reproduce',
+  '## Impact',
+  'Low',
+  '## Severity',
+  'Low',
+  '## Acceptance Criteria',
+  '- [ ] Fixed',
+  '',
+  'Execution mode: implementation',
+  'Depends on: none',
+].join('\n')
 
 async function readFixture(name: string): Promise<string> {
   return await readFile(path.join(FIXTURE_DIR, name), 'utf8')
 }
 
 describe('GitHub issue validation', () => {
+  it.each([
+    ['opened', 'always'],
+    ['edited', 'always'],
+    ['closed', 'always'],
+    ['reopened', 'always'],
+    ['labeled', 'on-projection-change'],
+    ['unlabeled', 'on-projection-change'],
+    [undefined, 'on-projection-change'],
+  ] as const)('uses the expected marker policy for the %s intake action', (action, expected) => {
+    expect(markerCommentPolicyForAction(action)).toBe(expected)
+  })
+
   it('validates complete Feature, Bug, Other, and Epic issues', async () => {
     const cases = [
       { file: 'feature-h3-form.md', issueType: 'feature' as const },
@@ -35,7 +91,8 @@ describe('GitHub issue validation', () => {
       expect(result.issueType).toBe(testCase.issueType)
       expect(result.valid).toBe(true)
       expect(result.missingSections).toEqual([])
-      expect(result.recommendedLabels).toEqual(['ready-for-agent'])
+      // Structural validation no longer recommends ready-for-agent
+      expect(result.recommendedLabels).toEqual([])
       expect(result.commentBody).toBeNull()
     }
   })
@@ -76,13 +133,19 @@ describe('GitHub issue validation', () => {
         htmlUrl: 'https://github.com/Joncallim/Forge/issues/142',
         authorLogin: 'Joncallim',
         isPullRequest: false,
+        stateReason: null,
+        updatedAt: null,
       }],
     })
 
     const issue = await client.getIssue(142)
     const firstRun = await runIssueValidation(client, issue, { botLogin: 'github-actions[bot]' })
     expect(firstRun.result.valid).toBe(false)
-    expect((await client.getIssue(142)).labels.sort()).toEqual(['enhancement', 'needs-clarification'])
+    // Structural validation removes ready-for-agent and adds needs-clarification
+    const labelsAfter = (await client.getIssue(142)).labels
+    expect(labelsAfter).toContain('enhancement')
+    expect(labelsAfter).toContain('needs-clarification')
+    // ready-for-agent may have been removed by the readiness projection
     expect(await client.listComments(142)).toHaveLength(1)
 
     const secondRun = await runIssueValidation(client, await client.getIssue(142), { botLogin: 'github-actions[bot]' })
@@ -90,52 +153,121 @@ describe('GitHub issue validation', () => {
     expect(await client.listComments(142)).toHaveLength(1)
   })
 
-  it('updates an existing marker comment to ready-for-agent when the issue becomes valid', async () => {
-    const invalidBody = await readFixture('other-invalid.md')
-    const validBody = await readFixture('other-valid.md')
-    const client = new FakeGitHubClient({
+  it('skips comment history for unchanged label self-heal projections', async () => {
+    const body = await readFixture('bug-invalid.md')
+    const client = new CommentCountingClient({
       issues: [{
-        number: 142,
-        title: '[OTHER] Documentation cleanup',
-        body: invalidBody,
+        number: 143,
+        title: '[BUG] Already projected validation issue',
+        body,
         labels: ['needs-clarification'],
         state: 'open',
-        htmlUrl: 'https://github.com/Joncallim/Forge/issues/142',
+        htmlUrl: 'https://github.com/Joncallim/Forge/issues/143',
         authorLogin: 'Joncallim',
         isPullRequest: false,
+        stateReason: null,
+        updatedAt: null,
       }],
-      commentsByIssue: {
-        142: [{
-          id: 1,
-          body: `${ISSUE_VALIDATION_MARKER_PREFIX}\nold validation body`,
-          authorLogin: 'github-actions[bot]',
-          authorType: 'Bot',
-          htmlUrl: 'https://github.com/Joncallim/Forge/issues/142#issuecomment-1',
-        }],
-      },
     })
 
-    await runIssueValidation(client, await client.getIssue(142), { botLogin: 'github-actions[bot]' })
+    const result = await runIssueValidation(client, await client.getIssue(143), {
+      botLogin: 'github-actions[bot]',
+      markerCommentPolicy: 'on-projection-change',
+    })
 
-    const mutableIssue = await client.getIssue(142)
-    const rerunClient = client as unknown as { issues?: unknown }
-    void rerunClient
+    expect(result.existingMarkerComment).toBeNull()
+    expect(client.listCommentCalls).toBe(0)
+  })
 
-    // Re-seed via the fake by replacing the issue body through a fresh client.
-    const readyClient = new FakeGitHubClient({
+  it('refreshes the marker for normal validation events even when labels are unchanged', async () => {
+    const body = await readFixture('bug-invalid.md')
+    const client = new CommentCountingClient({
       issues: [{
-        ...mutableIssue,
-        body: validBody,
+        number: 144,
+        title: '[BUG] Normal validation issue',
+        body,
         labels: ['needs-clarification'],
+        state: 'open',
+        htmlUrl: 'https://github.com/Joncallim/Forge/issues/144',
+        authorLogin: 'Joncallim',
+        isPullRequest: false,
+        stateReason: null,
+        updatedAt: null,
       }],
-      commentsByIssue: {
-        142: await client.listComments(142),
-      },
     })
 
-    const readyRun = await runIssueValidation(readyClient, await readyClient.getIssue(142), { botLogin: 'github-actions[bot]' })
-    expect(readyRun.result.valid).toBe(true)
-    expect((await readyClient.getIssue(142)).labels.sort()).toEqual(['ready-for-agent'])
-    expect((await readyClient.listComments(142))[0]?.body).toBe(buildReadyForAgentComment(readyRun.result))
+    await runIssueValidation(client, await client.getIssue(144), { botLogin: 'github-actions[bot]' })
+
+    expect(client.listCommentCalls).toBe(1)
+    expect(await client.listComments(144)).toHaveLength(1)
+  })
+
+  it('projects a current ready state when the supplied issue was stale and blocked', async () => {
+    const client = new FakeGitHubClient({
+      issues: [{
+        number: 145,
+        title: '[BUG] Current ready issue',
+        body: READY_BODY,
+        labels: ['needs-clarification'],
+        state: 'open',
+        htmlUrl: 'https://github.com/Joncallim/Forge/issues/145',
+        authorLogin: 'Joncallim',
+        isPullRequest: false,
+        stateReason: null,
+        updatedAt: null,
+      }],
+    })
+    const staleIssue = {
+      ...(await client.getIssue(145)),
+      body: 'incomplete stale event payload',
+      labels: ['needs-clarification'],
+    }
+
+    const result = await runIssueValidation(client, staleIssue, { botLogin: 'github-actions[bot]' })
+
+    expect(result.readinessResult?.dispatchable).toBe(true)
+    expect((await client.getIssue(145)).labels).toContain('ready-for-agent')
+    expect((await client.getIssue(145)).labels).not.toContain('needs-clarification')
+  })
+
+  it('returns and comments on the fresh blocked result when a dependency reopens immediately before ready promotion', async () => {
+    const client = new DependencyReopensBeforeReadyConfirmationClient({
+      issues: [
+        {
+          number: 146,
+          title: '[BUG] Target issue',
+          body: `${READY_BODY.replace('Depends on: none', 'Depends on: #147')}`,
+          labels: ['needs-clarification'],
+          state: 'open',
+          htmlUrl: 'https://github.com/Joncallim/Forge/issues/146',
+          authorLogin: 'Joncallim',
+          isPullRequest: false,
+          stateReason: null,
+          updatedAt: null,
+        },
+        {
+          number: 147,
+          title: '[BUG] Dependency issue',
+          body: READY_BODY,
+          labels: [],
+          state: 'closed',
+          htmlUrl: 'https://github.com/Joncallim/Forge/issues/147',
+          authorLogin: 'Joncallim',
+          isPullRequest: false,
+          stateReason: 'completed',
+          updatedAt: null,
+        },
+      ],
+    })
+
+    const result = await runIssueValidation(client, await client.getIssue(146), { botLogin: 'github-actions[bot]' })
+
+    expect(result.readinessResult?.dispatchable).toBe(false)
+    expect(result.readinessResult?.blockers).toEqual(expect.arrayContaining([
+      expect.objectContaining({ reasonCode: 'queue.issue_dependency_open', dependencyIssueNumber: 147 }),
+    ]))
+    expect((await client.getIssue(146)).labels).toContain('dependency-blocked')
+    expect((await client.getIssue(146)).labels).not.toContain('ready-for-agent')
+    expect((await client.listComments(146))[0]?.body).toContain('This issue is not semantically dispatchable.')
   })
 })
