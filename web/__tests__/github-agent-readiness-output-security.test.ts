@@ -4,7 +4,7 @@ import { READINESS_REASON_CODES, type IssueReadinessResult } from '@/scripts/git
 import { renderReadinessBlocker, renderReadinessReason } from '@/scripts/github-agent-workflow/core/readiness-reason-renderer'
 import { buildReadinessMachineOutput } from '@/scripts/github-agent-workflow/cli/check-readiness'
 import { buildReadinessComment } from '@/scripts/github-agent-workflow/shared/issue-validation-runner'
-import { reconcileWorkflowRef } from '@/scripts/github-agent-workflow/validate-issue'
+import { buildIssueValidationLogOutput, reconcileWorkflowRef } from '@/scripts/github-agent-workflow/validate-issue'
 
 describe('readiness output trust boundary', () => {
   it('renders every stable reason code through a bounded fixed renderer', () => {
@@ -47,6 +47,24 @@ describe('readiness output trust boundary', () => {
     expect(machineOutput.blockers).toEqual([
       { reasonCode: 'queue.issue_dependency_open', dependencyIssueNumber: 42 },
     ])
+  })
+
+  it('does not log raw issue titles, headings, or validation prose from intake', () => {
+    const sentinel = '<script>untrusted heading</script>'
+    const output = buildIssueValidationLogOutput({
+      issueNumber: 7,
+      issueTitle: sentinel,
+      issueType: 'bug',
+      valid: false,
+      missingSections: [sentinel],
+      detectedSections: [sentinel],
+      recommendedLabels: ['needs-clarification'],
+      markerPrefix: '<!-- forge-issue-validation -->',
+      commentBody: sentinel,
+    }, null)
+
+    expect(JSON.stringify(output)).not.toContain(sentinel)
+    expect(output).toEqual({ issueNumber: 7, issueType: 'bug', valid: false, missingSectionCount: 1, readiness: null })
   })
 })
 

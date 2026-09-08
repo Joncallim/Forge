@@ -14,6 +14,8 @@ import { runMain } from './cli/entrypoint'
 import { readGitHubEvent } from './io/event'
 import { RestGitHubClient, type GitHubClient } from './io/github-client'
 import { runIssueValidation } from './shared/issue-validation-runner'
+import type { IssueValidationResult } from './contracts/issue-validation-result'
+import type { IssueReadinessResult } from './contracts/issue-readiness-result'
 
 export type GitHubIssuesEvent = {
   issue?: {
@@ -42,6 +44,37 @@ const WRITE_LEVEL_PERMISSIONS = new Set(['admin', 'maintain', 'write'])
 
 export function markerCommentPolicyForAction(action: string | undefined): 'always' | 'on-projection-change' {
   return GRAPH_CHANGING_EVENTS.has(action ?? '') ? 'always' : 'on-projection-change'
+}
+
+/**
+ * Intake logs are visible to untrusted issue authors through Actions output.
+ * Keep them to stable enums, booleans, and numeric identifiers; never emit
+ * issue titles, Markdown headings, validation prose, or raw blocker detail.
+ */
+export function buildIssueValidationLogOutput(
+  result: IssueValidationResult,
+  readinessResult: IssueReadinessResult | null,
+) {
+  return {
+    issueNumber: result.issueNumber,
+    issueType: result.issueType,
+    valid: result.valid,
+    missingSectionCount: result.missingSections.length,
+    readiness: readinessResult ? {
+      issueNumber: readinessResult.issueNumber,
+      state: readinessResult.state,
+      dispatchable: readinessResult.dispatchable,
+      executionMode: readinessResult.executionMode,
+      dependencies: readinessResult.dependencies,
+      reasonCodes: readinessResult.reasonCodes,
+      blockers: readinessResult.blockers.map((blocker) => ({
+        reasonCode: blocker.reasonCode,
+        dependencyIssueNumber: blocker.dependencyIssueNumber,
+      })),
+      desiredReadinessLabels: readinessResult.desiredReadinessLabels,
+      partial: readinessResult.partial,
+    } : null,
+  }
 }
 
 export function reconcileWorkflowRef(
@@ -139,10 +172,7 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<void> 
     markerCommentPolicy: markerCommentPolicyForAction(action),
   })
 
-  console.info(JSON.stringify({
-    structuralValidation: result,
-    readinessResult,
-  }, null, 2))
+  console.info(JSON.stringify(buildIssueValidationLogOutput(result, readinessResult), null, 2))
 
   // Graph-changing events from trusted actors trigger full reconciliation
   if (GRAPH_CHANGING_EVENTS.has(action)) {
