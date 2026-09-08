@@ -59,6 +59,30 @@ describe('exact control metadata grammar', () => {
   })
 
   it.each([
+    'Depends on:\u00a0none',
+    'Depends on:\tnone',
+    'Depends on:  none',
+    'Depends on:none',
+  ])('does not widen the literal Depends on grammar: %s', async (dependsOn) => {
+    const target = { ...issue('none'), body: validBugBody('none').replace('Depends on: none', dependsOn) }
+    const result = await new IssueReadinessResolver(new FakeGitHubClient({ issues: [target] })).resolveFromIssue(target)
+
+    expect(result.dispatchable).toBe(false)
+    expect(result.reasonCodes).not.toHaveLength(0)
+  })
+
+  it('does not authorize controls inside nested HTML blocks', async () => {
+    const target = {
+      ...issue('none'),
+      body: [withoutControlBlock(validBugBody('none')), '<div>', '<section>', 'Execution mode: implementation', 'Depends on: none', '</section>', '</div>'].join('\r\n'),
+    }
+    const result = await new IssueReadinessResolver(new FakeGitHubClient({ issues: [target] })).resolveFromIssue(target)
+
+    expect(result.dispatchable).toBe(false)
+    expect(result.reasonCodes).toContain('queue.issue_control_missing')
+  })
+
+  it.each([
     ['same-line comment before fence', ['<!-- harmless -->```', 'Execution mode: implementation', 'Depends on: none', '```']],
     ['multiline comment close before fence', ['<!-- comment begins', '-->```', 'Execution mode: implementation', 'Depends on: none', '```']],
     ['multiline comment close before details', ['<!-- comment begins', '--><details>', 'Execution mode: implementation', 'Depends on: none', '</details>']],

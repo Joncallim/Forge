@@ -391,7 +391,7 @@ function buildResult(
   return {
     issueNumber,
     state,
-    dispatchable: state === 'ready',
+    dispatchable: state === 'ready' && !partial,
     executionMode: controlMetadata.executionMode,
     dependencies: controlMetadata.dependencies,
     reasonCodes: deduplicateCodes(reasonCodes),

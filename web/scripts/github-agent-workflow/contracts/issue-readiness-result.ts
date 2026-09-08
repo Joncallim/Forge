@@ -32,12 +32,15 @@ export const READINESS_REASON_CODES = Object.freeze([
 export const readinessReasonCodeSchema = freezeSchema(z.enum(READINESS_REASON_CODES))
 export type ReadinessReasonCode = z.infer<typeof readinessReasonCodeSchema>
 
+export const MAX_READINESS_REASON_CODES = READINESS_REASON_CODES.length
+export const MAX_BLOCKER_DETAIL_LENGTH = 256
+
 /**
  * A single blocker record with stable reason code and optional detail.
  */
 export const blockerRecordSchema = freezeSchema(z.object({
   reasonCode: readinessReasonCodeSchema,
-  detail: nonEmptyTrimmedStringSchema,
+  detail: nonEmptyTrimmedStringSchema.max(MAX_BLOCKER_DETAIL_LENGTH),
   dependencyIssueNumber: positiveIntSchema.nullable(),
 }).strict())
 
@@ -100,14 +103,29 @@ export const issueReadinessResultSchema = freezeSchema(z.object({
   dispatchable: z.boolean(),
   executionMode: executionModeSchema.nullable(),
   dependencies: z.array(positiveIntSchema).max(MAX_DEPENDENCIES_PER_ISSUE),
-  reasonCodes: z.array(readinessReasonCodeSchema),
+  reasonCodes: z.array(readinessReasonCodeSchema).max(MAX_READINESS_REASON_CODES).refine(
+    (codes) => new Set(codes).size === codes.length,
+    'Reason codes must be unique.',
+  ),
   blockers: z.array(blockerRecordSchema).max(MAX_READINESS_BLOCKERS),
-  desiredReadinessLabels: z.array(readinessLabelSchema),
+  desiredReadinessLabels: z.array(readinessLabelSchema).max(1).refine(
+    (labels) => new Set(labels).size === labels.length,
+    'Readiness labels must be unique.',
+  ),
   /**
    * Whether the readiness result could not be fully computed (e.g. API error,
    * graph limit exceeded). A partial result still fails closed.
    */
   partial: z.boolean(),
-}).strict())
+}).strict().superRefine((result, context) => {
+  const dispatchable = result.state === 'ready' && !result.partial
+  if (result.dispatchable !== dispatchable) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: 'Dispatchability must match ready and complete semantic state.', path: ['dispatchable'] })
+  }
+  const expectedLabels = STATE_TO_LABEL[result.state] ? [STATE_TO_LABEL[result.state]] : []
+  if (result.desiredReadinessLabels.length !== expectedLabels.length || result.desiredReadinessLabels[0] !== expectedLabels[0]) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: 'Readiness labels must match semantic state.', path: ['desiredReadinessLabels'] })
+  }
+}))
 
 export type IssueReadinessResult = z.infer<typeof issueReadinessResultSchema>

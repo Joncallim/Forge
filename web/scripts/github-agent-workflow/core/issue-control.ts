@@ -17,6 +17,20 @@ const EXECUTION_MODE_PREFIX = 'Execution mode:'
 const DEPENDS_ON_PREFIX = 'Depends on:'
 const ISSUE_REFERENCE_PATTERN = /^#(\d+)$/
 const NONE_VALUE = 'none'
+const ASCII_SPACE_TRIM = /^ +| +$/g
+
+function controlValue(line: string, prefix: string): string | null {
+  // The frozen grammar permits at most three Markdown indentation spaces and
+  // exactly one ASCII space after the literal field prefix. Do not use
+  // JavaScript's Unicode-aware trim here: non-breaking spaces and tabs must
+  // not become semantic control metadata.
+  const match = line.match(new RegExp(`^ {0,3}${prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} (.*)$`))
+  return match ? match[1] : null
+}
+
+function trimAsciiSpaces(value: string): string {
+  return value.replace(ASCII_SPACE_TRIM, '')
+}
 
 export type ControlParseResult = Readonly<{
   metadata: IssueControlMetadata
@@ -72,19 +86,15 @@ export function parseControlMetadata(
   // Extract lines that look like metadata declarations
   const executionModeLines: Array<{ lineNumber: number; value: string }> = []
   const dependsOnLines: Array<{ lineNumber: number; value: string }> = []
+  let hasMalformedDependsOnDeclaration = false
 
   for (const line of visible.lines) {
-    const trimmed = line.text.trim()
+    const executionModeValue = controlValue(line.text, EXECUTION_MODE_PREFIX)
+    if (executionModeValue !== null) executionModeLines.push({ lineNumber: line.lineNumber, value: executionModeValue })
 
-    if (trimmed.startsWith(EXECUTION_MODE_PREFIX)) {
-      const value = trimmed.slice(EXECUTION_MODE_PREFIX.length).trim()
-      executionModeLines.push({ lineNumber: line.lineNumber, value })
-    }
-
-    if (trimmed.startsWith(DEPENDS_ON_PREFIX)) {
-      const value = trimmed.slice(DEPENDS_ON_PREFIX.length).trim()
-      dependsOnLines.push({ lineNumber: line.lineNumber, value })
-    }
+    const dependsOnValue = controlValue(line.text, DEPENDS_ON_PREFIX)
+    if (dependsOnValue !== null) dependsOnLines.push({ lineNumber: line.lineNumber, value: dependsOnValue })
+    else if (/^ {0,3}Depends on:/.test(line.text)) hasMalformedDependsOnDeclaration = true
   }
 
   const hasDuplicateExecutionMode = executionModeLines.length > 1
@@ -93,7 +103,7 @@ export function parseControlMetadata(
 
   // Resolve execution mode
   let executionMode: 'implementation' | 'tracking' | null = null
-  const explicit = executionModeLines.length > 0 || dependsOnLines.length > 0
+  const explicit = executionModeLines.length > 0 || dependsOnLines.length > 0 || hasMalformedDependsOnDeclaration
 
   if (executionModeLines.length === 1) {
     const parsed = executionModeSchema.safeParse(executionModeLines[0].value)
@@ -125,7 +135,10 @@ export function parseControlMetadata(
   let dependencies: number[] = []
   let dependsOnNone = true
 
-  if (dependsOnLines.length === 1) {
+  if (hasMalformedDependsOnDeclaration) {
+    dependsOnNone = false
+    diagnose('queue.issue_dependency_syntax_invalid', 'depends_on', 'Depends on declaration does not use the canonical syntax.')
+  } else if (dependsOnLines.length === 1) {
     const value = dependsOnLines[0].value
     if (value === NONE_VALUE) {
       dependencies = []
@@ -134,7 +147,7 @@ export function parseControlMetadata(
       // A present Depends on line must be exactly 'none' or a non-empty comma-separated list
       // Empty value or separator-only (',', ' , ') is invalid and must fail closed
       dependsOnNone = false
-      const trimmedValue = value.trim()
+      const trimmedValue = trimAsciiSpaces(value)
       if (trimmedValue === '' || trimmedValue === ',' || /^[,\s]+$/.test(trimmedValue)) {
         diagnose('queue.issue_dependency_syntax_invalid', 'depends_on', 'Depends on value is empty.')
         dependencies = []
@@ -157,7 +170,7 @@ export function parseControlMetadata(
             break
           }
           const separatorIndex = value.indexOf(',', positionStart)
-          const part = value.slice(positionStart, separatorIndex === -1 ? value.length : separatorIndex).trim()
+          const part = trimAsciiSpaces(value.slice(positionStart, separatorIndex === -1 ? value.length : separatorIndex))
           if (part === '') {
             diagnose('queue.issue_dependency_syntax_invalid', 'depends_on', 'Dependency syntax contains an empty reference.')
           } else {
@@ -201,7 +214,7 @@ export function parseControlMetadata(
   // to be considered fully explicit. Missing either field is a parse error.
   const isImplementationIssue = !isLegacyTrackingEpic && issueType !== 'epic'
   const hasExecutionModeLine = executionModeLines.length > 0
-  const hasDependsOnLine = dependsOnLines.length > 0
+  const hasDependsOnLine = dependsOnLines.length > 0 || hasMalformedDependsOnDeclaration
 
   if (isImplementationIssue && !hasExecutionModeLine) {
     diagnose('queue.issue_control_missing', 'execution_mode', 'Execution mode declaration is required.')
@@ -235,7 +248,8 @@ export function hasControlMetadata(body: string | null): boolean {
   if (!body) return false
   const visible = scanVisibleMarkdownLines(body)
   if (visible.bodyTooLarge) return false
-  return visible.lines.some(
-    (l) => l.text.trim().startsWith(EXECUTION_MODE_PREFIX) || l.text.trim().startsWith(DEPENDS_ON_PREFIX),
-  )
+  return visible.lines.some((line) => (
+    controlValue(line.text, EXECUTION_MODE_PREFIX) !== null
+    || controlValue(line.text, DEPENDS_ON_PREFIX) !== null
+  ))
 }

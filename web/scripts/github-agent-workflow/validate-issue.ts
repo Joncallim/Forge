@@ -30,6 +30,13 @@ export type GitHubIssuesEvent = {
   }
 }
 
+/**
+ * The workflow-ref helper deliberately needs only string-valued environment
+ * entries.  Using a string index signature keeps Node's ProcessEnv structurally
+ * compatible while tests can pass a minimal, deterministic environment object.
+ */
+type WorkflowRefEnvironment = Readonly<Record<string, string | undefined>>
+
 const GRAPH_CHANGING_EVENTS = new Set(['opened', 'edited', 'closed', 'reopened'])
 const WRITE_LEVEL_PERMISSIONS = new Set(['admin', 'maintain', 'write'])
 
@@ -39,7 +46,7 @@ export function markerCommentPolicyForAction(action: string | undefined): 'alway
 
 export function reconcileWorkflowRef(
   event: GitHubIssuesEvent,
-  env: Readonly<{ GITHUB_REF_NAME?: string }>,
+  env: WorkflowRefEnvironment,
 ): string {
   const defaultBranch = event.repository?.default_branch?.trim()
   if (defaultBranch) return defaultBranch

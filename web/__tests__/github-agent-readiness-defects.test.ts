@@ -154,7 +154,7 @@ describe('empty Depends on: fails closed', () => {
 
     const result = parseControlMetadata(body, 'bug')
     expect(result.errors.length).toBeGreaterThan(0)
-    expect(result.errors[0]).toContain('empty')
+    expect(result.errors[0]).toContain('canonical')
     expect(result.metadata.dependsOnNone).toBe(false)
     // The issue should not be dispatchable
     expect(result.metadata.explicit).toBe(true)
@@ -543,18 +543,14 @@ describe('visible-markdown-scanner fence closing', () => {
       'Depends on: #1',
     ].join('\n')
 
-    // Inline code is NOT ignored by the scanner - but the contract says
-    // "full-line/inline-code representations that are not canonical literal metadata lines"
-    // Inline code on its own line is NOT a canonical metadata line.
-    // However, the current scanner only checks line starts, so
-    // "`Execution mode: implementation`" starts with backtick, not "Execution mode:"
+    // Inline-code representations remain visible prose for section parsing,
+    // but exact control grammar prevents them from becoming metadata.
     const result = scanVisibleMarkdownLines(body)
     const visibleText = result.lines.map((l) => l.text).join('\n')
-    // The backtick-wrapped lines should be visible but won't match the metadata prefix
     expect(visibleText).toContain('`Execution mode: implementation`')
     expect(visibleText).toContain('`Depends on: none`')
 
-    // But the parser should not treat them as metadata because they start with backtick
+    // The parser must use only the visible literal control block.
     const controlResult = parseControlMetadata(body, 'bug')
     expect(controlResult.metadata.executionMode).toBe('tracking')
     expect(controlResult.metadata.dependencies).toEqual([1])

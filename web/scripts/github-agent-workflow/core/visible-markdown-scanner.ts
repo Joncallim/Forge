@@ -41,16 +41,27 @@ type FenceState = Readonly<{
   fenceLength: number
 }>
 
+const HTML_BLOCK_TAGS = new Set([
+  'address', 'article', 'aside', 'blockquote', 'center', 'dd', 'dialog', 'dir',
+  'div', 'dl', 'dt', 'fieldset', 'figcaption', 'figure', 'footer', 'form',
+  'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'header', 'hr', 'html', 'iframe', 'li',
+  'main', 'menu', 'nav', 'ol', 'p', 'plaintext', 'pre', 'script', 'search',
+  'section', 'style', 'summary', 'table', 'tbody', 'td', 'tfoot', 'th', 'thead',
+  'title', 'tr', 'ul',
+])
+
 function startsInlineBlockBoundary(line: string): boolean {
   if (line.trim() === '') return true
   if (line.startsWith('    ') || line.startsWith('\t')) return true
   if (/^ {0,3}#{1,6}(?:\s|$)/.test(line)) return true
   if (/^ {0,3}>/.test(line)) return true
-  if (/^ {0,3}(?:`{3,}|~{3,})/.test(line)) return true
+  // Fences and HTML containers are handled by the stateful scanner below.
+  // Treating fence-looking or details-looking text as a precomputed inline
+  // boundary would let an invalid fence or a close tag split a real multiline
+  // code span before that stateful pass has established its meaning.
   if (/^ {0,3}(?:[-+*](?:\s+|$)|\d{1,9}[.)](?:\s+|$))/.test(line)) return true
   if (/^ {0,3}(?:={2,}|-{2,})\s*$/.test(line)) return true
   if (/^ {0,3}(?:(?:\*\s*){3,}|(?:_\s*){3,}|(?:-\s*){3,})$/.test(line)) return true
-  if (/^ {0,3}<\/?details\b/i.test(line)) return true
   return false
 }
 
@@ -117,6 +128,7 @@ export function scanVisibleMarkdownLines(
   let inHtmlComment = false
   let inlineCodeDelimiterLength: number | null = null
   let detailsDepth = 0
+  let htmlBlockDepth = 0
   let inDetailsOpener = false
   let inLazyBlockQuoteContinuation = false
   let inLazyListContinuation = false
@@ -172,6 +184,19 @@ export function scanVisibleMarkdownLines(
       else detailsDepth++
     }
     return true
+  }
+
+  const processHtmlBlockTokens = (segment: string): boolean => {
+    const tokens = segment.match(/<\/?[A-Za-z][A-Za-z0-9-]*\b[^>]*>/g) ?? []
+    let found = false
+    for (const token of tokens) {
+      const match = token.match(/^<\s*(\/)?\s*([A-Za-z][A-Za-z0-9-]*)\b/i)
+      if (!match || !HTML_BLOCK_TAGS.has(match[2].toLowerCase())) continue
+      found = true
+      if (match[1]) htmlBlockDepth = Math.max(0, htmlBlockDepth - 1)
+      else if (!/\/\s*>$/.test(token) && !/^<(?:hr)\b/i.test(token)) htmlBlockDepth++
+    }
+    return found
   }
 
   const observeNonAuthoritativeSegment = (segment: string, hasVisiblePrefix: boolean): void => {
@@ -310,7 +335,16 @@ export function scanVisibleMarkdownLines(
 
     // Inline HTML comments and code spans are non-authoritative. Their visible
     // surrounding segments can still open/close persistent containers.
-    if (consumeSuppressedInlineLine(line, lineOffsets[i], inlineRegionForLine)) continue
+    if (consumeSuppressedInlineLine(line, lineOffsets[i], inlineRegionForLine)) {
+      // A completed inline code span does not make surrounding prose hidden.
+      // Retain that line for section parsing, while the exact control grammar
+      // still rejects any representation containing the backticks. Comments
+      // remain fully non-authoritative because they can splice control text.
+      if (inlineCodeDelimiterLength === null && !inHtmlComment && !line.includes('<!--')) {
+        result.push({ lineNumber: i, text: line })
+      }
+      continue
+    }
 
     // Handle collapsible details containers on lines with no comment/code span.
     if (inDetailsOpener) {
@@ -332,6 +366,15 @@ export function scanVisibleMarkdownLines(
       processDetailsTokens(line)
       continue
     }
+
+    // HTML block containers are presentation, not control authority. Keep a
+    // bounded nesting count so metadata in examples such as nested <div>s
+    // cannot escape into the semantic parser.
+    if (htmlBlockDepth > 0) {
+      processHtmlBlockTokens(line)
+      continue
+    }
+    if (processHtmlBlockTokens(line)) continue
 
     const isBlockQuoteLine = /^ {0,3}>/.test(line)
     if (inLazyBlockQuoteContinuation && !isBlockQuoteLine) {
