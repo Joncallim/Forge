@@ -5,8 +5,9 @@ Last updated: 2026-09-10
 This is the canonical **product-roadmap view** for Forge.
 
 For the full architecture and invariants, read
-[`forge-vnext-architecture.md`](forge-vnext-architecture.md) and
-[ADR 0014](adr/0014-forge-vnext-general-agent-runtime.md).
+[`forge-vnext-architecture.md`](forge-vnext-architecture.md),
+[ADR 0014](adr/0014-forge-vnext-general-agent-runtime.md), and
+[ADR 0016](adr/0016-deterministic-workflow-kernel.md).
 For exact implementation order and release gates, read
 [`near-term-roadmap.md`](near-term-roadmap.md).
 The programme is tracked by
@@ -115,7 +116,7 @@ claim completion by bypassing an earlier safety or contract gate.
 |---|---:|---|
 | 0 | [#334](https://github.com/Joncallim/Forge/issues/334) | Generic runtime contracts and a compatibility seam around today's coding product. |
 | 1 | [#335](https://github.com/Joncallim/Forge/issues/335) | Deterministic budgets, provider routing, first-class context compilation, and routing receipts. |
-| 1B | [#367](https://github.com/Joncallim/Forge/issues/367) | Deterministic Workflow DAG readiness, fan-out/join, and artifact-routed Agent Run dispatch. Runs in parallel with Phase 2 after #335. |
+| 1B | [#367](https://github.com/Joncallim/Forge/issues/367) | Deterministic Workflow directed acyclic graph (DAG) readiness, fan-out/join, and artifact-routed Agent Run dispatch. Runs in parallel with Phase 2 after #335. |
 | 2 | [#336](https://github.com/Joncallim/Forge/issues/336) | Secure generic execution envelope, authority lineage, typed admission, and side-effect recovery. |
 | 3 | [#337](https://github.com/Joncallim/Forge/issues/337) | Software Engineering proves end-to-end safe delivery through the generic runtime, converging #367 orchestration with #336 confinement. |
 | 4 | [#338](https://github.com/Joncallim/Forge/issues/338) | Software Engineering becomes the first declarative installable Workforce package. |
@@ -129,6 +130,7 @@ claim completion by bypassing an earlier safety or contract gate.
 Phase 1B is intentionally not a new security prerequisite for Phase 2. After
 #335, #367 and #336 may proceed in parallel. Phase 3 begins only after both
 branches and its independent verification/proof prerequisites are complete.
+ADR 0016 records the binding Workflow/handoff decisions for this insertion.
 
 ## Three Reference Workforces
 
@@ -363,6 +365,6 @@ The VNext programme is governed by a set of normative specifications in `docs/sp
 | SPEC-0014 | Migration & Compatibility v1 | EXPAND→BACKFILL→SHADOW→SWITCH→VERIFY→CONTRACT |
 | SPEC-0015 | Reliability / SLO Profile v1 | Hard invariants, SLI baselining |
 
-Issue bodies should reference these specs instead of redefining cross-cutting semantics.
+Issue bodies should reference these specs instead of redefining cross-cutting semantics. ADR 0016 specializes the accepted VNext architecture for Workflow execution and artifact-routed handoff without changing the canonical ontology.
 
 For the frozen-vs-open distinction, see `docs/frozen-vs-open.md`. For the implementation checklist, see `docs/implementation-checklist.md`. For the industry standards matrix, see `docs/industry-benchmark-matrix.md`.
