@@ -1,6 +1,6 @@
 # Frozen vs Intentionally Open — VNext Architecture Decisions
 
-**Date:** 2026-09-04
+**Date:** 2026-09-10
 **Purpose:** Clarify which architectural decisions are frozen (binding on all implementation) and which are intentionally left open for implementers to decide.
 
 ## Frozen Semantics
@@ -64,6 +64,7 @@ These decisions are frozen by the normative specs and ADRs. Implementation agent
 - Provider readiness taxonomy (SPEC-0006 R10); circuit-breaking by failure class (SPEC-0006 R14)
 - Routing receipt requirement (SPEC-0006 R11)
 - Optimization target: minimum expected cost to verified outcome (SPEC-0006 R12)
+- Bounded context is constructed after destination/provider/budget admission and is minimum-useful rather than inherited full history (SPEC-0006 R1/R9)
 
 ### Error Codes
 - Namespaced reason codes (SPEC-0007 R1)
@@ -141,6 +142,9 @@ These decisions are intentionally left to implementation agents. They are not fr
 - ORM patterns (Drizzle, Kysely, raw SQL)
 - Opaque ID implementation (UUIDv7, CUID2, NanoID)
 - Exact deterministic policy engine internals
+- Exact `ContextManifest` / `ContextPacket` storage and retention representation within #335's governed-invocation and classification rules
+- Exact WorkflowDefinition schema/storage projection and Workflow-kernel module layout within #367's DAG, Work Package, Agent Run, Gate and single-authority constraints
+- Exact deterministic readiness implementation and stable ordering algorithm, provided it derives from authoritative PostgreSQL state
 - Schedule library choice (cron, later, etc.)
 - OpenTelemetry backend/exporter
 - Cache mechanism (Redis patterns, TTLs, invalidation)
@@ -160,6 +164,8 @@ These are explicitly deferred from VNext and MUST NOT be implemented:
 - General auto-merge/deploy authority
 - Full Workspace shell
 - A2A internal orchestration
+- Arbitrary executable Workflow callbacks/reducers or unrestricted cyclic Workflow programs
+- A third-party graph/agent framework acting as Forge Core's authoritative Workflow/checkpoint/Grant/Gate/persistence state
 - Multi-OS sandboxing
 - Exhaustive connector catalogue
 - Permanent Forge→Hermes fallback
@@ -167,6 +173,8 @@ These are explicitly deferred from VNext and MUST NOT be implemented:
 ### Later Phase Decisions
 These need their own evidence/ADR in the implementing phase:
 - Exact database migration shape for Mission/Execution compatibility (#334)
+- Exact WorkflowDefinition persistence projection and compatibility-shadow cutover details (#367)
+- Exact ContextManifest/ContextPacket retention/storage details (#335)
 - Exact sandbox technology and first supported host platform (#336)
 - Exact package manifest/DSL syntax (#338)
 - Exact provider cost metadata source/update mechanism (#335)
