@@ -1,7 +1,7 @@
 # Forge VNext — General Agent Runtime Architecture
 
 Status: **Accepted product direction for Epic #333**
-Date: 2026-09-03
+Date: 2026-09-10
 
 This document defines the long-term architecture and implementation order for
 Forge VNext.
@@ -47,6 +47,7 @@ always-on parent model
        +--> decides whether anything changed
        +--> coordinates workers
        +--> retries work
+       +--> rewrites handoff context
        +--> burns context and tokens
 ```
 
@@ -60,8 +61,10 @@ user / timer / event
 | deterministic Forge Core  |
 |---------------------------|
 | state machine             |
+| Workflow readiness/kernel |
 | scheduler / triggers      |
 | routing policy            |
+| context selection         |
 | budget policy             |
 | permission broker         |
 | operation catalog         |
@@ -78,7 +81,8 @@ user / timer / event
 ```
 
 An idle Forge installation should consume **zero model tokens** merely because
-wall-clock time passes.
+wall-clock time passes. Routine Work Package sequencing and handoff should also
+consume zero model tokens.
 
 ## Product Layers
 
@@ -91,8 +95,9 @@ wall-clock time passes.
 | Missions | Executions | workflows | work packages | gates    |
 +--------------------------------------------------------------+
 | Deterministic Control Plane                                  |
-| state | policy | budgets | routing | triggers | recovery     |
-| evidence | leases | audit | version pinning                  |
+| state | workflow kernel | context selection | policy         |
+| budgets | routing | triggers | recovery | evidence           |
+| leases | audit | version pinning                             |
 +--------------------------------------------------------------+
 | Resource + Capability Plane                                  |
 | filesystem | GitHub | browser | MCP | mail | calendar | DB   |
@@ -111,12 +116,13 @@ These are architecture rules, not suggestions.
 
 ### 1. Models are workers, not the operating system
 
-Scheduling, routing, retry policy, budgets, trigger processing, state
-transitions, permission checks, recovery, deduplication, and evidence handling
-are deterministic software.
+Scheduling, Workflow readiness, routine handoff, routing, retry policy, budgets,
+trigger processing, state transitions, permission checks, recovery,
+deduplication, and evidence handling are deterministic software.
 
-A model may propose a plan or operation request. It does not become the final
-policy authority because it wrote convincing prose.
+A model may propose a plan, decomposition or operation request. It does not
+become the final policy authority because it wrote convincing prose, and it does
+not need to rewrite predecessor output merely to hand work to another model.
 
 ### 2. Agents never possess authority
 
@@ -217,7 +223,7 @@ is not a trusted executable plugin.
 The package may contain:
 
 - roles/agents;
-- workflows;
+- workflows and dependency definitions;
 - prompts and references;
 - input/output schemas;
 - gates/evaluations;
@@ -265,7 +271,9 @@ could materially change its behaviour:
 - capability/operation version;
 - resolved provider/model and configuration;
 - resource versions/fingerprints where available;
-- input artifact ids/digests.
+- input artifact ids/digests;
+- context compiler/selection revision and delivered packet identity where a
+  model was invoked.
 
 Installing Workforce v1.5 must not silently change a Mission already running on
 v1.4.
@@ -283,7 +291,11 @@ registry.
 
 Redis may wake workers, carry retry scheduling, and hold reconstructable cache
 state. It must not become the only place that knows whether a Mission,
-Execution, grant, gate, or external operation really happened.
+Execution, Work Package, Agent Run, Grant, Gate, or external operation really
+happened.
+
+A graph/framework checkpoint store, mutable workflow-state document, or model
+conversation must not become a second source of readiness or execution truth.
 
 ### 10. No big-bang VNext rewrite
 
@@ -301,8 +313,8 @@ truth merely to obtain cleaner names.
 | **Mission** | Durable desired outcome or responsibility. It may be finite or persistent. |
 | **Execution** | One bounded attempt/cycle pursuing a Mission. |
 | **Workflow** | Reusable orchestration template. |
-| **Work Package** | Dependency-scoped unit of work inside an Execution. |
-| **Agent Run** | One bounded invocation of a model/agent runtime. |
+| **Work Package** | Dependency-scoped unit of work inside an Execution and the durable handoff unit between workflow stages. |
+| **Agent Run** | One bounded invocation of a model/agent runtime consuming freshly compiled context. |
 | **Operation** | Concrete deterministic action/read performed by Forge or an adapter. |
 | **Resource** | Thing Forge can read, reason about, or affect. |
 | **Capability** | Class of action that may be permitted. |
@@ -314,6 +326,11 @@ truth merely to obtain cleaner names.
 | **Budget** | Hard and soft limits governing spend, calls, tokens, time, retries, concurrency, etc. |
 | **Policy** | Versioned deterministic rules that constrain routing, grants, gates, budgets, egress, autonomy, or recovery. |
 | **Workforce** | Versioned organisation of roles, workflows, prompts, schemas, policies and evaluations. |
+
+There is deliberately no separate canonical `Handoff` entity. A handoff is a
+runtime transition from a ready Work Package through governed context
+compilation into an Agent Run. This avoids creating another orchestration record
+that can disagree with Work Package or Artifact state.
 
 ### Compatibility With Today's Product
 
@@ -359,15 +376,18 @@ Use deterministic code for:
 - health probes;
 - deduplication;
 - state transitions;
+- Workflow readiness, fan-out and joins;
 - provider readiness;
 - budget checks;
 - routing;
+- context reference selection and limits;
 - permission/policy checks;
 - hashing/index invalidation;
 - retry/recovery decisions;
 - canonical evidence calculations.
 
-This tier should handle routine idle orchestration.
+This tier should handle routine idle orchestration and ordinary Work Package
+handoff.
 
 #### Tier 1 — economical cognition
 
@@ -491,9 +511,32 @@ validated context packet
 Durable memory belongs in Forge state, resources and artifacts, not in one
 permanent conversation transcript.
 
+### Context planning is reference-first
+
+Before restricted payload is assembled, Forge builds an inspectable context
+selection manifest from safe metadata and authoritative references. The exact
+implementation name is owned by #335; `ContextManifest` is the working term.
+
+It should identify:
+
+- the Mission/Execution/Work Package/Agent Run intent;
+- required and optional Resource/Artifact/evidence references;
+- exact revisions/digests/fingerprints where available;
+- classification and trust class;
+- selection and stable exclusion/rejection reasons;
+- byte/token/item estimates and ceilings;
+- required output schema/reference;
+- context compiler/policy revision.
+
+The manifest is not another handoff database. Large predecessor outputs remain
+Artifacts/Resources and are referenced rather than copied into a durable prose
+relay.
+
 ### Context packets are first-class
 
-A worker receives the minimum useful packet:
+After destination/provider/egress/budget admission, the ContextCompiler
+materializes the exact packet for one Agent Run. A worker receives only the
+minimum useful content selected from the manifest:
 
 - Mission/Work Package summary;
 - relevant resource references/extracts;
@@ -504,7 +547,13 @@ A worker receives the minimum useful packet:
 - budget/context ceiling.
 
 External text is labelled untrusted data. It does not become Forge policy just
-because it contains instructions.
+because it contains instructions. Unrelated predecessor output and private model
+reasoning/transcripts are not inherited by default.
+
+The delivered packet has an identifiable version/digest/provenance record under
+retention/redaction policy. Required missing, stale, oversized or policy-
+ineligible context fails closed; optional exclusion must be deterministic and
+inspectable.
 
 ### Data egress is a policy boundary
 
@@ -527,6 +576,70 @@ Early VNext should favour content-addressed deterministic reuse:
 Do not make arbitrary model-output caching an early dependency. Cognitive
 outputs may be nondeterministic, stale, policy-sensitive, or unsafe to reuse.
 Any later reusable-result mechanism needs explicit validity semantics.
+
+## Deterministic Workflow Execution And Handoff
+
+Forge needs graph-shaped workflow capability, but it does not need a model or
+third-party agent framework to become the authority for that graph.
+
+### Work Package is the handoff unit
+
+The runtime transition is:
+
+```text
+ready Work Package
+  -> deterministic context-reference selection
+  -> #335 provider/egress/budget admission
+  -> exact bounded ContextPacket
+  -> Agent Run or deterministic Operation
+  -> structured Artifact/evidence
+  -> deterministic Workflow advancement
+```
+
+A supervisor model may still be invoked when genuine judgement is required —
+for example, to propose a different decomposition after repeated failure — but
+ordinary sequencing and relay are not cognitive tasks.
+
+### Workflow v1 is a DAG
+
+The first generic Workflow kernel (#367) should support a versioned directed
+acyclic graph (DAG):
+
+- node/Work Package definitions;
+- dependency edges;
+- deterministic entry/readiness rules;
+- bounded fan-out;
+- deterministic joins;
+- existing Gate and Execution `waiting` semantics;
+- expected input/output Artifact/schema requirements;
+- bounded retry/remediation policy references.
+
+Cycles, dangling edges and impossible joins fail before execution. Rework is
+represented by explicit attempt/revision lineage under hard remediation limits,
+not unrestricted graph cycles. Persistent repeated responsibility belongs to
+Mission/Execution/Trigger semantics later in the roadmap.
+
+### State stays in canonical Forge entities
+
+The Workflow kernel calculates readiness from authoritative Mission, Execution,
+Work Package, Artifact, Gate, Grant, Budget and lease state. It does not own a
+second generic mutable state document.
+
+Parallel branches may execute when dependencies, budget/capacity and Resource
+mutation policy allow it. #367 owns dependency/readiness/fan-out/join mechanics;
+#336 owns OS confinement and mutation conflict enforcement. Both consume #335,
+and they can be implemented in parallel after it.
+
+#337 is the first production convergence: Software Engineering must use both the
+#367 Workflow kernel and #336 secure execution boundary rather than a coding-only
+sequencer.
+
+### Framework boundary
+
+LangGraph or another graph/agent framework may be evaluated later as an optional
+runtime adapter only if it remains subordinate to Forge's canonical state,
+context, Grant, Operation, Artifact and Gate contracts. Its checkpoint store or
+agent-to-agent protocol must not become a second orchestration authority.
 
 ## Secure Execution Envelope
 
@@ -603,6 +716,10 @@ The manifest should cover:
 - workflows/roles;
 - package provenance/digest;
 - dependencies if genuinely necessary.
+
+Package Workflow definitions execute through the generic #367 kernel. A package
+must not gain its own hidden orchestration runtime simply because it contains a
+workflow description.
 
 ### Install does not mean authorize
 
@@ -736,6 +853,8 @@ Release proof:
 ```text
 request
  -> plan
+ -> deterministic Work Package readiness/dispatch
+ -> bounded per-run context
  -> bounded implementation
  -> tests
  -> independent review
@@ -750,7 +869,8 @@ No general auto-merge is required.
 Proves generality outside repositories:
 
 - web/document resources;
-- parallel discovery only when useful;
+- bounded parallel discovery and joins through the generic Workflow kernel;
+- selective per-run context rather than sending the full corpus to every worker;
 - evidence provenance;
 - contradiction handling;
 - citation/claim verification;
@@ -792,7 +912,8 @@ Hermes is an experiment from which Forge should keep lessons, not code.
 | Provider availability changes | Deterministic provider health with auth/quota/rate-limit states |
 | Failover must be explainable | Durable routing receipt |
 | Agent polling wastes tokens | Deterministic event/change detection before model invocation |
-| Long parent-agent context is expensive | Ephemeral workers + bounded context packets + durable artifacts |
+| Long parent-agent context is expensive | Ephemeral workers + bounded ContextManifest/ContextPacket + durable artifacts |
+| Supervisor prose handoffs repeatedly spend tokens and lose detail | Deterministic Work Package dispatch + reference-first artifact routing |
 | Parallel exploration/review can help | Bounded fan-out under dependency/resource/budget checks |
 | Independent review catches failures | Evidence-producing reviewers + trusted gates |
 | Dashboards can mislead when they summarize the wrong truth | Evidence-first, actionable operator state |
@@ -840,9 +961,10 @@ time. Shadow observation is allowed only when it cannot duplicate side effects.
 | Phase | Issue | Outcome |
 |---|---:|---|
 | 0 | [#334](https://github.com/Joncallim/Forge/issues/334) | Generic contracts + compatibility seam; no big-bang rewrite |
-| 1 | [#335](https://github.com/Joncallim/Forge/issues/335) | Deterministic budgets, provider routing, context economics |
+| 1 | [#335](https://github.com/Joncallim/Forge/issues/335) | Deterministic budgets, provider routing, ContextManifest/ContextCompiler, context economics |
+| 1B | [#367](https://github.com/Joncallim/Forge/issues/367) | Deterministic Workflow DAG readiness, fan-out/join and artifact-routed dispatch; parallel with Phase 2 after #335 |
 | 2 | [#336](https://github.com/Joncallim/Forge/issues/336) | Secure execution envelope, authority lineage, side-effect recovery |
-| 3 | [#337](https://github.com/Joncallim/Forge/issues/337) | Software Engineering completes end-to-end through generic contracts |
+| 3 | [#337](https://github.com/Joncallim/Forge/issues/337) | Software Engineering completes end-to-end through converged #367 Workflow + #336 confinement contracts |
 | 4 | [#338](https://github.com/Joncallim/Forge/issues/338) | Declarative Workforce packages; extract Software Engineering |
 | 5 | [#339](https://github.com/Joncallim/Forge/issues/339) | Deep Research proves non-repository generality |
 | 6 | [#340](https://github.com/Joncallim/Forge/issues/340) | Persistent Missions, checkpoints, leases, bounded autonomy |
@@ -851,8 +973,11 @@ time. Shadow observation is allowed only when it cannot duplicate side effects.
 | 9 | [#343](https://github.com/Joncallim/Forge/issues/343) | Infrastructure Ops persistent side-effect proof |
 | 10 | [#344](https://github.com/Joncallim/Forge/issues/344) | HearthBot cutover; remove Hermes completely |
 
-The order is dependency-significant. A later phase may prototype, but it cannot
-claim completion by bypassing an earlier contract gate.
+The order is dependency-significant. After #335, #367 and #336 may proceed in
+parallel. #337 is the first production convergence point and must not begin until
+its Workflow, confinement, verification and proof dependencies are complete.
+A later phase may prototype, but it cannot claim completion by bypassing an
+earlier contract gate.
 
 ## Relationship To Existing Earned-Autonomy Work
 
@@ -879,13 +1004,13 @@ Every applicable phase, Workforce, and capability adapter should prove the
 following rather than relying on model confidence.
 
 1. **Restart safety** — kill the process mid-work and recover correctly.
-2. **Replay safety** — duplicate delivery does not duplicate confirmed side effects.
+2. **Replay safety** — duplicate delivery does not duplicate confirmed side effects or intended Agent Run dispatches.
 3. **Authority containment** — child principals cannot increase their grant scope.
 4. **Resource containment** — unrelated resources remain inaccessible.
 5. **Secret containment** — arbitrary credentials/environment data are not exposed.
 6. **Network containment** — unauthorized egress fails.
 7. **Budget containment** — work stops before exceeding hard ceilings.
-8. **Audit completeness** — material decisions/actions are reconstructable from evidence.
+8. **Audit completeness** — material decisions/actions and context selection are reconstructable from evidence.
 9. **Verification independence** — workers cannot self-grade into authority.
 10. **Package integrity** — tampered package content/provenance is detected.
 11. **Update pinning** — running Missions do not silently change on package update.
@@ -896,6 +1021,9 @@ following rather than relying on model confidence.
 16. **Resource concurrency** — conflicting exclusive writers cannot silently race.
 17. **Data-egress enforcement** — ineligible providers never receive restricted content.
 18. **Zero-token idle** — deterministic monitoring/scheduling can remain active without model calls when nothing meaningful changes.
+19. **Zero-token routine orchestration** — Workflow readiness, fan-out/join and handoff do not invoke a model merely to coordinate other models.
+20. **Context isolation** — downstream Agent Runs receive only selected bounded context; unrelated predecessor output/private reasoning is not inherited by default.
+21. **Workflow replay safety** — crash/restart or duplicate wakeups cannot double-dispatch one intended attempt or create conflicting readiness truth.
 
 Each phase should add the subset it can actually prove; later phases inherit the
 suite.
@@ -914,7 +1042,11 @@ Do not let these expand the programme before its core proofs pass:
 - enterprise multi-user role-based access control;
 - broad automatic merge/deployment authority;
 - broad Forge Workspace UI expansion;
-- Personal Ops/email/calendar autonomy as an early proof workload.
+- Personal Ops/email/calendar autonomy as an early proof workload;
+- direct agent-to-agent messaging as an internal orchestration substrate;
+- arbitrary executable Workflow callbacks/reducers or unrestricted cyclic graphs;
+- LangGraph or another agent framework as Forge Core's authoritative Workflow,
+  checkpoint, Grant, Gate or persistence layer.
 
 Local/Git Workforce installation is sufficient to prove plug-and-play packaging.
 A later public registry is a separate supply-chain/product decision.
@@ -925,6 +1057,10 @@ These are deliberately **not** prematurely frozen by this architecture document.
 They need their own evidence/ADR in the phase that implements them:
 
 - exact database migration shape for Mission/Execution compatibility;
+- exact internal WorkflowDefinition schema/storage projection and module layout,
+  within #367's DAG/single-authority constraints;
+- exact ContextManifest/ContextPacket storage/retention representation within
+  #335's governed-invocation contract;
 - exact sandbox technology and first supported host platform;
 - exact package manifest/DSL syntax;
 - exact provider cost metadata source/update mechanism;
@@ -946,9 +1082,12 @@ Core contracts and the evidence shows:
 - Infrastructure Ops can own a persistent, event-driven responsibility with
   bounded reversible side effects;
 - routine idle operation does not burn model tokens;
+- routine Workflow sequencing/handoff does not burn model tokens;
+- every cognitive Agent Run receives bounded, reconstructable context selected
+  from authoritative references;
 - budgets and routing are inspectable and enforced;
 - no worker can widen its own authority;
-- restart/replay does not silently duplicate side effects;
+- restart/replay does not silently duplicate side effects or Agent Run dispatch;
 - HearthBot can operate as a thin Forge interface;
 - Hermes is no longer required and can be fully removed.
 

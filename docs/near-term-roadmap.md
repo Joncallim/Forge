@@ -1,6 +1,6 @@
 # FORGE Near-Term Execution Roadmap
 
-Last updated: 2026-09-03
+Last updated: 2026-09-10
 
 This document is the **execution-order view** of the Forge roadmap. The current
 VNext product direction is defined in
@@ -35,7 +35,7 @@ layer**, not build a second orchestrator and not resume broad Workspace expansio
 1. **No big-bang rewrite.** Keep today's Project/Task coding path working while
    generic Mission/Resource/Grant contracts are introduced underneath it.
 2. **No permanent LLM parent agent.** Deterministic software owns routing,
-   budgets, scheduling, policy, recovery and triggers.
+   budgets, scheduling, policy, recovery, Workflow readiness and triggers.
 3. **Budget before breadth.** Every future model call should be attributable,
    bounded, and chosen through deterministic policy.
 4. **Execution safety before autonomy.** Do not open repository or external
@@ -44,9 +44,12 @@ layer**, not build a second orchestrator and not resume broad Workspace expansio
    not legacy systems to replace.
 6. **One source of orchestration truth.** New VNext records must not duplicate
    task/work-package/operation/outcome/evidence state.
-7. **Hermes contributes lessons only.** No Hermes code, state, config, runtime or
+7. **Structured handoff, not narrative relay.** Work Packages remain the
+   dependency-scoped handoff unit. Context is selected by reference and compiled
+   freshly for each Agent Run; routine handoff does not need a supervisor model.
+8. **Hermes contributes lessons only.** No Hermes code, state, config, runtime or
    fallback path belongs in Forge.
-8. **No ensembles in this programme.** Model ensembles/latent bridges remain
+9. **No ensembles in this programme.** Model ensembles/latent bridges remain
    deferred.
 
 ## 0. Freeze And Merge The VNext Architecture — Epic #333
@@ -58,7 +61,7 @@ Canonical artifacts:
 - `docs/forge-vnext-architecture.md`;
 - `docs/adr/0014-forge-vnext-general-agent-runtime.md`;
 - `docs/architecture/forge-vnext-review-record.md`;
-- issues #333–#344.
+- issues #333–#344 plus later narrow programme issues such as #367.
 
 ### Exit criteria
 
@@ -86,10 +89,16 @@ Define versioned contracts for:
 Map the existing coding product through these contracts without destructive
 renames or duplicate sources of truth.
 
+Phase 0 only needs enough Workflow identity/revision and Work Package context
+shape for later execution to pin authoritative definitions. The deterministic
+Workflow engine itself belongs to #367, not #334.
+
 ### Exit criteria
 
 - Existing Project/Task behaviour remains compatible.
 - A non-repository Mission can be represented without fake Git fields.
+- Workflow identity/revision and Work Package/Agent Run relationships can be
+  represented and pinned without introducing a second execution engine.
 - PostgreSQL remains durable orchestration/evidence truth; Redis remains
   transport/wakeup state.
 - Remaining #187–#191 work has an explicit VNext integration decision before it
@@ -99,7 +108,8 @@ renames or duplicate sources of truth.
 ## 2. Deterministic Budget, Routing And Context Economics — #335
 
 Before Forge launches more agents, teach the control plane to decide when a model
-call is worth making and whether it is affordable.
+call is worth making, whether it is affordable, and exactly what context that run
+is allowed to receive.
 
 Implement:
 
@@ -109,12 +119,17 @@ Implement:
 - deterministic provider/model routing and failover;
 - actionable provider health categories;
 - routing receipts;
-- bounded context packets;
+- a reference-first `ContextManifest` describing required/optional
+  Resource/Artifact/evidence inputs, classifications, versions, limits and
+  inclusion/exclusion reasons;
+- a deterministic ContextCompiler that materializes the exact bounded
+  `ContextPacket` only after provider/egress/budget admission;
 - provider/data-egress policy;
 - cost-to-verified-outcome telemetry.
 
 Forge already stores per-run input/output tokens and cost when known. Extend that
-truth rather than creating a parallel usage database.
+truth rather than creating a parallel usage database. Do not preserve permanent
+model conversations merely to make later handoffs easier.
 
 ### Exit criteria
 
@@ -124,12 +139,72 @@ truth rather than creating a parallel usage database.
   permits.
 - Every model invocation has explainable routing and actual/unknown usage
   evidence; unknown usage is never forged into zero.
-- No LLM is used merely to route another LLM.
+- Every governed Agent Run has an inspectable context selection/packet identity
+  under explicit byte/token/item limits.
+- Restricted raw context is not assembled for an ineligible destination.
+- Required missing/stale/oversized/policy-ineligible context fails closed; an
+  unrelated predecessor Artifact is not inherited merely because it exists.
+- No LLM is used merely to route another LLM or rewrite context for another LLM.
+
+## 2B. Deterministic Workflow Kernel And Artifact-Routed Dispatch — #367
+
+After #335, add the small deterministic Workflow engine that VNext needs before
+Software Engineering becomes the integration proof. This work may proceed **in
+parallel with #336** because it can be proven with synthetic/read-only Agent Runs
+and does not open mutation authority.
+
+The kernel owns ordinary Workflow mechanics:
+
+- versioned Workflow definition/pinning;
+- directed-acyclic-graph validation;
+- Work Package readiness from authoritative state;
+- deterministic dispatch identity/idempotency;
+- bounded fan-out and deterministic joins;
+- existing Gate/Execution `waiting` semantics;
+- bounded rework/attempt lineage;
+- artifact/resource/evidence references passed into #335 context compilation;
+- compatibility shadowing before the old sequential path is retired.
+
+A handoff is not a new durable entity. It is the transition:
+
+```text
+ready Work Package
+  -> selected authoritative context references
+  -> #335 admission + ContextPacket compilation
+  -> Agent Run
+  -> structured Artifact/evidence
+  -> deterministic Workflow advancement
+```
+
+Do not add a generic mutable graph-state blob, arbitrary executable Workflow
+callbacks/reducers, direct agent-to-agent messaging, permanent conversations or
+a LangGraph checkpoint store as a second orchestration truth.
+
+### Exit criteria
+
+- A three-node linear synthetic Workflow routes without a model call for
+  sequencing/handoff.
+- A fork/join synthetic Workflow dispatches independent nodes and joins only
+  when required predecessor outcomes/Artifacts exist.
+- Cycles, dangling edges, impossible joins and unsupported revisions fail before
+  dispatch.
+- Crash/restart or duplicate wakeup cannot create duplicate authoritative Agent
+  Runs for one intended attempt.
+- Parallel ready nodes cannot collectively oversubscribe #335 hard
+  budget/concurrency ceilings.
+- Downstream runs receive only required context references/packets; private
+  reasoning and unrelated predecessor output are excluded.
+- Workflow/model content cannot widen Grants, budgets, protected policy, trusted
+  Gates or authoritative lifecycle state.
+- PostgreSQL remains the durable orchestration/evidence truth.
+- Shadow migration compares old/new readiness without creating dual writers.
+- #336 remains independently implementable; #367 does not claim confinement or
+  mutation safety.
 
 ## 3. Secure Generic Execution Envelope — #336
 
-Open the current fail-closed execution boundary only through an OS- and
-policy-enforced runtime.
+After #335, this proceeds in parallel with #367. Open the current fail-closed
+execution boundary only through an OS- and policy-enforced runtime.
 
 Prove:
 
@@ -154,19 +229,22 @@ Prove:
 
 ## 4. Prove Software Engineering End To End — #337
 
-Only after the generic and secure runtime contracts exist, complete the current
-flagship coding path through them.
+Only after the deterministic Workflow kernel (#367), secure execution branch
+(#336), independent Verification (#188) and on-demand proof execution (#355)
+exist, complete the current flagship coding path through them.
 
 Target:
 
 ```text
 Mission
   -> plan
-  -> bounded implementation
+  -> deterministic Work Package readiness/dispatch
+  -> #335 bounded per-run context
+  -> confined implementation
   -> deterministic validation
   -> independent QA / Review / Security evidence
   -> trusted gates
-  -> remediation
+  -> bounded remediation
   -> branch + commit + PR
 ```
 
@@ -176,7 +254,9 @@ General auto-merge is not required.
 
 - The simple-web-app release gate succeeds twice from clean/repaired supported
   environments.
-- Every model run is budgeted and context-bounded.
+- Software Engineering uses #367 rather than a coding-specific sequencer.
+- Routine sequencing/handoff uses zero model calls.
+- Every model run is budgeted and context-bounded through #335.
 - Every mutation is attributable to a typed Operation, Principal, Grant and
   resource scope/version.
 - Parallel writers cannot silently conflict.
@@ -198,6 +278,9 @@ Prove:
 - running-Mission pinning;
 - explicit local derived revisions for operator edits.
 
+Package Workflow definitions must execute through the already-proven #367 kernel;
+package extraction must not introduce a second package-specific orchestrator.
+
 ### Exit criteria
 
 - Software Engineering passes the same Phase 4 release gate as an installed
@@ -205,6 +288,7 @@ Prove:
 - Installing/removing a Workforce needs no Forge Core source change.
 - Workforce package content cannot execute arbitrary host code by virtue of
   installation.
+- Package Workflows reuse #367 readiness/dispatch/context-ref semantics.
 - No coding-only Core hook is added simply to make the extraction pass.
 
 ## 6. Prove Non-Coding Generality — Deep Research #339
@@ -214,7 +298,10 @@ Deep Research is the second reference Workforce.
 It must prove:
 
 - non-repository Resources;
-- bounded parallel discovery;
+- #367 bounded parallel discovery and joins without a research-specific
+  orchestrator;
+- #335 selective per-run context instead of sending the full corpus to each
+  worker;
 - evidence provenance;
 - contradiction/uncertainty handling;
 - source/citation validation;
@@ -348,6 +435,8 @@ Before adding a large feature, ask:
 4. Does it have a hard budget, authority boundary, failure/recovery path and
    objective verification plan?
 5. Is it needed for the next reference proof, or is it attractive but deferrable?
+6. Does it route through Work Package + Artifact/context references, or is it
+   quietly recreating an agent-to-agent conversation/handoff system?
 
 If it is not needed for a current gate and delaying it reduces risk/complexity,
 defer it.

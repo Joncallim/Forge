@@ -1,9 +1,10 @@
 # Forge VNext Architecture Review Record
 
 Date: 2026-09-03
-Scope: Forge VNext product direction, architecture invariants, phase order, Hermes/HearthBot relationship, budget model, installable Workforce design, and compatibility with the live Forge repository.
+Post-freeze addendum reviewed: 2026-09-10
+Scope: Forge VNext product direction, architecture invariants, phase order, Hermes/HearthBot relationship, budget model, installable Workforce design, Workflow/context handoff architecture, and compatibility with the live Forge repository.
 
-Reviewed repository state: `main` after `dc78d0e` and the then-current architecture/docs/issues including ADR 0007, ADRs 0010–0013, Epic #184, #187, Operation Catalog/canonical outcome/capability-reliability work, `AGENTS.md`, `README.md`, `docs/roadmap.md`, and `docs/near-term-roadmap.md`.
+Reviewed repository state: `main` after `dc78d0e` and the then-current architecture/docs/issues including ADR 0007, ADRs 0010–0013, Epic #184, #187, Operation Catalog/canonical outcome/capability-reliability work, `AGENTS.md`, `README.md`, `docs/roadmap.md`, and `docs/near-term-roadmap.md`. The 2026-09-10 addendum rechecked current `main` at `e9d1129` and the VNext issues affected by the Workflow/context sequencing adjustment.
 
 This is an architecture review, not proof that the implementation already satisfies VNext.
 
@@ -13,7 +14,7 @@ Status: **No blockers found in the inspected architecture scope after revision**
 
 Confidence: **High for roadmap/contract direction; medium for implementation feasibility details that deliberately remain phase-level decisions.**
 
-Reason: The original general-agent roadmap contained several material risks: coding assumptions could have been hardened before generalisation, "cheap" routing could have optimized the wrong metric, Workforce packages could have become an executable plugin bypass, persistent Missions lacked distributed-systems/recovery semantics, and Hermes migration risked preserving a second orchestration authority. The plan was revised between review passes to close those design problems. The final architecture reuses Forge's existing trust/evidence foundations and leaves unresolved implementation choices explicitly gated rather than guessed.
+Reason: The original general-agent roadmap contained several material risks: coding assumptions could have been hardened before generalisation, "cheap" routing could have optimized the wrong metric, Workforce packages could have become an executable plugin bypass, persistent Missions lacked distributed-systems/recovery semantics, and Hermes migration risked preserving a second orchestration authority. The plan was revised between review passes to close those design problems. The 2026-09-10 addendum additionally removes model-written narrative handoffs from routine orchestration by separating #335 context compilation from #367 deterministic Workflow execution without introducing a second state authority. The final architecture reuses Forge's existing trust/evidence foundations and leaves unresolved implementation choices explicitly gated rather than guessed.
 
 ## Iterative Findings And Resolutions
 
@@ -47,7 +48,7 @@ generic contracts
 
 This keeps the current product usable without doing a big-bang rewrite.
 
-Result: resolved in #334–#338.
+Result: resolved in #334–#338. The post-freeze Pass 18 refines, rather than replaces, this sequence by inserting #367 after #335 and parallel to #336.
 
 ### Pass 3 — Trust / authority
 
@@ -116,7 +117,7 @@ Resolution:
 - prioritize content-addressed deterministic reuse for indexes/extracts/validated immutable artifacts;
 - defer general cognitive-result caching until explicit validity semantics exist.
 
-Result: resolved in the architecture and #335/#339.
+Result: resolved in the architecture and #335/#339. Pass 18 later makes context selection/compilation explicit so downstream agents do not require supervisor-written summaries.
 
 ### Pass 7 — Workforce package / supply-chain boundary
 
@@ -222,7 +223,7 @@ Resolution:
 - one writer per file/resource lane where applicable;
 - share validated source/index artifacts rather than independently ingesting all context.
 
-Result: resolved in #336/#337/#339.
+Result: resolved in #336/#337/#339. Pass 18 separates dependency/readiness fan-out (#367) from mutation-conflict authority (#336).
 
 ### Pass 14 — Proof-workload selection
 
@@ -287,19 +288,71 @@ Deferred:
 
 Result: VNext remains large but dependency-ordered and testable.
 
+### Pass 18 — Workflow/context handoff and implementation sequencing — 2026-09-10
+
+Finding: The accepted architecture correctly prohibited a permanent LLM parent agent and required bounded context, but the implementation roadmap still left ordinary supervisor-to-specialist handoff underspecified. If each supervisor rereads predecessor outputs and writes a long narrative handoff, Forge pays recurring token/latency cost, loses provenance, and risks making prose an implicit orchestration state. Directly adopting LangGraph as Core would solve some ergonomics while creating a more serious risk: a second checkpoint/orchestration truth beside PostgreSQL, Work Packages, Artifacts, Gates and Forge recovery semantics.
+
+The first proposed correction also introduced a separate durable `HandoffEnvelope`; review rejected that because Work Package is already the dependency-scoped handoff unit under SPEC-0002.
+
+Resolution:
+
+- keep Work Package as the durable handoff unit; handoff is a transition, not a new canonical entity;
+- extend #335 to own a reference-first ContextManifest and deterministic ContextCompiler, with restricted payload materialization only after provider/egress/budget admission;
+- exclude permanent model conversations, private reasoning transcripts and unrelated predecessor output from default downstream context;
+- create #367 as a small deterministic Workflow kernel for versioned DAG validation, readiness, dispatch identity, bounded fan-out/join, existing Gate/waiting semantics and bounded rework attempt lineage;
+- keep PostgreSQL canonical entity state authoritative; no generic mutable graph-state/checkpoint database;
+- run #367 in parallel with #336 after #335 because graph/readiness logic can be proven without opening mutation authority;
+- keep #336 responsible for OS confinement, Resource mutation concurrency and side-effect recovery;
+- make #337 the first production convergence point and require #367 alongside #188/#355, with #336 inherited through those security/verification prerequisites;
+- have #338 packages declare Workflows consumed by #367 rather than carry executable orchestration;
+- have #339 Deep Research reuse #367 fan-out/join and #335 selective per-run context rather than a research-specific supervisor;
+- keep LangGraph or another framework off the critical path; any future adapter must remain subordinate to Forge state, Grants, Operations, Artifacts and Gates.
+
+Alternative sequencing reviewed and rejected:
+
+1. **Put all Workflow work in #337** — rejected because the flagship proof would invent Core architecture while trying to prove it.
+2. **Make #336 depend on #367** — rejected because deterministic graph mechanics are not required to prove OS confinement and would unnecessarily delay the security branch.
+3. **Implement #367 before #335** — rejected because fan-out/dispatch needs the governed context/budget/concurrency boundary to avoid duplicating it.
+4. **Add LangGraph as Forge Core** — rejected because checkpoint/persistence/recovery semantics could become a second source of orchestration truth.
+5. **Create a durable Handoff entity** — rejected because it duplicates Work Package/Artifact semantics.
+
+Final dependency shape:
+
+```text
+#334
+  |
+#335
+  |\
+  | +------> #367 Workflow kernel
+  |
+  +--------> #336 secure execution
+                |\
+                | +--> #188 verification
+                +----> #355 proof runner
+
+#367 + #188 + #355
+          |
+        #337
+```
+
+#336 remains a transitive foundation of #337 through #188/#355. The branches are independent until the Software Engineering integration proof.
+
+Result: resolved in #333, #335, #337, new #367, the canonical roadmap/architecture documentation, and narrow alignment addenda on #334/#336/#338/#339.
+
 ## Orthogonal Pass Coverage
 
 | Pass | Checked | Findings | Remaining uncertainty |
 |---|---:|---:|---|
 | Contract / requirements | Yes | 2 material | Exact UI vocabulary migration remains phase-specific |
 | Repository/current architecture | Yes | 3 material | Implementation must re-check live repo at each phase |
-| State / data / persistence | Yes | 2 material | Exact Mission/Execution schema/migration deliberately not frozen |
+| State / data / persistence | Yes | 2 material | Exact Mission/Execution and Workflow/context persistence projection deliberately not frozen |
 | Error handling / recovery | Yes | 3 material | Connector-specific reconciliation capabilities vary |
 | Tests / verification | Yes | 2 material | Conformance suite is planned, not implemented |
 | Security / permissions / secrets | Yes | 5 material | Exact sandbox and adapter process technology deliberately not frozen |
 | Budget / model economics | Yes | 4 material | Cost metadata freshness/source requires phase ADR |
+| Workflow / context / handoff | Yes | 5 material | Exact ContextManifest/WorkflowDefinition storage/module layout remains implementation-specific |
 | UX / operator experience | Yes | 2 advisory | Exact dashboard surfaces remain deferred |
-| Regression / compatibility | Yes | 3 material | Compatibility seam needs code-level proof |
+| Regression / compatibility | Yes | 3 material | Compatibility seam and #367 shadow cutover need code-level proof |
 | Supply chain / packages | Yes | 3 material | Exact manifest/dependency resolver syntax remains open |
 | Concurrency / scalability | Yes | 2 material | Distributed multi-host Forge is explicitly deferred |
 | Hermes cutover | Yes | 3 material | Live Hermes inventory belongs to final cutover phase |
@@ -309,6 +362,8 @@ Result: VNext remains large but dependency-ordered and testable.
 
 The architecture is frozen into the VNext programme. Implementation should start
 with #334 and must not skip directly to new Workforces or Hermes cutover.
+
+After #335 closes, #367 and #336 may proceed in parallel. #337 must not become a place to invent missing Workflow/context/confinement contracts; it is their production integration proof.
 
 Before each phase is marked complete:
 
@@ -324,6 +379,8 @@ These are not architecture blockers; they are intentionally deferred because the
 correct choice depends on implementation evidence:
 
 - exact Mission/Execution database migration strategy;
+- exact ContextManifest/ContextPacket persistence and retention representation;
+- exact WorkflowDefinition persistence projection, module layout and compatibility-shadow cutover;
 - exact OS confinement technology and first supported host;
 - exact package manifest/DSL;
 - exact provider cost metadata source/update mechanism;
@@ -332,8 +389,8 @@ correct choice depends on implementation evidence:
 - exact scheduler backend;
 - whether and how verified cognitive result reuse is ever safe.
 
-Each should receive an ADR or explicit issue-level design when its phase begins.
+Each should receive an ADR or explicit issue-level design when its phase begins if implementation evidence requires a durable decision.
 
 ## Final Statement
 
-> No blockers were found in the inspected architecture scope after the iterative revisions above. This does not prove absence of defects. The remaining unchecked areas are implementation-specific behaviour, live-host confinement, connector-specific external semantics, migrations, and empirical cost/quality performance. Those uncertainties are now explicit phase gates rather than hidden assumptions.
+> No blockers were found in the inspected architecture scope after the iterative revisions and the 2026-09-10 Workflow/context addendum. This does not prove absence of defects. The remaining unchecked areas are implementation-specific behaviour, live-host confinement, concrete Workflow/context persistence and migration mechanics, connector-specific external semantics, migrations, and empirical cost/quality performance. Those uncertainties are explicit phase gates rather than hidden assumptions.
