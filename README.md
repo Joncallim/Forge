@@ -230,10 +230,16 @@ not a claim that those future capabilities already ship.
 The active implementation order starts with:
 
 1. generic Mission/Execution/Resource/Grant contracts and a compatibility seam (#334);
-2. deterministic budgets, provider routing, routing receipts, and context economics (#335);
-3. the OS-enforced secure generic execution envelope (#336);
-4. end-to-end Software Engineering through those contracts (#337);
+2. deterministic budgets, provider routing, routing receipts, and first-class context compilation (#335);
+3. two parallel foundations after #335: the deterministic Workflow kernel and artifact-routed dispatch (#367), and the OS-enforced secure generic execution envelope (#336);
+4. end-to-end Software Engineering through the converged Workflow/context/confinement contracts (#337), after independent Verification (#188) and on-demand proof execution (#355);
 5. extraction into the first declarative installable Workforce (#338).
+
+The Workflow kernel keeps routine readiness, sequencing, fan-out/join and
+handoff deterministic. A Work Package remains the durable handoff unit; each
+cognitive Agent Run receives a fresh bounded context packet compiled from
+selected Resource/Artifact/evidence references. LangGraph or another agent
+framework is not an authoritative Forge Core dependency.
 
 Deep Research then proves non-repository generality, persistent Missions and
 Triggers establish zero-token idle operation, Infrastructure Ops proves bounded
