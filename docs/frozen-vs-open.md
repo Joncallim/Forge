@@ -5,7 +5,7 @@
 
 ## Frozen Semantics
 
-These decisions are frozen by the normative specs and ADRs. Implementation agents MUST NOT change them without a spec revision.
+These decisions are frozen by the normative specs and accepted ADRs. Implementation agents MUST NOT change them without a spec/ADR revision.
 
 ### Ontology & Lifecycle
 - Entity relationships: Mission (0..N Executions) → Execution → Work Package / Operation; Trigger bound to Mission (SPEC-0002 R1)
@@ -66,6 +66,20 @@ These decisions are frozen by the normative specs and ADRs. Implementation agent
 - Optimization target: minimum expected cost to verified outcome (SPEC-0006 R12)
 - Bounded context is constructed after destination/provider/budget admission and is minimum-useful rather than inherited full history (SPEC-0006 R1/R9)
 
+### Workflow Execution & Handoff
+- Work Package remains the dependency-scoped durable handoff unit; no canonical Handoff/HandoffEnvelope entity is added (ADR 0016)
+- Workflow v1 uses a versioned directed acyclic graph (DAG); cycles, dangling edges, unsupported revisions and impossible required joins fail before dispatch (ADR 0016)
+- Rework/retry uses bounded attempt/revision lineage rather than arbitrary Workflow cycles (ADR 0016)
+- Routine readiness, fan-out/join and handoff are deterministic and consume zero model calls (ADR 0016)
+- Workflow readiness is preflight, not authority: #335 remains final provider/egress/budget reservation authority for cognitive dispatch and #336 remains final mutation authority (ADR 0016)
+- Context is reference-first and compiled through #335; unrelated predecessor output/private model reasoning is not inherited by default (ADR 0016 + SPEC-0006)
+- Agent/Workflow content produces evidence/proposals and cannot directly widen Grants/budgets, set trusted Gates or set authoritative lifecycle/outcome (ADR 0016 + SPEC-0003)
+- Existing Gate and Execution `waiting` semantics are reused; no graph-specific interrupt lifecycle is introduced (ADR 0016 + SPEC-0002)
+- PostgreSQL remains authoritative Workflow/runtime truth; framework checkpoints or mutable graph blobs cannot become a second authority (ADR 0016)
+- Workflow migration follows the full SPEC-0014 sequence including BACKFILL / ADAPT before SHADOW COMPARE (ADR 0016 + SPEC-0014)
+- #367 and #336 are parallel after #335; #337 is their first production convergence (ADR 0016)
+- LangGraph/other graph frameworks may only be future subordinate adapters, not Forge Core authority (ADR 0016)
+
 ### Error Codes
 - Namespaced reason codes (SPEC-0007 R1)
 - Code stability (SPEC-0007 R2)
@@ -122,7 +136,7 @@ These decisions are frozen by the normative specs and ADRs. Implementation agent
 - Residual risk documentation (SPEC-0013 R4)
 
 ### Migration & Compatibility
-- Default migration sequence: EXPAND→BACKFILL→SHADOW→SWITCH→VERIFY→CONTRACT (SPEC-0014 R1)
+- Default migration sequence: EXPAND→BACKFILL/ADAPT→SHADOW COMPARE→SWITCH AUTHORITATIVE PATH→VERIFY→CONTRACT OLD SURFACE (SPEC-0014 R1)
 - Single authority rule (SPEC-0014 R2)
 - Historical evidence preservation (SPEC-0014 R5)
 - Unknown enum fail-closed (SPEC-0014 R6)
@@ -143,7 +157,7 @@ These decisions are intentionally left to implementation agents. They are not fr
 - Opaque ID implementation (UUIDv7, CUID2, NanoID)
 - Exact deterministic policy engine internals
 - Exact `ContextManifest` / `ContextPacket` storage and retention representation within #335's governed-invocation and classification rules
-- Exact WorkflowDefinition schema/storage projection and Workflow-kernel module layout within #367's DAG, Work Package, Agent Run, Gate and single-authority constraints
+- Exact WorkflowDefinition schema/storage projection and Workflow-kernel module layout within ADR 0016/#367 constraints
 - Exact deterministic readiness implementation and stable ordering algorithm, provided it derives from authoritative PostgreSQL state
 - Schedule library choice (cron, later, etc.)
 - OpenTelemetry backend/exporter
@@ -173,7 +187,7 @@ These are explicitly deferred from VNext and MUST NOT be implemented:
 ### Later Phase Decisions
 These need their own evidence/ADR in the implementing phase:
 - Exact database migration shape for Mission/Execution compatibility (#334)
-- Exact WorkflowDefinition persistence projection and compatibility-shadow cutover details (#367)
+- Exact WorkflowDefinition persistence projection and compatibility-shadow cutover details (#367, constrained by ADR 0016)
 - Exact ContextManifest/ContextPacket retention/storage details (#335)
 - Exact sandbox technology and first supported host platform (#336)
 - Exact package manifest/DSL syntax (#338)
