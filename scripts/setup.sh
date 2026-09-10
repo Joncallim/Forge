@@ -88,7 +88,7 @@ if [ ! -f "$ENV_FILE" ]; then
     printf 'NEXT_PUBLIC_APP_URL=http://localhost:3000\n'
     printf 'NEXT_TELEMETRY_DISABLED=1\n'
     printf 'FORGE_EMBED_WORKER=1\n'
-    printf 'FORGE_AGENT_WEB_SEARCH=1\n'
+    printf 'FORGE_AGENT_WEB_SEARCH=0\n'
     printf 'FORGE_WORKER_CLAIM_TIMEOUT_SECONDS=5\n'
     printf 'FORGE_PASSKEYS_ENABLED=1\n'
     printf 'FORGE_TRUST_PROXY=0\n'
