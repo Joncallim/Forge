@@ -73,16 +73,33 @@ describe('public web research privacy boundary', () => {
     await expect(researchPublicTopic('software_engineering_basics')).resolves.toEqual([])
   })
 
-  it('keeps the DuckDuckGo constructor and environment interpretation inside the common boundary', () => {
-    const root = path.resolve(__dirname, '..')
-    const architect = fs.readFileSync(path.join(root, 'worker/architect-context.ts'), 'utf8')
-    const evaluation = fs.readFileSync(path.join(root, 'lib/agent-evaluation.ts'), 'utf8')
-    const client = fs.readFileSync(path.join(root, 'lib/research/public-web/client.ts'), 'utf8')
+  it('keeps the DuckDuckGo constructor and environment parser inside the common boundary repo-wide', () => {
+    const repositoryRoot = path.resolve(__dirname, '../..')
+    const permitted = new Set([
+      'web/lib/research/public-web/client.ts',
+      'web/lib/research/public-web/config.ts',
+      'web/__tests__/public-web-research.test.ts',
+      'web/__tests__/orchestrator-eval.test.ts',
+    ])
+    const sourceFiles: string[] = []
+    const walk = (directory: string) => {
+      for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+        if (entry.name === '.git' || entry.name === 'node_modules' || entry.name === '.next') continue
+        const absolute = path.join(directory, entry.name)
+        if (entry.isDirectory()) walk(absolute)
+        else if (/\.(?:ts|tsx|js|mjs|cjs)$/.test(entry.name)) sourceFiles.push(absolute)
+      }
+    }
+    walk(repositoryRoot)
 
-    expect(architect).not.toContain('FORGE_AGENT_WEB_SEARCH')
-    expect(evaluation).not.toContain('FORGE_AGENT_WEB_SEARCH')
-    expect(architect).not.toContain('duckduckgo.com')
-    expect(evaluation).not.toContain('duckduckgo.com')
+    for (const absolute of sourceFiles) {
+      const relative = path.relative(repositoryRoot, absolute)
+      if (permitted.has(relative)) continue
+      const source = fs.readFileSync(absolute, 'utf8')
+      expect(source, relative).not.toMatch(/api\.duckduckgo\.com|process\.env\.FORGE_AGENT_WEB_SEARCH/)
+    }
+
+    const client = fs.readFileSync(path.join(repositoryRoot, 'web/lib/research/public-web/client.ts'), 'utf8')
     expect(client).toContain("redirect: 'error'")
   })
 })
