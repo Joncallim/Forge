@@ -48,6 +48,7 @@
 - SPEC-0002 — Runtime Contract (Agent Run, Artifact and Execution context)
 - SPEC-0013 — Agentic Threat Model v1
 - ADR 0014 — deterministic Core and ephemeral model workers
+- ADR 0016 — Workflow/context handoff boundary consumed by #367
 
 **Implementation emphasis:**
 - Every governed model invocation crosses one deterministic broker.
@@ -60,7 +61,7 @@
 
 ## Phase 1B — Deterministic Workflow Kernel And Artifact-Routed Dispatch (#367)
 
-#367 is an implementation phase under already-accepted VNext semantics. It does not add a new normative ontology or second orchestration state model.
+ADR 0016 records the binding VNext Workflow/handoff decisions for this phase. #367 implements those decisions without adding a new product ontology or second orchestration state model.
 
 **Primary specs:**
 - SPEC-0002 — Runtime Contract v1 (Workflow, Work Package, Agent Run, Artifact, Gate and `waiting` semantics)
@@ -69,16 +70,22 @@
 - SPEC-0007 — Error & Reason Codes v1 (machine-readable readiness/block reasons)
 - SPEC-0008 — Conformance Test Standard v1 (restart, replay and invariant tests)
 - SPEC-0012 — Observability vs Audit v1
-- SPEC-0014 — Migration & Compatibility v1 (single authority; EXPAND→SHADOW→SWITCH→VERIFY→CONTRACT)
+- SPEC-0014 — Migration & Compatibility v1 (single authority; EXPAND→BACKFILL/ADAPT→SHADOW COMPARE→SWITCH AUTHORITATIVE PATH→VERIFY→CONTRACT OLD SURFACE)
+
+**Required ADR:**
+- ADR 0016 — Deterministic Workflow Kernel And Artifact-Routed Handoff
 
 **Supporting:**
 - ADR 0014 — deterministic Core; no permanent LLM orchestrator
+- ADR 0005 — existing PostgreSQL Workforce graph foundation
+- ADR 0004 — existing non-authoritative checkpoint boundary
 - #335 — ContextManifest/ContextCompiler, model broker and budget reservation
 
 **Implementation emphasis:**
 - Work Package remains the dependency-scoped handoff unit; do not create a second Handoff entity.
 - Workflow v1 is a directed acyclic graph; rework uses bounded attempt/revision lineage rather than arbitrary graph cycles.
 - Readiness, fan-out/join and routine handoff are deterministic and consume zero model calls.
+- Readiness is preflight only: #335 remains final provider/egress/budget authority at cognitive dispatch and #336 remains final mutation authority at execution.
 - PostgreSQL remains orchestration truth; framework/checkpoint state cannot become authoritative.
 - #367 may run in parallel with #336 after #335. #337 is their first production convergence.
 
@@ -97,6 +104,7 @@
 - ADR 0015 — Secure Execution Technology / conformance profile
 - SPEC-0002 — Principal/Execution/Work Package lineage and lease semantics
 - SPEC-0006 — pre-existing budget/egress/model-invocation boundary from #335
+- ADR 0016 — boundary between Workflow readiness and execution authority
 
 **Implementation emphasis:**
 - Prove OS/runtime confinement before opening mutation authority.
@@ -163,7 +171,7 @@
 - #334 — generic compatibility seam
 - #335 — ContextManifest/ContextCompiler + governed invocation
 - #336 — secure execution envelope
-- #367 — deterministic Workflow kernel
+- #367 / ADR 0016 — deterministic Workflow kernel
 - #188 — independent Verification/Gate contract
 - #355 — deterministic proof execution
 
@@ -186,7 +194,7 @@
 
 **Supporting:**
 - #337 — proven Software Engineering behavior to preserve
-- #367 — package Workflow definitions execute through the generic kernel
+- #367 / ADR 0016 — package Workflow definitions execute through the generic kernel
 - SPEC-0014 — migration/history/pinning discipline
 
 **Implementation emphasis:**
@@ -210,7 +218,7 @@
 
 **Supporting:**
 - #338 — official declarative Workforce package
-- #367 — bounded fan-out/join and artifact-routed Work Package dispatch
+- #367 / ADR 0016 — bounded fan-out/join and artifact-routed Work Package dispatch
 - #336 — bounded read Operation/confinement semantics
 
 **Implementation emphasis:**
@@ -231,12 +239,13 @@
 
 **Supporting:**
 - SPEC-0004 — consume existing uncertain-side-effect/reconciliation semantics on restart
-- #367 — pending/completed Workflow node state remains derived from canonical Work Package/Artifact/Gate truth
+- #367 / ADR 0016 — pending/completed Workflow progress remains derived from canonical Work Package/Artifact/Gate truth
+- ADR 0004 — non-authoritative checkpoint precedent
 - #189 — earned-autonomy ceiling consumed by persistent Missions
 
 **Implementation emphasis:**
 - A persistent Mission is durable intent, not a persistent model session.
-- Checkpoints contain bounded validated refs/state needed to resume, not replayed conversations.
+- Checkpoints contain bounded validated refs/state needed to resume, not replayed conversations or a second Workflow truth.
 - Waiting consumes zero model tokens.
 
 ---
@@ -370,13 +379,13 @@ Historical review reports may preserve an older phase map. They are evidence of 
 
 ```text
 Phase 0  (#334): 0001, 0002, 0003, 0014, 0008
-Phase 1  (#335): 0003, 0005, 0006, 0007, 0008, 0012 (+ 0002, 0013)
-Phase 1B (#367): 0002, 0003, 0006, 0007, 0008, 0012, 0014 (+ ADR 0014)
-Phase 2  (#336): 0003, 0004, 0005, 0008, 0013 (+ 0002, 0006, ADR 0015)
-Phase 3  (#337): 0002, 0003, 0004, 0005, 0006, 0008, 0011, 0012, 0013, 0014
-Phase 4  (#338): 0010, 0011, 0003, 0005, 0008 (+ 0014, #367)
-Phase 5  (#339): 0002, 0003, 0005, 0006, 0008, 0011, 0012, 0013 (+ #367)
-Phase 6  (#340): 0002, 0003, 0008, 0014 (+ 0004, #367)
+Phase 1  (#335): 0003, 0005, 0006, 0007, 0008, 0012 (+ 0002, 0013; ADR 0016 boundary)
+Phase 1B (#367): 0002, 0003, 0006, 0007, 0008, 0012, 0014 + ADR 0016 (+ ADR 0014)
+Phase 2  (#336): 0003, 0004, 0005, 0008, 0013 (+ 0002, 0006, ADR 0015, ADR 0016 boundary)
+Phase 3  (#337): 0002, 0003, 0004, 0005, 0006, 0008, 0011, 0012, 0013, 0014 + ADR 0016
+Phase 4  (#338): 0010, 0011, 0003, 0005, 0008 (+ 0014, ADR 0016)
+Phase 5  (#339): 0002, 0003, 0005, 0006, 0008, 0011, 0012, 0013 (+ ADR 0016)
+Phase 6  (#340): 0002, 0003, 0008, 0014 (+ 0004, ADR 0016)
 Phase 7  (#341): 0009, 0002, 0004, 0008
 Phase 8  (#342): 0003, 0004, 0005, 0008
 Phase 9  (#343): 0004, 0008, 0012 (+ 0002, 0003, 0005, 0006, 0009)
