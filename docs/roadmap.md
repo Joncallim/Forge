@@ -1,6 +1,6 @@
 # Forge Product Roadmap
 
-Last updated: 2026-09-03
+Last updated: 2026-09-10
 
 This is the canonical **product-roadmap view** for Forge.
 
@@ -76,6 +76,11 @@ definition of Forge Core.
     Forge-to-Hermes fallback belongs in the target system.
 13. **No model ensembles in this programme.** Ensemble/voting and latent-model
     bridging remain explicitly deferred.
+14. **Structured handoff, not narrative relay.** A Work Package remains the
+    dependency-scoped handoff unit. Forge deterministically selects authoritative
+    Resource/Artifact/evidence references and compiles a fresh bounded context
+    packet for each Agent Run; routine sequencing does not require a supervisor
+    model to rewrite previous outputs.
 
 ## Canonical VNext Concepts
 
@@ -109,16 +114,21 @@ claim completion by bypassing an earlier safety or contract gate.
 | Phase | Issue | Product outcome |
 |---|---:|---|
 | 0 | [#334](https://github.com/Joncallim/Forge/issues/334) | Generic runtime contracts and a compatibility seam around today's coding product. |
-| 1 | [#335](https://github.com/Joncallim/Forge/issues/335) | Deterministic budgets, provider routing, context economics, and routing receipts. |
+| 1 | [#335](https://github.com/Joncallim/Forge/issues/335) | Deterministic budgets, provider routing, first-class context compilation, and routing receipts. |
+| 1B | [#367](https://github.com/Joncallim/Forge/issues/367) | Deterministic Workflow DAG readiness, fan-out/join, and artifact-routed Agent Run dispatch. Runs in parallel with Phase 2 after #335. |
 | 2 | [#336](https://github.com/Joncallim/Forge/issues/336) | Secure generic execution envelope, authority lineage, typed admission, and side-effect recovery. |
-| 3 | [#337](https://github.com/Joncallim/Forge/issues/337) | Software Engineering proves end-to-end safe delivery through the generic runtime. |
+| 3 | [#337](https://github.com/Joncallim/Forge/issues/337) | Software Engineering proves end-to-end safe delivery through the generic runtime, converging #367 orchestration with #336 confinement. |
 | 4 | [#338](https://github.com/Joncallim/Forge/issues/338) | Software Engineering becomes the first declarative installable Workforce package. |
-| 5 | [#339](https://github.com/Joncallim/Forge/issues/339) | Deep Research proves non-repository reasoning, evidence, and provider-egress controls. |
+| 5 | [#339](https://github.com/Joncallim/Forge/issues/339) | Deep Research proves non-repository reasoning, evidence, bounded parallelism, and provider-egress controls. |
 | 6 | [#340](https://github.com/Joncallim/Forge/issues/340) | Persistent Missions, checkpoints, leases, quiescence, and bounded autonomy. |
 | 7 | [#341](https://github.com/Joncallim/Forge/issues/341) | Trigger/Event runtime with authentication, dedupe, causality, loop prevention, and zero-token idle. |
 | 8 | [#342](https://github.com/Joncallim/Forge/issues/342) | General Resource/Capability adapter plane with brokered credentials and recovery semantics. |
 | 9 | [#343](https://github.com/Joncallim/Forge/issues/343) | Infrastructure Ops proves persistent event-driven bounded side effects. |
 | 10 | [#344](https://github.com/Joncallim/Forge/issues/344) | HearthBot cuts over to Forge and Hermes is completely retired. |
+
+Phase 1B is intentionally not a new security prerequisite for Phase 2. After
+#335, #367 and #336 may proceed in parallel. Phase 3 begins only after both
+branches and its independent verification/proof prerequisites are complete.
 
 ## Three Reference Workforces
 
@@ -132,6 +142,7 @@ Proves safe mutation and deterministic verification:
 ```text
 Mission
   -> plan
+  -> deterministic Work Package readiness/dispatch
   -> bounded implementation
   -> deterministic validation
   -> independent review evidence
@@ -179,8 +190,9 @@ access to sensitive email/calendar workflows.
 
 Forge should use three computational tiers:
 
-- **Tier 0 — deterministic/no model:** scheduling, health, state, routing,
-  budgets, permissions, hashing, recovery, dedupe, evidence calculations.
+- **Tier 0 — deterministic/no model:** scheduling, health, state, Workflow
+  readiness/joins, routing, budgets, permissions, hashing, recovery, dedupe,
+  evidence calculations.
 - **Tier 1 — economical cognition:** extraction, triage, mechanical work,
   routine review, summarisation, bulk processing.
 - **Tier 2 — stronger cognition:** architecture, difficult diagnosis, conflicting
@@ -190,6 +202,11 @@ Forge should use three computational tiers:
 Workforces request provider-neutral cognitive requirements rather than hard-coded
 vendor models. The deterministic router resolves them against provider health,
 budget, data-egress policy, operator policy, and comparable reliability evidence.
+
+Context is reference-first: #335 records an inspectable ContextManifest and only
+materializes the exact bounded ContextPacket after provider/egress/budget
+admission. #367 decides when a Work Package is ready; it does not maintain a
+second context store or ask a model to summarize predecessor transcripts.
 
 Hard budgets are checked before provider calls and must remain safe under
 concurrent reservations. Unknown provider cost remains unknown; Forge must not
@@ -297,7 +314,11 @@ reference material.
 - enterprise multi-user RBAC;
 - broad Forge Workspace expansion;
 - Personal Ops/email/calendar autonomy as an early proof;
-- generic arbitrary model-output caching without explicit validity semantics.
+- generic arbitrary model-output caching without explicit validity semantics;
+- direct agent-to-agent messaging as a second orchestration path;
+- LangGraph or another agent framework as Forge Core's authoritative Workflow,
+  checkpoint, Grant, Gate, or persistence layer;
+- arbitrary executable Workflow callbacks/reducers or unrestricted cyclic graphs.
 
 ## Programme Success
 
@@ -307,12 +328,14 @@ VNext is proven when:
 2. Deep Research completes non-repository evidence work through the same Core.
 3. Infrastructure Ops owns a persistent bounded responsibility with zero-token
    idle periods and verified reversible side effects.
-4. Budgets, routing, grants, evidence, recovery, and version pinning are
-   reconstructable and enforced.
-5. Restart/replay cannot silently duplicate confirmed side effects.
+4. Budgets, routing, context selection, workflow dispatch, grants, evidence,
+   recovery, and version pinning are reconstructable and enforced.
+5. Restart/replay cannot silently duplicate confirmed side effects or Agent Run
+   dispatches.
 6. Workers cannot widen their own authority or self-grade into trust.
-7. HearthBot operates as a thin Forge interface.
-8. Hermes is no longer required and is fully removed.
+7. Routine Workflow orchestration and handoff require no model call.
+8. HearthBot operates as a thin Forge interface.
+9. Hermes is no longer required and is fully removed.
 
 At that point Forge is no longer a coding orchestrator with extra integrations.
 It is a general agent runtime with Software Engineering as one installed
@@ -329,7 +352,7 @@ The VNext programme is governed by a set of normative specifications in `docs/sp
 | SPEC-0003 | Authorization & Grants v1 | PARC model, default-deny, child Grant constraint |
 | SPEC-0004 | Operation & Side-Effect Semantics v1 | Operation Catalog, idempotency, reconciliation |
 | SPEC-0005 | Resource Classification, Data Egress & Secrets v1 | Classification levels, egress authorization, credential brokering |
-| SPEC-0006 | Model Invocation & Cost Contract v1 | Budget hierarchy, provider routing, cost telemetry |
+| SPEC-0006 | Model Invocation & Cost Contract v1 | Budget hierarchy, provider routing, bounded context, cost telemetry |
 | SPEC-0007 | Error & Reason Codes v1 | Namespaced reason codes, error contract |
 | SPEC-0008 | Conformance Test Standard v1 | Test classes C1-C8, failure injection requirements |
 | SPEC-0009 | Trigger/Event Envelope v1 | CloudEvents compatibility, causality, loop prevention |
