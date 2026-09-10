@@ -1,6 +1,6 @@
 # Phase Reference — Spec Reading Guide
 
-**Date:** 2026-09-04
+**Date:** 2026-09-10
 **Purpose:** For each major VNext phase or issue family, list the subset of specs that MUST be read first. Implementation agents should read these specs before starting work on the corresponding issue.
 
 ## How to use this guide
@@ -30,16 +30,16 @@
 - SPEC-0005 (classification — Phase 1)
 - SPEC-0006 (model invocation — Phase 1)
 - SPEC-0007 (error codes — Phase 1)
-- SPEC-0009 (triggers — Phase 2)
-- SPEC-0010 (workforce packages — Phase 2)
-- SPEC-0011 (provenance — Phase 2)
+- SPEC-0009 (triggers — later)
+- SPEC-0010 (workforce packages — later)
+- SPEC-0011 (provenance — later)
 - SPEC-0012 (observability — Phase 1)
 - SPEC-0013 (threat model — reference only)
-- SPEC-0015 (reliability — Phase 2)
+- SPEC-0015 (reliability — later)
 
 ---
 
-## Phase 1 — Authorization, Classification & Cost (#335)
+## Phase 1 — Authorization, Classification, Cost & Context (#335)
 
 **Primary specs:**
 - SPEC-0003 — Authorization & Grants v1
@@ -50,17 +50,49 @@
 - SPEC-0012 — Observability vs Audit v1
 
 **Supporting:**
-- SPEC-0002 — Runtime Contract (entity context)
+- SPEC-0002 — Runtime Contract (Agent Run and Artifact context)
 - SPEC-0013 — Agentic Threat Model (control mapping)
 - ADR 0015 — Secure Execution Technology (sandbox for adapters)
 
+**Implementation emphasis:**
+- Context planning is reference-first through an inspectable ContextManifest.
+- Provider/data-egress/budget admission occurs before restricted raw payload is materialized.
+- The ContextCompiler produces one exact bounded ContextPacket per governed Agent Run.
+- Permanent conversations and supervisor-written handoff summaries are not runtime state.
+
 **Skip:**
 - SPEC-0004 (Operations — Phase 2)
-- SPEC-0009 (Triggers — Phase 2)
-- SPEC-0010 (Workforce packages — Phase 2)
-- SPEC-0011 (Provenance — Phase 2)
-- SPEC-0014 (Migration — already covered in Phase 0)
-- SPEC-0015 (Reliability — Phase 2)
+- SPEC-0009 (Triggers — later)
+- SPEC-0010 (Workforce packages — later)
+- SPEC-0011 (Provenance — later package/evidence work)
+- SPEC-0014 (Migration — already covered in Phase 0, except as supporting migration discipline)
+- SPEC-0015 (Reliability — later)
+
+---
+
+## Phase 1B — Deterministic Workflow Kernel (#367)
+
+#367 is an implementation phase under already-accepted VNext semantics. It does not add a new normative ontology or a second orchestration state model.
+
+**Primary specs:**
+- SPEC-0002 — Runtime Contract v1 (Workflow, Work Package, Agent Run, Artifact, Gate and `waiting` semantics)
+- SPEC-0003 — Authorization & Grants v1 (model/Workflow content cannot mint authority)
+- SPEC-0006 — Model Invocation & Cost Contract v1 (bounded context, concurrency budgets, governed invocation)
+- SPEC-0007 — Error & Reason Codes v1 (machine-readable readiness/block reasons)
+- SPEC-0008 — Conformance Test Standard v1 (restart, replay, property/invariant tests)
+- SPEC-0012 — Observability vs Audit v1 (authoritative decisions/evidence)
+- SPEC-0014 — Migration & Compatibility v1 (single authority; EXPAND→SHADOW→SWITCH→VERIFY→CONTRACT)
+
+**Supporting:**
+- ADR 0014 — deterministic Core; no permanent LLM orchestrator
+- #335 — ContextManifest/ContextCompiler and invocation broker
+
+**Implementation emphasis:**
+- Work Package remains the dependency-scoped handoff unit; do not create a second Handoff entity.
+- Workflow v1 is a directed acyclic graph; rework uses bounded attempt/revision lineage rather than arbitrary graph cycles.
+- Readiness, fan-out/join and routine handoff are deterministic and consume zero model calls.
+- PostgreSQL remains orchestration truth; framework/checkpoint state cannot become authoritative.
+- #367 may run in parallel with #336 after #335. #337 is their first production convergence.
 
 ---
 
@@ -86,6 +118,9 @@
 - SPEC-0003 — Authorization & Grants v1 (Capability requests, activation)
 - SPEC-0005 — Resource Classification (package content classification)
 - SPEC-0008 — Conformance Test Standard v1
+
+**Supporting:**
+- #367 — package Workflow definitions must execute through the generic deterministic Workflow kernel, not a package-specific orchestrator.
 
 ### Triggers & Events (#341)
 
@@ -134,6 +169,10 @@
 - SPEC-0013 — Agentic Threat Model v1 (self-verification T12)
 - SPEC-0008 — Conformance Test Standard v1
 
+**Supporting:**
+- #335 — selective per-run context and egress boundaries
+- #367 — bounded fan-out/join and artifact-routed Work Package dispatch
+
 ### Release & Deployment (#344)
 
 **Primary specs:**
@@ -178,15 +217,16 @@ Every implementation agent MUST read:
 
 ## Reference: Spec Dependencies by Phase
 
-```
+```text
 Phase 0 (#334): SPEC-0001, 0002, 0003, 0014, 0008
 Phase 1 (#335): SPEC-0003, 0005, 0006, 0007, 0008, 0012, 0013
+Phase 1B (#367): SPEC-0002, 0003, 0006, 0007, 0008, 0012, 0014 + ADR 0014
 Phase 2a (#336): SPEC-0003, 0004, 0005, 0008, 0013 + ADR 0015
-Phase 2b (#338): SPEC-0010, 0011, 0003, 0005, 0008
+Phase 2b (#338): SPEC-0010, 0011, 0003, 0005, 0008 + #367
 Phase 2c (#341): SPEC-0002, 0004, 0008, 0009
 Phase 3a (#342): SPEC-0003, 0004, 0005, 0008
 Phase 3b (#343): SPEC-0004, 0012, 0008
 Phase 4a (#340): SPEC-0002, 0003, 0008
-Phase 4b (#339): SPEC-0002, 0003, 0011, 0013, 0008
+Phase 4b (#339): SPEC-0002, 0003, 0011, 0013, 0008 + #335/#367
 Phase 4c (#344): SPEC-0008, 0010, 0011, 0014, 0015
 ```
