@@ -239,6 +239,13 @@
       "when": 1786752000000,
       "tag": "0033_verification_goal_registry_revisions",
       "breakpoints": true
+    },
+    {
+      "idx": 34,
+      "version": "7",
+      "when": 1786838400000,
+      "tag": "0034_vnext_phase0_a1_runtime_foundation",
+      "breakpoints": true
     }
   ]
 }

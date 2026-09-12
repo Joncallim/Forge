@@ -52,7 +52,11 @@ INSERT INTO forge_expected_protected_owner_inventory (relation_name, owner_name)
   ('filesystem_mcp_issuance_recovery_actions', 'forge_s4_routines_owner'),
   ('local_effect_recovery_actions', 'forge_s4_routines_owner'),
   ('local_projection_archive_operations', 'forge_s4_routines_owner'),
-  ('local_projection_archive_operation_checkpoints', 'forge_s4_routines_owner');
+  ('local_projection_archive_operation_checkpoints', 'forge_s4_routines_owner'),
+  ('missions', 'forge_s4_routines_owner'),
+  ('executions', 'forge_s4_routines_owner'),
+  ('task_mission_bindings', 'forge_s4_routines_owner'),
+  ('runtime_transition_audits', 'forge_s4_routines_owner');
 -- canonical-protected-owner-map-end
 
 DO $boundary$
@@ -107,7 +111,7 @@ BEGIN
   ) THEN
     RAISE EXCEPTION 'protected owner roles are outside the exact safe boundary';
   END IF;
-  IF (SELECT count(*) FROM forge_expected_protected_owner_inventory) <> 40 OR EXISTS (
+  IF (SELECT count(*) FROM forge_expected_protected_owner_inventory) <> 44 OR EXISTS (
     SELECT 1
     FROM forge_expected_protected_owner_inventory expected
     LEFT JOIN pg_catalog.pg_class relation
@@ -221,7 +225,11 @@ GRANT SELECT ON TABLE
   public.work_package_local_projection_heads,
   public.verification_goal_registry_revisions,
   public.verification_goal_registry_entries,
-  public.verification_goal_registry_heads
+  public.verification_goal_registry_heads,
+  public.missions,
+  public.executions,
+  public.task_mission_bindings,
+  public.runtime_transition_audits
 TO forge;
 REVOKE ALL ON FUNCTION public.forge_commit_verification_goal_registry_revision_v1(
   uuid,uuid,uuid,uuid,timestamptz,text,uuid,bigint,bigint,timestamptz,text,jsonb
@@ -229,12 +237,24 @@ REVOKE ALL ON FUNCTION public.forge_commit_verification_goal_registry_revision_v
 GRANT EXECUTE ON FUNCTION public.forge_commit_verification_goal_registry_revision_v1(
   uuid,uuid,uuid,uuid,timestamptz,text,uuid,bigint,bigint,timestamptz,text,jsonb
 ) TO forge;
+REVOKE ALL ON FUNCTION forge.create_vnext_mission_v1(
+  uuid,uuid,text,uuid,text,text,jsonb,text,jsonb,text
+) FROM PUBLIC, forge;
+REVOKE ALL ON FUNCTION forge.transition_vnext_execution_v1(
+  uuid,bigint,text,text,text,text,uuid,text,text
+) FROM PUBLIC, forge;
+GRANT EXECUTE ON FUNCTION forge.create_vnext_mission_v1(
+  uuid,uuid,text,uuid,text,text,jsonb,text,jsonb,text
+) TO forge;
+GRANT EXECUTE ON FUNCTION forge.transition_vnext_execution_v1(
+  uuid,bigint,text,text,text,text,uuid,text,text
+) TO forge;
 
 DO $verify$
 DECLARE
   projection_name text;
 BEGIN
-  IF (SELECT count(*) FROM forge_expected_protected_owner_inventory) <> 40 OR EXISTS (
+  IF (SELECT count(*) FROM forge_expected_protected_owner_inventory) <> 44 OR EXISTS (
     SELECT 1
     FROM forge_expected_protected_owner_inventory expected
     LEFT JOIN pg_catalog.pg_class relation
@@ -354,7 +374,11 @@ BEGIN
           'work_package_local_projection_heads',
           'verification_goal_registry_revisions',
           'verification_goal_registry_entries',
-          'verification_goal_registry_heads'
+          'verification_goal_registry_heads',
+          'missions',
+          'executions',
+          'task_mission_bindings',
+          'runtime_transition_audits'
         )
         OR privilege.privilege_type <> 'SELECT'
         OR privilege.is_grantable
@@ -437,7 +461,11 @@ BEGIN
             'work_package_local_projection_heads',
             'verification_goal_registry_revisions',
             'verification_goal_registry_entries',
-            'verification_goal_registry_heads'
+            'verification_goal_registry_heads',
+            'missions',
+            'executions',
+            'task_mission_bindings',
+            'runtime_transition_audits'
           )
           AND (
             pg_catalog.has_table_privilege(forge_role.oid, relation.oid, 'SELECT')
@@ -453,7 +481,11 @@ BEGIN
     'work_package_local_projection_heads',
     'verification_goal_registry_revisions',
     'verification_goal_registry_entries',
-    'verification_goal_registry_heads'
+    'verification_goal_registry_heads',
+    'missions',
+    'executions',
+    'task_mission_bindings',
+    'runtime_transition_audits'
   ]
   LOOP
     IF (
