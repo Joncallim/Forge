@@ -69,6 +69,7 @@ export async function POST(request: NextRequest) {
         agentConfigs: allAgentConfigs,
         activeProviders,
         enableWebResearch: parsed.data.enableWebResearch,
+        signal: request.signal,
       })
 
       return NextResponse.json({ recommendations, usage })
