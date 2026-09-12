@@ -161,7 +161,7 @@ assert_contains "const TARGET_MIGRATION = '0033_verification_goal_registry_revis
 assert_contains 'routine.oid = any(array[${BEGIN}::regprocedure, ${FINALIZE}::regprocedure])' "$PROTECTED_OWNER_BOOTSTRAP"
 assert_contains "revoke create on schema public, forge from forge_s4_routines_owner" "$PROTECTED_OWNER_BOOTSTRAP"
 assert_contains "grant usage on schema forge to forge_s4_routines_owner" "$PROTECTED_OWNER_BOOTSTRAP"
-assert_contains "owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner')" "$PRIVILEGE_SQL"
+assert_contains "'forge_runtime_routines_owner'" "$PRIVILEGE_SQL"
 assert_contains 'FOR UPDATE OF relation;' "$PRIVILEGE_SQL"
 assert_contains 'FOR UPDATE OF attribute;' "$PRIVILEGE_SQL"
 assert_contains "'REVOKE ALL PRIVILEGES ON TABLE %I.%I FROM forge'" "$PRIVILEGE_SQL"
@@ -191,7 +191,8 @@ esac
 sql_owner_map="$TEST_ROOT/sql-owner-map"
 ts_owner_map="$TEST_ROOT/ts-owner-map"
 sed -n '/canonical-protected-owner-map-begin/,/canonical-protected-owner-map-end/p' "$PRIVILEGE_SQL" \
-  | sed -n "s/^  ('\([^']*\)', '\([^']*\)').*/\1|\2/p" | sort > "$sql_owner_map"
+  | sed -n "s/^  ('\([^']*\)', '\([^']*\)').*/\1|\2/p" \
+  | grep -Ev '^(missions|executions|task_mission_bindings|runtime_transition_audits)\|' | sort > "$sql_owner_map"
 sed -n '/canonical-protected-owner-map-begin/,/canonical-protected-owner-map-end/p' \
   "$SCRIPT_DIR/../web/scripts/repair-epic-172-legacy-release.ts" \
   | sed -n "s/^  { name: '\([^']*\)', owner: \([^,]*\),.*/\1|\2/p" \
@@ -984,7 +985,7 @@ run_managed_case() {
   CASE_DIR="$case_dir"
 }
 
-expected_stages=(release migrate-0025 s3 migrate-0026 legacy-repair s4 migrate-0027 s5 registry latest)
+expected_stages=(release migrate-0025 s3 migrate-0026 legacy-repair s4 migrate-0027 s5 registry runtime latest)
 
 run_managed_case current current
 [ "$CASE_STATUS" -eq 0 ] || fail 'current-user managed migration should succeed'
@@ -1023,6 +1024,12 @@ run_managed_case registry-failure current 0 registry
 assert_contains 'registry-cleanup-attempted' "$CASE_DIR/stages"
 assert_not_contains 'latest' "$CASE_DIR/stages"
 assert_contains 'verification-goal registry; its cleanup wrapper preserves the original migration failure' "$CASE_DIR/stderr"
+
+run_managed_case runtime-failure current 0 runtime
+[ "$CASE_STATUS" -ne 0 ] || fail 'VNext runtime migration failure must fail the orchestration'
+assert_contains 'runtime-cleanup-attempted' "$CASE_DIR/stages"
+assert_not_contains 'latest' "$CASE_DIR/stages"
+assert_contains 'VNext runtime foundation' "$CASE_DIR/stderr"
 
 run_managed_case legacy-repair-failure current 0 legacy-repair
 [ "$CASE_STATUS" -ne 0 ] || fail 'legacy repair failure must fail the orchestration'

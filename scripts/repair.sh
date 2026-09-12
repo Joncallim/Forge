@@ -644,7 +644,7 @@ load_database_url_from_local_fallbacks
 if [ "$SKIP_MIGRATE" = "1" ]; then
   warn "Skipping database migrations by request."
 elif [ -n "${DATABASE_URL:-}" ]; then
-  run "Applying database migrations" bash -c 'cd "$1" && npm run db:migrate' _ "$WEB_DIR"
+  run "Applying database migrations with protected-owner cleanup" bash -c 'cd "$1" && bash scripts/ci/apply-vnext-phase0-a1-runtime-foundation.sh' _ "$WEB_DIR"
 else
   warn "DATABASE_URL is not set; skipping database migrations."
 fi

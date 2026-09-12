@@ -2,10 +2,12 @@ import { describe, expect, it } from 'vitest'
 import {
   capabilityRequestSchema,
   executionContextSchema,
+  executionRefSchema,
   grantEnvelopeSchema,
   isValidExecutionState,
   isValidMissionState,
   missionSpecSchema,
+  missionRefSchema,
 } from '@/lib/runtime/v1'
 
 const id = '018f2a70-9d7b-7cc2-8c74-9ab3a301cf2f'
@@ -31,6 +33,8 @@ describe('VNext runtime v1 contracts', () => {
     expect(isValidExecutionState('waiting', null)).toBe(true)
     expect(isValidExecutionState('terminal', 'succeeded')).toBe(true)
     expect(isValidExecutionState('terminal', null)).toBe(false)
+    expect(() => missionRefSchema.parse({ version: 'v1', id, owner: { version: 'v1', type: 'user', id }, lifecycle: 'active', outcome: 'failed', revision: '0' })).toThrow()
+    expect(() => executionRefSchema.parse({ version: 'v1', id, missionId: id, lifecycle: 'queued', outcome: 'succeeded', revision: '0' })).toThrow()
   })
 
   it('does not make a principal type an authority grant', () => {

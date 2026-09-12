@@ -226,6 +226,7 @@ jobs:
           psql "$FORGE_DATABASE_ADMIN_URL" --set ON_ERROR_STOP=1 --command "do \$\$ begin if pg_catalog.has_function_privilege('forge_migration_test', 'public.forge_begin_epic_172_s4_owner_bootstrap_v1()', 'execute') or pg_catalog.has_function_privilege('forge_migration_test', 'public.forge_finalize_epic_172_s4_owner_bootstrap_v1()', 'execute') or pg_catalog.pg_has_role('forge_migration_test', 'forge_s4_routines_owner', 'member') or pg_catalog.has_schema_privilege('forge_migration_test', 'forge', 'create') or pg_catalog.has_schema_privilege('forge_s4_routines_owner', 'public', 'create') or pg_catalog.has_schema_privilege('forge_s4_routines_owner', 'forge', 'create') or not pg_catalog.has_schema_privilege('forge_s4_routines_owner', 'forge', 'usage') then raise exception 'registry cleanup proof retained or removed authority'; end if; end \$\$;"
           test "$registry_failed" -ne 0
           bash scripts/ci/apply-verification-goal-registry-migration.sh
+          bash scripts/ci/apply-vnext-phase0-a1-runtime-foundation.sh
       - name: Create the freshly migrated isolated S4 PostgreSQL proof database
         run: |
           npm run protocol:bootstrap-epic-172-release-roles
@@ -236,6 +237,7 @@ jobs:
           npx tsx scripts/ci/migrate-through-0027.ts
           bash scripts/ci/apply-epic-172-s5-recovery-migration.sh
           bash scripts/ci/apply-verification-goal-registry-migration.sh
+          bash scripts/ci/apply-vnext-phase0-a1-runtime-foundation.sh
         env:
           DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_s4_ci_test
           FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_s4_ci_test
@@ -340,6 +342,11 @@ jobs:
           FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_epic_172_ci_test
       - name: Apply verification-goal registry migration with failure-safe ownership
         run: bash scripts/ci/apply-verification-goal-registry-migration.sh
+        env:
+          DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_epic_172_ci_test
+          FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_epic_172_ci_test
+      - name: Apply VNext runtime foundation with failure-safe ownership
+        run: bash scripts/ci/apply-vnext-phase0-a1-runtime-foundation.sh
         env:
           DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_epic_172_ci_test
           FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_epic_172_ci_test
@@ -778,6 +785,9 @@ jobs:
           FORGE_VERIFICATION_GOAL_REGISTRY_POSTGRES_APP_TEST_URL: postgresql://forge:forge_registry_test@localhost:5432/forge_epic_172_ci_test
           FORGE_WORKFORCE_MATERIALIZER_REQUIRE_POSTGRES_TEST: '1'
           FORGE_WORKFORCE_MATERIALIZER_POSTGRES_ADMIN_TEST_URL: postgresql://forge_e2e:forge@localhost:5432/forge_epic_172_ci_test
+          FORGE_VNEXT_RUNTIME_REQUIRE_POSTGRES_TEST: '1'
+          FORGE_VNEXT_RUNTIME_POSTGRES_APP_TEST_URL: postgresql://forge:forge_registry_test@localhost:5432/forge_epic_172_ci_test
+          FORGE_VNEXT_RUNTIME_POSTGRES_ADMIN_TEST_URL: postgresql://forge_e2e:forge@localhost:5432/forge_epic_172_ci_test
           FORGE_EPIC_172_TEST_APP_DATABASE_URL: postgresql://forge_app_test:forge_app_test@localhost:5432/forge_epic_172_ci_test
           FORGE_EPIC_172_TEST_WRITER_DATABASE_URL: postgresql://forge_release_evidence_writer:forge_writer_test@localhost:5432/forge_epic_172_ci_test
           FORGE_EPIC_172_TEST_TRANSITION_DATABASE_URL: postgresql://forge_release_transition:forge_transition_test@localhost:5432/forge_epic_172_ci_test

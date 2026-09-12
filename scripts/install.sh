@@ -1612,7 +1612,7 @@ prepare_web_app() {
   if managed_local_migrations_enabled; then
     run_managed_local_migrations
   else
-    run "npm run db:migrate" bash -c 'cd "$1" && FORGE_WORKSPACE_ROOT="$2" FORGE_ENV_FILE="$3" FORGE_SUPPRESS_MIGRATION_NOTICES=1 npm run db:migrate --silent' _ "$REPO_ROOT/web" "$WORKSPACE_ROOT" "$ENV_FILE"
+    run "Apply database migrations with protected-owner cleanup" bash -c 'cd "$1" && FORGE_WORKSPACE_ROOT="$2" FORGE_ENV_FILE="$3" FORGE_SUPPRESS_MIGRATION_NOTICES=1 bash scripts/ci/apply-vnext-phase0-a1-runtime-foundation.sh' _ "$REPO_ROOT/web" "$WORKSPACE_ROOT" "$ENV_FILE"
   fi
   grant_forge_privileges
   run "npm run db:seed-agents" bash -c 'cd "$1" && FORGE_WORKSPACE_ROOT="$2" FORGE_ENV_FILE="$3" FORGE_PROMPT_UPGRADE_MODE="$4" npm run db:seed-agents' _ "$REPO_ROOT/web" "$WORKSPACE_ROOT" "$ENV_FILE" "$PROMPT_UPGRADE_MODE"
@@ -1772,7 +1772,7 @@ run_managed_local_migration_stage() {
     printf '%s\n' "$stage" >> "${FORGE_INSTALL_TEST_STAGE_LOG:?}"
     if [ "${FORGE_INSTALL_TEST_FAIL_STAGE:-}" = "$stage" ]; then
       case "$stage" in
-        s5|registry) printf '%s-cleanup-attempted\n' "$stage" >> "${FORGE_INSTALL_TEST_STAGE_LOG:?}" ;;
+        s5|registry|runtime) printf '%s-cleanup-attempted\n' "$stage" >> "${FORGE_INSTALL_TEST_STAGE_LOG:?}" ;;
       esac
       return 1
     fi
@@ -1791,6 +1791,7 @@ run_managed_local_migration_stage() {
         migrate-0027) npx tsx scripts/ci/migrate-through-0027.ts ;;
         s5) bash scripts/ci/apply-epic-172-s5-recovery-migration.sh ;;
         registry) bash scripts/ci/apply-verification-goal-registry-migration.sh ;;
+        runtime) bash scripts/ci/apply-vnext-phase0-a1-runtime-foundation.sh ;;
         latest) npm run db:migrate ;;
         *) exit 64 ;;
       esac' _ "$REPO_ROOT/web" "$stage"
@@ -1900,6 +1901,7 @@ run_managed_local_migration_as_runuser() {
       migrate-0027) npx tsx scripts/ci/migrate-through-0027.ts ;;
       s5) bash scripts/ci/apply-epic-172-s5-recovery-migration.sh ;;
       registry) bash scripts/ci/apply-verification-goal-registry-migration.sh ;;
+      runtime) bash scripts/ci/apply-vnext-phase0-a1-runtime-foundation.sh ;;
       latest) npm run db:migrate ;;
       *) exit 64 ;;
     esac' _ "$REPO_ROOT/web" "$stage"
@@ -1924,6 +1926,7 @@ run_managed_local_migration_as_sudo() {
       migrate-0027) npx tsx scripts/ci/migrate-through-0027.ts ;;
       s5) bash scripts/ci/apply-epic-172-s5-recovery-migration.sh ;;
       registry) bash scripts/ci/apply-verification-goal-registry-migration.sh ;;
+      runtime) bash scripts/ci/apply-vnext-phase0-a1-runtime-foundation.sh ;;
       latest) npm run db:migrate ;;
       *) exit 64 ;;
     esac' _ "$REPO_ROOT/web" "$stage"
@@ -1933,7 +1936,7 @@ run_managed_local_migration_as_sudo() {
 run_managed_local_migrations() {
   step "Applying managed local database migrations"
   if [ "$DRY_RUN" = "1" ]; then
-    info "[dry-run] Bootstrap release roles, migrate through 0025, bootstrap S3, migrate through 0026, repair an exact known legacy release catalog if needed, bootstrap S4, migrate through 0027, apply S5 through 0028 with cleanup, apply the verification-goal registry through 0033 with cleanup, then run the latest migrator."
+    info "[dry-run] Bootstrap release roles, migrate through 0025, bootstrap S3, migrate through 0026, repair an exact known legacy release catalog if needed, bootstrap S4, migrate through 0027, apply S5 through 0028 with cleanup, apply the verification-goal registry through 0033 with cleanup, apply the VNext runtime foundation through 0034 with cleanup, then run the latest migrator."
     return 0
   fi
 
@@ -1965,6 +1968,7 @@ run_managed_local_migration_sequence() {
   run_managed_local_migration_stage "Migrate managed local database through 0027" migrate-0027 || die "Managed local migration failed while applying migrations through 0027."
   run_managed_local_migration_stage "Apply S5 managed local migration with mandatory cleanup" s5 || die "Managed local migration failed while applying S5; its cleanup wrapper preserves the original migration failure."
   run_managed_local_migration_stage "Apply verification-goal registry migration with mandatory cleanup" registry || die "Managed local migration failed while applying the verification-goal registry; its cleanup wrapper preserves the original migration failure."
+  run_managed_local_migration_stage "Apply VNext runtime foundation with mandatory cleanup" runtime || die "Managed local migration failed while applying the VNext runtime foundation."
   run_managed_local_migration_stage "Run the latest managed local migrator" latest || die "Managed local migration failed while applying the latest migration set."
 }
 

@@ -2,14 +2,15 @@
 -- Existing Task/Project state remains authoritative until later slices perform
 -- the explicitly fenced compatibility migration. No legacy rows are backfilled
 -- or projected by this migration.
-SELECT public.forge_begin_epic_172_s4_owner_bootstrap_v1();
+-- The wrapper grants this dedicated, non-login owner only for the migration
+-- and always revokes it afterwards. Do not reuse the S4 owner: this is a
+-- separate generic-runtime authority boundary.
+SET ROLE forge_runtime_routines_owner;
 --> statement-breakpoint
-SET ROLE forge_s4_routines_owner;
---> statement-breakpoint
-CREATE TABLE missions (
+CREATE TABLE public.missions (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  owner_principal_type text NOT NULL,
-  owner_principal_id uuid NOT NULL,
+  owner_principal_type text NOT NULL DEFAULT 'user',
+  owner_principal_id uuid NOT NULL REFERENCES public.users(id) ON DELETE RESTRICT,
   desired_outcome_digest text NOT NULL,
   constraints_digest text NOT NULL,
   compatibility_pins jsonb NOT NULL,
@@ -19,7 +20,7 @@ CREATE TABLE missions (
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now(),
   terminal_at timestamptz,
-  CONSTRAINT missions_owner_type_chk CHECK (owner_principal_type IN ('user', 'service', 'workspace', 'operator')),
+  CONSTRAINT missions_owner_type_chk CHECK (owner_principal_type = 'user'),
   CONSTRAINT missions_digest_chk CHECK (desired_outcome_digest ~ '^[0-9a-f]{64}$' AND constraints_digest ~ '^[0-9a-f]{64}$'),
   CONSTRAINT missions_pins_chk CHECK (jsonb_typeof(compatibility_pins) = 'object'),
   CONSTRAINT missions_lifecycle_chk CHECK (lifecycle_state IN ('active', 'paused', 'terminal')),
@@ -31,9 +32,9 @@ CREATE TABLE missions (
   CONSTRAINT missions_revision_chk CHECK (state_revision >= 0)
 );
 --> statement-breakpoint
-CREATE TABLE executions (
+CREATE TABLE public.executions (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  mission_id uuid NOT NULL REFERENCES missions(id) ON DELETE RESTRICT,
+  mission_id uuid NOT NULL REFERENCES public.missions(id) ON DELETE RESTRICT,
   workflow_revision text NOT NULL,
   resource_bindings jsonb NOT NULL DEFAULT '[]'::jsonb,
   lifecycle_state text NOT NULL DEFAULT 'created',
@@ -60,10 +61,10 @@ CREATE TABLE executions (
   CONSTRAINT executions_revision_chk CHECK (state_revision >= 0)
 );
 --> statement-breakpoint
-CREATE TABLE task_mission_bindings (
-  task_id uuid PRIMARY KEY REFERENCES tasks(id) ON DELETE RESTRICT,
-  mission_id uuid NOT NULL UNIQUE REFERENCES missions(id) ON DELETE RESTRICT,
-  current_execution_id uuid REFERENCES executions(id) ON DELETE RESTRICT,
+CREATE TABLE public.task_mission_bindings (
+  task_id uuid PRIMARY KEY REFERENCES public.tasks(id) ON DELETE RESTRICT,
+  mission_id uuid NOT NULL UNIQUE REFERENCES public.missions(id) ON DELETE RESTRICT,
+  current_execution_id uuid REFERENCES public.executions(id) ON DELETE RESTRICT,
   current_execution_generation bigint NOT NULL DEFAULT 0,
   binding_version integer NOT NULL DEFAULT 1,
   created_at timestamptz NOT NULL DEFAULT now(),
@@ -71,7 +72,7 @@ CREATE TABLE task_mission_bindings (
   CONSTRAINT task_mission_bindings_version_chk CHECK (binding_version = 1)
 );
 --> statement-breakpoint
-CREATE TABLE runtime_transition_audits (
+CREATE TABLE public.runtime_transition_audits (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   entity_kind text NOT NULL,
   entity_id uuid NOT NULL,
@@ -91,13 +92,13 @@ CREATE TABLE runtime_transition_audits (
   CONSTRAINT runtime_transition_audits_unique_revision UNIQUE (entity_kind, entity_id, resulting_revision)
 );
 --> statement-breakpoint
-CREATE INDEX executions_mission_id_idx ON executions(mission_id, created_at);
-CREATE INDEX runtime_transition_audits_entity_idx ON runtime_transition_audits(entity_kind, entity_id, resulting_revision);
+CREATE INDEX executions_mission_id_idx ON public.executions(mission_id, created_at);
+CREATE INDEX runtime_transition_audits_entity_idx ON public.runtime_transition_audits(entity_kind, entity_id, resulting_revision);
 --> statement-breakpoint
 CREATE FUNCTION forge.guard_vnext_runtime_write_v1()
-RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$
+RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS $$
 BEGIN
-  IF session_user <> 'forge' OR current_user <> 'forge_s4_routines_owner' THEN
+  IF session_user <> 'forge' OR current_user <> 'forge_runtime_routines_owner' THEN
     RAISE EXCEPTION 'VNext runtime state is writable only through protected routines' USING ERRCODE = '42501';
   END IF;
   IF TG_OP IN ('UPDATE', 'DELETE') AND TG_TABLE_NAME = 'runtime_transition_audits' THEN
@@ -106,79 +107,103 @@ BEGIN
   RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
 END;
 $$;
---> statement-breakpoint
-CREATE TRIGGER missions_protected_write BEFORE INSERT OR UPDATE OR DELETE ON missions FOR EACH ROW EXECUTE FUNCTION forge.guard_vnext_runtime_write_v1();
-CREATE TRIGGER executions_protected_write BEFORE INSERT OR UPDATE OR DELETE ON executions FOR EACH ROW EXECUTE FUNCTION forge.guard_vnext_runtime_write_v1();
-CREATE TRIGGER task_mission_bindings_protected_write BEFORE INSERT OR UPDATE OR DELETE ON task_mission_bindings FOR EACH ROW EXECUTE FUNCTION forge.guard_vnext_runtime_write_v1();
-CREATE TRIGGER runtime_transition_audits_protected_write BEFORE INSERT OR UPDATE OR DELETE ON runtime_transition_audits FOR EACH ROW EXECUTE FUNCTION forge.guard_vnext_runtime_write_v1();
+CREATE TRIGGER missions_protected_write BEFORE INSERT OR UPDATE OR DELETE ON public.missions FOR EACH ROW EXECUTE FUNCTION forge.guard_vnext_runtime_write_v1();
+CREATE TRIGGER executions_protected_write BEFORE INSERT OR UPDATE OR DELETE ON public.executions FOR EACH ROW EXECUTE FUNCTION forge.guard_vnext_runtime_write_v1();
+CREATE TRIGGER task_mission_bindings_protected_write BEFORE INSERT OR UPDATE OR DELETE ON public.task_mission_bindings FOR EACH ROW EXECUTE FUNCTION forge.guard_vnext_runtime_write_v1();
+CREATE TRIGGER runtime_transition_audits_protected_write BEFORE INSERT OR UPDATE OR DELETE ON public.runtime_transition_audits FOR EACH ROW EXECUTE FUNCTION forge.guard_vnext_runtime_write_v1();
 --> statement-breakpoint
 CREATE FUNCTION forge.create_vnext_mission_v1(
-  p_mission_id uuid, p_execution_id uuid, p_owner_principal_type text, p_owner_principal_id uuid,
+  p_mission_id uuid, p_execution_id uuid, p_owner_user_id uuid,
   p_desired_outcome_digest text, p_constraints_digest text, p_compatibility_pins jsonb,
   p_workflow_revision text, p_resource_bindings jsonb, p_reason_code text
 ) RETURNS TABLE(mission_id uuid, execution_id uuid, occurred_at timestamptz)
-LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
 DECLARE v_now timestamptz := pg_catalog.clock_timestamp();
 BEGIN
   IF session_user <> 'forge' THEN RAISE EXCEPTION 'VNext mission creation requires Forge application login' USING ERRCODE = '42501'; END IF;
-  IF p_owner_principal_type NOT IN ('user', 'service', 'workspace', 'operator') OR p_owner_principal_id IS NULL
+  IF p_owner_user_id IS NULL
     OR p_desired_outcome_digest !~ '^[0-9a-f]{64}$' OR p_constraints_digest !~ '^[0-9a-f]{64}$'
-    OR jsonb_typeof(p_compatibility_pins) <> 'object' OR jsonb_typeof(p_resource_bindings) <> 'array'
-    OR length(btrim(p_workflow_revision)) NOT BETWEEN 1 AND 256
+    OR pg_catalog.jsonb_typeof(p_compatibility_pins) <> 'object' OR pg_catalog.jsonb_typeof(p_resource_bindings) <> 'array'
+    OR pg_catalog.length(pg_catalog.btrim(p_workflow_revision)) NOT BETWEEN 1 AND 256
     OR p_reason_code !~ '^vnext\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$' THEN
     RAISE EXCEPTION 'VNext mission creation arguments are invalid' USING ERRCODE = '22023';
   END IF;
-  INSERT INTO missions (id, owner_principal_type, owner_principal_id, desired_outcome_digest, constraints_digest, compatibility_pins, created_at, updated_at)
-  VALUES (p_mission_id, p_owner_principal_type, p_owner_principal_id, p_desired_outcome_digest, p_constraints_digest, p_compatibility_pins, v_now, v_now);
-  INSERT INTO executions (id, mission_id, workflow_revision, resource_bindings, created_at, updated_at)
+  IF NOT EXISTS (SELECT 1 FROM public.users WHERE id = p_owner_user_id) THEN
+    RAISE EXCEPTION 'VNext mission owner does not exist' USING ERRCODE = 'P3345';
+  END IF;
+  INSERT INTO public.missions (id, owner_principal_type, owner_principal_id, desired_outcome_digest, constraints_digest, compatibility_pins, created_at, updated_at)
+  VALUES (p_mission_id, 'user', p_owner_user_id, p_desired_outcome_digest, p_constraints_digest, p_compatibility_pins, v_now, v_now);
+  INSERT INTO public.executions (id, mission_id, workflow_revision, resource_bindings, created_at, updated_at)
   VALUES (p_execution_id, p_mission_id, p_workflow_revision, p_resource_bindings, v_now, v_now);
-  INSERT INTO runtime_transition_audits (entity_kind, entity_id, from_lifecycle_state, to_lifecycle_state, outcome, resulting_revision, actor_principal_type, actor_principal_id, reason_code, occurred_at)
+  INSERT INTO public.runtime_transition_audits (entity_kind, entity_id, from_lifecycle_state, to_lifecycle_state, outcome, resulting_revision, actor_principal_type, actor_principal_id, reason_code, occurred_at)
   VALUES
-    ('mission', p_mission_id, NULL, 'active', NULL, 0, p_owner_principal_type, p_owner_principal_id, p_reason_code, v_now),
-    ('execution', p_execution_id, NULL, 'created', NULL, 0, p_owner_principal_type, p_owner_principal_id, p_reason_code, v_now);
+    ('mission', p_mission_id, NULL, 'active', NULL, 0, 'user', p_owner_user_id, p_reason_code, v_now),
+    ('execution', p_execution_id, NULL, 'created', NULL, 0, 'user', p_owner_user_id, p_reason_code, v_now);
   RETURN QUERY SELECT p_mission_id, p_execution_id, v_now;
 END;
 $$;
 --> statement-breakpoint
 CREATE FUNCTION forge.transition_vnext_execution_v1(
   p_execution_id uuid, p_expected_revision bigint, p_to_lifecycle_state text, p_outcome text,
-  p_blocker_reason_code text, p_actor_principal_type text, p_actor_principal_id uuid,
+  p_blocker_reason_code text, p_actor_user_id uuid,
   p_reason_code text, p_evidence_digest text DEFAULT NULL
 ) RETURNS TABLE(resulting_revision bigint, occurred_at timestamptz)
-LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
-DECLARE v_from text; v_revision bigint; v_now timestamptz := pg_catalog.clock_timestamp();
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
+DECLARE v_from text; v_revision bigint; v_owner_user_id uuid; v_now timestamptz := pg_catalog.clock_timestamp();
 BEGIN
   IF session_user <> 'forge' THEN RAISE EXCEPTION 'VNext execution transition requires Forge application login' USING ERRCODE = '42501'; END IF;
-  IF p_expected_revision < 0 OR p_to_lifecycle_state NOT IN ('created','admitted','queued','leased','running','waiting','terminal')
+  IF p_expected_revision IS NULL OR p_expected_revision < 0 OR p_to_lifecycle_state NOT IN ('created','admitted','queued','leased','running','waiting','terminal')
     OR (p_to_lifecycle_state = 'terminal') <> (p_outcome IS NOT NULL)
     OR (p_outcome IS NOT NULL AND p_outcome NOT IN ('succeeded','failed','cancelled','rejected'))
-    OR p_actor_principal_type NOT IN ('user','service','workspace','operator') OR p_actor_principal_id IS NULL
+    OR p_actor_user_id IS NULL
     OR p_reason_code !~ '^vnext\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$'
     OR (p_blocker_reason_code IS NOT NULL AND p_blocker_reason_code !~ '^vnext\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$')
     OR (p_evidence_digest IS NOT NULL AND p_evidence_digest !~ '^[0-9a-f]{64}$') THEN
     RAISE EXCEPTION 'VNext execution transition arguments are invalid' USING ERRCODE = '22023';
   END IF;
-  SELECT lifecycle_state, state_revision INTO v_from, v_revision FROM executions WHERE id = p_execution_id FOR UPDATE;
+  SELECT execution.lifecycle_state, execution.state_revision, mission.owner_principal_id
+  INTO v_from, v_revision, v_owner_user_id
+  FROM public.executions execution
+  JOIN public.missions mission ON mission.id = execution.mission_id
+  WHERE execution.id = p_execution_id
+  FOR UPDATE OF execution, mission;
   IF NOT FOUND THEN RAISE EXCEPTION 'VNext execution does not exist' USING ERRCODE = 'P3342'; END IF;
+  IF v_owner_user_id IS DISTINCT FROM p_actor_user_id THEN
+    RAISE EXCEPTION 'VNext execution owner authorization failed' USING ERRCODE = 'P3345';
+  END IF;
   IF v_revision <> p_expected_revision THEN RAISE EXCEPTION 'VNext execution revision conflict' USING ERRCODE = 'P3343'; END IF;
   IF v_from = 'terminal' THEN RAISE EXCEPTION 'VNext execution terminal state is absorbing' USING ERRCODE = 'P3344'; END IF;
-  UPDATE executions SET lifecycle_state = p_to_lifecycle_state, outcome = p_outcome, blocker_reason_code = p_blocker_reason_code,
+  IF NOT (
+    (v_from = 'created' AND p_to_lifecycle_state IN ('admitted', 'terminal'))
+    OR (v_from = 'admitted' AND p_to_lifecycle_state IN ('queued', 'terminal'))
+    OR (v_from = 'queued' AND p_to_lifecycle_state IN ('leased', 'terminal'))
+    OR (v_from = 'leased' AND p_to_lifecycle_state IN ('running', 'queued', 'terminal'))
+    OR (v_from = 'running' AND p_to_lifecycle_state IN ('waiting', 'terminal'))
+    OR (v_from = 'waiting' AND p_to_lifecycle_state IN ('queued', 'terminal'))
+  ) THEN RAISE EXCEPTION 'VNext execution lifecycle transition is invalid' USING ERRCODE = 'P3346'; END IF;
+  IF (p_outcome = 'succeeded' AND v_from <> 'running')
+     OR (p_outcome = 'failed' AND v_from NOT IN ('leased', 'running', 'waiting'))
+     OR (p_outcome = 'rejected' AND v_from <> 'waiting') THEN
+    RAISE EXCEPTION 'VNext execution outcome is invalid for its lifecycle transition' USING ERRCODE = 'P3346';
+  END IF;
+  UPDATE public.executions SET lifecycle_state = p_to_lifecycle_state, outcome = p_outcome, blocker_reason_code = p_blocker_reason_code,
     state_revision = state_revision + 1, updated_at = v_now, terminal_at = CASE WHEN p_to_lifecycle_state = 'terminal' THEN v_now ELSE NULL END
   WHERE id = p_execution_id;
-  INSERT INTO runtime_transition_audits (entity_kind, entity_id, from_lifecycle_state, to_lifecycle_state, outcome, resulting_revision, actor_principal_type, actor_principal_id, reason_code, evidence_digest, occurred_at)
-  VALUES ('execution', p_execution_id, v_from, p_to_lifecycle_state, p_outcome, v_revision + 1, p_actor_principal_type, p_actor_principal_id, p_reason_code, p_evidence_digest, v_now);
+  INSERT INTO public.runtime_transition_audits (entity_kind, entity_id, from_lifecycle_state, to_lifecycle_state, outcome, resulting_revision, actor_principal_type, actor_principal_id, reason_code, evidence_digest, occurred_at)
+  VALUES ('execution', p_execution_id, v_from, p_to_lifecycle_state, p_outcome, v_revision + 1, 'user', p_actor_user_id, p_reason_code, p_evidence_digest, v_now);
   RETURN QUERY SELECT v_revision + 1, v_now;
 END;
 $$;
 --> statement-breakpoint
-REVOKE ALL ON TABLE missions, executions, task_mission_bindings, runtime_transition_audits FROM PUBLIC, forge;
+REVOKE ALL ON TABLE public.missions, public.executions, public.task_mission_bindings, public.runtime_transition_audits FROM PUBLIC, forge;
 REVOKE ALL ON FUNCTION forge.guard_vnext_runtime_write_v1() FROM PUBLIC;
-REVOKE ALL ON FUNCTION forge.create_vnext_mission_v1(uuid,uuid,text,uuid,text,text,jsonb,text,jsonb,text) FROM PUBLIC;
-REVOKE ALL ON FUNCTION forge.transition_vnext_execution_v1(uuid,bigint,text,text,text,text,uuid,text,text) FROM PUBLIC;
-GRANT SELECT ON TABLE missions, executions, task_mission_bindings, runtime_transition_audits TO forge;
-GRANT EXECUTE ON FUNCTION forge.create_vnext_mission_v1(uuid,uuid,text,uuid,text,text,jsonb,text,jsonb,text) TO forge;
-GRANT EXECUTE ON FUNCTION forge.transition_vnext_execution_v1(uuid,bigint,text,text,text,text,uuid,text,text) TO forge;
+REVOKE ALL ON FUNCTION forge.create_vnext_mission_v1(uuid,uuid,uuid,text,text,jsonb,text,jsonb,text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.transition_vnext_execution_v1(uuid,bigint,text,text,text,uuid,text,text) FROM PUBLIC;
+GRANT SELECT ON TABLE public.missions, public.executions, public.task_mission_bindings, public.runtime_transition_audits TO forge;
+-- Only the server-only runtime service exposes these fixed routines. It derives
+-- user identity from an authenticated session; there is no public owner/actor API.
+GRANT EXECUTE ON FUNCTION forge.create_vnext_mission_v1(uuid,uuid,uuid,text,text,jsonb,text,jsonb,text) TO forge;
+GRANT EXECUTE ON FUNCTION forge.transition_vnext_execution_v1(uuid,bigint,text,text,text,uuid,text,text) TO forge;
 --> statement-breakpoint
 RESET ROLE;
 --> statement-breakpoint
-SELECT public.forge_finalize_epic_172_s4_owner_bootstrap_v1();

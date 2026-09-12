@@ -95,7 +95,11 @@ export const missionRefSchema = z.object({
   lifecycle: missionLifecycleSchema,
   outcome: missionOutcomeSchema.nullable(),
   revision: revisionSchema,
-}).strict()
+}).strict().superRefine((value, context) => {
+  if (!isValidMissionState(value.lifecycle, value.outcome)) {
+    context.addIssue({ code: 'custom', message: 'Mission lifecycle and outcome are inconsistent.' })
+  }
+})
 export type MissionRef = z.infer<typeof missionRefSchema>
 
 export const executionRefSchema = z.object({
@@ -105,7 +109,11 @@ export const executionRefSchema = z.object({
   lifecycle: executionLifecycleSchema,
   outcome: executionOutcomeSchema.nullable(),
   revision: revisionSchema,
-}).strict()
+}).strict().superRefine((value, context) => {
+  if (!isValidExecutionState(value.lifecycle, value.outcome)) {
+    context.addIssue({ code: 'custom', message: 'Execution lifecycle and outcome are inconsistent.' })
+  }
+})
 export type ExecutionRef = z.infer<typeof executionRefSchema>
 
 export const executionContextSchema = z.object({

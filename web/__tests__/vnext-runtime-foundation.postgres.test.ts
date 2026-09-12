@@ -15,6 +15,7 @@ describe.skipIf(!enabled)('VNext runtime protected PostgreSQL foundation', () =>
   let app: ReturnType<typeof postgres>
   let admin: ReturnType<typeof postgres>
   const actor = randomUUID()
+  const otherActor = randomUUID()
   const mission = randomUUID()
   const execution = randomUUID()
   const digest = 'a'.repeat(64)
@@ -22,7 +23,7 @@ describe.skipIf(!enabled)('VNext runtime protected PostgreSQL foundation', () =>
   async function create(): Promise<void> {
     await app`
       select * from forge.create_vnext_mission_v1(
-        ${mission}::uuid, ${execution}::uuid, 'operator', ${actor}::uuid,
+        ${mission}::uuid, ${execution}::uuid, ${actor}::uuid,
         ${digest}, ${digest}, ${JSON.stringify({ version: 'v1', workflowRevision: 'zero-capability-v1', policyRevision: 'zero-capability-v1', budgetEnvelopeRevision: 'zero-capability-v1' })}::jsonb,
         'zero-capability-v1', '[]'::jsonb, 'vnext.mission.created'
       )
@@ -32,6 +33,7 @@ describe.skipIf(!enabled)('VNext runtime protected PostgreSQL foundation', () =>
   beforeAll(async () => {
     app = postgres(appUrl!, { max: 4, onnotice: () => {} })
     admin = postgres(adminUrl!, { max: 1, onnotice: () => {} })
+    await admin`insert into users (id, display_name) values (${actor}::uuid, 'runtime owner'), (${otherActor}::uuid, 'other runtime owner')`
   })
   afterAll(async () => { await app?.end({ timeout: 5 }); await admin?.end({ timeout: 5 }) })
 
@@ -48,11 +50,13 @@ describe.skipIf(!enabled)('VNext runtime protected PostgreSQL foundation', () =>
   })
 
   it('uses CAS so concurrent terminal transitions produce one audit revision', async () => {
-    const transition = () => app`select * from forge.transition_vnext_execution_v1(${execution}::uuid, 0::bigint, 'terminal', 'cancelled', null, 'operator', ${actor}::uuid, 'vnext.execution.cancelled', null)`
+    await expect(app`select * from forge.transition_vnext_execution_v1(${execution}::uuid, 0::bigint, 'running', null, null, ${actor}::uuid, 'vnext.execution.running', null)`).rejects.toMatchObject({ code: 'P3346' })
+    await expect(app`select * from forge.transition_vnext_execution_v1(${execution}::uuid, 0::bigint, 'terminal', 'cancelled', null, ${otherActor}::uuid, 'vnext.execution.cancelled', null)`).rejects.toMatchObject({ code: 'P3345' })
+    const transition = () => app`select * from forge.transition_vnext_execution_v1(${execution}::uuid, 0::bigint, 'terminal', 'cancelled', null, ${actor}::uuid, 'vnext.execution.cancelled', null)`
     const results = await Promise.allSettled([transition(), transition()])
     expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1)
     expect(results.filter((result) => result.status === 'rejected')).toHaveLength(1)
-    await expect(app`select * from forge.transition_vnext_execution_v1(${execution}::uuid, 1::bigint, 'terminal', 'failed', null, 'operator', ${actor}::uuid, 'vnext.execution.failed', null)`).rejects.toMatchObject({ code: 'P3344' })
+    await expect(app`select * from forge.transition_vnext_execution_v1(${execution}::uuid, 1::bigint, 'terminal', 'failed', null, ${actor}::uuid, 'vnext.execution.failed', null)`).rejects.toMatchObject({ code: 'P3344' })
     const audits = await admin`select resulting_revision, reason_code from runtime_transition_audits where entity_kind = 'execution' and entity_id = ${execution}::uuid order by resulting_revision`
     expect(audits).toHaveLength(2)
     expect(audits.map((row) => row.resulting_revision)).toEqual(['0', '1'])

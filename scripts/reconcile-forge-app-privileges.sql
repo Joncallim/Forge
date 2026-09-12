@@ -53,10 +53,10 @@ INSERT INTO forge_expected_protected_owner_inventory (relation_name, owner_name)
   ('local_effect_recovery_actions', 'forge_s4_routines_owner'),
   ('local_projection_archive_operations', 'forge_s4_routines_owner'),
   ('local_projection_archive_operation_checkpoints', 'forge_s4_routines_owner'),
-  ('missions', 'forge_s4_routines_owner'),
-  ('executions', 'forge_s4_routines_owner'),
-  ('task_mission_bindings', 'forge_s4_routines_owner'),
-  ('runtime_transition_audits', 'forge_s4_routines_owner');
+  ('missions', 'forge_runtime_routines_owner'),
+  ('executions', 'forge_runtime_routines_owner'),
+  ('task_mission_bindings', 'forge_runtime_routines_owner'),
+  ('runtime_transition_audits', 'forge_runtime_routines_owner');
 -- canonical-protected-owner-map-end
 
 DO $boundary$
@@ -87,7 +87,7 @@ BEGIN
   IF (
     SELECT count(*)
     FROM pg_catalog.pg_authid role_row
-    WHERE role_row.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner')
+    WHERE role_row.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner', 'forge_runtime_routines_owner')
       AND NOT role_row.rolcanlogin
       AND NOT role_row.rolinherit
       AND NOT role_row.rolsuper
@@ -98,15 +98,17 @@ BEGIN
       AND role_row.rolconnlimit = -1
       AND role_row.rolpassword IS NULL
       AND role_row.rolvaliduntil IS NULL
-  ) <> 2 OR EXISTS (
+  ) <> 3 OR EXISTS (
     SELECT 1
     FROM pg_catalog.pg_auth_members membership
     WHERE membership.roleid IN (
       'forge_release_routines_owner'::pg_catalog.regrole,
-      'forge_s4_routines_owner'::pg_catalog.regrole
+      'forge_s4_routines_owner'::pg_catalog.regrole,
+      'forge_runtime_routines_owner'::pg_catalog.regrole
     ) OR membership.member IN (
       'forge_release_routines_owner'::pg_catalog.regrole,
-      'forge_s4_routines_owner'::pg_catalog.regrole
+      'forge_s4_routines_owner'::pg_catalog.regrole,
+      'forge_runtime_routines_owner'::pg_catalog.regrole
     )
   ) THEN
     RAISE EXCEPTION 'protected owner roles are outside the exact safe boundary';
@@ -129,8 +131,8 @@ BEGIN
   JOIN pg_catalog.pg_roles owner_role ON owner_role.oid = relation.relowner
   WHERE namespace_row.nspname = 'public'
     AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
-    AND owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner');
-  IF protected_count < 40 THEN
+    AND owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner', 'forge_runtime_routines_owner');
+  IF protected_count < 44 THEN
     RAISE EXCEPTION 'protected ownership boundary is incomplete';
   END IF;
 END;
@@ -144,7 +146,7 @@ JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = relation.relna
 JOIN pg_catalog.pg_roles owner_role ON owner_role.oid = relation.relowner
 WHERE namespace_row.nspname = 'public'
   AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
-  AND owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner')
+  AND owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner', 'forge_runtime_routines_owner')
 ORDER BY relation.oid
 FOR UPDATE OF relation;
 
@@ -155,7 +157,7 @@ JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = relation.relna
 JOIN pg_catalog.pg_roles owner_role ON owner_role.oid = relation.relowner
 WHERE namespace_row.nspname = 'public'
   AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
-  AND owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner')
+  AND owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner', 'forge_runtime_routines_owner')
   AND attribute.attnum > 0
   AND NOT attribute.attisdropped
 ORDER BY attribute.attrelid, attribute.attnum
@@ -191,7 +193,7 @@ BEGIN
     JOIN pg_catalog.pg_roles owner_role ON owner_role.oid = relation.relowner
     WHERE namespace_row.nspname = 'public'
       AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
-      AND owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner')
+      AND owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner', 'forge_runtime_routines_owner')
     ORDER BY relation.oid
   LOOP
     EXECUTE pg_catalog.format(
@@ -288,7 +290,7 @@ BEGIN
   IF (
     SELECT count(*)
     FROM pg_catalog.pg_authid role_row
-    WHERE role_row.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner')
+    WHERE role_row.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner', 'forge_runtime_routines_owner')
       AND NOT role_row.rolcanlogin
       AND NOT role_row.rolinherit
       AND NOT role_row.rolsuper
@@ -299,15 +301,17 @@ BEGIN
       AND role_row.rolconnlimit = -1
       AND role_row.rolpassword IS NULL
       AND role_row.rolvaliduntil IS NULL
-  ) <> 2 OR EXISTS (
+  ) <> 3 OR EXISTS (
     SELECT 1
     FROM pg_catalog.pg_auth_members membership
     WHERE membership.roleid IN (
       'forge_release_routines_owner'::pg_catalog.regrole,
-      'forge_s4_routines_owner'::pg_catalog.regrole
+      'forge_s4_routines_owner'::pg_catalog.regrole,
+      'forge_runtime_routines_owner'::pg_catalog.regrole
     ) OR membership.member IN (
       'forge_release_routines_owner'::pg_catalog.regrole,
-      'forge_s4_routines_owner'::pg_catalog.regrole
+      'forge_s4_routines_owner'::pg_catalog.regrole,
+      'forge_runtime_routines_owner'::pg_catalog.regrole
     )
   ) THEN
     RAISE EXCEPTION 'protected owner roles changed during reconciliation';
@@ -333,6 +337,23 @@ BEGIN
       )
   ) THEN
     RAISE EXCEPTION 'verification goal registry commit routine owner or execute boundary is invalid';
+  END IF;
+  IF (SELECT count(*) FROM pg_catalog.pg_proc routine
+      WHERE routine.oid IN (
+        'forge.create_vnext_mission_v1(uuid,uuid,uuid,text,text,jsonb,text,jsonb,text)'::pg_catalog.regprocedure,
+        'forge.transition_vnext_execution_v1(uuid,bigint,text,text,text,uuid,text,text)'::pg_catalog.regprocedure
+      )
+        AND routine.proowner = 'forge_runtime_routines_owner'::pg_catalog.regrole
+        AND routine.prosecdef
+        AND routine.proconfig = ARRAY['search_path=pg_catalog']
+        AND pg_catalog.has_function_privilege('forge', routine.oid, 'EXECUTE')
+        AND NOT EXISTS (
+          SELECT 1 FROM pg_catalog.aclexplode(COALESCE(routine.proacl, pg_catalog.acldefault('f', routine.proowner))) privilege
+          WHERE privilege.privilege_type = 'EXECUTE'
+            AND privilege.grantee NOT IN ('forge'::pg_catalog.regrole, 'forge_runtime_routines_owner'::pg_catalog.regrole)
+        )
+  ) <> 2 THEN
+    RAISE EXCEPTION 'VNext runtime routine owner, search path, or execute boundary is invalid';
   END IF;
   IF EXISTS (
     SELECT 1
@@ -366,7 +387,7 @@ BEGIN
     ) privilege
     WHERE namespace_row.nspname = 'public'
       AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
-      AND owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner')
+      AND owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner', 'forge_runtime_routines_owner')
       AND privilege.grantee = 'forge'::pg_catalog.regrole
       AND (
         relation.relname NOT IN (
@@ -393,7 +414,7 @@ BEGIN
     CROSS JOIN LATERAL pg_catalog.aclexplode(attribute.attacl) privilege
     WHERE namespace_row.nspname = 'public'
       AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
-      AND owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner')
+      AND owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner', 'forge_runtime_routines_owner')
       AND attribute.attnum > 0
       AND NOT attribute.attisdropped
       AND privilege.grantee = 'forge'::pg_catalog.regrole
@@ -410,7 +431,7 @@ BEGIN
     ) privilege
     WHERE namespace_row.nspname = 'public'
       AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
-      AND owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner')
+      AND owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner', 'forge_runtime_routines_owner')
       AND privilege.grantee = 0
       AND (
         relation.relname <> 'forge_epic_172_s3_release_state'
@@ -427,7 +448,7 @@ BEGIN
     CROSS JOIN LATERAL pg_catalog.aclexplode(attribute.attacl) privilege
     WHERE namespace_row.nspname = 'public'
       AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
-      AND owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner')
+      AND owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner', 'forge_runtime_routines_owner')
       AND attribute.attnum > 0
       AND NOT attribute.attisdropped
       AND privilege.grantee = 0
@@ -442,7 +463,7 @@ BEGIN
     CROSS JOIN pg_catalog.pg_roles forge_role
     WHERE namespace_row.nspname = 'public'
       AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
-      AND owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner')
+      AND owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner', 'forge_runtime_routines_owner')
       AND forge_role.rolname = 'forge'
       AND (
         pg_catalog.has_table_privilege(forge_role.oid, relation.oid, 'INSERT')
