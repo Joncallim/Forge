@@ -24,15 +24,19 @@ async function main(): Promise<void> {
     end $$;`)
     if (process.argv.includes('--cleanup')) {
       await admin.unsafe(`revoke ${OWNER} from ${identifier(migrationRole)};`)
-      await admin.unsafe(`revoke create on schema public, forge from ${OWNER}; grant usage on schema forge to ${OWNER};`)
-      const [boundary] = await admin<{ membership: boolean; publicCreate: boolean; forgeCreate: boolean; forgeUsage: boolean }[]>`
+      await admin.unsafe(`revoke create on schema public, forge from ${OWNER}; revoke select, references on table public.users, public.tasks from ${OWNER}; grant usage on schema forge to ${OWNER};`)
+      const [boundary] = await admin<{ membership: boolean; publicCreate: boolean; forgeCreate: boolean; userSelect: boolean; userReferences: boolean; taskSelect: boolean; taskReferences: boolean; forgeUsage: boolean }[]>`
         select
           pg_catalog.pg_has_role(${migrationRole}::name, ${OWNER}::name, 'member') as membership,
           pg_catalog.has_schema_privilege(${OWNER}, 'public', 'create') as "publicCreate",
           pg_catalog.has_schema_privilege(${OWNER}, 'forge', 'create') as "forgeCreate",
+          pg_catalog.has_table_privilege(${OWNER}, 'public.users', 'select') as "userSelect",
+          pg_catalog.has_table_privilege(${OWNER}, 'public.users', 'references') as "userReferences",
+          pg_catalog.has_table_privilege(${OWNER}, 'public.tasks', 'select') as "taskSelect",
+          pg_catalog.has_table_privilege(${OWNER}, 'public.tasks', 'references') as "taskReferences",
           pg_catalog.has_schema_privilege(${OWNER}, 'forge', 'usage') as "forgeUsage"
       `
-      if (boundary.membership || boundary.publicCreate || boundary.forgeCreate || !boundary.forgeUsage) {
+      if (boundary.membership || boundary.publicCreate || boundary.forgeCreate || boundary.userSelect || boundary.userReferences || boundary.taskSelect || boundary.taskReferences || !boundary.forgeUsage) {
         throw new Error('The VNext runtime protected-owner cleanup did not restore the authority boundary.')
       }
       console.log('✓ Removed and verified the temporary VNext runtime owner handoff.')
@@ -44,7 +48,9 @@ async function main(): Promise<void> {
       from pg_catalog.pg_roles where rolname = ${OWNER}
     `
     if (!safeRole?.safe) throw new Error('The VNext runtime owner role is outside its exact non-login boundary.')
-    await admin.unsafe(`grant ${OWNER} to ${identifier(migrationRole)}; grant usage, create on schema public, forge to ${OWNER};`)
+    // The migration needs only schema creation plus the exact users FK and
+    // routine ownership read. Both grants are revoked in the EXIT cleanup.
+    await admin.unsafe(`grant ${OWNER} to ${identifier(migrationRole)}; grant usage, create on schema public, forge to ${OWNER}; grant select, references on table public.users, public.tasks to ${OWNER};`)
   } finally {
     await admin.end({ timeout: 5 })
   }

@@ -33,12 +33,12 @@ describe('VNext runtime server service', () => {
   it('rejects forged owner input and derives the owner from the authorized session', async () => {
     await expect(createMissionForAuthorizedSession(request, {
       version: 'v1', desiredOutcomeDigest: digest, constraintsDigest: digest, resourceBindings: [],
-      compatibilityPins: { version: 'v1', workflowRevision: 'zero', policyRevision: 'zero', budgetEnvelopeRevision: 'zero' },
+      compatibilityPins: { version: 'v1', workflowRevision: 'zero', policyRevision: 'zero', budgetEnvelopeRevision: 'zero', compatibilityMode: 'software_engineering_legacy_v1' },
       ownerUserId: '018f2a70-9d7b-7cc2-8c74-9ab3a301cf2f',
     }, store)).rejects.toThrow()
     await createMissionForAuthorizedSession(request, {
       version: 'v1', desiredOutcomeDigest: digest, constraintsDigest: digest, resourceBindings: [],
-      compatibilityPins: { version: 'v1', workflowRevision: 'zero', policyRevision: 'zero', budgetEnvelopeRevision: 'zero' },
+      compatibilityPins: { version: 'v1', workflowRevision: 'zero', policyRevision: 'zero', budgetEnvelopeRevision: 'zero', compatibilityMode: 'software_engineering_legacy_v1' },
     }, store)
     expect(store.createForUser).toHaveBeenCalledWith(expect.objectContaining({
       ownerUserId: '018f2a70-9d7b-7cc2-8c74-9ab3a301cf2f',
@@ -49,7 +49,7 @@ describe('VNext runtime server service', () => {
     await readMissionForAuthorizedSession(request, '018f2a70-9d7b-7cc2-8c74-9ab3a301cf2f', store)
     await expect(transitionExecutionForAuthorizedSession(request, '018f2a70-9d7b-7cc2-8c74-9ab3a301cf2f', {
       expectedRevision: '0', lifecycle: 'admitted', outcome: null, blockerReasonCode: null,
-      reasonCode: 'vnext.execution.admitted', evidenceDigest: null, actorUserId: 'forged',
+      reasonCode: 'execution.admitted', evidenceDigest: null, actorUserId: 'forged',
     }, store)).rejects.toThrow()
     expect(store.readMissionForUser).toHaveBeenCalledWith(expect.any(String), '018f2a70-9d7b-7cc2-8c74-9ab3a301cf2f')
   })
@@ -68,7 +68,7 @@ describe('VNext runtime server service', () => {
     expect(await readMissionForAuthorizedSession(request, '018f2a70-9d7b-7cc2-8c74-9ab3a301cf2f', isolatedStore)).toBeNull()
     await expect(transitionExecutionForAuthorizedSession(request, '018f2a70-9d7b-7cc2-8c74-9ab3a301cf2f', {
       expectedRevision: '0', lifecycle: 'admitted', outcome: null, blockerReasonCode: null,
-      reasonCode: 'vnext.execution.admitted', evidenceDigest: null,
+      reasonCode: 'execution.admitted', evidenceDigest: null,
     }, isolatedStore)).rejects.toThrow('owner authorization failed')
   })
 
@@ -76,7 +76,7 @@ describe('VNext runtime server service', () => {
     getAccessibleTask.mockResolvedValue({ submittedBy: '018f2a70-9d7b-7cc2-8c74-9ab3a301cf30' })
     await expect(createTaskMissionForAuthorizedSession(request, '018f2a70-9d7b-7cc2-8c74-9ab3a301cf2f', {
       version: 'v1', desiredOutcomeDigest: digest, constraintsDigest: digest, resourceBindings: [],
-      compatibilityPins: { version: 'v1', workflowRevision: 'zero', policyRevision: 'zero', budgetEnvelopeRevision: 'zero' },
+      compatibilityPins: { version: 'v1', workflowRevision: 'zero', policyRevision: 'zero', budgetEnvelopeRevision: 'zero', compatibilityMode: 'software_engineering_legacy_v1' },
     }, store)).rejects.toThrow('Runtime compatibility task not found')
   })
 

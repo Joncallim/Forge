@@ -239,18 +239,14 @@ REVOKE ALL ON FUNCTION public.forge_commit_verification_goal_registry_revision_v
 GRANT EXECUTE ON FUNCTION public.forge_commit_verification_goal_registry_revision_v1(
   uuid,uuid,uuid,uuid,timestamptz,text,uuid,bigint,bigint,timestamptz,text,jsonb
 ) TO forge;
-REVOKE ALL ON FUNCTION forge.create_vnext_mission_v1(
-  uuid,uuid,text,uuid,text,text,jsonb,text,jsonb,text
-) FROM PUBLIC, forge;
-REVOKE ALL ON FUNCTION forge.transition_vnext_execution_v1(
-  uuid,bigint,text,text,text,text,uuid,text,text
-) FROM PUBLIC, forge;
-GRANT EXECUTE ON FUNCTION forge.create_vnext_mission_v1(
-  uuid,uuid,text,uuid,text,text,jsonb,text,jsonb,text
-) TO forge;
-GRANT EXECUTE ON FUNCTION forge.transition_vnext_execution_v1(
-  uuid,bigint,text,text,text,text,uuid,text,text
-) TO forge;
+REVOKE ALL ON FUNCTION forge.create_vnext_mission_v1(uuid,uuid,uuid,uuid,text,text,jsonb,text,jsonb,text) FROM PUBLIC, forge;
+REVOKE ALL ON FUNCTION forge.transition_vnext_mission_v1(uuid,bigint,text,text,uuid,text,text) FROM PUBLIC, forge;
+REVOKE ALL ON FUNCTION forge.transition_vnext_execution_v1(uuid,bigint,text,text,text,uuid,text,text) FROM PUBLIC, forge;
+REVOKE ALL ON FUNCTION forge.advance_task_execution_pointer_v1(uuid,bigint,uuid,uuid,text) FROM PUBLIC, forge;
+GRANT EXECUTE ON FUNCTION forge.create_vnext_mission_v1(uuid,uuid,uuid,uuid,text,text,jsonb,text,jsonb,text) TO forge;
+GRANT EXECUTE ON FUNCTION forge.transition_vnext_mission_v1(uuid,bigint,text,text,uuid,text,text) TO forge;
+GRANT EXECUTE ON FUNCTION forge.transition_vnext_execution_v1(uuid,bigint,text,text,text,uuid,text,text) TO forge;
+GRANT EXECUTE ON FUNCTION forge.advance_task_execution_pointer_v1(uuid,bigint,uuid,uuid,text) TO forge;
 
 DO $verify$
 DECLARE
@@ -340,8 +336,10 @@ BEGIN
   END IF;
   IF (SELECT count(*) FROM pg_catalog.pg_proc routine
       WHERE routine.oid IN (
-        'forge.create_vnext_mission_v1(uuid,uuid,uuid,text,text,jsonb,text,jsonb,text)'::pg_catalog.regprocedure,
-        'forge.transition_vnext_execution_v1(uuid,bigint,text,text,text,uuid,text,text)'::pg_catalog.regprocedure
+        'forge.create_vnext_mission_v1(uuid,uuid,uuid,uuid,text,text,jsonb,text,jsonb,text)'::pg_catalog.regprocedure,
+        'forge.transition_vnext_mission_v1(uuid,bigint,text,text,uuid,text,text)'::pg_catalog.regprocedure,
+        'forge.transition_vnext_execution_v1(uuid,bigint,text,text,text,uuid,text,text)'::pg_catalog.regprocedure,
+        'forge.advance_task_execution_pointer_v1(uuid,bigint,uuid,uuid,text)'::pg_catalog.regprocedure
       )
         AND routine.proowner = 'forge_runtime_routines_owner'::pg_catalog.regrole
         AND routine.prosecdef
@@ -352,7 +350,7 @@ BEGIN
           WHERE privilege.privilege_type = 'EXECUTE'
             AND privilege.grantee NOT IN ('forge'::pg_catalog.regrole, 'forge_runtime_routines_owner'::pg_catalog.regrole)
         )
-  ) <> 2 THEN
+  ) <> 4 THEN
     RAISE EXCEPTION 'VNext runtime routine owner, search path, or execute boundary is invalid';
   END IF;
   IF EXISTS (

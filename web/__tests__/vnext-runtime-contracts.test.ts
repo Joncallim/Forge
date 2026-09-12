@@ -8,6 +8,7 @@ import {
   isValidMissionState,
   missionSpecSchema,
   missionRefSchema,
+  reasonCodeSchema,
 } from '@/lib/runtime/v1'
 
 const id = '018f2a70-9d7b-7cc2-8c74-9ab3a301cf2f'
@@ -18,7 +19,7 @@ describe('VNext runtime v1 contracts', () => {
     expect(missionSpecSchema.parse({
       version: 'v1', desiredOutcomeDigest: digest, constraintsDigest: digest,
       resourceBindings: [], parentMissionId: null,
-      compatibilityPins: { version: 'v1', workflowRevision: 'zero-capability-v1', policyRevision: 'zero-capability-v1', budgetEnvelopeRevision: 'zero-capability-v1' },
+      compatibilityPins: { version: 'v1', workflowRevision: 'zero-capability-v1', policyRevision: 'zero-capability-v1', budgetEnvelopeRevision: 'zero-capability-v1', compatibilityMode: 'software_engineering_legacy_v1' },
     }).resourceBindings).toEqual([])
   })
 
@@ -43,5 +44,13 @@ describe('VNext runtime v1 contracts', () => {
       principal: { version: 'v1', type: 'user', id }, workflowRevision: 'zero-capability-v1', resourceBindings: [], blockerReasonCode: null,
       implicitGrant: { capability: 'repository.write' },
     })).toThrow()
+  })
+
+  it('uses the closed SPEC-0007 registry and exact accepted lifecycle values', () => {
+    expect(reasonCodeSchema.parse('execution.indeterminate')).toBe('execution.indeterminate')
+    expect(() => reasonCodeSchema.parse('vnext.execution.running')).toThrow()
+    expect(missionRefSchema.parse({ version: 'v1', id, owner: { version: 'v1', type: 'user', id }, lifecycle: 'draft', outcome: null, revision: '9007199254740993' }).revision).toBe('9007199254740993')
+    expect(() => missionRefSchema.parse({ version: 'v1', id, owner: { version: 'v1', type: 'user', id }, lifecycle: 'waiting', outcome: null, revision: '01' })).toThrow()
+    expect(() => executionRefSchema.parse({ version: 'v1', id, missionId: id, lifecycle: 'terminal', outcome: 'rejected', revision: '1' })).toThrow()
   })
 })

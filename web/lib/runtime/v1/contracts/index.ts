@@ -4,12 +4,35 @@ import { z } from 'zod'
 // queues, providers, or UI.  They describe generic runtime data, not authority to
 // perform a side effect.
 export const runtimeContractVersion = 'v1' as const
+// Forge's existing random UUID identities are the accepted opaque equivalent
+// to UUIDv7 for this additive slice.  They carry no type, hierarchy, owner, or
+// lifecycle information; a later ordered-ID migration must not re-key them.
 export const opaqueIdSchema = z.string().uuid()
 export const digestSchema = z.string().regex(/^[a-f0-9]{64}$/)
 // Revisions cross JSON as canonical decimal strings. This avoids unsafe JS
 // numbers while remaining compatible with the repository's ES2017 target.
 export const revisionSchema = z.string().regex(/^(0|[1-9][0-9]*)$/)
-export const reasonCodeSchema = z.string().regex(/^vnext\.[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$/)
+export const reasonCodes = [
+  'internal.error', 'auth.unauthorized', 'auth.credentials_missing', 'auth.credentials_expired', 'auth.session_expired',
+  'policy.denied', 'policy.evaluation_error', 'policy.missing', 'policy.version_mismatch',
+  'grant.denied', 'grant.expired', 'grant.revoked', 'grant.missing', 'grant.insufficient_scope', 'grant.parent_revoked',
+  'resource.not_found', 'resource.access_denied', 'resource.classification_denied', 'resource.locked',
+  'budget.exhausted', 'budget.reservation_failed', 'budget.unknown_cost', 'budget.ceiling_exceeded',
+  'provider.unavailable', 'provider.configuration_error', 'provider.authentication_error', 'provider.quota_exhausted', 'provider.rate_limited', 'provider.timeout',
+  'model.invocation_failed', 'model.refused', 'model.output_validation_failed', 'model.context_exceeded',
+  'operation.invalid_input', 'operation.validation_failed', 'operation.timeout', 'operation.cancelled', 'operation.unsupported_resource', 'operation.version_mismatch',
+  'side_effect.submission_uncertain', 'side_effect.reconciliation_failed', 'side_effect.human_required', 'side_effect.duplicate_prevented',
+  'execution.admitted', 'execution.queued', 'execution.leased', 'execution.running', 'execution.waiting', 'execution.succeeded', 'execution.failed', 'execution.admission_denied', 'execution.lease_lost', 'execution.timeout', 'execution.cancelled', 'execution.blocked', 'execution.indeterminate',
+  'mission.created', 'mission.activated', 'mission.waiting', 'mission.paused', 'mission.succeeded', 'mission.failed', 'mission.not_found', 'mission.terminal', 'mission.cancelled',
+  'queue.full', 'queue.rate_limited', 'queue.dispatch_failed', 'trigger.invalid_event', 'trigger.deduplicated', 'trigger.loop_prevented', 'trigger.processing_failed',
+  'verification.evidence_missing', 'verification.evidence_stale', 'verification.gate_blocked', 'verification.self_verification_denied',
+  'gate.evaluation_error', 'gate.evidence_insufficient', 'gate.human_required',
+  'package.install_failed', 'package.validation_failed', 'package.version_mismatch',
+  'adapter.unavailable', 'adapter.invalid_response', 'adapter.capability_unsupported',
+  'migration.in_progress', 'migration.validation_failed', 'migration.rollback_required',
+  'security.policy_violation', 'security.audit_failed', 'security.integrity_violation',
+] as const
+export const reasonCodeSchema = z.enum(reasonCodes)
 
 export const principalRefSchema = z.object({
   version: z.literal(runtimeContractVersion),
@@ -66,16 +89,19 @@ export const grantEnvelopeSchema = z.object({
 }).strict()
 export type GrantEnvelope = z.infer<typeof grantEnvelopeSchema>
 
-export const missionLifecycleSchema = z.enum(['active', 'paused', 'terminal'])
+export const missionLifecycleSchema = z.enum(['draft', 'active', 'waiting', 'paused', 'terminal'])
 export const missionOutcomeSchema = z.enum(['succeeded', 'failed', 'cancelled'])
 export const executionLifecycleSchema = z.enum(['created', 'admitted', 'queued', 'leased', 'running', 'waiting', 'terminal'])
-export const executionOutcomeSchema = z.enum(['succeeded', 'failed', 'cancelled', 'rejected'])
+export const executionOutcomeSchema = z.enum(['succeeded', 'failed', 'cancelled', 'blocked', 'indeterminate'])
 
 export const compatibilityPinsSchema = z.object({
   version: z.literal(runtimeContractVersion),
   workflowRevision: z.string().min(1).max(256),
   policyRevision: z.string().min(1).max(256),
   budgetEnvelopeRevision: z.string().min(1).max(256),
+  // A compatibility pin is a truthful reference to the existing coding path,
+  // not a hidden Phase-1 budget reservation or Workflow executor.
+  compatibilityMode: z.literal('software_engineering_legacy_v1'),
 }).strict()
 
 export const missionSpecSchema = z.object({

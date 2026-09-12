@@ -19,4 +19,4 @@ cleanup() {
 trap cleanup EXIT
 
 npx tsx scripts/bootstrap-vnext-runtime-owner.ts
-npx tsx db/migrate.ts
+npx tsx scripts/ci/migrate-through-0034.ts
