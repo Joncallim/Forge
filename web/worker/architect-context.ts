@@ -113,7 +113,7 @@ export async function buildWebResearchContext(signal?: AbortSignal): Promise<str
   }
 
   if (signal?.aborted) {
-    return 'Public web research: unavailable. No external request was made.'
+    return 'Public web research: unavailable because the workflow was cancelled before research started.'
   }
 
   const groups = await Promise.all(topicsForPublicResearchPurpose('architect_planning').map(async (topicId) => ({
@@ -122,7 +122,7 @@ export async function buildWebResearchContext(signal?: AbortSignal): Promise<str
   })))
 
   if (signal?.aborted) {
-    return 'Public web research: unavailable. No external request was made.'
+    return 'Public web research: unavailable because the workflow was cancelled; any in-flight results were discarded.'
   }
 
   const lines = [

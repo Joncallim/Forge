@@ -84,6 +84,28 @@ describe('public web research privacy boundary', () => {
     expect(requestSignal?.aborted).toBe(true)
   })
 
+  it('does not claim that no request was made after cancellation interrupts research', async () => {
+    vi.stubEnv('FORGE_AGENT_WEB_SEARCH', '1')
+    const preAborted = new AbortController()
+    preAborted.abort()
+    await expect(buildWebResearchContext(preAborted.signal)).resolves.toContain('before research started')
+
+    const controller = new AbortController()
+    let requestSignal: AbortSignal | undefined
+    vi.stubGlobal('fetch', vi.fn((_url: URL, init?: RequestInit) => new Promise((_resolve, reject) => {
+      requestSignal = init?.signal ?? undefined
+      requestSignal?.addEventListener('abort', () => reject(requestSignal?.reason), { once: true })
+    })))
+
+    const context = buildWebResearchContext(controller.signal)
+    await vi.waitFor(() => expect(requestSignal).toBeDefined())
+    controller.abort(new Error('architect claim lost'))
+
+    const cancelledContext = await context
+    expect(cancelledContext).toContain('in-flight results were discarded')
+    expect(cancelledContext).not.toContain('No external request was made')
+  })
+
   it('retains the four-second request bound when no external cancellation occurs', async () => {
     vi.useFakeTimers()
     let requestSignal: AbortSignal | undefined

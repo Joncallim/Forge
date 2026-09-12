@@ -34,7 +34,7 @@ afterEach(() => {
   vi.clearAllMocks()
 })
 
-function evaluationOptions() {
+function evaluationOptions(): Parameters<typeof evaluateAgentRoles>[0] {
   return {
     agentConfigs: [{
       agentType: 'architect',
@@ -47,7 +47,7 @@ function evaluationOptions() {
       providerType: 'openai',
       modelId: 'test-model',
     }],
-  } as never
+  } as Parameters<typeof evaluateAgentRoles>[0]
 }
 
 function mockEvaluationDependencies() {
@@ -116,5 +116,48 @@ describe('evaluateAgentRoles public-web boundary', () => {
     expect(url.searchParams.get('q')).toBe('software engineering agent code review security practices')
     expect(url.toString()).not.toContain(SENTINEL)
     expect(vi.mocked(generateText).mock.calls[0]?.[0]?.prompt).toContain('UNTRUSTED DATA')
+  })
+
+  it('does not start public research or a provider call when evaluation is already cancelled', async () => {
+    vi.stubEnv('FORGE_AGENT_WEB_SEARCH', '1')
+    const controller = new AbortController()
+    controller.abort(new Error('request closed'))
+    const fetchSpy = vi.fn()
+    vi.stubGlobal('fetch', fetchSpy)
+    mockEvaluationDependencies()
+
+    await expect(evaluateAgentRoles({ ...evaluationOptions(), signal: controller.signal })).rejects.toThrow('request closed')
+
+    expect(fetchSpy).not.toHaveBeenCalled()
+    expect(generateText).not.toHaveBeenCalled()
+  })
+
+  it('cancels in-flight public research and does not fall through to a provider retry', async () => {
+    vi.stubEnv('FORGE_AGENT_WEB_SEARCH', '1')
+    const controller = new AbortController()
+    let requestSignal: AbortSignal | undefined
+    vi.stubGlobal('fetch', vi.fn((_url: URL, init?: RequestInit) => new Promise((_resolve, reject) => {
+      requestSignal = init?.signal ?? undefined
+      requestSignal?.addEventListener('abort', () => reject(requestSignal?.reason), { once: true })
+    })))
+    mockEvaluationDependencies()
+
+    const evaluation = evaluateAgentRoles({ ...evaluationOptions(), signal: controller.signal })
+    await vi.waitFor(() => expect(requestSignal).toBeDefined())
+    controller.abort(new Error('request closed while researching'))
+
+    await expect(evaluation).rejects.toThrow('request closed while researching')
+    expect(requestSignal?.aborted).toBe(true)
+    expect(generateText).not.toHaveBeenCalled()
+  })
+
+  it('passes the request cancellation signal to the AI SDK provider call', async () => {
+    vi.stubEnv('FORGE_AGENT_WEB_SEARCH', '0')
+    const controller = new AbortController()
+    mockEvaluationDependencies()
+
+    await evaluateAgentRoles({ ...evaluationOptions(), signal: controller.signal })
+
+    expect(vi.mocked(generateText).mock.calls[0]?.[0]?.abortSignal).toBe(controller.signal)
   })
 })
