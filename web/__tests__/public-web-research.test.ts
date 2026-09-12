@@ -8,6 +8,7 @@ const SENTINEL = 'PRIVATE_TASK_PROMPT_PROJECT_REPOSITORY_ARTIFACT_SECRET'
 const originalFetch = globalThis.fetch
 
 afterEach(() => {
+  vi.useRealTimers()
   vi.unstubAllEnvs()
   vi.unstubAllGlobals()
   globalThis.fetch = originalFetch
@@ -57,6 +58,46 @@ describe('public web research privacy boundary', () => {
     expect(init).toMatchObject({ credentials: 'omit', redirect: 'error', referrerPolicy: 'no-referrer' })
     expect(context).toContain('UNTRUSTED DATA')
     expect(context).toContain('ordinary result')
+  })
+
+  it('does not start or continue public search after the owning workflow is cancelled', async () => {
+    const preAborted = new AbortController()
+    preAborted.abort()
+    const fetchSpy = vi.fn()
+    vi.stubGlobal('fetch', fetchSpy)
+
+    await expect(researchPublicTopic('software_engineering_basics', preAborted.signal)).resolves.toEqual([])
+    expect(fetchSpy).not.toHaveBeenCalled()
+
+    const controller = new AbortController()
+    let requestSignal: AbortSignal | undefined
+    vi.stubGlobal('fetch', vi.fn((_url: URL, init?: RequestInit) => new Promise((_resolve, reject) => {
+      requestSignal = init?.signal ?? undefined
+      requestSignal?.addEventListener('abort', () => reject(requestSignal?.reason), { once: true })
+    })))
+
+    const research = researchPublicTopic('software_engineering_basics', controller.signal)
+    await vi.waitFor(() => expect(requestSignal).toBeDefined())
+    controller.abort(new Error('architect claim lost'))
+
+    await expect(research).resolves.toEqual([])
+    expect(requestSignal?.aborted).toBe(true)
+  })
+
+  it('retains the four-second request bound when no external cancellation occurs', async () => {
+    vi.useFakeTimers()
+    let requestSignal: AbortSignal | undefined
+    vi.stubGlobal('fetch', vi.fn((_url: URL, init?: RequestInit) => new Promise((_resolve, reject) => {
+      requestSignal = init?.signal ?? undefined
+      requestSignal?.addEventListener('abort', () => reject(requestSignal?.reason), { once: true })
+    })))
+
+    const research = researchPublicTopic('software_engineering_basics', new AbortController().signal)
+    expect(requestSignal).toBeDefined()
+
+    await vi.advanceTimersByTimeAsync(4_000)
+    await expect(research).resolves.toEqual([])
+    expect(requestSignal?.aborted).toBe(true)
   })
 
   it('rejects redirects, non-JSON, oversized bodies, and unsafe result links without exposing request data', async () => {

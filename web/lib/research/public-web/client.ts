@@ -86,10 +86,21 @@ async function boundedJson(response: Response): Promise<DuckDuckGoResponse | nul
  * The only pre-#335 public-search egress seam. It accepts a trusted closed
  * topic ID, never caller-provided text, and returns untrusted evidence only.
  */
-export async function researchPublicTopic(topicId: PublicResearchTopicId): Promise<readonly PublicWebResult[]> {
+export async function researchPublicTopic(
+  topicId: PublicResearchTopicId,
+  externalSignal?: AbortSignal,
+): Promise<readonly PublicWebResult[]> {
+  // Do not even construct a request after the owning workflow has been cancelled.
+  if (externalSignal?.aborted) return []
+
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), TIMEOUT_MS)
+  const abortForExternalSignal = (): void => controller.abort(externalSignal?.reason)
+  if (externalSignal) {
+    externalSignal.addEventListener('abort', abortForExternalSignal, { once: true })
+  }
   try {
+    if (controller.signal.aborted) return []
     const url = new URL(ENDPOINT)
     url.searchParams.set('q', PUBLIC_RESEARCH_TOPICS[topicId])
     url.searchParams.set('format', 'json')
@@ -123,5 +134,6 @@ export async function researchPublicTopic(topicId: PublicResearchTopicId): Promi
     return []
   } finally {
     clearTimeout(timeout)
+    externalSignal?.removeEventListener('abort', abortForExternalSignal)
   }
 }

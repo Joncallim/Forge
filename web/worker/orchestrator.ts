@@ -1040,7 +1040,7 @@ async function runArchitect(
       const profile = detectSoftwareProfile(task, project)
       const [specialistContext, webResearchContext, configuredAgents, workspace] = await Promise.all([
         Promise.resolve(buildSpecialistContext(profile)),
-        buildWebResearchContext(),
+        buildWebResearchContext(claimLeaseFence.signal),
         loadAgentCatalog(),
         getWorkspaceSettings({ ensure: false }),
       ])

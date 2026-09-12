@@ -9,6 +9,7 @@ const {
   mockDbInsert,
   mockDbSelect,
   mockDbUpdate,
+  mockBuildWebResearchContext,
   mockGetModel,
   mockGetProjectMcpOverview,
   mockGetProvider,
@@ -24,6 +25,7 @@ const {
   mockDbInsert: vi.fn(),
   mockDbSelect: vi.fn(),
   mockDbUpdate: vi.fn(),
+  mockBuildWebResearchContext: vi.fn(),
   mockGetModel: vi.fn(),
   mockGetProjectMcpOverview: vi.fn(),
   mockGetProvider: vi.fn(),
@@ -71,7 +73,7 @@ vi.mock('@/lib/workspace', () => ({
 }))
 vi.mock('@/worker/architect-context', () => ({
   buildSpecialistContext: vi.fn().mockReturnValue(''),
-  buildWebResearchContext: vi.fn().mockResolvedValue(''),
+  buildWebResearchContext: mockBuildWebResearchContext,
   detectSoftwareProfile: vi.fn().mockReturnValue({}),
 }))
 vi.mock('@/worker/events', () => ({
@@ -113,6 +115,7 @@ describe('Architect queue-claim cancellation', () => {
 
   beforeEach(() => {
     vi.clearAllMocks()
+    mockBuildWebResearchContext.mockResolvedValue('')
     delete process.env.FORGE_WORKER_MOCK_ARCHITECT
   })
 
@@ -246,6 +249,7 @@ describe('Architect queue-claim cancellation', () => {
       }),
       signal: fence.signal,
     }))
+    expect(mockBuildWebResearchContext).toHaveBeenCalledWith(fence.signal)
     expect(insertedRuns[0]).toEqual(expect.objectContaining({
       acpExecutionMode: 'not_applicable',
       modelIdUsed: 'model-1',
