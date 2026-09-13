@@ -43,6 +43,7 @@ describe('VNext Phase 0 A1 executable conformance contract', () => {
     const staticBinding = manifest.runnerBindings.find((binding) => binding.id === 'a1-vitest-static')
     const postgresBinding = manifest.runnerBindings.find((binding) => binding.id === 'a1-vitest-postgres')
     const recoveryBinding = manifest.runnerBindings.find((binding) => binding.id === 'a1-protected-migration-recovery')
+    const controllerBinding = manifest.runnerBindings.find((binding) => binding.id === 'a1-controller-sigkill-restart')
     expect(staticBinding).toMatchObject({ runner: 'vitest', command: 'npx vitest run __tests__/vnext-phase0-conformance.contract.test.ts', forbidSkipped: true })
     expect(staticBinding?.executionKeys).toEqual(staticScenarioIds.map((id) => `vitest::${id}`))
     expect(postgresBinding).toMatchObject({ runner: 'vitest', forbidSkipped: true })
@@ -57,16 +58,29 @@ describe('VNext Phase 0 A1 executable conformance contract', () => {
       forbidSkipped: true,
       executionKeys: recoveryScenarioIds.map((id) => `command::${id}`),
     })
+    expect(controllerBinding).toMatchObject({
+      runner: 'command',
+      command: 'npm run test:managed-migration-controller-restart',
+      forbidSkipped: true,
+      executionKeys: ['command::vnext.a1.controller-sigkill-restart'],
+    })
     for (const proofId of ['C5a-protected-cleanup-failure', 'C5b-protected-restart', 'C5c-protected-reupgrade']) {
       expect(manifest.proofs.find((proof) => proof.id === proofId)).toMatchObject({
         runnerBinding: 'a1-protected-migration-recovery',
         file: 'scripts/ci/prove-vnext-protected-migration-handoff-recovery.ts',
       })
     }
+    expect(manifest.proofs.find((proof) => proof.id === 'C5d-controller-sigkill-restart')).toEqual({
+      id: 'C5d-controller-sigkill-restart',
+      runnerBinding: 'a1-controller-sigkill-restart',
+      file: 'scripts/ci/prove-managed-migration-controller-restart.ts',
+      scenarioIds: ['vnext.a1.controller-sigkill-restart'],
+    })
     expect(manifest.proofs.flatMap((proof) => proof.scenarioIds)).toEqual([
       'vnext.a1.contracts', 'vnext.a1.schema', 'vnext.a1.service-owner-cas',
       'vnext.a1.protected-postgres', 'vnext.a1.projectless-lifecycle',
-      ...recoveryScenarioIds, 'vnext.a1.pointer-concurrency-fixture-boundary', 'vnext.a1.manifest-identity',
+      ...recoveryScenarioIds, 'vnext.a1.controller-sigkill-restart',
+      'vnext.a1.pointer-concurrency-fixture-boundary', 'vnext.a1.manifest-identity',
     ])
   })
 })

@@ -1,15 +1,17 @@
 /** Managed-Docker protected migration lifecycle. This controller owns the
  * complete fence: application quiescence through verified cleanup. */
 import '../lib/load-env'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { execFile } from 'node:child_process'
 import { readFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
 import { promisify } from 'node:util'
 import postgres from 'postgres'
 import { getRequiredEnv } from '@/lib/env'
-import { assertProtectedMigrationLiveAttestation, ensureProtectedMigrationState, recordProtectedMigrationCleanup, recordProtectedMigrationHandoff } from './ci/protected-migration-state'
+import { assertProtectedMigrationLiveAttestation, ensureProtectedMigrationState, markProtectedMigrationControllerFenced, prepareProtectedMigrationController, recordProtectedMigrationCleanup, recordProtectedMigrationHandoff, type ProtectedMigrationDatabaseSnapshot } from './ci/protected-migration-state'
 import { assertProtectedMigrationMarkers, protectedMigrationForTag } from './ci/protected-migration-registry'
+import { createEphemeralMigrationUrl, createMigrationChildEnvironment } from './ci/managed-migration-child-environment'
+import { runWithDatabaseUrlSentinel } from './ci/bootstrap-database-urls'
 import { runEpic172ReleaseRoleBootstrap } from './bootstrap-epic-172-release-roles'
 import { runEpic172S3OwnerBootstrap } from './bootstrap-epic-172-s3-release-owner'
 import { runEpic172S4RoleBootstrap } from './bootstrap-epic-172-s4-roles'
@@ -18,57 +20,176 @@ import { runEpic172S5OwnerBootstrap } from './bootstrap-epic-172-s5-recovery-own
 
 const LOCK = 334001
 const RUNTIME_MIGRATION_TAG = '0034_vnext_phase0_a1_runtime_foundation'
+const RUNTIME_MIGRATION_CREATED_AT = 1786838400000
 const OWNER = 'forge_runtime_routines_owner'
 const API = 'forge_runtime_api'
 const execFileAsync = promisify(execFile)
 const safe = (value: string) => { if (!/^[a-z_][a-z0-9_]*$/i.test(value)) throw new Error('Unsafe PostgreSQL identifier.'); return `"${value}"` }
-
-function migrationUrl(adminUrl: string, migrationRole: string, migrationPassword: string): string {
-  const result = new URL(adminUrl)
-  result.username = migrationRole
-  result.password = migrationPassword
-  return result.toString()
+type DatabaseAcl = Array<{ grantorOid: number; grantor: string; granteeOid: number; grantee: string; privilege: string; grantable: boolean }>
+const quoteCatalogIdentifier = (value: string) => `"${value.replaceAll('"', '""')}"`
+const normalizeDatabaseAcl = (value: unknown): DatabaseAcl => {
+  if (!Array.isArray(value)) throw new Error('Managed migration durable database ACL is not an array.')
+  return value.map((candidate) => {
+    const entry = candidate as Partial<DatabaseAcl[number]>
+    if (!Number.isInteger(entry.grantorOid) || Number(entry.grantorOid) <= 0 || typeof entry.grantor !== 'string' || entry.grantor.length === 0
+      || !Number.isInteger(entry.granteeOid) || Number(entry.granteeOid) < 0 || typeof entry.grantee !== 'string' || entry.grantee.length === 0
+      || (entry.granteeOid === 0) !== (entry.grantee === 'PUBLIC')
+      || !['CONNECT', 'CREATE', 'TEMPORARY'].includes(entry.privilege ?? '') || typeof entry.grantable !== 'boolean') {
+      throw new Error('Managed migration durable database ACL contains an invalid entry.')
+    }
+    return entry as DatabaseAcl[number]
+  })
+}
+const databaseSnapshotDigest = (databaseName: string, databaseOid: number, databaseOwnerOid: number, acl: unknown) => {
+  const normalizedAcl = normalizeDatabaseAcl(acl).map((entry) => [entry.grantorOid, entry.grantor, entry.granteeOid, entry.grantee, entry.privilege, entry.grantable])
+  return createHash('sha256').update(JSON.stringify([databaseName, databaseOid, databaseOwnerOid, normalizedAcl])).digest('hex')
 }
 
-/** The trusted historical bootstrap modules keep their own exact catalog
- * verification.  Calling them here keeps the administrator secret in the
- * one-shot controller process; no migration child inherits it. */
-async function withControllerMigrationIdentity<T>(url: string, run: () => Promise<T>): Promise<T> {
-  const previous = process.env.DATABASE_URL
-  process.env.DATABASE_URL = url
-  try { return await run() } finally {
-    if (previous === undefined) delete process.env.DATABASE_URL
-    else process.env.DATABASE_URL = previous
+function orderAclReplay(snapshot: ProtectedMigrationDatabaseSnapshot): DatabaseAcl {
+  const pending = [...normalizeDatabaseAcl(snapshot.acl)]
+  const ordered: DatabaseAcl = []
+  const grantAuthority = new Map<string, Set<number>>()
+  for (const privilege of ['CONNECT', 'CREATE', 'TEMPORARY']) grantAuthority.set(privilege, new Set([snapshot.databaseOwnerOid]))
+  while (pending.length > 0) {
+    const index = pending.findIndex((entry) => grantAuthority.get(entry.privilege)?.has(entry.grantorOid))
+    if (index < 0) throw new Error('Managed migration durable database ACL has an unreplayable grantor dependency.')
+    const [entry] = pending.splice(index, 1)
+    ordered.push(entry)
+    if (entry.grantable && entry.granteeOid !== 0) grantAuthority.get(entry.privilege)?.add(entry.granteeOid)
+  }
+  return ordered
+}
+
+async function snapshotDatabaseAcl(sql: ReturnType<typeof postgres>): Promise<ProtectedMigrationDatabaseSnapshot> {
+  const [identity] = await sql<{ databaseName: string; databaseOid: number; databaseOwnerOid: number }[]>`
+    select datname as "databaseName", oid::integer as "databaseOid", datdba::integer as "databaseOwnerOid"
+    from pg_catalog.pg_database where datname=pg_catalog.current_database()
+  `
+  if (!identity) throw new Error('Managed migration could not identify its target database.')
+  const aclRows = await sql<DatabaseAcl>`
+    select acl.grantor::integer as "grantorOid", grantor_role.rolname as grantor,
+      acl.grantee::integer as "granteeOid", case when acl.grantee=0 then 'PUBLIC' else grantee_role.rolname end as grantee,
+      acl.privilege_type as privilege, acl.is_grantable as grantable
+    from pg_catalog.pg_database database_row
+    cross join lateral pg_catalog.aclexplode(coalesce(database_row.datacl, pg_catalog.acldefault('d',database_row.datdba))) acl
+    join pg_catalog.pg_roles grantor_role on grantor_role.oid=acl.grantor
+    left join pg_catalog.pg_roles grantee_role on grantee_role.oid=acl.grantee
+    where database_row.datname=pg_catalog.current_database()
+    order by "grantorOid", "granteeOid", privilege, grantable
+  `
+  const acl = Array.from(aclRows)
+  return { ...identity, acl, aclDigest: databaseSnapshotDigest(identity.databaseName, identity.databaseOid, identity.databaseOwnerOid, acl) }
+}
+
+async function fenceRuntimeConnect(sql: ReturnType<typeof postgres>, database: string): Promise<void> {
+  const inherited = await sql<{ roleName: string }[]>`
+    with recursive authority(role_oid) as (
+      select oid from pg_catalog.pg_roles where rolname in ('forge','forge_runtime_api_login')
+      union
+      select membership.roleid from pg_catalog.pg_auth_members membership
+      join authority on authority.role_oid=membership.member
+      where membership.inherit_option
+    )
+    select role_row.rolname as "roleName" from authority
+    join pg_catalog.pg_roles role_row on role_row.oid=authority.role_oid
+    where role_row.rolname <> current_user
+  `
+  const targetRoles = inherited.map((row) => row.roleName)
+  const grants = await sql<{ grantor: string; grantee: string }[]>`
+    select grantor_role.rolname as grantor,
+      case when acl.grantee=0 then 'PUBLIC' else grantee_role.rolname end as grantee
+    from pg_catalog.pg_database database_row
+    cross join lateral pg_catalog.aclexplode(coalesce(database_row.datacl, pg_catalog.acldefault('d',database_row.datdba))) acl
+    join pg_catalog.pg_roles grantor_role on grantor_role.oid=acl.grantor
+    left join pg_catalog.pg_roles grantee_role on grantee_role.oid=acl.grantee
+    where database_row.datname=pg_catalog.current_database() and acl.privilege_type='CONNECT'
+      and (acl.grantee=0 or grantee_role.rolname=any(${sql.array(targetRoles)}::name[]))
+    order by acl.grantor, acl.grantee
+  `
+  await sql.begin(async (transaction) => {
+    for (const grant of grants) {
+      const grantee = grant.grantee === 'PUBLIC' ? 'public' : quoteCatalogIdentifier(grant.grantee)
+      await transaction.unsafe(`set local role ${quoteCatalogIdentifier(grant.grantor)}; revoke connect on database ${database} from ${grantee} cascade`)
+    }
+  })
+  const [boundary] = await sql<{ appConnect: boolean; runtimeConnect: boolean }[]>`
+    select pg_catalog.has_database_privilege('forge', current_database(), 'connect') as "appConnect",
+      pg_catalog.has_database_privilege('forge_runtime_api_login', current_database(), 'connect') as "runtimeConnect"
+  `
+  if (boundary?.appConnect || boundary?.runtimeConnect) throw new Error('Managed migration failed to fence effective application CONNECT authority.')
+}
+
+async function restoreDatabaseAcl(sql: ReturnType<typeof postgres>, database: string, snapshot: ProtectedMigrationDatabaseSnapshot): Promise<void> {
+  const current = await snapshotDatabaseAcl(sql)
+  if (current.databaseName !== snapshot.databaseName || current.databaseOid !== snapshot.databaseOid
+    || current.databaseOwnerOid !== snapshot.databaseOwnerOid
+    || databaseSnapshotDigest(snapshot.databaseName, snapshot.databaseOid, snapshot.databaseOwnerOid, snapshot.acl) !== snapshot.aclDigest) {
+    throw new Error('Managed migration durable database ACL identity or digest is invalid.')
+  }
+  for (const entry of normalizeDatabaseAcl(snapshot.acl)) {
+    const [identity] = await sql<{ grantor: boolean; grantee: boolean }[]>`
+      select exists(select 1 from pg_catalog.pg_roles where oid=${entry.grantorOid}::oid and rolname=${entry.grantor}) as grantor,
+        (${entry.granteeOid}=0 or exists(select 1 from pg_catalog.pg_roles where oid=${entry.granteeOid}::oid and rolname=${entry.grantee})) as grantee
+    `
+    if (!identity?.grantor || !identity.grantee) throw new Error('Managed migration database ACL role identity changed before restoration.')
+  }
+  await sql.begin(async (transaction) => {
+    for (const entry of current.acl as DatabaseAcl) {
+      const grantee = entry.grantee === 'PUBLIC' ? 'public' : quoteCatalogIdentifier(entry.grantee)
+      await transaction.unsafe(`set local role ${quoteCatalogIdentifier(entry.grantor)}; revoke ${entry.privilege} on database ${database} from ${grantee} cascade`)
+    }
+    for (const entry of orderAclReplay(snapshot)) {
+      const grantee = entry.grantee === 'PUBLIC' ? 'public' : quoteCatalogIdentifier(entry.grantee)
+      await transaction.unsafe(`set local role ${quoteCatalogIdentifier(entry.grantor)}; grant ${entry.privilege} on database ${database} to ${grantee}${entry.grantable ? ' with grant option' : ''}`)
+    }
+  })
+  const restored = await snapshotDatabaseAcl(sql)
+  if (restored.databaseName !== snapshot.databaseName || restored.databaseOid !== snapshot.databaseOid
+    || restored.databaseOwnerOid !== snapshot.databaseOwnerOid || restored.aclDigest !== snapshot.aclDigest) {
+    throw new Error('Managed migration did not restore the exact database ACL snapshot including grantors.')
   }
 }
 
-async function closeLifecycleCas(sql: ReturnType<typeof postgres>, migrationRole: string, attestedGeneration: bigint): Promise<void> {
+async function closeLifecycleCas(sql: ReturnType<typeof postgres>, migrationRole: string, operationId: string, attestedGeneration: bigint): Promise<bigint> {
   const [closed] = await sql`
-    update public.forge_protected_migration_handoffs set generation=generation+1
+    update public.forge_protected_migration_handoffs set generation=generation+1, controller_phase='restore_pending'
     where migration_tag=${RUNTIME_MIGRATION_TAG} and migration_role=${migrationRole}::name
-      and cleanup_completed_at is not null and generation=${attestedGeneration.toString()}::bigint
+      and cleanup_completed_at is not null and controller_phase='cleanup_complete'
+      and generation=${attestedGeneration.toString()}::bigint
+      and operation_id=${operationId}::uuid
     returning generation
   `
   if (!closed) throw new Error('Managed Docker protected migration cleanup state changed before its CAS close.')
+  return BigInt(closed.generation)
 }
 
-async function openRuntimeHandoff(sql: ReturnType<typeof postgres>, migrationRole: string, runtimePassword: string): Promise<void> {
+async function finalizeLifecycleCas(sql: ReturnType<typeof postgres>, operationId: string, expectedGeneration: bigint): Promise<void> {
+  const [closed] = await sql`
+    update public.forge_protected_migration_handoffs set generation=generation+1, controller_phase='complete'
+    where migration_tag=${RUNTIME_MIGRATION_TAG} and operation_id=${operationId}::uuid
+      and controller_phase='restore_pending' and generation=${expectedGeneration.toString()}::bigint
+    returning generation
+  `
+  if (!closed) throw new Error('Managed migration ACL restoration lost its final operation/generation fence.')
+}
+
+async function openRuntimeHandoff(sql: ReturnType<typeof postgres>, migrationRole: string, runtimePassword: string | null, operationId: string, expectedGeneration: bigint): Promise<bigint> {
   const protectedMigration = protectedMigrationForTag(RUNTIME_MIGRATION_TAG)
   if (!protectedMigration) throw new Error('The managed Docker protected migration is absent from the checked-in registry.')
   await sql.unsafe(`do $$ begin
     if not exists(select 1 from pg_roles where rolname='${OWNER}') then create role ${OWNER} nologin noinherit nosuperuser nocreatedb nocreaterole noreplication nobypassrls; end if;
     if not exists(select 1 from pg_roles where rolname='${API}') then create role ${API} nologin noinherit nosuperuser nocreatedb nocreaterole noreplication nobypassrls; end if;
-    alter role forge_runtime_api_login password '${runtimePassword.replaceAll("'", "''")}';
+    ${runtimePassword ? `alter role forge_runtime_api_login password '${runtimePassword.replaceAll("'", "''")}';` : ''}
   end $$;
   grant ${API} to forge_runtime_api_login with inherit true;
   grant ${OWNER} to ${safe(migrationRole)};
   grant usage, create on schema public, forge to ${OWNER} with grant option;
   grant usage on schema forge to ${API};
   grant select, references on table public.users, public.sessions, public.tasks, public.projects to ${OWNER};`)
-  await recordProtectedMigrationHandoff(sql, protectedMigration, migrationRole)
+  return recordProtectedMigrationHandoff(sql, protectedMigration, migrationRole, operationId, expectedGeneration)
 }
 
-async function closeRuntimeHandoff(sql: ReturnType<typeof postgres>, migrationRole: string): Promise<void> {
+async function closeRuntimeHandoff(sql: ReturnType<typeof postgres>, migrationRole: string, operationId: string, expectedGeneration: bigint): Promise<bigint> {
   const protectedMigration = protectedMigrationForTag(RUNTIME_MIGRATION_TAG)
   if (!protectedMigration) throw new Error('The managed Docker protected migration is absent from the checked-in registry.')
   await sql.unsafe(`revoke ${OWNER} from ${safe(migrationRole)};
@@ -83,27 +204,40 @@ async function closeRuntimeHandoff(sql: ReturnType<typeof postgres>, migrationRo
     grant select, update on table public.sessions to ${OWNER};
     grant select (id, project_id, submitted_by) on table public.tasks to ${OWNER};
     grant select (id, submitted_by, root_ref, root_binding_revision, archived_at) on table public.projects to ${OWNER};`)
-  await recordProtectedMigrationCleanup(sql, protectedMigration, migrationRole)
+  return recordProtectedMigrationCleanup(sql, protectedMigration, migrationRole, operationId, expectedGeneration)
 }
 
-/** Runs the only valid managed-Docker path. There is intentionally no public
- * prepare phase: releasing the fence before the child has finished is unsafe. */
+/** Runs the shared native/Docker controller. There is intentionally no public
+ * prepare command: releasing the fence before the child has finished is unsafe. */
 export async function runManagedDockerMigration(): Promise<void> {
   const adminUrl = getRequiredEnv('FORGE_DATABASE_ADMIN_URL')
-  const appPassword = getRequiredEnv('FORGE_APP_DATABASE_PASSWORD')
-  const runtimePassword = getRequiredEnv('FORGE_RUNTIME_API_DATABASE_PASSWORD')
+  const applicationUrl = getRequiredEnv('DATABASE_URL')
+  const appPassword = process.env.FORGE_APP_DATABASE_PASSWORD?.trim() || new URL(applicationUrl).password
+  const runtimePassword = process.env.FORGE_RUNTIME_API_DATABASE_PASSWORD?.trim()
+    || (process.env.FORGE_RUNTIME_DATABASE_URL?.trim() ? new URL(process.env.FORGE_RUNTIME_DATABASE_URL).password : null)
+  if (!appPassword) throw new Error('Managed migration requires the application database password from its URL or controller-only environment.')
   const database = safe(new URL(adminUrl).pathname.slice(1))
   const migratorPassword = randomUUID()
   const migrator = `forge_migrator_${randomUUID().replaceAll('-', '')}`
   const migratorExpiresAt = new Date(Date.now() + 10 * 60_000).toISOString()
+  const ephemeralMigrationUrl = createEphemeralMigrationUrl(applicationUrl, migrator, migratorPassword)
+  const operationId = randomUUID()
   const sql = postgres(adminUrl, { max: 1, onnotice: () => {} })
   let locked = false
   let fenced = false
   let handoffOpened = false
   let s5HandoffOpened = false
+  let databaseAcl: ProtectedMigrationDatabaseSnapshot | null = null
+  let restoreGeneration: bigint | null = null
+  let lifecycleGeneration: bigint | null = null
+  let primaryFailure: unknown = null
   try {
     const journal = JSON.parse(await readFile(resolve(process.cwd(), 'db/migrations/meta/_journal.json'), 'utf8')) as { entries: Array<{ tag: string; when: number }> }
     await assertProtectedMigrationMarkers(resolve(process.cwd(), 'db/migrations'), journal.entries.map((entry) => entry.tag))
+    const targetEntry = journal.entries.find((entry) => entry.tag === RUNTIME_MIGRATION_TAG)
+    const protectedMigration = protectedMigrationForTag(RUNTIME_MIGRATION_TAG)
+    if (!protectedMigration || !targetEntry) throw new Error('The managed migration is absent from the checked-in journal or registry.')
+    if (targetEntry.when !== RUNTIME_MIGRATION_CREATED_AT) throw new Error('The managed migration journal timestamp changed without a controller contract update.')
     await sql`select pg_advisory_lock(${LOCK})`
     locked = true
     // A blank PostgreSQL cluster has no application roles yet.  Provision the
@@ -115,18 +249,40 @@ export async function runManagedDockerMigration(): Promise<void> {
       if not exists(select 1 from pg_roles where rolname='forge_runtime_api_login') then create role forge_runtime_api_login login noinherit connection limit 5 nosuperuser nocreatedb nocreaterole noreplication nobypassrls; end if;
       alter role forge password '${appPassword.replaceAll("'", "''")}';
     end $$;`)
-    // Fence only Forge runtime connections. The admin connection holding the
-    // lock remains alive throughout child execution and final verification.
-    await sql.unsafe(`revoke connect on database ${database} from forge, forge_runtime_api_login;`)
+    // The prepared row is durable before application CONNECT is touched. It
+    // carries the exact database/owner identity, normalized grantor-aware ACL,
+    // operation, phase, and generation needed after a hard process death.
+    const currentDatabaseAcl = await snapshotDatabaseAcl(sql)
+    const [ledgerAtStart] = await sql<{ applied: boolean }[]>`
+      select exists(select 1 from drizzle.__drizzle_migrations where created_at=${targetEntry.when}) as applied
+    `.catch((error: unknown) => {
+      if ((error as { code?: string }).code === '42P01') return [{ applied: false }]
+      throw error
+    })
+    const preparation = await prepareProtectedMigrationController(sql, protectedMigration, migrator, migratorPassword, migratorExpiresAt, operationId, currentDatabaseAcl, ledgerAtStart.applied)
+    if (preparation.mode === 'complete') {
+      await sql.unsafe(`${runtimePassword ? `alter role forge_runtime_api_login password '${runtimePassword.replaceAll("'", "''")}';` : ''}
+        grant ${API} to forge_runtime_api_login with inherit true;`)
+      await sql.unsafe(await readFile('../scripts/reconcile-forge-app-privileges.sql', 'utf8'))
+      await ensureProtectedMigrationState(sql)
+      await assertProtectedMigrationLiveAttestation(sql, protectedMigration, preparation.completedMigrationRole!)
+      return
+    }
+    // Snapshot every database privilege, then remove PUBLIC, direct, and
+    // inherited application CONNECT authority. The controller connection
+    // holding the lock remains alive until exact restoration is verified.
+    databaseAcl = preparation.databaseSnapshot
     fenced = true
+    await fenceRuntimeConnect(sql, database)
+    lifecycleGeneration = await markProtectedMigrationControllerFenced(sql, protectedMigration, operationId, preparation.generation)
+    const pauseAfterFence = Number.parseInt(process.env.FORGE_MANAGED_MIGRATION_PAUSE_AFTER_FENCE_MS ?? '0', 10)
+    if (pauseAfterFence > 0) await new Promise((resolvePause) => setTimeout(resolvePause, Math.min(pauseAfterFence, 60_000)))
     await sql`
       select pg_terminate_backend(pid) from pg_stat_activity
       where datname=current_database() and usename=any(array['forge','forge_runtime_api_login'])
         and pid <> pg_backend_pid()
     `
-    await sql.unsafe(`do $$ begin
-      create role ${safe(migrator)} login noinherit connection limit 1 password '${migratorPassword}' valid until '${migratorExpiresAt}' nosuperuser nocreatedb nocreaterole noreplication nobypassrls;
-    end $$; grant forge_schema_owner to ${safe(migrator)} with inherit true; grant connect, create on database ${database} to forge_schema_owner; grant usage, create on schema public to forge_schema_owner; grant connect on database ${database} to ${safe(migrator)};`)
+    await sql.unsafe(`grant forge_schema_owner to ${safe(migrator)} with inherit true; grant connect, create on database ${database} to forge_schema_owner; grant usage, create on schema public to forge_schema_owner; grant connect on database ${database} to ${safe(migrator)};`)
     // Legacy application objects never remain application-owned. The temporary
     // login only inherits the non-login schema role and is dropped in finally.
     await sql.unsafe(`reassign owned by forge to forge_schema_owner; alter role forge nosuperuser nocreatedb nocreaterole noreplication nobypassrls noinherit;`)
@@ -136,62 +292,40 @@ export async function runManagedDockerMigration(): Promise<void> {
     `
     if (authority?.appSuper || authority?.appOwnsObjects) throw new Error('Managed Docker app ownership reconciliation did not reach the required boundary.')
 
-    // A normal managed-service restart must not reopen a completed protected
-    // handoff under a new disposable login.  Its durable row identifies the
-    // original login for the same catalog attestation instead.
-    const targetEntry = journal.entries.find((entry) => entry.tag === RUNTIME_MIGRATION_TAG)
-    let completedMigrationRole: string | undefined
-    if (targetEntry) {
-      try {
-        const [completed] = await sql<{ migrationRole: string }[]>`
-          select handoff.migration_role::text as "migrationRole"
-          from public.forge_protected_migration_handoffs handoff
-          where handoff.migration_tag=${RUNTIME_MIGRATION_TAG}
-            and handoff.cleanup_completed_at is not null
-            and exists(select 1 from drizzle.__drizzle_migrations where created_at=${targetEntry.when})
-        `
-        completedMigrationRole = completed?.migrationRole
-      } catch (error) {
-        if ((error as { code?: string }).code !== '42P01') throw error
-      }
-    }
-    if (completedMigrationRole) {
-      await sql.unsafe(`alter role forge password '${appPassword.replaceAll("'", "''")}'; alter role forge_runtime_api_login password '${runtimePassword.replaceAll("'", "''")}'; grant ${API} to forge_runtime_api_login with inherit true;`)
+    if (preparation.ledgerApplied) {
+      lifecycleGeneration = await openRuntimeHandoff(sql, migrator, runtimePassword, operationId, lifecycleGeneration)
+      handoffOpened = true
+      lifecycleGeneration = await closeRuntimeHandoff(sql, migrator, operationId, lifecycleGeneration)
+      handoffOpened = false
       await sql.unsafe(await readFile('../scripts/reconcile-forge-app-privileges.sql', 'utf8'))
       await ensureProtectedMigrationState(sql)
-      const protectedMigration = protectedMigrationForTag(RUNTIME_MIGRATION_TAG)
-      if (!protectedMigration) throw new Error('The managed Docker protected migration is absent from the checked-in registry.')
-      await assertProtectedMigrationLiveAttestation(sql, protectedMigration, completedMigrationRole)
+      const generation = await assertProtectedMigrationLiveAttestation(sql, protectedMigration, migrator)
+      restoreGeneration = await closeLifecycleCas(sql, migrator, operationId, generation)
       return
     }
 
-    const childEnv = {
-      PATH: process.env.PATH ?? '',
-      NODE_ENV: process.env.NODE_ENV ?? 'production',
-      DATABASE_URL: migrationUrl(adminUrl, migrator, migratorPassword),
-      FORGE_MANAGED_DOCKER_MIGRATIONS: '0',
-    }
+    const childEnv = createMigrationChildEnvironment(ephemeralMigrationUrl)
     const runChild = (script: string) => execFileAsync('npx', ['tsx', script], { cwd: process.cwd(), env: childEnv })
-    const runControllerBootstrap = <T>(bootstrap: () => Promise<T>) => withControllerMigrationIdentity(childEnv.DATABASE_URL, bootstrap)
+    const bootstrapUrls = { adminUrl, migrationUrl: childEnv.DATABASE_URL }
 
     // Preserve the historical order and bootstrap invariants.  These calls
     // run in this locked controller, not as children carrying admin secrets.
-    await runControllerBootstrap(runEpic172ReleaseRoleBootstrap)
+    await runWithDatabaseUrlSentinel(() => runEpic172ReleaseRoleBootstrap(bootstrapUrls))
     await runChild('scripts/ci/migrate-through-0025.ts')
-    await runControllerBootstrap(runEpic172S3OwnerBootstrap)
+    await runWithDatabaseUrlSentinel(() => runEpic172S3OwnerBootstrap(bootstrapUrls))
     await runChild('scripts/ci/migrate-through-0026.ts')
-    await runControllerBootstrap(runEpic172LegacyReleaseRepair)
-    await runControllerBootstrap(runEpic172S4RoleBootstrap)
+    await runWithDatabaseUrlSentinel(() => runEpic172LegacyReleaseRepair({ adminUrl }))
+    await runWithDatabaseUrlSentinel(() => runEpic172S4RoleBootstrap(bootstrapUrls))
     await runChild('scripts/ci/migrate-through-0027.ts')
-    await runControllerBootstrap(runEpic172S5OwnerBootstrap)
+    await runWithDatabaseUrlSentinel(() => runEpic172S5OwnerBootstrap(false, bootstrapUrls))
     s5HandoffOpened = true
     await runChild('scripts/ci/migrate-through-0028.ts')
-    await runControllerBootstrap(() => runEpic172S5OwnerBootstrap(true))
+    await runWithDatabaseUrlSentinel(() => runEpic172S5OwnerBootstrap(true, bootstrapUrls))
     s5HandoffOpened = false
-    await runControllerBootstrap(runEpic172S5OwnerBootstrap)
+    await runWithDatabaseUrlSentinel(() => runEpic172S5OwnerBootstrap(false, bootstrapUrls))
     s5HandoffOpened = true
     await runChild('scripts/ci/migrate-through-0033.ts')
-    await runControllerBootstrap(() => runEpic172S5OwnerBootstrap(true))
+    await runWithDatabaseUrlSentinel(() => runEpic172S5OwnerBootstrap(true, bootstrapUrls))
     s5HandoffOpened = false
 
     // The protected 0034 owner is not granted until all source objects exist.
@@ -199,7 +333,7 @@ export async function runManagedDockerMigration(): Promise<void> {
     // schema-owner context used by the final child without retaining the
     // disposable login as an owner.
     await sql.unsafe(`reassign owned by ${safe(migrator)} to forge_schema_owner;`)
-    await openRuntimeHandoff(sql, migrator, runtimePassword)
+    lifecycleGeneration = await openRuntimeHandoff(sql, migrator, runtimePassword, operationId, lifecycleGeneration!)
     handoffOpened = true
     // This second child applies only 0034 (the ledger has the prefix).  It
     // receives neither administrator authority nor the application passwords.
@@ -207,7 +341,7 @@ export async function runManagedDockerMigration(): Promise<void> {
       cwd: process.cwd(),
       env: childEnv,
     })
-    await closeRuntimeHandoff(sql, migrator)
+    lifecycleGeneration = await closeRuntimeHandoff(sql, migrator, operationId, lifecycleGeneration)
     handoffOpened = false
     // Historical ordinary migrations execute as the disposable session so
     // their exact `current_user` bootstrap guards remain valid.  Transfer any
@@ -219,23 +353,66 @@ export async function runManagedDockerMigration(): Promise<void> {
     // The shared reconciler grants legacy app access to ordinary public
     // tables.  Reapply the controller-only state ACL after that broad pass.
     await ensureProtectedMigrationState(sql)
-    const protectedMigration = protectedMigrationForTag(RUNTIME_MIGRATION_TAG)
-    if (!protectedMigration) throw new Error('The managed Docker protected migration is absent from the checked-in registry.')
     const attestedGeneration = await assertProtectedMigrationLiveAttestation(sql, protectedMigration, migrator)
-    await closeLifecycleCas(sql, migrator, attestedGeneration)
+    restoreGeneration = await closeLifecycleCas(sql, migrator, operationId, attestedGeneration)
+  } catch (error) {
+    primaryFailure = error
   } finally {
+    const cleanupFailures: unknown[] = []
     // Success and every failure path remove the ephemeral login before app
     // reconnect authority is restored; no process receives its credential.
-    if (handoffOpened) await closeRuntimeHandoff(sql, migrator).catch(() => {})
-    if (s5HandoffOpened) await withControllerMigrationIdentity(migrationUrl(adminUrl, migrator, migratorPassword), () => runEpic172S5OwnerBootstrap(true)).catch(() => {})
-    await sql.unsafe(`revoke forge_schema_owner from ${safe(migrator)}`).catch(() => {})
-    // REASSIGN above moved relations; DROP OWNED now removes only residual
-    // grants/dependencies that would otherwise keep this expiring login alive.
-    await sql.unsafe(`drop owned by ${safe(migrator)}`).catch(() => {})
-    await sql.unsafe(`drop role if exists ${safe(migrator)}`).catch(() => {})
-    if (fenced) await sql.unsafe(`grant connect on database ${database} to forge, forge_runtime_api_login;`).catch(() => {})
+    if (handoffOpened && lifecycleGeneration !== null) {
+      try { lifecycleGeneration = await closeRuntimeHandoff(sql, migrator, operationId, lifecycleGeneration) } catch (error) { cleanupFailures.push(error) }
+    }
+    if (restoreGeneration === null && lifecycleGeneration !== null) {
+      try {
+        const [ledger] = await sql<{ applied: boolean }[]>`
+          select exists(select 1 from drizzle.__drizzle_migrations where created_at=${RUNTIME_MIGRATION_CREATED_AT}) as applied
+        `.catch((error: unknown) => {
+          if ((error as { code?: string }).code === '42P01') return [{ applied: false }]
+          throw error
+        })
+        if (!ledger.applied) {
+          const [rewound] = await sql`
+            update public.forge_protected_migration_handoffs
+            set controller_phase='fenced', cleanup_completed_at=null, generation=generation+1
+            where migration_tag=${RUNTIME_MIGRATION_TAG} and operation_id=${operationId}::uuid
+              and generation=${lifecycleGeneration.toString()}::bigint
+            returning generation
+          `
+          if (rewound) lifecycleGeneration = BigInt(rewound.generation)
+        }
+      } catch (error) { cleanupFailures.push(error) }
+    }
+    if (s5HandoffOpened) {
+      await runWithDatabaseUrlSentinel(() => runEpic172S5OwnerBootstrap(true, { adminUrl, migrationUrl: ephemeralMigrationUrl }))
+        .catch((error) => cleanupFailures.push(error))
+    }
+    const [migrationRoleState] = await sql<{ exists: boolean }[]>`
+      select exists(select 1 from pg_catalog.pg_roles where rolname=${migrator}) as exists
+    `.catch((error) => { cleanupFailures.push(error); return [{ exists: true }] })
+    if (migrationRoleState.exists) {
+      await sql.unsafe(`revoke forge_schema_owner from ${safe(migrator)}`).catch((error) => cleanupFailures.push(error))
+      // REASSIGN above moved relations; DROP OWNED now removes only residual
+      // grants/dependencies that would otherwise keep this expiring login alive.
+      await sql.unsafe(`drop owned by ${safe(migrator)}`).catch((error) => cleanupFailures.push(error))
+      await sql.unsafe(`drop role ${safe(migrator)}`).catch((error) => cleanupFailures.push(error))
+    }
+    let restoreFailure: unknown = null
+    if (cleanupFailures.length === 0 && fenced && databaseAcl) {
+      try { await restoreDatabaseAcl(sql, database, databaseAcl) } catch (error) { restoreFailure = error }
+    }
+    if (cleanupFailures.length === 0 && !restoreFailure && restoreGeneration !== null) {
+      try { await finalizeLifecycleCas(sql, operationId, restoreGeneration) } catch (error) { restoreFailure = error }
+    }
     if (locked) await sql`select pg_advisory_unlock(${LOCK})`.catch(() => {})
     await sql.end({ timeout: 5 })
+    if (primaryFailure && (cleanupFailures.length > 0 || restoreFailure)) {
+      throw new AggregateError([primaryFailure, ...cleanupFailures, ...(restoreFailure ? [restoreFailure] : [])], 'Managed migration failed and cleanup could not safely restore application reconnect authority.')
+    }
+    if (primaryFailure) throw primaryFailure
+    if (cleanupFailures.length > 0) throw new AggregateError(cleanupFailures, 'Managed migration cleanup failed; application reconnect authority remains fenced.')
+    if (restoreFailure) throw restoreFailure
   }
 }
 

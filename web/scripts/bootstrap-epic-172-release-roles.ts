@@ -1,6 +1,6 @@
 import '../lib/load-env'
 import postgres from 'postgres'
-import { getRequiredEnv } from '@/lib/env'
+import { resolveBootstrapDatabaseUrls, type BootstrapDatabaseUrls } from './ci/bootstrap-database-urls'
 
 const ROLE_NAMES = [
   'forge_release_evidence_writer',
@@ -31,15 +31,10 @@ function roleIsUnsafe(role: ReleaseRoleRow): boolean {
     || role.bypassesRls
 }
 
-export async function runEpic172ReleaseRoleBootstrap(): Promise<void> {
-  const adminUrl = process.env.FORGE_DATABASE_ADMIN_URL?.trim()
-  if (!adminUrl) {
-    throw new Error(
-      'FORGE_DATABASE_ADMIN_URL is required. Use a short-lived PostgreSQL administrator connection; the ordinary Forge application role must not create release principals.',
-    )
-  }
+export async function runEpic172ReleaseRoleBootstrap(explicitUrls?: BootstrapDatabaseUrls): Promise<void> {
+  const { adminUrl, migrationUrl } = resolveBootstrapDatabaseUrls(explicitUrls)
 
-  const migrationClient = postgres(getRequiredEnv('DATABASE_URL'), { max: 1, onnotice: () => {} })
+  const migrationClient = postgres(migrationUrl, { max: 1, onnotice: () => {} })
   const [{ migrationRole }] = await migrationClient<{ migrationRole: string }[]>`
     select current_user as "migrationRole"
   `

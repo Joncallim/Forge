@@ -1792,6 +1792,7 @@ run_managed_local_migration_stage() {
         s5) bash scripts/ci/apply-epic-172-s5-recovery-migration.sh ;;
         registry) bash scripts/ci/apply-verification-goal-registry-migration.sh ;;
         runtime) bash scripts/ci/apply-vnext-phase0-a1-runtime-foundation.sh ;;
+        controller) FORGE_MANAGED_DOCKER_MIGRATIONS=1 npm run db:migrate ;;
         latest) npm run db:migrate ;;
         *) exit 64 ;;
       esac' _ "$REPO_ROOT/web" "$stage"
@@ -1902,6 +1903,7 @@ run_managed_local_migration_as_runuser() {
       s5) bash scripts/ci/apply-epic-172-s5-recovery-migration.sh ;;
       registry) bash scripts/ci/apply-verification-goal-registry-migration.sh ;;
       runtime) bash scripts/ci/apply-vnext-phase0-a1-runtime-foundation.sh ;;
+      controller) FORGE_MANAGED_DOCKER_MIGRATIONS=1 npm run db:migrate ;;
       latest) npm run db:migrate ;;
       *) exit 64 ;;
     esac' _ "$REPO_ROOT/web" "$stage"
@@ -1927,6 +1929,7 @@ run_managed_local_migration_as_sudo() {
       s5) bash scripts/ci/apply-epic-172-s5-recovery-migration.sh ;;
       registry) bash scripts/ci/apply-verification-goal-registry-migration.sh ;;
       runtime) bash scripts/ci/apply-vnext-phase0-a1-runtime-foundation.sh ;;
+      controller) FORGE_MANAGED_DOCKER_MIGRATIONS=1 npm run db:migrate ;;
       latest) npm run db:migrate ;;
       *) exit 64 ;;
     esac' _ "$REPO_ROOT/web" "$stage"
@@ -1936,7 +1939,7 @@ run_managed_local_migration_as_sudo() {
 run_managed_local_migrations() {
   step "Applying managed local database migrations"
   if [ "$DRY_RUN" = "1" ]; then
-    info "[dry-run] Bootstrap release roles, migrate through 0025, bootstrap S3, migrate through 0026, repair an exact known legacy release catalog if needed, bootstrap S4, migrate through 0027, apply S5 through 0028 with cleanup, apply the verification-goal registry through 0033 with cleanup, apply the VNext runtime foundation through 0034 with cleanup, then run the latest migrator."
+    info "[dry-run] Run the shared managed migration controller once; it owns quiescence, historical bootstraps, protected handoffs, cleanup, and reconnect."
     return 0
   fi
 
@@ -1959,17 +1962,7 @@ run_managed_local_migrations() {
 }
 
 run_managed_local_migration_sequence() {
-  run_managed_local_migration_stage "Bootstrap release roles for managed local migration" release || die "Managed local migration failed while bootstrapping release roles."
-  run_managed_local_migration_stage "Migrate managed local database through 0025" migrate-0025 || die "Managed local migration failed while applying migrations through 0025."
-  run_managed_local_migration_stage "Bootstrap S3 owner handoff for managed local migration" s3 || die "Managed local migration failed while bootstrapping the S3 owner handoff."
-  run_managed_local_migration_stage "Migrate managed local database through 0026" migrate-0026 || die "Managed local migration failed while applying migrations through 0026."
-  run_managed_local_migration_stage "Repair exact known legacy release catalog drift" legacy-repair || die "Managed local migration failed while repairing the exact known legacy release catalog drift."
-  run_managed_local_migration_stage "Bootstrap S4 owner handoff for managed local migration" s4 || die "Managed local migration failed while bootstrapping the S4 owner handoff."
-  run_managed_local_migration_stage "Migrate managed local database through 0027" migrate-0027 || die "Managed local migration failed while applying migrations through 0027."
-  run_managed_local_migration_stage "Apply S5 managed local migration with mandatory cleanup" s5 || die "Managed local migration failed while applying S5; its cleanup wrapper preserves the original migration failure."
-  run_managed_local_migration_stage "Apply verification-goal registry migration with mandatory cleanup" registry || die "Managed local migration failed while applying the verification-goal registry; its cleanup wrapper preserves the original migration failure."
-  run_managed_local_migration_stage "Apply VNext runtime foundation with mandatory cleanup" runtime || die "Managed local migration failed while applying the VNext runtime foundation."
-  run_managed_local_migration_stage "Run the latest managed local migrator" latest || die "Managed local migration failed while applying the latest migration set."
+  run_managed_local_migration_stage "Run the shared managed database migration controller" controller || die "Managed local migration controller failed; application reconnect remains gated until cleanup and ACL restoration succeed."
 }
 
 run_doctor() {

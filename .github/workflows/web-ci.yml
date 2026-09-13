@@ -82,6 +82,9 @@ jobs:
       - name: Exercise managed local installer migration orchestration
         working-directory: .
         run: bash scripts/test-install-managed-migrations.sh
+      - name: Prove isolated PostgreSQL 16 controller crash recovery
+        working-directory: web
+        run: npm run test:managed-migration-controller-restart
       - name: Install PostgreSQL 16 and redis-cli for migration proof
         working-directory: .
         run: |

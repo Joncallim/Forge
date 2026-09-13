@@ -25,6 +25,13 @@
       "command": "npm run test:vnext-protected-migration-recovery",
       "forbidSkipped": true,
       "executionKeys": ["command::vnext.a1.protected-cleanup-failure", "command::vnext.a1.protected-restart", "command::vnext.a1.protected-reupgrade"]
+    },
+    {
+      "id": "a1-controller-sigkill-restart",
+      "runner": "command",
+      "command": "npm run test:managed-migration-controller-restart",
+      "forbidSkipped": true,
+      "executionKeys": ["command::vnext.a1.controller-sigkill-restart"]
     }
   ],
   "proofs": [
@@ -36,6 +43,7 @@
     { "id": "C5a-protected-cleanup-failure", "runnerBinding": "a1-protected-migration-recovery", "file": "scripts/ci/prove-vnext-protected-migration-handoff-recovery.ts", "scenarioIds": ["vnext.a1.protected-cleanup-failure"] },
     { "id": "C5b-protected-restart", "runnerBinding": "a1-protected-migration-recovery", "file": "scripts/ci/prove-vnext-protected-migration-handoff-recovery.ts", "scenarioIds": ["vnext.a1.protected-restart"] },
     { "id": "C5c-protected-reupgrade", "runnerBinding": "a1-protected-migration-recovery", "file": "scripts/ci/prove-vnext-protected-migration-handoff-recovery.ts", "scenarioIds": ["vnext.a1.protected-reupgrade"] },
+    { "id": "C5d-controller-sigkill-restart", "runnerBinding": "a1-controller-sigkill-restart", "file": "scripts/ci/prove-managed-migration-controller-restart.ts", "scenarioIds": ["vnext.a1.controller-sigkill-restart"] },
     { "id": "C9-pointer-concurrency-boundary", "runnerBinding": "a1-vitest-postgres", "file": "__tests__/vnext-runtime-foundation.postgres.test.ts", "scenarioIds": ["vnext.a1.pointer-concurrency-fixture-boundary"] },
     { "id": "C0-manifest-identity", "runnerBinding": "a1-vitest-static", "file": "__tests__/vnext-phase0-conformance.contract.test.ts", "scenarioIds": ["vnext.a1.manifest-identity"] }
   ]

@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import postgres from 'postgres'
-import { getRequiredEnv } from '@/lib/env'
+import { resolveBootstrapAdminUrl } from './ci/bootstrap-database-urls'
 
 const legacy0023 = 'bf855fc0d4f110864badedf287c987adbe7913059b3673d385c81b1dbc2d9d31'
 const current0023 = 'e8234134bb5356d2c0093d4618a6e60251e2c16b8bdf8dcacfd5673cbbafbe85'
@@ -1411,8 +1411,8 @@ async function loadRepairArtifact(): Promise<string> {
   return source
 }
 
-export async function runEpic172LegacyReleaseRepair(): Promise<void> {
-  const client = postgres(process.env.FORGE_DATABASE_ADMIN_URL ?? getRequiredEnv('DATABASE_URL'), { max: 1, onnotice: () => {} })
+export async function runEpic172LegacyReleaseRepair(explicit?: Readonly<{ adminUrl: string }>): Promise<void> {
+  const client = postgres(resolveBootstrapAdminUrl(explicit), { max: 1, onnotice: () => {} })
   try {
     const outcome = await client.begin(async (sql) => {
       await sql.unsafe('LOCK TABLE pg_catalog.pg_authid IN SHARE ROW EXCLUSIVE MODE')

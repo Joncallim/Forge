@@ -985,7 +985,7 @@ run_managed_case() {
   CASE_DIR="$case_dir"
 }
 
-expected_stages=(release migrate-0025 s3 migrate-0026 legacy-repair s4 migrate-0027 s5 registry runtime latest)
+expected_stages=(controller)
 
 run_managed_case current current
 [ "$CASE_STATUS" -eq 0 ] || fail 'current-user managed migration should succeed'
@@ -1006,35 +1006,17 @@ assert_stages "$CASE_DIR/stages" "${expected_stages[@]}"
 
 run_managed_case dry-run current 1
 [ "$CASE_STATUS" -eq 0 ] || fail 'dry-run should succeed'
-assert_contains '[dry-run] Bootstrap release roles, migrate through 0025' "$CASE_DIR/stdout"
+assert_contains '[dry-run] Run the shared managed migration controller once' "$CASE_DIR/stdout"
 [ "$(wc -l < "$CASE_DIR/stages" | tr -d '[:space:]')" = 1 ] || fail 'dry-run must not execute migration stages'
 
 run_managed_case admin-unavailable unavailable
 [ "$CASE_STATUS" -ne 0 ] || fail 'unavailable local admin must fail closed'
 assert_contains 'Could not establish passwordless local PostgreSQL administrator access' "$CASE_DIR/stderr"
 
-run_managed_case s5-failure current 0 s5
-[ "$CASE_STATUS" -ne 0 ] || fail 'S5 migration failure must fail the orchestration'
-assert_contains 's5-cleanup-attempted' "$CASE_DIR/stages"
-assert_not_contains 'latest' "$CASE_DIR/stages"
-assert_contains 'its cleanup wrapper preserves the original migration failure' "$CASE_DIR/stderr"
-
-run_managed_case registry-failure current 0 registry
-[ "$CASE_STATUS" -ne 0 ] || fail 'registry migration failure must fail the orchestration'
-assert_contains 'registry-cleanup-attempted' "$CASE_DIR/stages"
-assert_not_contains 'latest' "$CASE_DIR/stages"
-assert_contains 'verification-goal registry; its cleanup wrapper preserves the original migration failure' "$CASE_DIR/stderr"
-
-run_managed_case runtime-failure current 0 runtime
-[ "$CASE_STATUS" -ne 0 ] || fail 'VNext runtime migration failure must fail the orchestration'
-assert_contains 'runtime-cleanup-attempted' "$CASE_DIR/stages"
-assert_not_contains 'latest' "$CASE_DIR/stages"
-assert_contains 'VNext runtime foundation' "$CASE_DIR/stderr"
-
-run_managed_case legacy-repair-failure current 0 legacy-repair
-[ "$CASE_STATUS" -ne 0 ] || fail 'legacy repair failure must fail the orchestration'
-assert_not_contains s4 "$CASE_DIR/stages"
-assert_contains 'repairing the exact known legacy release catalog drift' "$CASE_DIR/stderr"
+run_managed_case controller-failure current 0 controller
+[ "$CASE_STATUS" -ne 0 ] || fail 'shared managed controller failure must fail the orchestration'
+assert_stages "$CASE_DIR/stages" controller
+assert_contains 'application reconnect remains gated until cleanup and ACL restoration succeed' "$CASE_DIR/stderr"
 
 run_enabled_case() {
   local name="$1" service_mode="$2" database_url="$3"

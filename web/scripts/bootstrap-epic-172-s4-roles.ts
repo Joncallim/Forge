@@ -1,6 +1,6 @@
 import '../lib/load-env'
 import postgres from 'postgres'
-import { getRequiredEnv } from '@/lib/env'
+import { resolveBootstrapDatabaseUrls, type BootstrapDatabaseUrls } from './ci/bootstrap-database-urls'
 
 const LOGIN_ROLES = [
   'forge_architect_plan_writer',
@@ -70,13 +70,10 @@ function literal(value: string): string {
   return `'${value.replaceAll("'", "''")}'`
 }
 
-export async function runEpic172S4RoleBootstrap(): Promise<void> {
-  const adminUrl = process.env.FORGE_DATABASE_ADMIN_URL?.trim()
-  if (!adminUrl) {
-    throw new Error('FORGE_DATABASE_ADMIN_URL is required; the ordinary Forge login must not create S4 principals.')
-  }
+export async function runEpic172S4RoleBootstrap(explicitUrls?: BootstrapDatabaseUrls): Promise<void> {
+  const { adminUrl, migrationUrl } = resolveBootstrapDatabaseUrls(explicitUrls)
 
-  const migration = postgres(getRequiredEnv('DATABASE_URL'), { max: 1, onnotice: () => {} })
+  const migration = postgres(migrationUrl, { max: 1, onnotice: () => {} })
   const [{ migrationRole }] = await migration<{ migrationRole: string }[]>`select current_user as "migrationRole"`
   await migration.end({ timeout: 5 })
 

@@ -1,6 +1,6 @@
 import '../lib/load-env'
 import postgres from 'postgres'
-import { getRequiredEnv } from '@/lib/env'
+import { resolveBootstrapDatabaseUrls, type BootstrapDatabaseUrls } from './ci/bootstrap-database-urls'
 
 const ROUTINES_OWNER = 'forge_release_routines_owner'
 const RELEASE_ROLES = [
@@ -13,15 +13,10 @@ function quotedLiteral(value: string): string {
   return `'${value.replaceAll("'", "''")}'`
 }
 
-export async function runEpic172S3OwnerBootstrap(): Promise<void> {
-  const adminUrl = process.env.FORGE_DATABASE_ADMIN_URL?.trim()
-  if (!adminUrl) {
-    throw new Error(
-      'FORGE_DATABASE_ADMIN_URL is required. Use a short-lived PostgreSQL administrator connection for the versioned S3 owner handoff.',
-    )
-  }
+export async function runEpic172S3OwnerBootstrap(explicitUrls?: BootstrapDatabaseUrls): Promise<void> {
+  const { adminUrl, migrationUrl } = resolveBootstrapDatabaseUrls(explicitUrls)
 
-  const migrationClient = postgres(getRequiredEnv('DATABASE_URL'), { max: 1, onnotice: () => {} })
+  const migrationClient = postgres(migrationUrl, { max: 1, onnotice: () => {} })
   const [{ migrationRole }] = await migrationClient<{ migrationRole: string }[]>`
     select session_user as "migrationRole"
   `
