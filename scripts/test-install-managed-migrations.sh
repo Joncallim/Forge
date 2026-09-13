@@ -861,11 +861,9 @@ EOF
 }
 
 managed_repair_url="postgresql://forge:${TEST_SECRET}@localhost:5432/forge"
-case "$(uname -s)" in
-  Darwin) REPAIR_EXPECTED_SOCKET=/tmp ;;
-  Linux) REPAIR_EXPECTED_SOCKET=/var/run/postgresql ;;
-  *) fail 'unsupported repair process-test operating system' ;;
-esac
+case "$(uname -s)" in Darwin|Linux) ;; *) fail 'unsupported repair process-test operating system' ;; esac
+REPAIR_EXPECTED_SOCKET="$TEST_ROOT/repair-socket"
+mkdir -p "$REPAIR_EXPECTED_SOCKET"
 
 run_repair_process_case dry-run "$managed_repair_url" native --dry-run
 [ "$CASE_STATUS" -eq 0 ] || fail 'full-process repair dry-run should succeed'

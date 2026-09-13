@@ -101,6 +101,8 @@ describe('managed Docker migration authority', () => {
   })
 
   it('attests and rejects any remaining application-owned public object before reconnect', () => {
+    expect(controller).toContain("dependency.deptype='o'")
+    expect(controller).toContain('refused forge-owned shared objects outside the exact current database')
     expect(controller).toContain("relowner='forge'::regrole")
     expect(controller).toContain('Managed Docker app ownership reconciliation did not reach the required boundary.')
     expect(controller).toContain('Managed Docker protected migration cleanup state changed before its CAS close.')

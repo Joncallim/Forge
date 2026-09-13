@@ -140,6 +140,28 @@ async function fenceRuntimeConnect(sql: ReturnType<typeof postgres>, database: s
   if (boundary?.appConnect || boundary?.runtimeConnect) throw new Error('Managed migration failed to fence effective application CONNECT authority.')
 }
 
+async function attestRuntimeQuiescence(sql: ReturnType<typeof postgres>): Promise<void> {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    await sql`
+      select pg_catalog.pg_terminate_backend(pid, 2000) from pg_catalog.pg_stat_activity
+      where datname=pg_catalog.current_database() and usename=any(array['forge','forge_runtime_api_login'])
+        and pid<>pg_catalog.pg_backend_pid()
+    `
+    const [boundary] = await sql<{ sessions: number; appConnect: boolean; runtimeConnect: boolean }[]>`
+      select count(*) filter (where activity.pid is not null)::integer as sessions,
+        pg_catalog.has_database_privilege('forge', pg_catalog.current_database(), 'connect') as "appConnect",
+        pg_catalog.has_database_privilege('forge_runtime_api_login', pg_catalog.current_database(), 'connect') as "runtimeConnect"
+      from (values (1)) singleton(value)
+      left join pg_catalog.pg_stat_activity activity
+        on activity.datname=pg_catalog.current_database()
+       and activity.usename=any(array['forge','forge_runtime_api_login'])
+       and activity.pid<>pg_catalog.pg_backend_pid()
+    `
+    if (!boundary?.appConnect && !boundary?.runtimeConnect && boundary?.sessions === 0) return
+  }
+  throw new Error('Managed migration could not prove zero application/runtime sessions with effective CONNECT still fenced.')
+}
+
 async function restoreDatabaseAcl(sql: ReturnType<typeof postgres>, database: string, snapshot: ProtectedMigrationDatabaseSnapshot): Promise<void> {
   const current = await snapshotDatabaseAcl(sql)
   if (current.databaseName !== snapshot.databaseName || current.databaseOid !== snapshot.databaseOid
@@ -319,6 +341,36 @@ export async function runManagedDockerMigration(): Promise<void> {
       if not exists(select 1 from pg_roles where rolname='forge_runtime_api_login') then create role forge_runtime_api_login login noinherit connection limit 5 nosuperuser nocreatedb nocreaterole noreplication nobypassrls; end if;
       alter role forge password '${appPassword.replaceAll("'", "''")}';
     end $$;`)
+    // REASSIGN OWNED also reaches cluster-wide objects. Refuse it unless the
+    // only shared object owned by `forge` is this exact managed database; this
+    // prevents a second database or tablespace from entering the transition.
+    const [legacyOwnerScope] = await sql<{ foreignSharedOwnership: boolean }[]>`
+      select exists(
+        select 1 from pg_catalog.pg_shdepend dependency
+        where dependency.refclassid='pg_catalog.pg_authid'::pg_catalog.regclass
+          and dependency.refobjid='forge'::pg_catalog.regrole
+          and dependency.deptype='o'
+          and not (dependency.classid='pg_catalog.pg_database'::pg_catalog.regclass
+            and dependency.objid=(select oid from pg_catalog.pg_database where datname=pg_catalog.current_database()))
+      ) as "foreignSharedOwnership"
+    `
+    if (legacyOwnerScope?.foreignSharedOwnership) {
+      throw new Error('Managed Docker app owner transition refused forge-owned shared objects outside the exact current database.')
+    }
+    // A legacy install may have used the long-lived application login as the
+    // database and object owner. Move that authority to the non-login schema
+    // owner before writing any durable ACL snapshot. If the controller dies in
+    // this small pre-snapshot window, the committed owner transition is safe
+    // and the next run snapshots the already-normalized identity.
+    await sql.unsafe(`reassign owned by forge to forge_schema_owner; alter role forge nosuperuser nocreatedb nocreaterole noreplication nobypassrls noinherit;`)
+    const [normalizedOwner] = await sql<{ appSuper: boolean; appOwnsDatabase: boolean; appOwnsObjects: boolean }[]>`
+      select (select rolsuper from pg_catalog.pg_roles where rolname='forge') as "appSuper",
+        exists(select 1 from pg_catalog.pg_database where datname=pg_catalog.current_database() and datdba='forge'::regrole) as "appOwnsDatabase",
+        exists(select 1 from pg_catalog.pg_class where relnamespace='public'::regnamespace and relowner='forge'::regrole) as "appOwnsObjects"
+    `
+    if (normalizedOwner?.appSuper || normalizedOwner?.appOwnsDatabase || normalizedOwner?.appOwnsObjects) {
+      throw new Error('Managed Docker app ownership reconciliation did not reach the required boundary. ACL snapshot is forbidden until this transition completes.')
+    }
     // The prepared row is durable before application CONNECT is touched. It
     // carries the exact database/owner identity, normalized grantor-aware ACL,
     // operation, phase, and generation needed after a hard process death.
@@ -347,20 +399,8 @@ export async function runManagedDockerMigration(): Promise<void> {
     lifecycleGeneration = await markProtectedMigrationControllerFenced(sql, protectedMigration, operationId, preparation.generation)
     const pauseAfterFence = Number.parseInt(process.env.FORGE_MANAGED_MIGRATION_PAUSE_AFTER_FENCE_MS ?? '0', 10)
     if (pauseAfterFence > 0) await new Promise((resolvePause) => setTimeout(resolvePause, Math.min(pauseAfterFence, 60_000)))
-    await sql`
-      select pg_terminate_backend(pid) from pg_stat_activity
-      where datname=current_database() and usename=any(array['forge','forge_runtime_api_login'])
-        and pid <> pg_backend_pid()
-    `
+    await attestRuntimeQuiescence(sql)
     await sql.unsafe(`grant forge_schema_owner to ${safe(migrator)} with inherit true; grant connect, create on database ${database} to forge_schema_owner; grant usage, create on schema public to forge_schema_owner; grant connect on database ${database} to ${safe(migrator)};`)
-    // Legacy application objects never remain application-owned. The temporary
-    // login only inherits the non-login schema role and is dropped in finally.
-    await sql.unsafe(`reassign owned by forge to forge_schema_owner; alter role forge nosuperuser nocreatedb nocreaterole noreplication nobypassrls noinherit;`)
-    const [authority] = await sql<{ appSuper: boolean; appOwnsObjects: boolean }[]>`
-      select (select rolsuper from pg_roles where rolname='forge') as "appSuper",
-        exists(select 1 from pg_class where relnamespace='public'::regnamespace and relowner='forge'::regrole) as "appOwnsObjects"
-    `
-    if (authority?.appSuper || authority?.appOwnsObjects) throw new Error('Managed Docker app ownership reconciliation did not reach the required boundary.')
 
     if (preparation.ledgerApplied) {
       lifecycleGeneration = await openRuntimeHandoff(sql, migrator, runtimePassword, operationId, lifecycleGeneration)

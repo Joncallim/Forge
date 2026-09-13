@@ -325,7 +325,7 @@ repair_test_psql() {
   local candidate="${FORGE_REPAIR_TEST_PSQL_BIN:-}"
   repair_library_test_route_enabled || return 1
   case "$candidate" in
-    /*) [ -f "$candidate" ] && [ -x "$candidate" ] && [ ! -w "$candidate" ] || return 1 ;;
+    /*) [ -f "$candidate" ] && [ -x "$candidate" ] || return 1 ;;
     *) return 1 ;;
   esac
   printf '%s\n' "$candidate"

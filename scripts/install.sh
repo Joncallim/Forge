@@ -447,7 +447,7 @@ initial_env_value() {
 
 placeholder_value() {
   case "${1:-}" in
-    ''|change_me|change-me|password|your_password|paste_the_generated_value_here|change_me_generate_with_openssl_rand_hex_32)
+    ''|change_me|change-me|password|your_password|paste_the_generated_value_here|change_me_generate_separately|change_me_generate_with_openssl_rand_hex_32)
       return 0
       ;;
     *)
@@ -458,7 +458,7 @@ placeholder_value() {
 
 placeholder_database_url() {
   case "${1:-}" in
-    *'://forge:change_me@localhost:5432/forge'|*'://forge:password@localhost:5432/forge')
+    *'://forge:change_me@localhost:5432/forge'|*'://forge:change_me_generate_separately@localhost:5432/forge'|*'://forge:password@localhost:5432/forge')
       return 0
       ;;
     *)
@@ -1373,7 +1373,11 @@ ensure_env_value() {
   current="$(env_value "$key")"
 
   if [ -z "$current" ]; then
-    ensure_env_line "$key" "$value"
+    if grep -q "^${key}=" "$ENV_FILE" 2>/dev/null; then
+      set_env_line "$key" "$value"
+    else
+      ensure_env_line "$key" "$value"
+    fi
     return 0
   fi
 
@@ -2465,6 +2469,16 @@ if placeholder_value "$SESSION_SECRET"; then
   SESSION_SECRET=""
 fi
 SESSION_SECRET="${SESSION_SECRET:-$(random_hex 32)}"
+
+# Every generated credential crosses a different trust boundary. Extremely
+# unlikely random collisions are still rejected rather than persisted.
+while [ "$APP_DATABASE_PASSWORD" = "$DB_PASSWORD" ]; do APP_DATABASE_PASSWORD="$(random_hex 16)"; done
+while [ "$RUNTIME_API_DATABASE_PASSWORD" = "$DB_PASSWORD" ] || [ "$RUNTIME_API_DATABASE_PASSWORD" = "$APP_DATABASE_PASSWORD" ]; do
+  RUNTIME_API_DATABASE_PASSWORD="$(random_hex 16)"
+done
+while [ "$SESSION_SECRET" = "$DB_PASSWORD" ] || [ "$SESSION_SECRET" = "$APP_DATABASE_PASSWORD" ] || [ "$SESSION_SECRET" = "$RUNTIME_API_DATABASE_PASSWORD" ]; do
+  SESSION_SECRET="$(random_hex 32)"
+done
 
 write_env_file
 install_cli_entrypoint
