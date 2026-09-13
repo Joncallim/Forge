@@ -21,7 +21,7 @@ describe('VNext runtime v1 contracts', () => {
     expect(missionSpecSchema.parse({
       version: 'v1', desiredOutcomeDigest: digest, constraintsDigest: digest,
       resourceBindings: [], parentMissionId: null,
-      compatibilityPins: { version: 'v1', workflowRevision: 'zero-capability-v1', policyRevision: 'zero-capability-v1', budgetEnvelopeRevision: 'zero-capability-v1', compatibilityMode: 'generic_zero_capability_v1' },
+      compatibilityPins: { version: 'v1', workflowRevision: 'rev:v1:zero-capability-v1', policyRevision: 'rev:v1:zero-capability-v1', budgetEnvelopeRevision: 'rev:v1:zero-capability-v1', compatibilityMode: 'generic_zero_capability_v1' },
     }).resourceBindings).toEqual([])
   })
 
@@ -29,6 +29,15 @@ describe('VNext runtime v1 contracts', () => {
     expect(() => capabilityRequestSchema.parse({ version: 'v1', capability: { version: 'v1', actionClass: 'repository.write' }, resource: { version: 'v1', id, type: 'unknown', revision: '1', classification: 'unknown' }, requestedConstraintsDigest: digest, grant: true })).toThrow()
     expect(() => grantEnvelopeSchema.parse({ version: 'v1', id, principal: { version: 'v1', type: 'model', id }, capability: { version: 'v1', actionClass: 'repository.write' }, resourceScope: { version: 'v1', id, type: 'repository', revision: '1', classification: 'unknown' }, constraintsDigest: digest, policyRevision: '1', parentGrantId: null, evidenceDigest: digest, expiresAt: null, revokedAt: null })).toThrow()
     expect(() => missionSpecSchema.parse({ version: 'v1', desiredOutcomeDigest: digest, constraintsDigest: digest, resourceBindings: [{ version: 'v1', resource: { version: 'v1', id, type: 'repository', revision: '1', classification: 'internal' }, selectorDigest: digest, provenance: 'system' }], parentMissionId: null, compatibilityPins: { version: 'v1', workflowRevision: 'zero', policyRevision: 'zero', budgetEnvelopeRevision: 'zero', compatibilityMode: 'generic_zero_capability_v1' } })).toThrow()
+  })
+
+  it('rejects legacy and freeform authority revision identifiers', () => {
+    for (const revision of ['zero-capability-v1', 'zero', 'freeform revision']) {
+      expect(() => missionSpecSchema.parse({
+        version: 'v1', desiredOutcomeDigest: digest, constraintsDigest: digest, resourceBindings: [], parentMissionId: null,
+        compatibilityPins: { version: 'v1', workflowRevision: revision, policyRevision: revision, budgetEnvelopeRevision: revision, compatibilityMode: 'generic_zero_capability_v1' },
+      })).toThrow()
+    }
   })
 
   it('keeps lifecycle and terminal outcome separate', () => {
@@ -44,7 +53,7 @@ describe('VNext runtime v1 contracts', () => {
   it('does not make a principal type an authority grant', () => {
     expect(() => executionContextSchema.parse({
       version: 'v1', execution: { version: 'v1', id, missionId: id, lifecycle: 'created', outcome: null, revision: '0', ...executionTimestamps },
-      principal: { version: 'v1', type: 'operator', id }, workflowRevision: 'zero-capability-v1', resourceBindings: [], blockerReasonCode: null,
+      principal: { version: 'v1', type: 'operator', id }, workflowRevision: 'rev:v1:zero-capability-v1', resourceBindings: [], blockerReasonCode: null,
       implicitGrant: { capability: 'repository.write' },
     })).toThrow()
   })
