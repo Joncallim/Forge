@@ -1,10 +1,12 @@
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
+import { reasonCodes } from '@/lib/runtime/v1'
 
 const migration = readFileSync(fileURLToPath(new URL('../db/migrations/0034_vnext_phase0_a1_runtime_foundation.sql', import.meta.url)), 'utf8')
 const reconciler = readFileSync(fileURLToPath(new URL('../../scripts/reconcile-forge-app-privileges.sql', import.meta.url)), 'utf8')
 const bootstrap = readFileSync(fileURLToPath(new URL('../scripts/bootstrap-vnext-runtime-owner.ts', import.meta.url)), 'utf8')
+const journal = JSON.parse(readFileSync(fileURLToPath(new URL('../db/migrations/meta/_journal.json', import.meta.url)), 'utf8')) as { entries: Array<{ idx: number; tag: string }> }
 
 describe('VNext Phase 0 A1 protected persistence foundation', () => {
   it('uses the bounded non-login protected-owner handoff rather than application DML', () => {
@@ -25,6 +27,30 @@ describe('VNext Phase 0 A1 protected persistence foundation', () => {
     expect(transition).toContain("RAISE EXCEPTION 'VNext execution terminal state is absorbing'")
   })
 
+  it('enforces the closed reason registry and strict persisted binding shapes', () => {
+    expect(migration).toContain('vnext_reason_code_valid_v1')
+    expect(migration).toContain('vnext_resource_bindings_valid_v1')
+    expect(migration).toContain('vnext_compatibility_pins_valid_v1')
+    expect(migration).toContain('p_task_id IS NOT NULL AND NOT EXISTS')
+    expect(migration).toContain("jsonb_typeof(item->'resource'->'id') IS DISTINCT FROM 'string'")
+    expect(migration).toContain('jsonb_array_length(p_bindings) <= 32')
+    expect(migration).toContain('IS NOT TRUE')
+  })
+
+  it('contains every accepted SPEC-0007 v1 reason in both the TS and SQL boundaries', () => {
+    const specification = readFileSync(fileURLToPath(new URL('../../docs/specs/SPEC-0007.md', import.meta.url)), 'utf8')
+    const codeBlock = specification.match(/### R7: Initial reason codes[\s\S]*?```\n([\s\S]*?)```/)
+    expect(codeBlock?.[1]).toBeTruthy()
+    const requiredCodes = codeBlock![1].split('\n').map((line) => line.trim()).filter(Boolean)
+    expect(reasonCodes).toEqual(expect.arrayContaining(requiredCodes))
+    for (const code of requiredCodes) expect(migration).toContain(`'${code}'`)
+  })
+
+  it('keeps A1 at the journal migration tip so a generated installer cannot silently skip it', () => {
+    expect(journal.entries.at(-1)).toMatchObject({ idx: 34, tag: '0034_vnext_phase0_a1_runtime_foundation' })
+    expect(migration).toContain('CREATE TABLE public.missions')
+  })
+
   it('has no Task copy/backfill or prompt/title audit column in A1', () => {
     expect(migration).not.toMatch(/insert\s+into\s+task_mission_bindings[\s\S]*select/i)
     expect(migration).not.toMatch(/\b(prompt|title|local_path)\b/i)
@@ -39,5 +65,7 @@ describe('VNext Phase 0 A1 protected persistence foundation', () => {
     expect(reconciler).toContain("routine.proowner = 'forge_runtime_routines_owner'::pg_catalog.regrole")
     expect(reconciler).toContain('forge.create_vnext_mission_v1')
     expect(reconciler).toContain('forge.transition_vnext_execution_v1')
+    expect(reconciler).toContain("GRANT SELECT (id, submitted_by) ON TABLE public.tasks TO forge_runtime_routines_owner;")
+    expect(bootstrap).toContain('grant select (id, submitted_by) on table public.tasks')
   })
 })

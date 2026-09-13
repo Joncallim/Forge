@@ -13,6 +13,8 @@ import {
 
 const id = '018f2a70-9d7b-7cc2-8c74-9ab3a301cf2f'
 const digest = 'a'.repeat(64)
+const timestamps = { createdAt: '2026-01-01T00:00:00.000Z', activeAt: null, waitingAt: null, pausedAt: null, terminalAt: null, updatedAt: '2026-01-01T00:00:00.000Z' }
+const executionTimestamps = { createdAt: '2026-01-01T00:00:00.000Z', admittedAt: null, queuedAt: null, leasedAt: null, runningAt: null, waitingAt: null, terminalAt: null, updatedAt: '2026-01-01T00:00:00.000Z' }
 
 describe('VNext runtime v1 contracts', () => {
   it('keeps a project-less Mission pure and zero-capability', () => {
@@ -34,13 +36,13 @@ describe('VNext runtime v1 contracts', () => {
     expect(isValidExecutionState('waiting', null)).toBe(true)
     expect(isValidExecutionState('terminal', 'succeeded')).toBe(true)
     expect(isValidExecutionState('terminal', null)).toBe(false)
-    expect(() => missionRefSchema.parse({ version: 'v1', id, owner: { version: 'v1', type: 'user', id }, lifecycle: 'active', outcome: 'failed', revision: '0' })).toThrow()
-    expect(() => executionRefSchema.parse({ version: 'v1', id, missionId: id, lifecycle: 'queued', outcome: 'succeeded', revision: '0' })).toThrow()
+    expect(() => missionRefSchema.parse({ version: 'v1', id, owner: { version: 'v1', type: 'user', id }, lifecycle: 'active', outcome: 'failed', revision: '0', ...timestamps })).toThrow()
+    expect(() => executionRefSchema.parse({ version: 'v1', id, missionId: id, lifecycle: 'queued', outcome: 'succeeded', revision: '0', ...executionTimestamps })).toThrow()
   })
 
   it('does not make a principal type an authority grant', () => {
     expect(() => executionContextSchema.parse({
-      version: 'v1', execution: { version: 'v1', id, missionId: id, lifecycle: 'created', outcome: null, revision: '0' },
+      version: 'v1', execution: { version: 'v1', id, missionId: id, lifecycle: 'created', outcome: null, revision: '0', ...executionTimestamps },
       principal: { version: 'v1', type: 'user', id }, workflowRevision: 'zero-capability-v1', resourceBindings: [], blockerReasonCode: null,
       implicitGrant: { capability: 'repository.write' },
     })).toThrow()
@@ -49,8 +51,17 @@ describe('VNext runtime v1 contracts', () => {
   it('uses the closed SPEC-0007 registry and exact accepted lifecycle values', () => {
     expect(reasonCodeSchema.parse('execution.indeterminate')).toBe('execution.indeterminate')
     expect(() => reasonCodeSchema.parse('vnext.execution.running')).toThrow()
-    expect(missionRefSchema.parse({ version: 'v1', id, owner: { version: 'v1', type: 'user', id }, lifecycle: 'draft', outcome: null, revision: '9007199254740993' }).revision).toBe('9007199254740993')
-    expect(() => missionRefSchema.parse({ version: 'v1', id, owner: { version: 'v1', type: 'user', id }, lifecycle: 'waiting', outcome: null, revision: '01' })).toThrow()
-    expect(() => executionRefSchema.parse({ version: 'v1', id, missionId: id, lifecycle: 'terminal', outcome: 'rejected', revision: '1' })).toThrow()
+    expect(missionRefSchema.parse({ version: 'v1', id, owner: { version: 'v1', type: 'user', id }, lifecycle: 'draft', outcome: null, revision: '9007199254740993', ...timestamps }).revision).toBe('9007199254740993')
+    expect(() => missionRefSchema.parse({ version: 'v1', id, owner: { version: 'v1', type: 'user', id }, lifecycle: 'waiting', outcome: null, revision: '01', ...timestamps })).toThrow()
+    expect(() => executionRefSchema.parse({ version: 'v1', id, missionId: id, lifecycle: 'terminal', outcome: 'rejected', revision: '1', ...executionTimestamps })).toThrow()
+  })
+
+  it('requires the DB-authored timestamp for each durable non-initial lifecycle', () => {
+    expect(() => missionRefSchema.parse({ version: 'v1', id, owner: { version: 'v1', type: 'user', id }, lifecycle: 'waiting', outcome: null, revision: '1', ...timestamps })).toThrow('authoritative transition timestamp')
+    expect(() => executionRefSchema.parse({ version: 'v1', id, missionId: id, lifecycle: 'leased', outcome: null, revision: '1', ...executionTimestamps })).toThrow('authoritative transition timestamp')
+    expect(executionRefSchema.parse({
+      version: 'v1', id, missionId: id, lifecycle: 'waiting', outcome: null, revision: '1',
+      ...executionTimestamps, waitingAt: '2026-01-01T00:00:01.000Z',
+    }).waitingAt).toBe('2026-01-01T00:00:01.000Z')
   })
 })

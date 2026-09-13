@@ -140,6 +140,13 @@ $boundary$;
 
 ALTER ROLE forge NOINHERIT;
 
+-- The runtime owner needs a narrow, permanent read to verify that a Task
+-- compatibility binding belongs to its submitted-by principal. It cannot read
+-- prompt, title, Project, or other Task data, and the ordinary app login never
+-- receives membership in the protected owner role.
+REVOKE ALL PRIVILEGES ON TABLE public.tasks FROM forge_runtime_routines_owner;
+GRANT SELECT (id, submitted_by) ON TABLE public.tasks TO forge_runtime_routines_owner;
+
 SELECT relation.oid, relation.relname
 FROM pg_catalog.pg_class relation
 JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = relation.relnamespace
@@ -311,6 +318,20 @@ BEGIN
     )
   ) THEN
     RAISE EXCEPTION 'protected owner roles changed during reconciliation';
+  END IF;
+  IF pg_catalog.has_table_privilege('forge_runtime_routines_owner', 'public.tasks', 'SELECT')
+     OR NOT pg_catalog.has_column_privilege('forge_runtime_routines_owner', 'public.tasks', 'id', 'SELECT')
+     OR NOT pg_catalog.has_column_privilege('forge_runtime_routines_owner', 'public.tasks', 'submitted_by', 'SELECT')
+     OR EXISTS (
+       SELECT 1
+       FROM pg_catalog.pg_attribute attribute
+       WHERE attribute.attrelid = 'public.tasks'::pg_catalog.regclass
+         AND attribute.attnum > 0
+         AND NOT attribute.attisdropped
+         AND attribute.attname NOT IN ('id', 'submitted_by')
+         AND pg_catalog.has_column_privilege('forge_runtime_routines_owner', attribute.attrelid, attribute.attname, 'SELECT')
+     ) THEN
+    RAISE EXCEPTION 'runtime owner Task read boundary is outside the exact compatibility check';
   END IF;
   IF NOT EXISTS (
     SELECT 1

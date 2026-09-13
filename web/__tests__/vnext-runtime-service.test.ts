@@ -19,9 +19,10 @@ const request = new Request('https://forge.test') as never
 
 describe('VNext runtime server service', () => {
   const store: RuntimeStore = {
-    createForUser: vi.fn(async ({ missionId, executionId }) => ({ missionId, executionId })),
-    readMissionForUser: vi.fn(async () => null),
-    transitionForUser: vi.fn(async () => {}),
+  createForUser: vi.fn(async ({ missionId, executionId }) => ({ missionId, executionId })),
+  readMissionForUser: vi.fn(async () => null),
+  transitionMissionForUser: vi.fn(async () => {}),
+  transitionForUser: vi.fn(async () => {}),
   }
 
   beforeEach(() => {
@@ -60,6 +61,9 @@ describe('VNext runtime server service', () => {
     const isolatedStore: RuntimeStore = {
       createForUser: vi.fn(),
       readMissionForUser: vi.fn(async (_missionId, userId) => userId === owner ? { id: 'mission' } : null),
+      transitionMissionForUser: vi.fn(async (_missionId, userId) => {
+        if (userId !== owner) throw new Error('owner authorization failed')
+      }),
       transitionForUser: vi.fn(async (_executionId, userId) => {
         if (userId !== owner) throw new Error('owner authorization failed')
       }),

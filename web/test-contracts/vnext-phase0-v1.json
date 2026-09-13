@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "contractVersion": "vnext-phase0-v1",
+  "scope": "A1 additive authority foundation",
+  "nonGoals": ["migration write fence", "cutover", "rollback/re-upgrade", "Redis outbox/dispatcher"],
+  "proofs": [
+    { "id": "C1-contracts", "runner": "vitest", "file": "__tests__/vnext-runtime-contracts.test.ts" },
+    { "id": "C2-schema", "runner": "vitest", "file": "__tests__/vnext-runtime-foundation-schema.test.ts" },
+    { "id": "C4-service-owner-cas", "runner": "vitest", "file": "__tests__/vnext-runtime-service.test.ts" },
+    { "id": "C5-protected-postgres", "runner": "vitest", "file": "__tests__/vnext-runtime-foundation.postgres.test.ts", "requires": "FORGE_VNEXT_RUNTIME_REQUIRE_POSTGRES_TEST=1" },
+    { "id": "C8-projectless-lifecycle", "runner": "vitest", "file": "__tests__/vnext-runtime-foundation.postgres.test.ts", "requires": "FORGE_VNEXT_RUNTIME_REQUIRE_POSTGRES_TEST=1" }
+  ]
+}

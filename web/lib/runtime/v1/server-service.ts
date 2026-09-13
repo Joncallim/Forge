@@ -12,6 +12,9 @@ import {
   executionLifecycleSchema,
   executionOutcomeSchema,
   missionSpecSchema,
+  missionLifecycleSchema,
+  missionOutcomeSchema,
+  missionRefSchema,
   reasonCodeSchema,
   revisionSchema,
 } from './contracts'
@@ -45,8 +48,17 @@ export type RuntimeStore = {
     taskId: string | null
   }): Promise<{ missionId: string; executionId: string }>
   readMissionForUser(missionId: string, ownerUserId: string): Promise<unknown | null>
+  transitionMissionForUser(missionId: string, ownerUserId: string, input: z.infer<typeof transitionMissionRequestSchema>): Promise<void>
   transitionForUser(executionId: string, ownerUserId: string, input: z.infer<typeof transitionExecutionRequestSchema>): Promise<void>
 }
+
+export const transitionMissionRequestSchema = z.object({
+  expectedRevision: revisionSchema,
+  lifecycle: missionLifecycleSchema,
+  outcome: missionOutcomeSchema.nullable(),
+  reasonCode: reasonCodeSchema,
+  evidenceDigest: digestSchema.nullable(),
+}).strict()
 
 /**
  * The only production runtime store in A1.  The server boundary derives the
@@ -69,8 +81,8 @@ export class PostgreSqlRuntimeStore implements RuntimeStore {
       select mission_id as "missionId", execution_id as "executionId"
       from forge.create_vnext_mission_v1(
         ${input.missionId}::uuid, ${input.executionId}::uuid, ${input.taskId}::uuid, ${input.ownerUserId}::uuid,
-        ${input.desiredOutcomeDigest}, ${input.constraintsDigest}, ${JSON.stringify(input.compatibilityPins)}::jsonb,
-        ${input.compatibilityPins.workflowRevision}, ${JSON.stringify(input.resourceBindings)}::jsonb, ${'mission.created'}
+        ${input.desiredOutcomeDigest}, ${input.constraintsDigest}, ${this.sql.json(input.compatibilityPins)},
+        ${input.compatibilityPins.workflowRevision}, ${this.sql.json(input.resourceBindings)}, ${'mission.created'}
       )
     `
     if (!row) throw new Error('Protected mission create routine returned no row.')
@@ -80,10 +92,29 @@ export class PostgreSqlRuntimeStore implements RuntimeStore {
   async readMissionForUser(missionId: string, ownerUserId: string): Promise<unknown | null> {
     const [row] = await this.sql`
       select id, lifecycle_state as "lifecycle", outcome, state_revision::text as revision,
-        owner_principal_id as "ownerUserId", compatibility_pins as "compatibilityPins"
+        owner_principal_type as "ownerType", owner_principal_id as "ownerId",
+        created_at as "createdAt", active_at as "activeAt", waiting_at as "waitingAt",
+        paused_at as "pausedAt", terminal_at as "terminalAt", updated_at as "updatedAt"
       from public.missions where id=${missionId}::uuid and owner_principal_id=${ownerUserId}::uuid
     `
-    return row ?? null
+    if (!row) return null
+    const value = row as Record<string, unknown>
+    const iso = (timestamp: unknown): string | null => timestamp instanceof Date ? timestamp.toISOString() : typeof timestamp === 'string' ? timestamp : null
+    return missionRefSchema.parse({
+      version: 'v1', id: value.id, owner: { version: 'v1', type: value.ownerType, id: value.ownerId },
+      lifecycle: value.lifecycle, outcome: value.outcome, revision: value.revision,
+      createdAt: iso(value.createdAt), activeAt: iso(value.activeAt), waitingAt: iso(value.waitingAt),
+      pausedAt: iso(value.pausedAt), terminalAt: iso(value.terminalAt), updatedAt: iso(value.updatedAt),
+    })
+  }
+
+  async transitionMissionForUser(missionId: string, ownerUserId: string, input: z.infer<typeof transitionMissionRequestSchema>): Promise<void> {
+    await this.sql`
+      select * from forge.transition_vnext_mission_v1(
+        ${missionId}::uuid, ${input.expectedRevision}::bigint, ${input.lifecycle}, ${input.outcome},
+        ${ownerUserId}::uuid, ${input.reasonCode}, ${input.evidenceDigest}
+      )
+    `
   }
 
   async transitionForUser(executionId: string, ownerUserId: string, input: z.infer<typeof transitionExecutionRequestSchema>): Promise<void> {
@@ -143,4 +174,14 @@ export async function transitionExecutionForAuthorizedSession(
 ): Promise<void> {
   const input = transitionExecutionRequestSchema.parse(untrustedInput)
   await store.transitionForUser(executionId, await authenticatedUserId(request), input)
+}
+
+export async function transitionMissionForAuthorizedSession(
+  request: NextRequest,
+  missionId: string,
+  untrustedInput: unknown,
+  store: RuntimeStore,
+): Promise<void> {
+  const input = transitionMissionRequestSchema.parse(untrustedInput)
+  await store.transitionMissionForUser(missionId, await authenticatedUserId(request), input)
 }

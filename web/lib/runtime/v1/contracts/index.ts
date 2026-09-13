@@ -27,10 +27,10 @@ export const reasonCodes = [
   'queue.full', 'queue.rate_limited', 'queue.dispatch_failed', 'trigger.invalid_event', 'trigger.deduplicated', 'trigger.loop_prevented', 'trigger.processing_failed',
   'verification.evidence_missing', 'verification.evidence_stale', 'verification.gate_blocked', 'verification.self_verification_denied',
   'gate.evaluation_error', 'gate.evidence_insufficient', 'gate.human_required',
-  'package.install_failed', 'package.validation_failed', 'package.version_mismatch',
-  'adapter.unavailable', 'adapter.invalid_response', 'adapter.capability_unsupported',
-  'migration.in_progress', 'migration.validation_failed', 'migration.rollback_required',
-  'security.policy_violation', 'security.audit_failed', 'security.integrity_violation',
+  'package.install_failed', 'package.validation_failed', 'package.version_mismatch', 'package.provenance_mismatch', 'package.dependency_failed',
+  'adapter.unavailable', 'adapter.timeout', 'adapter.credential_missing', 'adapter.invalid_response', 'adapter.capability_unsupported',
+  'migration.in_progress', 'migration.validation_failed', 'migration.conflict', 'migration.rollback_required', 'migration.rollback_failed',
+  'security.policy_violation', 'security.audit_failed', 'security.integrity_violation', 'security.violation', 'security.egress_denied', 'security.sandbox_escape_prevented', 'security.confused_denied',
 ] as const
 export const reasonCodeSchema = z.enum(reasonCodes)
 
@@ -121,9 +121,28 @@ export const missionRefSchema = z.object({
   lifecycle: missionLifecycleSchema,
   outcome: missionOutcomeSchema.nullable(),
   revision: revisionSchema,
+  createdAt: z.string().datetime({ offset: true }),
+  activeAt: z.string().datetime({ offset: true }).nullable(),
+  waitingAt: z.string().datetime({ offset: true }).nullable(),
+  pausedAt: z.string().datetime({ offset: true }).nullable(),
+  terminalAt: z.string().datetime({ offset: true }).nullable(),
+  updatedAt: z.string().datetime({ offset: true }),
 }).strict().superRefine((value, context) => {
   if (!isValidMissionState(value.lifecycle, value.outcome)) {
     context.addIssue({ code: 'custom', message: 'Mission lifecycle and outcome are inconsistent.' })
+  }
+  const timestampForLifecycle = {
+    draft: null,
+    active: value.activeAt,
+    waiting: value.waitingAt,
+    paused: value.pausedAt,
+    terminal: value.terminalAt,
+  }[value.lifecycle]
+  if (value.lifecycle !== 'draft' && timestampForLifecycle === null) {
+    context.addIssue({ code: 'custom', message: 'Mission lifecycle is missing its authoritative transition timestamp.' })
+  }
+  if (value.lifecycle !== 'terminal' && value.terminalAt !== null) {
+    context.addIssue({ code: 'custom', message: 'A non-terminal Mission cannot have a terminal timestamp.' })
   }
 })
 export type MissionRef = z.infer<typeof missionRefSchema>
@@ -135,9 +154,32 @@ export const executionRefSchema = z.object({
   lifecycle: executionLifecycleSchema,
   outcome: executionOutcomeSchema.nullable(),
   revision: revisionSchema,
+  createdAt: z.string().datetime({ offset: true }),
+  admittedAt: z.string().datetime({ offset: true }).nullable(),
+  queuedAt: z.string().datetime({ offset: true }).nullable(),
+  leasedAt: z.string().datetime({ offset: true }).nullable(),
+  runningAt: z.string().datetime({ offset: true }).nullable(),
+  waitingAt: z.string().datetime({ offset: true }).nullable(),
+  terminalAt: z.string().datetime({ offset: true }).nullable(),
+  updatedAt: z.string().datetime({ offset: true }),
 }).strict().superRefine((value, context) => {
   if (!isValidExecutionState(value.lifecycle, value.outcome)) {
     context.addIssue({ code: 'custom', message: 'Execution lifecycle and outcome are inconsistent.' })
+  }
+  const timestampForLifecycle = {
+    created: null,
+    admitted: value.admittedAt,
+    queued: value.queuedAt,
+    leased: value.leasedAt,
+    running: value.runningAt,
+    waiting: value.waitingAt,
+    terminal: value.terminalAt,
+  }[value.lifecycle]
+  if (value.lifecycle !== 'created' && timestampForLifecycle === null) {
+    context.addIssue({ code: 'custom', message: 'Execution lifecycle is missing its authoritative transition timestamp.' })
+  }
+  if (value.lifecycle !== 'terminal' && value.terminalAt !== null) {
+    context.addIssue({ code: 'custom', message: 'A non-terminal Execution cannot have a terminal timestamp.' })
   }
 })
 export type ExecutionRef = z.infer<typeof executionRefSchema>
