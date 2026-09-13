@@ -29,6 +29,25 @@ services:
       retries: 5
     command: redis-server --appendonly yes
 
+  # One-shot bootstrap lane. It alone receives PostgreSQL administrator and
+  # provisioning secrets; it exits before either long-lived application plane
+  # is allowed to connect.
+  migration:
+    image: node:22-alpine
+    working_dir: /app
+    volumes:
+      - ./web:/app
+    command: sh -c "npm install && npm run db:migrate"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://forge_admin:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-forge}
+      FORGE_DATABASE_ADMIN_URL: postgresql://forge_admin:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-forge}
+      FORGE_APP_DATABASE_PASSWORD: ${FORGE_APP_DATABASE_PASSWORD:?set FORGE_APP_DATABASE_PASSWORD}
+      FORGE_RUNTIME_API_DATABASE_PASSWORD: ${FORGE_RUNTIME_API_DATABASE_PASSWORD:?set FORGE_RUNTIME_API_DATABASE_PASSWORD}
+      FORGE_MANAGED_DOCKER_MIGRATIONS: "1"
+
   web:
     image: node:22-alpine
     working_dir: /app
@@ -41,11 +60,13 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      migration:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
     environment:
       DATABASE_URL: postgresql://forge:${FORGE_APP_DATABASE_PASSWORD:?set FORGE_APP_DATABASE_PASSWORD}@postgres:5432/${POSTGRES_DB:-forge}
-      FORGE_DATABASE_ADMIN_URL: postgresql://forge_admin:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-forge}
+      FORGE_RUNTIME_DATABASE_URL: postgresql://forge_runtime_api_login:${FORGE_RUNTIME_API_DATABASE_PASSWORD:?set FORGE_RUNTIME_API_DATABASE_PASSWORD}@postgres:5432/${POSTGRES_DB:-forge}
       REDIS_URL: redis://redis:6379/0
       NEXT_PUBLIC_APP_URL: ${NEXT_PUBLIC_APP_URL:-http://localhost:3000}
       FORGE_WORKSPACE_ROOT: /forge-workspace
@@ -70,11 +91,13 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      migration:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
     environment:
       DATABASE_URL: postgresql://forge:${FORGE_APP_DATABASE_PASSWORD:?set FORGE_APP_DATABASE_PASSWORD}@postgres:5432/${POSTGRES_DB:-forge}
-      FORGE_DATABASE_ADMIN_URL: postgresql://forge_admin:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-forge}
+      FORGE_RUNTIME_DATABASE_URL: postgresql://forge_runtime_api_login:${FORGE_RUNTIME_API_DATABASE_PASSWORD:?set FORGE_RUNTIME_API_DATABASE_PASSWORD}@postgres:5432/${POSTGRES_DB:-forge}
       REDIS_URL: redis://redis:6379/0
       FORGE_WORKER_CLAIM_TIMEOUT_SECONDS: ${FORGE_WORKER_CLAIM_TIMEOUT_SECONDS:-5}
       FORGE_WORKSPACE_ROOT: /forge-workspace

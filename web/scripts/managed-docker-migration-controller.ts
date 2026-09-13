@@ -7,11 +7,13 @@ import { readFile } from 'node:fs/promises'
 import { promisify } from 'node:util'
 import postgres from 'postgres'
 import { getRequiredEnv } from '@/lib/env'
-import { assertProtectedMigrationLiveAttestation } from './ci/protected-migration-state'
+import { assertProtectedMigrationLiveAttestation, recordProtectedMigrationCleanup, recordProtectedMigrationHandoff } from './ci/protected-migration-state'
 import { protectedMigrationForTag } from './ci/protected-migration-registry'
 
 const LOCK = 334001
 const RUNTIME_MIGRATION_TAG = '0034_vnext_phase0_a1_runtime_foundation'
+const OWNER = 'forge_runtime_routines_owner'
+const API = 'forge_runtime_api'
 const execFileAsync = promisify(execFile)
 const safe = (value: string) => { if (!/^[a-z_][a-z0-9_]*$/i.test(value)) throw new Error('Unsafe PostgreSQL identifier.'); return `"${value}"` }
 
@@ -39,17 +41,49 @@ async function closeLifecycleCas(sql: ReturnType<typeof postgres>, migrationRole
   if (!closed) throw new Error('Managed Docker protected migration cleanup state changed before its CAS close.')
 }
 
+async function openRuntimeHandoff(sql: ReturnType<typeof postgres>, migrationRole: string, runtimePassword: string): Promise<void> {
+  const protectedMigration = protectedMigrationForTag(RUNTIME_MIGRATION_TAG)
+  if (!protectedMigration) throw new Error('The managed Docker protected migration is absent from the checked-in registry.')
+  await sql.unsafe(`do $$ begin
+    if not exists(select 1 from pg_roles where rolname='${OWNER}') then create role ${OWNER} nologin noinherit nosuperuser nocreatedb nocreaterole noreplication nobypassrls; end if;
+    if not exists(select 1 from pg_roles where rolname='${API}') then create role ${API} nologin noinherit nosuperuser nocreatedb nocreaterole noreplication nobypassrls; end if;
+    alter role forge_runtime_api_login password '${runtimePassword.replaceAll("'", "''")}';
+  end $$;
+  grant ${API} to forge_runtime_api_login with inherit true;
+  grant ${OWNER} to ${safe(migrationRole)};
+  grant usage, create on schema public, forge to ${OWNER} with grant option;
+  grant usage on schema forge to ${API};
+  grant select, references on table public.users, public.sessions, public.tasks, public.projects to ${OWNER};`)
+  await recordProtectedMigrationHandoff(sql, protectedMigration, migrationRole)
+}
+
+async function closeRuntimeHandoff(sql: ReturnType<typeof postgres>, migrationRole: string): Promise<void> {
+  const protectedMigration = protectedMigrationForTag(RUNTIME_MIGRATION_TAG)
+  if (!protectedMigration) throw new Error('The managed Docker protected migration is absent from the checked-in registry.')
+  await sql.unsafe(`revoke ${OWNER} from ${safe(migrationRole)};
+    revoke create on schema public, forge from ${OWNER};
+    revoke grant option for usage on schema public, forge from ${OWNER};
+    revoke select, update, references on table public.users, public.sessions, public.tasks, public.projects from ${OWNER};
+    grant usage on schema forge to ${OWNER};
+    grant select, update on table public.sessions to ${OWNER};
+    grant select (id, project_id, submitted_by) on table public.tasks to ${OWNER};
+    grant select (id, submitted_by, root_ref, root_binding_revision, archived_at) on table public.projects to ${OWNER};`)
+  await recordProtectedMigrationCleanup(sql, protectedMigration, migrationRole)
+}
+
 /** Runs the only valid managed-Docker path. There is intentionally no public
  * prepare phase: releasing the fence before the child has finished is unsafe. */
 export async function runManagedDockerMigration(): Promise<void> {
   const adminUrl = getRequiredEnv('FORGE_DATABASE_ADMIN_URL')
   const appPassword = getRequiredEnv('FORGE_APP_DATABASE_PASSWORD')
+  const runtimePassword = getRequiredEnv('FORGE_RUNTIME_API_DATABASE_PASSWORD')
   const database = safe(new URL(adminUrl).pathname.slice(1))
   const migratorPassword = randomUUID()
   const migrator = `forge_migrator_${randomUUID().replaceAll('-', '')}`
   const sql = postgres(adminUrl, { max: 1, onnotice: () => {} })
   let locked = false
   let fenced = false
+  let handoffOpened = false
   try {
     await sql`select pg_advisory_lock(${LOCK})`
     locked = true
@@ -78,16 +112,21 @@ export async function runManagedDockerMigration(): Promise<void> {
     `
     if (authority?.appSuper || authority?.appOwnsObjects) throw new Error('Managed Docker app ownership reconciliation did not reach the required boundary.')
 
-    await execFileAsync('bash', ['scripts/ci/apply-vnext-phase0-a1-runtime-foundation.sh'], {
+    await openRuntimeHandoff(sql, migrator, runtimePassword)
+    handoffOpened = true
+    // The child migrates exactly through 0034 under the ephemeral login. It
+    // receives neither administrator authority nor the application passwords.
+    await execFileAsync('npx', ['tsx', 'scripts/ci/migrate-through-0034.ts'], {
       cwd: process.cwd(),
       env: {
-        ...process.env,
+        PATH: process.env.PATH ?? '',
+        NODE_ENV: process.env.NODE_ENV ?? 'production',
         DATABASE_URL: migrationUrl(adminUrl, migrator, migratorPassword),
-        FORGE_DATABASE_ADMIN_URL: adminUrl,
         FORGE_MANAGED_DOCKER_MIGRATIONS: '0',
       },
     })
-
+    await closeRuntimeHandoff(sql, migrator)
+    handoffOpened = false
     // The reconciler is mandatory, not a best-effort repair after reconnect.
     await sql.unsafe(await readFile('../scripts/reconcile-forge-app-privileges.sql', 'utf8'))
     const protectedMigration = protectedMigrationForTag(RUNTIME_MIGRATION_TAG)
@@ -97,6 +136,7 @@ export async function runManagedDockerMigration(): Promise<void> {
   } finally {
     // Success and every failure path remove the ephemeral login before app
     // reconnect authority is restored; no process receives its credential.
+    if (handoffOpened) await closeRuntimeHandoff(sql, migrator).catch(() => {})
     await sql.unsafe(`drop role if exists ${safe(migrator)}`).catch(() => {})
     if (fenced) await sql.unsafe(`grant connect on database ${database} to forge, forge_runtime_api_login;`).catch(() => {})
     if (locked) await sql`select pg_advisory_unlock(${LOCK})`.catch(() => {})
