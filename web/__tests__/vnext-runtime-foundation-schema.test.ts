@@ -7,6 +7,7 @@ const migration = readFileSync(fileURLToPath(new URL('../db/migrations/0034_vnex
 const reconciler = readFileSync(fileURLToPath(new URL('../../scripts/reconcile-forge-app-privileges.sql', import.meta.url)), 'utf8')
 const bootstrap = readFileSync(fileURLToPath(new URL('../scripts/bootstrap-vnext-runtime-owner.ts', import.meta.url)), 'utf8')
 const migrator = readFileSync(fileURLToPath(new URL('../db/migrate.ts', import.meta.url)), 'utf8')
+const migrationWrapper = readFileSync(fileURLToPath(new URL('../scripts/ci/apply-vnext-phase0-a1-runtime-foundation.sh', import.meta.url)), 'utf8')
 const journal = JSON.parse(readFileSync(fileURLToPath(new URL('../db/migrations/meta/_journal.json', import.meta.url)), 'utf8')) as { entries: Array<{ idx: number; tag: string }> }
 
 describe('VNext Phase 0 A1 protected persistence foundation', () => {
@@ -61,9 +62,27 @@ describe('VNext Phase 0 A1 protected persistence foundation', () => {
 
   it('keeps ordinary latest migration and repair on the documented bounded handoff', () => {
     expect(migrator).toContain('runtimeFoundationIsPending')
-    expect(migrator).toContain('scripts/bootstrap-vnext-runtime-owner.ts')
+    expect(migrator).toContain('scripts/ci/apply-vnext-phase0-a1-runtime-foundation.sh')
+    expect(migrator).not.toContain('RUNTIME_FOUNDATION_MIGRATION_AT')
     expect(bootstrap).toContain("process.env.FORGE_DATABASE_ADMIN_URL?.trim() || getRequiredEnv('DATABASE_URL')")
     expect(bootstrap).toContain("const API = 'forge_runtime_api'")
+    expect(bootstrap).toContain('from pg_catalog.pg_authid where rolname = ${OWNER}')
+    expect(bootstrap).toContain('from pg_catalog.pg_authid where rolname = ${API}')
+  })
+
+  it('never invokes the protected 0034 migration before its historical ownership prerequisites', () => {
+    for (const command of [
+      'protocol:bootstrap-epic-172-release-roles',
+      'migrate-through-0025.ts',
+      'protocol:bootstrap-epic-172-s3-release-owner',
+      'migrate-through-0026.ts',
+      'protocol:bootstrap-epic-172-s4-roles',
+      'migrate-through-0027.ts',
+      'apply-epic-172-s5-recovery-migration.sh',
+      'apply-verification-goal-registry-migration.sh',
+    ]) expect(migrationWrapper).toContain(command)
+    expect(migrationWrapper.indexOf('migrate-through-0027.ts')).toBeLessThan(migrationWrapper.lastIndexOf('bootstrap-vnext-runtime-owner.ts'))
+    expect(migrationWrapper.indexOf('migrate-through-0034.ts')).toBeLessThan(migrationWrapper.indexOf('npx tsx db/migrate.ts'))
   })
 
   it('has no Task copy/backfill or prompt/title audit column in A1', () => {

@@ -4,15 +4,17 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
 const required = process.env.FORGE_VNEXT_RUNTIME_REQUIRE_POSTGRES_TEST === '1'
 const appUrl = process.env.FORGE_VNEXT_RUNTIME_POSTGRES_APP_TEST_URL?.trim()
+const apiUrl = process.env.FORGE_VNEXT_RUNTIME_POSTGRES_API_TEST_URL?.trim()
 const adminUrl = process.env.FORGE_VNEXT_RUNTIME_POSTGRES_ADMIN_TEST_URL?.trim()
-const enabled = Boolean(appUrl && adminUrl)
+const enabled = Boolean(appUrl && apiUrl && adminUrl)
 
 if (required && !enabled) {
-  throw new Error('FORGE_VNEXT_RUNTIME_REQUIRE_POSTGRES_TEST=1 requires disposable app and administrator PostgreSQL URLs.')
+  throw new Error('FORGE_VNEXT_RUNTIME_REQUIRE_POSTGRES_TEST=1 requires disposable legacy-app, runtime-API, and administrator PostgreSQL URLs.')
 }
 
 describe.skipIf(!enabled)('VNext runtime protected PostgreSQL foundation', () => {
   let app: ReturnType<typeof postgres>
+  let legacy: ReturnType<typeof postgres>
   let admin: ReturnType<typeof postgres>
   const actor = randomUUID()
   const otherActor = randomUUID()
@@ -31,14 +33,16 @@ describe.skipIf(!enabled)('VNext runtime protected PostgreSQL foundation', () =>
   }
 
   beforeAll(async () => {
-    app = postgres(appUrl!, { max: 4, onnotice: () => {} })
+    app = postgres(apiUrl!, { max: 4, onnotice: () => {} })
+    legacy = postgres(appUrl!, { max: 2, onnotice: () => {} })
     admin = postgres(adminUrl!, { max: 1, onnotice: () => {} })
     await admin`insert into users (id, display_name) values (${actor}::uuid, 'runtime owner'), (${otherActor}::uuid, 'other runtime owner')`
   })
-  afterAll(async () => { await app?.end({ timeout: 5 }); await admin?.end({ timeout: 5 }) })
+  afterAll(async () => { await legacy?.end({ timeout: 5 }); await app?.end({ timeout: 5 }); await admin?.end({ timeout: 5 }) })
 
   it('denies direct app DML but permits the protected atomic creator', async () => {
-    await expect(app`insert into missions (id, owner_principal_type, owner_principal_id, desired_outcome_digest, constraints_digest, compatibility_pins) values (${randomUUID()}::uuid, 'operator', ${actor}::uuid, ${digest}, ${digest}, '{}'::jsonb)`).rejects.toMatchObject({ code: '42501' })
+    await expect(legacy`insert into missions (id, owner_principal_type, owner_principal_id, desired_outcome_digest, constraints_digest, compatibility_pins) values (${randomUUID()}::uuid, 'operator', ${actor}::uuid, ${digest}, ${digest}, '{}'::jsonb)`).rejects.toMatchObject({ code: '42501' })
+    await expect(legacy`select * from forge.create_vnext_mission_v1(${randomUUID()}::uuid, ${randomUUID()}::uuid, null::uuid, ${otherActor}::uuid, ${digest}, ${digest}, ${legacy.json({ version: 'v1', workflowRevision: 'zero-capability-v1', policyRevision: 'zero-capability-v1', budgetEnvelopeRevision: 'zero-capability-v1', compatibilityMode: 'generic_zero_capability_v1' })}, 'zero-capability-v1', ${legacy.json([])}, 'mission.created')`).rejects.toMatchObject({ code: '42501' })
     const projectId = randomUUID()
     const taskId = randomUUID()
     await admin`insert into projects (id, name, submitted_by) values (${projectId}::uuid, 'runtime task-owner hostile fixture', ${actor}::uuid)`
@@ -79,6 +83,35 @@ describe.skipIf(!enabled)('VNext runtime protected PostgreSQL foundation', () =>
       from runtime_transition_audits where entity_id in (${mission}::uuid, ${execution}::uuid)
     `
     expect(rows[0]).toEqual({ missionAuditCount: '1', executionAuditCount: '1' })
+  })
+
+  it('gives only the dedicated runtime login the group-backed read and routine boundary', async () => {
+    const [acl] = await admin<{ apiExecute: boolean; apiRead: boolean; legacyExecute: boolean; legacyMembership: boolean }[]>`
+      select
+        pg_catalog.has_function_privilege('forge_runtime_api_login', 'forge.create_vnext_mission_v1(uuid,uuid,uuid,uuid,text,text,jsonb,text,jsonb,text)'::regprocedure, 'execute') as "apiExecute",
+        pg_catalog.has_table_privilege('forge_runtime_api_login', 'public.missions', 'select') as "apiRead",
+        pg_catalog.has_function_privilege('forge', 'forge.create_vnext_mission_v1(uuid,uuid,uuid,uuid,text,text,jsonb,text,jsonb,text)'::regprocedure, 'execute') as "legacyExecute",
+        pg_catalog.pg_has_role('forge', 'forge_runtime_api', 'member') as "legacyMembership"
+    `
+    expect(acl).toEqual({ apiExecute: true, apiRead: true, legacyExecute: false, legacyMembership: false })
+  })
+
+  it('keeps the generic project-less profile distinct and strictly zero-capability', async () => {
+    const genericPins = { version: 'v1', workflowRevision: 'zero-capability-v1', policyRevision: 'zero-capability-v1', budgetEnvelopeRevision: 'zero-capability-v1', compatibilityMode: 'generic_zero_capability_v1' }
+    await app`
+      select * from forge.create_vnext_mission_v1(
+        ${randomUUID()}::uuid, ${randomUUID()}::uuid, null::uuid, ${actor}::uuid,
+        ${digest}, ${digest}, ${app.json(genericPins)}, 'zero-capability-v1', ${app.json([])}, 'mission.created'
+      )
+    `
+    await expect(app`
+      select * from forge.create_vnext_mission_v1(
+        ${randomUUID()}::uuid, ${randomUUID()}::uuid, null::uuid, ${actor}::uuid,
+        ${digest}, ${digest}, ${app.json(genericPins)}, 'zero-capability-v1',
+        ${app.json([{ version: 'v1', resource: { version: 'v1', id: randomUUID(), type: 'service', revision: '1', classification: 'unknown' }, selectorDigest: digest, provenance: 'system' }])},
+        'mission.created'
+      )
+    `).rejects.toMatchObject({ code: '22023' })
   })
 
   it('uses CAS so concurrent terminal transitions produce one audit revision', async () => {

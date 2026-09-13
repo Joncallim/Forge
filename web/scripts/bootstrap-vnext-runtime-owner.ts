@@ -3,9 +3,8 @@ import postgres from 'postgres'
 import { getRequiredEnv } from '@/lib/env'
 
 const OWNER = 'forge_runtime_routines_owner'
-// This role deliberately has no inherited membership from `forge`. A later
-// deployment step gives the server process a separate authenticated database
-// login; ordinary application SQL can never become that boundary with SET ROLE.
+// This is a non-login capability group. The server login is separately
+// provisioned as its member; `forge` never receives that membership.
 const API = 'forge_runtime_api'
 
 function identifier(value: string): string {
@@ -61,13 +60,13 @@ async function main(): Promise<void> {
     const [safeRole] = await admin<{ safe: boolean }[]>`
       select (not rolcanlogin and not rolinherit and not rolsuper and not rolcreatedb and not rolcreaterole
         and not rolreplication and not rolbypassrls and rolpassword is null and rolvaliduntil is null) as safe
-      from pg_catalog.pg_roles where rolname = ${OWNER}
+      from pg_catalog.pg_authid where rolname = ${OWNER}
     `
     if (!safeRole?.safe) throw new Error('The VNext runtime owner role is outside its exact non-login boundary.')
     const [safeApi] = await admin<{ safe: boolean }[]>`
       select (not rolcanlogin and not rolinherit and not rolsuper and not rolcreatedb and not rolcreaterole
         and not rolreplication and not rolbypassrls and rolpassword is null and rolvaliduntil is null) as safe
-      from pg_catalog.pg_roles where rolname = ${API}
+      from pg_catalog.pg_authid where rolname = ${API}
     `
     if (!safeApi?.safe) throw new Error('The VNext runtime API boundary role is outside its exact non-login boundary.')
     // The migration needs only schema creation plus the exact users FK and

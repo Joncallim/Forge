@@ -14,6 +14,8 @@
 
 import '../lib/load-env'
 import { execFile } from 'node:child_process'
+import { readFile } from 'node:fs/promises'
+import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import { drizzle } from 'drizzle-orm/postgres-js'
 import { migrate } from 'drizzle-orm/postgres-js/migrator'
@@ -21,33 +23,21 @@ import postgres from 'postgres'
 import { getRequiredEnv } from '@/lib/env'
 
 const MIGRATIONS_FOLDER = './db/migrations'
-const RUNTIME_FOUNDATION_MIGRATION_AT = 1786838400000
 const execFileAsync = promisify(execFile)
 
 async function runtimeFoundationIsPending(client: ReturnType<typeof postgres>): Promise<boolean> {
   try {
-    const [row] = await client<{ pending: boolean }[]>`
-      select coalesce(max(created_at) < ${RUNTIME_FOUNDATION_MIGRATION_AT}, true) as pending
-      from drizzle.__drizzle_migrations
+    const journal = JSON.parse(await readFile(fileURLToPath(new URL('./migrations/meta/_journal.json', import.meta.url)), 'utf8')) as { entries: Array<{ tag: string; when: number }> }
+    const foundation = journal.entries.find((entry) => entry.tag === '0034_vnext_phase0_a1_runtime_foundation')
+    if (!foundation) throw new Error('Migration journal is missing the VNext runtime foundation entry.')
+    const [row] = await client<{ applied: boolean }[]>`
+      select exists(select 1 from drizzle.__drizzle_migrations where created_at=${foundation.when}) as applied
     `
-    return row?.pending === true
+    return !row?.applied
   } catch (error) {
-    // New installs have not created Drizzle's ledger yet. Earlier protected
-    // migrations retain their own bootstrap path; this handoff starts at 0034.
-    if ((error as { code?: string }).code === '42P01') return false
+    if ((error as { code?: string }).code === '42P01') return true
     throw error
   }
-}
-
-async function withRuntimeOwnerHandoff(): Promise<void> {
-  // This is intentionally part of the ordinary migrator, not a separate
-  // operator-only command. Local Docker/custom owner installs use DATABASE_URL;
-  // hosted PostgreSQL may provide the documented short-lived admin URL.
-  await execFileAsync('npx', ['tsx', 'scripts/bootstrap-vnext-runtime-owner.ts'], { cwd: process.cwd() })
-}
-
-async function cleanupRuntimeOwnerHandoff(): Promise<void> {
-  await execFileAsync('npx', ['tsx', 'scripts/bootstrap-vnext-runtime-owner.ts', '--cleanup'], { cwd: process.cwd() })
 }
 
 async function main(): Promise<void> {
@@ -57,13 +47,17 @@ async function main(): Promise<void> {
   // idempotent statements ("... already exists, skipping"). `max: 1` keeps the
   // migrator on a single connection, which is all it needs.
   const client = postgres(databaseUrl, { max: 1, onnotice: () => {} })
-  let runtimeHandoff = false
+  let clientClosed = false
 
   console.log('• Checking the database for pending migrations…')
 
   try {
-    runtimeHandoff = await runtimeFoundationIsPending(client)
-    if (runtimeHandoff) await withRuntimeOwnerHandoff()
+    if (await runtimeFoundationIsPending(client)) {
+      await client.end({ timeout: 5 })
+      clientClosed = true
+      await execFileAsync('bash', ['scripts/ci/apply-vnext-phase0-a1-runtime-foundation.sh'], { cwd: process.cwd(), env: process.env })
+      return
+    }
     const db = drizzle(client)
     await migrate(db, { migrationsFolder: MIGRATIONS_FOLDER })
     console.log('✓ Database schema is up to date.')
@@ -74,15 +68,7 @@ async function main(): Promise<void> {
     console.error('  Check that PostgreSQL is running and DATABASE_URL is correct, then try again.')
     process.exitCode = 1
   } finally {
-    if (runtimeHandoff) {
-      try {
-        await cleanupRuntimeOwnerHandoff()
-      } catch (cleanupError) {
-        console.error(`✗ Could not restore the protected runtime migration boundary: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`)
-        process.exitCode = 1
-      }
-    }
-    await client.end({ timeout: 5 })
+    if (!clientClosed) await client.end({ timeout: 5 })
   }
 }
 

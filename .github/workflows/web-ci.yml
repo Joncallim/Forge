@@ -104,6 +104,9 @@ jobs:
           CREATE ROLE forge
             LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
             PASSWORD 'forge_registry_test';
+          CREATE ROLE forge_runtime_api_login
+            LOGIN INHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
+            PASSWORD 'forge_runtime_api_test';
           -- CI-only observer. PostgreSQL's default PUBLIC CONNECT/TEMPORARY
           -- privileges can still cover other disposable runner databases; this
           -- role is constrained by its direct attributes, memberships, and the
@@ -364,6 +367,7 @@ jobs:
           ALTER ROLE forge_packet_issuer PASSWORD 'forge_packet_issuer_test';
           ALTER ROLE forge_local_evidence_reader PASSWORD 'forge_local_evidence_reader_test';
           ALTER ROLE forge_project_root_reconciler PASSWORD 'forge_project_root_reconciler_test';
+          GRANT forge_runtime_api TO forge_runtime_api_login;
           SQL
       - name: Materialize legacy root references through the dedicated principal
         env:
@@ -787,6 +791,7 @@ jobs:
           FORGE_WORKFORCE_MATERIALIZER_POSTGRES_ADMIN_TEST_URL: postgresql://forge_e2e:forge@localhost:5432/forge_epic_172_ci_test
           FORGE_VNEXT_RUNTIME_REQUIRE_POSTGRES_TEST: '1'
           FORGE_VNEXT_RUNTIME_POSTGRES_APP_TEST_URL: postgresql://forge:forge_registry_test@localhost:5432/forge_epic_172_ci_test
+          FORGE_VNEXT_RUNTIME_POSTGRES_API_TEST_URL: postgresql://forge_runtime_api_login:forge_runtime_api_test@localhost:5432/forge_epic_172_ci_test
           FORGE_VNEXT_RUNTIME_POSTGRES_ADMIN_TEST_URL: postgresql://forge_e2e:forge@localhost:5432/forge_epic_172_ci_test
           FORGE_EPIC_172_TEST_APP_DATABASE_URL: postgresql://forge_app_test:forge_app_test@localhost:5432/forge_epic_172_ci_test
           FORGE_EPIC_172_TEST_WRITER_DATABASE_URL: postgresql://forge_release_evidence_writer:forge_writer_test@localhost:5432/forge_epic_172_ci_test

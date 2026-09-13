@@ -239,7 +239,7 @@ GRANT SELECT ON TABLE
   public.executions,
   public.task_mission_bindings,
   public.runtime_transition_audits
-TO forge;
+TO forge, forge_runtime_api;
 REVOKE ALL ON FUNCTION public.forge_commit_verification_goal_registry_revision_v1(
   uuid,uuid,uuid,uuid,timestamptz,text,uuid,bigint,bigint,timestamptz,text,jsonb
 ) FROM PUBLIC, forge;
