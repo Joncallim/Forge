@@ -2,7 +2,6 @@
 set -euo pipefail
 
 : "${DATABASE_URL:?DATABASE_URL is required.}"
-: "${FORGE_DATABASE_ADMIN_URL:?FORGE_DATABASE_ADMIN_URL is required.}"
 
 cleanup() {
   local original_status=$?

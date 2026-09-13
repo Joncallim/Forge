@@ -250,10 +250,11 @@ REVOKE ALL ON FUNCTION forge.create_vnext_mission_v1(uuid,uuid,uuid,uuid,text,te
 REVOKE ALL ON FUNCTION forge.transition_vnext_mission_v1(uuid,bigint,text,text,uuid,text,text) FROM PUBLIC, forge;
 REVOKE ALL ON FUNCTION forge.transition_vnext_execution_v1(uuid,bigint,text,text,text,uuid,text,text) FROM PUBLIC, forge;
 REVOKE ALL ON FUNCTION forge.advance_task_execution_pointer_v1(uuid,bigint,uuid,uuid,text) FROM PUBLIC, forge;
-GRANT EXECUTE ON FUNCTION forge.create_vnext_mission_v1(uuid,uuid,uuid,uuid,text,text,jsonb,text,jsonb,text) TO forge;
-GRANT EXECUTE ON FUNCTION forge.transition_vnext_mission_v1(uuid,bigint,text,text,uuid,text,text) TO forge;
-GRANT EXECUTE ON FUNCTION forge.transition_vnext_execution_v1(uuid,bigint,text,text,text,uuid,text,text) TO forge;
-GRANT EXECUTE ON FUNCTION forge.advance_task_execution_pointer_v1(uuid,bigint,uuid,uuid,text) TO forge;
+GRANT USAGE ON SCHEMA forge TO forge_runtime_api;
+GRANT EXECUTE ON FUNCTION forge.create_vnext_mission_v1(uuid,uuid,uuid,uuid,text,text,jsonb,text,jsonb,text) TO forge_runtime_api;
+GRANT EXECUTE ON FUNCTION forge.transition_vnext_mission_v1(uuid,bigint,text,text,uuid,text,text) TO forge_runtime_api;
+GRANT EXECUTE ON FUNCTION forge.transition_vnext_execution_v1(uuid,bigint,text,text,text,uuid,text,text) TO forge_runtime_api;
+GRANT EXECUTE ON FUNCTION forge.advance_task_execution_pointer_v1(uuid,bigint,uuid,uuid,text) TO forge_runtime_api;
 
 DO $verify$
 DECLARE

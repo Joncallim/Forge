@@ -3,6 +3,10 @@ import postgres from 'postgres'
 import { getRequiredEnv } from '@/lib/env'
 
 const OWNER = 'forge_runtime_routines_owner'
+// This role deliberately has no inherited membership from `forge`. A later
+// deployment step gives the server process a separate authenticated database
+// login; ordinary application SQL can never become that boundary with SET ROLE.
+const API = 'forge_runtime_api'
 
 function identifier(value: string): string {
   if (!/^[a-z_][a-z0-9_]*$/i.test(value)) throw new Error('The migration login is not a safe PostgreSQL role identifier.')
@@ -10,8 +14,11 @@ function identifier(value: string): string {
 }
 
 async function main(): Promise<void> {
-  const adminUrl = process.env.FORGE_DATABASE_ADMIN_URL?.trim()
-  if (!adminUrl) throw new Error('FORGE_DATABASE_ADMIN_URL is required for the VNext runtime owner handoff.')
+  // Docker and ordinary self-hosted installations commonly run migrations with
+  // the database owner itself. Use that documented normal path first; hosted
+  // PostgreSQL may provide a short-lived administrator URL for the one-time
+  // protected-owner handoff.
+  const adminUrl = process.env.FORGE_DATABASE_ADMIN_URL?.trim() || getRequiredEnv('DATABASE_URL')
   const migration = postgres(getRequiredEnv('DATABASE_URL'), { max: 1, onnotice: () => {} })
   const [{ migrationRole }] = await migration<{ migrationRole: string }[]>`select current_user as "migrationRole"`
   await migration.end({ timeout: 5 })
@@ -20,6 +27,9 @@ async function main(): Promise<void> {
     await admin.unsafe(`do $$ begin
       if not exists (select 1 from pg_catalog.pg_roles where rolname = '${OWNER}') then
         create role ${OWNER} noinherit nologin nosuperuser nocreatedb nocreaterole noreplication nobypassrls;
+      end if;
+      if not exists (select 1 from pg_catalog.pg_roles where rolname = '${API}') then
+        create role ${API} noinherit nologin nosuperuser nocreatedb nocreaterole noreplication nobypassrls;
       end if;
     end $$;`)
     if (process.argv.includes('--cleanup')) {
@@ -54,9 +64,15 @@ async function main(): Promise<void> {
       from pg_catalog.pg_roles where rolname = ${OWNER}
     `
     if (!safeRole?.safe) throw new Error('The VNext runtime owner role is outside its exact non-login boundary.')
+    const [safeApi] = await admin<{ safe: boolean }[]>`
+      select (not rolcanlogin and not rolinherit and not rolsuper and not rolcreatedb and not rolcreaterole
+        and not rolreplication and not rolbypassrls and rolpassword is null and rolvaliduntil is null) as safe
+      from pg_catalog.pg_roles where rolname = ${API}
+    `
+    if (!safeApi?.safe) throw new Error('The VNext runtime API boundary role is outside its exact non-login boundary.')
     // The migration needs only schema creation plus the exact users FK and
     // routine ownership read. Both grants are revoked in the EXIT cleanup.
-    await admin.unsafe(`grant ${OWNER} to ${identifier(migrationRole)}; grant usage, create on schema public, forge to ${OWNER}; grant select, references on table public.users, public.tasks to ${OWNER};`)
+    await admin.unsafe(`grant ${OWNER} to ${identifier(migrationRole)}; grant usage, create on schema public, forge to ${OWNER}; grant usage on schema forge to ${API}; grant select, references on table public.users, public.tasks to ${OWNER};`)
   } finally {
     await admin.end({ timeout: 5 })
   }

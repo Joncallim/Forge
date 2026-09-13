@@ -34,9 +34,17 @@ export const reasonCodes = [
 ] as const
 export const reasonCodeSchema = z.enum(reasonCodes)
 
+// Principal kind is identity provenance, never an authority grant.  Keep this
+// closed: a new actor must be deliberately added to contracts, persistence and
+// audit policy together.
+export const principalTypeSchema = z.enum([
+  'operator', 'system', 'mission', 'execution', 'agent_run', 'trigger',
+  'adapter', 'verifier', 'service',
+])
+
 export const principalRefSchema = z.object({
   version: z.literal(runtimeContractVersion),
-  type: z.enum(['user', 'service', 'workspace', 'operator']),
+  type: principalTypeSchema,
   id: opaqueIdSchema,
 }).strict()
 export type PrincipalRef = z.infer<typeof principalRefSchema>
@@ -94,24 +102,46 @@ export const missionOutcomeSchema = z.enum(['succeeded', 'failed', 'cancelled'])
 export const executionLifecycleSchema = z.enum(['created', 'admitted', 'queued', 'leased', 'running', 'waiting', 'terminal'])
 export const executionOutcomeSchema = z.enum(['succeeded', 'failed', 'cancelled', 'blocked', 'indeterminate'])
 
-export const compatibilityPinsSchema = z.object({
+const compatibilityPinRevisionsSchema = z.object({
   version: z.literal(runtimeContractVersion),
   workflowRevision: z.string().min(1).max(256),
   policyRevision: z.string().min(1).max(256),
   budgetEnvelopeRevision: z.string().min(1).max(256),
-  // A compatibility pin is a truthful reference to the existing coding path,
-  // not a hidden Phase-1 budget reservation or Workflow executor.
+}).strict()
+
+// The generic profile is deliberately separate from the coding compatibility
+// seam. It is a truthful project-less, zero-capability baseline rather than a
+// software-engineering workflow with empty-looking fields.
+export const genericZeroCapabilityPinsSchema = compatibilityPinRevisionsSchema.extend({
+  compatibilityMode: z.literal('generic_zero_capability_v1'),
+}).strict()
+
+export const softwareEngineeringLegacyPinsSchema = compatibilityPinRevisionsSchema.extend({
   compatibilityMode: z.literal('software_engineering_legacy_v1'),
 }).strict()
 
-export const missionSpecSchema = z.object({
+export const compatibilityPinsSchema = z.discriminatedUnion('compatibilityMode', [
+  genericZeroCapabilityPinsSchema,
+  softwareEngineeringLegacyPinsSchema,
+])
+
+const missionSpecBaseSchema = z.object({
   version: z.literal(runtimeContractVersion),
   desiredOutcomeDigest: digestSchema,
   constraintsDigest: digestSchema,
-  resourceBindings: z.array(resourceBindingSchema).max(32),
-  compatibilityPins: compatibilityPinsSchema,
   parentMissionId: opaqueIdSchema.nullable(),
 }).strict()
+
+export const missionSpecSchema = z.union([
+  missionSpecBaseSchema.extend({
+    resourceBindings: z.array(resourceBindingSchema).length(0),
+    compatibilityPins: genericZeroCapabilityPinsSchema,
+  }).strict(),
+  missionSpecBaseSchema.extend({
+    resourceBindings: z.array(resourceBindingSchema).max(32),
+    compatibilityPins: softwareEngineeringLegacyPinsSchema,
+  }).strict(),
+])
 export type MissionSpec = z.infer<typeof missionSpecSchema>
 
 export const missionRefSchema = z.object({

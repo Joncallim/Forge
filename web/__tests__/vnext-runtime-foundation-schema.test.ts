@@ -6,6 +6,7 @@ import { reasonCodes } from '@/lib/runtime/v1'
 const migration = readFileSync(fileURLToPath(new URL('../db/migrations/0034_vnext_phase0_a1_runtime_foundation.sql', import.meta.url)), 'utf8')
 const reconciler = readFileSync(fileURLToPath(new URL('../../scripts/reconcile-forge-app-privileges.sql', import.meta.url)), 'utf8')
 const bootstrap = readFileSync(fileURLToPath(new URL('../scripts/bootstrap-vnext-runtime-owner.ts', import.meta.url)), 'utf8')
+const migrator = readFileSync(fileURLToPath(new URL('../db/migrate.ts', import.meta.url)), 'utf8')
 const journal = JSON.parse(readFileSync(fileURLToPath(new URL('../db/migrations/meta/_journal.json', import.meta.url)), 'utf8')) as { entries: Array<{ idx: number; tag: string }> }
 
 describe('VNext Phase 0 A1 protected persistence foundation', () => {
@@ -13,7 +14,9 @@ describe('VNext Phase 0 A1 protected persistence foundation', () => {
     expect(migration).toContain('SET ROLE forge_runtime_routines_owner;')
     expect(migration).not.toContain('forge_s4_routines_owner')
     expect(migration).toContain('REVOKE ALL ON TABLE public.missions,public.executions,public.task_mission_bindings,public.runtime_transition_audits FROM PUBLIC,forge;')
-    expect(migration).toContain("session_user<>'forge' OR current_user<>'forge_runtime_routines_owner'")
+    expect(migration).toContain("NOT pg_catalog.pg_has_role(session_user,'forge_runtime_api','member') OR current_user<>'forge_runtime_routines_owner'")
+    expect(migration).toContain("NOT pg_catalog.pg_has_role(session_user,'forge_runtime_api','member') THEN RAISE EXCEPTION 'VNext mission creation requires the dedicated authenticated server boundary'")
+    expect(migration).toContain('TO forge_runtime_api;')
     expect(migration).toContain('SET search_path=pg_catalog AS')
     expect(bootstrap).toContain("const OWNER = 'forge_runtime_routines_owner'")
   })
@@ -35,6 +38,11 @@ describe('VNext Phase 0 A1 protected persistence foundation', () => {
     expect(migration).toContain("jsonb_typeof(item->'resource'->'id') IS DISTINCT FROM 'string'")
     expect(migration).toContain('jsonb_array_length(p_bindings) <= 32')
     expect(migration).toContain('IS NOT TRUE')
+    expect(migration).toContain("'generic_zero_capability_v1'")
+    expect(migration).toContain("p_bindings = '[]'::jsonb")
+    for (const type of ['operator', 'system', 'mission', 'execution', 'agent_run', 'trigger', 'adapter', 'verifier', 'service']) {
+      expect(migration).toContain(`'${type}'`)
+    }
   })
 
   it('contains every accepted SPEC-0007 v1 reason in both the TS and SQL boundaries', () => {
@@ -49,6 +57,13 @@ describe('VNext Phase 0 A1 protected persistence foundation', () => {
   it('keeps A1 at the journal migration tip so a generated installer cannot silently skip it', () => {
     expect(journal.entries.at(-1)).toMatchObject({ idx: 34, tag: '0034_vnext_phase0_a1_runtime_foundation' })
     expect(migration).toContain('CREATE TABLE public.missions')
+  })
+
+  it('keeps ordinary latest migration and repair on the documented bounded handoff', () => {
+    expect(migrator).toContain('runtimeFoundationIsPending')
+    expect(migrator).toContain('scripts/bootstrap-vnext-runtime-owner.ts')
+    expect(bootstrap).toContain("process.env.FORGE_DATABASE_ADMIN_URL?.trim() || getRequiredEnv('DATABASE_URL')")
+    expect(bootstrap).toContain("const API = 'forge_runtime_api'")
   })
 
   it('has no Task copy/backfill or prompt/title audit column in A1', () => {
@@ -67,5 +82,12 @@ describe('VNext Phase 0 A1 protected persistence foundation', () => {
     expect(reconciler).toContain('forge.transition_vnext_execution_v1')
     expect(reconciler).toContain("GRANT SELECT (id, submitted_by) ON TABLE public.tasks TO forge_runtime_routines_owner;")
     expect(bootstrap).toContain('grant select (id, submitted_by) on table public.tasks')
+  })
+
+  it('makes Task current execution pointers forward-only and non-terminal', () => {
+    expect(migration).toContain('executions_mission_sequence_unique UNIQUE (mission_id,execution_sequence)')
+    expect(migration).toContain("v_next_lifecycle='terminal' OR v_next_sequence<=v_current_sequence")
+    expect(migration).toContain("VNext task pointer requires a newer non-terminal Execution")
+    expect(migration).toContain("VNext current execution pointer requires a non-terminal successor")
   })
 })

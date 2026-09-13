@@ -11,18 +11,29 @@ import {
   digestSchema,
   executionLifecycleSchema,
   executionOutcomeSchema,
-  missionSpecSchema,
+  genericZeroCapabilityPinsSchema,
   missionLifecycleSchema,
   missionOutcomeSchema,
   missionRefSchema,
   reasonCodeSchema,
+  resourceBindingSchema,
   revisionSchema,
+  softwareEngineeringLegacyPinsSchema,
 } from './contracts'
 
 // These schemas are the only inputs a route may pass into this service. Owner
 // and actor identity are intentionally absent: the authenticated server session
 // supplies them below, and internal principals are reserved for closed code.
-export const createMissionRequestSchema = missionSpecSchema.omit({ parentMissionId: true })
+export const createMissionRequestSchema = z.union([
+  z.object({
+    version: z.literal('v1'), desiredOutcomeDigest: digestSchema, constraintsDigest: digestSchema,
+    resourceBindings: z.array(resourceBindingSchema).length(0), compatibilityPins: genericZeroCapabilityPinsSchema,
+  }).strict(),
+  z.object({
+    version: z.literal('v1'), desiredOutcomeDigest: digestSchema, constraintsDigest: digestSchema,
+    resourceBindings: z.array(resourceBindingSchema).max(32), compatibilityPins: softwareEngineeringLegacyPinsSchema,
+  }).strict(),
+])
 export const transitionExecutionRequestSchema = z.object({
   expectedRevision: revisionSchema,
   lifecycle: executionLifecycleSchema,
@@ -68,7 +79,10 @@ export const transitionMissionRequestSchema = z.object({
 export class PostgreSqlRuntimeStore implements RuntimeStore {
   private readonly sql: ReturnType<typeof postgres>
 
-  constructor(databaseUrl = getRequiredEnv('DATABASE_URL')) {
+  // Runtime writes never share the broad legacy `forge` connection. The
+  // separate server-only connection is the database half of actor provenance:
+  // a direct legacy SQL client cannot forge another operator UUID.
+  constructor(databaseUrl = getRequiredEnv('FORGE_RUNTIME_DATABASE_URL')) {
     this.sql = postgres(databaseUrl, { max: 1, prepare: true, onnotice: () => {}, transform: { undefined: null } })
   }
 

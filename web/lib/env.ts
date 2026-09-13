@@ -2,6 +2,7 @@ import { passkeysEnabled } from '@/lib/auth-options'
 
 type EnvVarName =
   | 'DATABASE_URL'
+  | 'FORGE_RUNTIME_DATABASE_URL'
   | 'REDIS_URL'
   | 'SESSION_SECRET'
   | 'WEBAUTHN_RP_ID'
