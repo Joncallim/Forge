@@ -33,9 +33,9 @@ CREATE FUNCTION forge.vnext_compatibility_pins_valid_v1(p_pins jsonb) RETURNS bo
    AND jsonb_typeof(p_pins->'version')='string' AND jsonb_typeof(p_pins->'workflowRevision')='string'
    AND jsonb_typeof(p_pins->'policyRevision')='string' AND jsonb_typeof(p_pins->'budgetEnvelopeRevision')='string'
    AND jsonb_typeof(p_pins->'compatibilityMode')='string'
-   AND length(btrim(p_pins->>'workflowRevision')) BETWEEN 1 AND 256
-   AND length(btrim(p_pins->>'policyRevision')) BETWEEN 1 AND 256
-   AND length(btrim(p_pins->>'budgetEnvelopeRevision')) BETWEEN 1 AND 256
+   AND p_pins->>'workflowRevision' ~ '^(rev:v1:[A-Za-z0-9._-]{1,200}|sha256:[a-f0-9]{64})$'
+   AND p_pins->>'policyRevision' ~ '^(rev:v1:[A-Za-z0-9._-]{1,200}|sha256:[a-f0-9]{64})$'
+   AND p_pins->>'budgetEnvelopeRevision' ~ '^(rev:v1:[A-Za-z0-9._-]{1,200}|sha256:[a-f0-9]{64})$'
 $$;
 REVOKE ALL ON FUNCTION forge.vnext_compatibility_pins_valid_v1(jsonb) FROM PUBLIC, forge;
 CREATE FUNCTION forge.vnext_resource_bindings_valid_v1(p_bindings jsonb) RETURNS boolean LANGUAGE sql IMMUTABLE PARALLEL SAFE SET search_path=pg_catalog AS $$

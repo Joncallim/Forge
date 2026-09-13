@@ -1,5 +1,7 @@
 import { z } from 'zod'
 
+export const safeRevisionSchema = z.string().regex(/^(?:rev:v1:[A-Za-z0-9._-]{1,200}|sha256:[a-f0-9]{64})$/, 'safe revision identifier required')
+
 // These contracts deliberately have no dependencies on persistence, compatibility,
 // queues, providers, or UI.  They describe generic runtime data, not authority to
 // perform a side effect.
@@ -89,7 +91,7 @@ export const grantEnvelopeSchema = z.object({
   capability: capabilityRefSchema,
   resourceScope: resourceRefSchema,
   constraintsDigest: digestSchema,
-  policyRevision: z.string().min(1).max(256),
+  policyRevision: safeRevisionSchema,
   parentGrantId: opaqueIdSchema.nullable(),
   evidenceDigest: digestSchema,
   expiresAt: z.coerce.date().nullable(),
@@ -104,9 +106,9 @@ export const executionOutcomeSchema = z.enum(['succeeded', 'failed', 'cancelled'
 
 const compatibilityPinRevisionsSchema = z.object({
   version: z.literal(runtimeContractVersion),
-  workflowRevision: z.string().min(1).max(256),
-  policyRevision: z.string().min(1).max(256),
-  budgetEnvelopeRevision: z.string().min(1).max(256),
+  workflowRevision: safeRevisionSchema,
+  policyRevision: safeRevisionSchema,
+  budgetEnvelopeRevision: safeRevisionSchema,
 }).strict()
 
 // The generic profile is deliberately separate from the coding compatibility
@@ -218,7 +220,7 @@ export const executionContextSchema = z.object({
   version: z.literal(runtimeContractVersion),
   execution: executionRefSchema,
   principal: principalRefSchema,
-  workflowRevision: z.string().min(1).max(256),
+  workflowRevision: safeRevisionSchema,
   resourceBindings: z.array(resourceBindingSchema).max(32),
   blockerReasonCode: reasonCodeSchema.nullable(),
 }).strict()
