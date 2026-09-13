@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+  assertProtectedMigrationMarkers,
   protectedMigrationRecoveryPlan,
   protectedMigrationRegistry,
   syntheticFutureProtectedMigration,
@@ -74,4 +75,11 @@ describe('protected migration registry', () => {
       cleanupStateTags: new Set(),
     })).toThrow(`Applied protected migration '${runtime.migrationTag}' has no durable handoff state`)
   })
+
+  it('keeps checked-in protected SQL markers one-to-one with the recovery registry', async () => {
+    const journal = JSON.parse(await readFile(resolve(process.cwd(), 'db/migrations/meta/_journal.json'), 'utf8')) as { entries: Array<{ tag: string }> }
+    await expect(assertProtectedMigrationMarkers(resolve(process.cwd(), 'db/migrations'), journal.entries.map((entry) => entry.tag))).resolves.toBeUndefined()
+  })
 })
+import { readFile } from 'node:fs/promises'
+import { resolve } from 'node:path'

@@ -60,3 +60,25 @@ export function protectedMigrationRecoveryPlan(input: Readonly<{
     !input.appliedTags.has(migration.migrationTag) || input.cleanupPendingTags.has(migration.migrationTag)
   ))
 }
+
+/** Every SQL marker is a declaration of privileged migration behavior.  Do
+ * not allow a migration to add one without a recovery wrapper, or a registry
+ * entry to silently point at an unmarked ordinary migration. */
+export async function assertProtectedMigrationMarkers(migrationsDirectory: string, journalTags: readonly string[]): Promise<void> {
+  const markers: string[] = []
+  for (const tag of journalTags) {
+    const source = await readFile(join(migrationsDirectory, `${tag}.sql`), 'utf8')
+    const matches = [...source.matchAll(/^\s*--\s*forge-protected-migration:\s*([^\s]+)\s*$/gm)].map((match) => match[1])
+    if (matches.length > 1 || (matches.length === 1 && matches[0] !== tag)) {
+      throw new Error(`Protected migration marker is malformed or duplicated in '${tag}'.`)
+    }
+    if (matches.length === 1) markers.push(tag)
+  }
+  const registered = protectedMigrationsInJournal(journalTags).map((migration) => migration.migrationTag)
+  if (new Set(markers).size !== markers.length || new Set(registered).size !== registered.length
+    || JSON.stringify([...markers].sort()) !== JSON.stringify([...registered].sort())) {
+    throw new Error('Protected migration SQL markers and registry entries must be one-to-one.')
+  }
+}
+import { readFile } from 'node:fs/promises'
+import { join } from 'node:path'

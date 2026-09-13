@@ -34,7 +34,7 @@ describe.skipIf(!enabled)('VNext runtime session authority', () => {
   })
   afterAll(async () => { await legacy?.end({ timeout: 5 }); await api?.end({ timeout: 5 }); await admin?.end({ timeout: 5 }) })
 
-  it('exposes neither protected tables nor caller-shaped routines to either app role', async () => {
+  it('[scenarioId=vnext.a1.protected-postgres] exposes neither protected tables nor caller-shaped routines to either app role', async () => {
     await expect(legacy`insert into missions (id, owner_principal_type, owner_principal_id, desired_outcome_digest, constraints_digest, compatibility_pins) values (${randomUUID()}::uuid, 'operator', ${actor}::uuid, ${digest}, ${digest}, '{}'::jsonb)`).rejects.toMatchObject({ code: '42501' })
     await expect(api`select * from forge.create_vnext_mission_v1(${randomUUID()}::uuid, ${randomUUID()}::uuid, null::uuid, ${actor}::uuid, ${digest}, ${digest}, '{}'::jsonb, 'rev:v1:forged', '[]'::jsonb, 'mission.created')`).rejects.toMatchObject({ code: '42501' })
     const [acl] = await admin<{ apiRead: boolean; apiCreate: boolean; apiResolver: boolean; legacyCreate: boolean }[]>`
@@ -67,7 +67,7 @@ describe.skipIf(!enabled)('VNext runtime session authority', () => {
     await api`select * from forge.transition_vnext_execution_for_session_v1(${Buffer.from(credential, 'ascii')}::bytea, ${execution}::uuid, 0::bigint, 'terminal', 'cancelled', null, 'execution.cancelled', null)`
   })
 
-  it('keeps compare-and-swap transitions inside the credential-derived owner boundary', async () => {
+  it('[scenarioId=vnext.a1.pointer-concurrency-fixture-boundary] keeps compare-and-swap transitions inside the credential-derived owner boundary', async () => {
     const mission = randomUUID()
     const execution = randomUUID()
     await generic(credential, mission, execution)
@@ -80,7 +80,7 @@ describe.skipIf(!enabled)('VNext runtime session authority', () => {
     expect(audits.map((row) => row.resulting_revision)).toEqual(['0', '1'])
   })
 
-  it('derives Task resources and rejects mismatched, archived, and rootless Task fixtures', async () => {
+  it('[scenarioId=vnext.a1.projectless-lifecycle] derives Task resources and rejects mismatched, archived, and rootless Task fixtures', async () => {
     const makeTask = async (options: { taskOwner?: string; projectOwner?: string; archived?: boolean; rootRef?: string | null; rootRevision?: number } = {}) => {
       const project = randomUUID(); const task = randomUUID()
       const rootRef = options.rootRef === undefined ? randomUUID() : options.rootRef

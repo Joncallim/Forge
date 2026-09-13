@@ -46,6 +46,11 @@ describe('VNext Phase 0 A1 executable conformance contract', () => {
     expect(staticBinding).toMatchObject({ runner: 'vitest', command: 'npx vitest run __tests__/vnext-phase0-conformance.contract.test.ts', forbidSkipped: true })
     expect(staticBinding?.executionKeys).toEqual(staticScenarioIds.map((id) => `vitest::${id}`))
     expect(postgresBinding).toMatchObject({ runner: 'vitest', forbidSkipped: true })
+    expect(postgresBinding?.executionKeys).toEqual([
+      'vitest::vnext.a1.protected-postgres',
+      'vitest::vnext.a1.projectless-lifecycle',
+      'vitest::vnext.a1.pointer-concurrency-fixture-boundary',
+    ])
     expect(recoveryBinding).toMatchObject({
       runner: 'command',
       command: 'npm run test:vnext-protected-migration-recovery',

@@ -28,18 +28,23 @@ function recoveryMarker(executionKey) {
   return `VNEXT_A1_PROTECTED_${scenario.replace('PROTECTED_', '')}_PASSED`
 }
 
-async function runStaticBinding(binding) {
+async function runVitestBinding(binding) {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'forge-vnext-a1-contract-'))
   const output = path.join(directory, 'result.json')
   try {
-    const result = await run('npx', ['vitest', 'run', '__tests__/vnext-phase0-conformance.contract.test.ts', '--retry=0', '--silent=true', '--reporter=json', `--outputFile=${output}`], { env: process.env })
+    const requiresPostgres = binding.id === 'a1-vitest-postgres'
+    const testFile = requiresPostgres ? '__tests__/vnext-runtime-foundation.postgres.test.ts' : '__tests__/vnext-phase0-conformance.contract.test.ts'
+    const result = await run('npx', ['vitest', 'run', testFile, '--retry=0', '--silent=true', '--reporter=json', `--outputFile=${output}`], {
+      env: { ...process.env, ...(requiresPostgres ? { FORGE_VNEXT_RUNTIME_REQUIRE_POSTGRES_TEST: '1' } : {}) },
+    })
     const report = JSON.parse(await readFile(output, 'utf8'))
     const assertions = report.testResults.flatMap((testResult) => testResult.assertionResults)
     if (assertions.some((assertion) => assertion.status === 'skipped')) throw new Error('A1 static conformance runner rejected skipped scenarios.')
-    const actual = assertions.map(scenarioKey).sort()
+    const taggedAssertions = assertions.filter((assertion) => assertion.fullName.includes('[scenarioId='))
+    const actual = taggedAssertions.map(scenarioKey).sort()
     const expected = [...binding.executionKeys].sort()
     if (result.code !== 0 || JSON.stringify(actual) !== JSON.stringify(expected) || assertions.some((assertion) => assertion.status !== 'passed')) {
-      throw new Error('A1 static conformance runner rejected scenario identity or outcome.')
+      throw new Error(`A1 ${binding.id} conformance runner rejected scenario identity or outcome.`)
     }
   } finally {
     await rm(directory, { recursive: true, force: true })
@@ -65,14 +70,20 @@ async function runRecoveryBinding(manifest, binding) {
 
 async function main() {
   const manifest = JSON.parse(await readFile('test-contracts/vnext-phase0-v1.json', 'utf8'))
-  const staticBinding = manifest.runnerBindings?.find((candidate) => candidate.id === 'a1-vitest-static')
-  const recoveryBinding = manifest.runnerBindings?.find((candidate) => candidate.id === 'a1-protected-migration-recovery')
-  if (!staticBinding || staticBinding.runner !== 'vitest' || staticBinding.forbidSkipped !== true || !Array.isArray(staticBinding.executionKeys)) {
-    throw new Error('Invalid A1 static conformance runner binding.')
+  if (!Array.isArray(manifest.runnerBindings) || !Array.isArray(manifest.proofs)) throw new Error('Invalid A1 conformance manifest.')
+  const ids = manifest.runnerBindings.map((binding) => binding.id)
+  if (new Set(ids).size !== ids.length) throw new Error('A1 conformance manifest has duplicate runner bindings.')
+  const proofKeys = manifest.proofs.flatMap((proof) => proof.scenarioIds.map((id) => `${proof.runnerBinding === 'a1-protected-migration-recovery' ? 'command' : 'vitest'}::${id}`))
+  if (new Set(proofKeys).size !== proofKeys.length) throw new Error('A1 conformance manifest has duplicate proof scenarios.')
+  for (const binding of manifest.runnerBindings) {
+    const proofs = manifest.proofs.filter((proof) => proof.runnerBinding === binding.id)
+    if (!Array.isArray(binding.executionKeys) || proofs.length === 0 || JSON.stringify([...binding.executionKeys].sort()) !== JSON.stringify(proofs.flatMap((proof) => proof.scenarioIds.map((id) => `${binding.runner === 'command' ? 'command' : 'vitest'}::${id}`)).sort())) {
+      throw new Error(`A1 conformance manifest has missing, duplicate, or orphan execution keys for ${binding.id}.`)
+    }
+    if (binding.runner === 'vitest' && binding.forbidSkipped === true) await runVitestBinding(binding)
+    else if (binding.runner === 'command') await runRecoveryBinding(manifest, binding)
+    else throw new Error(`Unsupported A1 conformance runner binding ${binding.id}.`)
   }
-  if (!recoveryBinding || !Array.isArray(recoveryBinding.executionKeys)) throw new Error('Missing A1 executable protected-migration recovery runner binding.')
-  await runStaticBinding(staticBinding)
-  await runRecoveryBinding(manifest, recoveryBinding)
   process.stdout.write('VNEXT_A1_CONFORMANCE_PASSED\n')
 }
 

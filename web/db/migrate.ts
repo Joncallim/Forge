@@ -21,7 +21,7 @@ import { drizzle } from 'drizzle-orm/postgres-js'
 import { migrate } from 'drizzle-orm/postgres-js/migrator'
 import postgres from 'postgres'
 import { getRequiredEnv } from '@/lib/env'
-import { protectedMigrationRecoveryPlan } from '@/scripts/ci/protected-migration-registry'
+import { assertProtectedMigrationMarkers, protectedMigrationRecoveryPlan } from '@/scripts/ci/protected-migration-registry'
 import { protectedMigrationCleanupState } from '@/scripts/ci/protected-migration-state'
 import { runManagedDockerMigration } from '@/scripts/managed-docker-migration-controller'
 
@@ -34,12 +34,24 @@ async function pendingProtectedMigrations(client: ReturnType<typeof postgres>): 
   try {
     const journal = JSON.parse(await readFile(fileURLToPath(new URL('./migrations/meta/_journal.json', import.meta.url)), 'utf8')) as MigrationJournal
     const protectedTags = journal.entries.map((entry) => entry.tag)
+    await assertProtectedMigrationMarkers(fileURLToPath(new URL('./migrations', import.meta.url)), protectedTags)
     const rows = await client<{ createdAt: number }[]>`
       select created_at as "createdAt" from drizzle.__drizzle_migrations
     `
     const appliedAt = new Set(rows.map((row) => Number(row.createdAt)))
     const appliedTags = new Set(journal.entries.filter((entry) => appliedAt.has(entry.when)).map((entry) => entry.tag))
-    const cleanupState = await protectedMigrationCleanupState(client, protectedTags)
+    // Handoff rows are controller-only.  A normal application connection
+    // must never acquire table access simply so a migration restart can plan
+    // recovery; a documented administrator connection performs this narrow
+    // inspection when one is needed.
+    const stateUrl = process.env.FORGE_DATABASE_ADMIN_URL?.trim()
+    const stateClient = stateUrl ? postgres(stateUrl, { max: 1, onnotice: () => {} }) : client
+    let cleanupState
+    try {
+      cleanupState = await protectedMigrationCleanupState(stateClient, protectedTags)
+    } finally {
+      if (stateClient !== client) await stateClient.end({ timeout: 5 })
+    }
     return protectedMigrationRecoveryPlan({
       journalTags: protectedTags,
       appliedTags,
@@ -70,12 +82,20 @@ async function main(): Promise<void> {
   console.log('• Checking the database for pending migrations…')
 
   try {
+    // The managed lane owns its administrator connection and must verify the
+    // durable state itself.  Do not probe controller-only state using the
+    // long-lived application URL before handing over to that lane.
+    if (process.env.FORGE_MANAGED_DOCKER_MIGRATIONS === '1') {
+      await client.end({ timeout: 5 })
+      clientClosed = true
+      await runManagedDockerMigration()
+      return
+    }
     const protectedMigrations = await pendingProtectedMigrations(client)
     if (protectedMigrations.length > 0) {
       await client.end({ timeout: 5 })
       clientClosed = true
-      if (process.env.FORGE_MANAGED_DOCKER_MIGRATIONS === '1') await runManagedDockerMigration()
-      else await execFileAsync('bash', [protectedMigrations[0].wrapper], { cwd: process.cwd(), env: process.env })
+      await execFileAsync('bash', [protectedMigrations[0].wrapper], { cwd: process.cwd(), env: process.env })
       return
     }
     const db = drizzle(client)

@@ -1,3 +1,4 @@
+-- forge-protected-migration: 0034_vnext_phase0_a1_runtime_foundation
 -- VNext Phase 0 / #334 Slice A1. Additive authority only: no backfill,
 -- cutover, enqueue, or legacy Task rewrite occurs in this migration.
 SET ROLE forge_runtime_routines_owner;
