@@ -87,25 +87,40 @@ jobs:
           selected_version="$($selected_node --version)"
           [[ "$selected_version" =~ ^v22\. ]] || { echo "Expected setup-node to select Node 22, got $selected_version" >&2; exit 1; }
           selected_root="$(dirname "$(dirname "$selected_node")")"
-          trusted_root=/usr/local/lib/forge-ci-node22
+          trusted_root=/usr/lib/forge-ci-node22
           sudo install -d -o root -g root -m 0755 "$trusted_root"
           sudo cp -a "$selected_root/." "$trusted_root/"
           sudo chown -R root:root "$trusted_root"
           sudo chmod -R go-w "$trusted_root"
-          for tool in node npm npx; do
-            sudo ln -sfn "$trusted_root/bin/$tool" "/usr/local/bin/$tool"
-            canonical="$(readlink -f "/usr/local/bin/$tool")"
-            [[ "$canonical" = "$trusted_root/"* && -f "$canonical" ]] || { echo "Trusted $tool target escaped its fixed tree" >&2; exit 1; }
-            while [[ "$canonical" != / ]]; do
-              [[ "$(stat -c '%U' "$canonical")" = root ]] || { echo "$canonical is not root-owned" >&2; exit 1; }
-              [[ $((8#$(stat -c '%a' "$canonical") & 022)) -eq 0 ]] || { echo "$canonical is group/other writable" >&2; exit 1; }
-              canonical="${canonical%/*}"
-              [[ -n "$canonical" ]] || canonical=/
+          validate_trusted_chain() {
+            local candidate="$1" current="$1"
+            while :; do
+              [[ -e "$current" || -L "$current" ]] || { echo "$current is missing" >&2; exit 1; }
+              [[ "$(stat -c '%U' "$current")" = root ]] || { echo "$current is not root-owned" >&2; exit 1; }
+              if [[ ! -L "$current" ]]; then
+                [[ $((8#$(stat -c '%a' "$current") & 022)) -eq 0 ]] || { echo "$current is group/other writable" >&2; exit 1; }
+              fi
+              [[ "$current" = / ]] && break
+              current="${current%/*}"
+              [[ -n "$current" ]] || current=/
             done
+            current="$(readlink -f "$candidate")"
+            [[ "$current" = "$trusted_root/"* && -f "$current" ]] || { echo "Trusted candidate escaped its fixed tree" >&2; exit 1; }
+            while :; do
+              [[ "$(stat -c '%U' "$current")" = root ]] || { echo "$current is not root-owned" >&2; exit 1; }
+              [[ $((8#$(stat -c '%a' "$current") & 022)) -eq 0 ]] || { echo "$current is group/other writable" >&2; exit 1; }
+              [[ "$current" = / ]] && break
+              current="${current%/*}"
+              [[ -n "$current" ]] || current=/
+            done
+          }
+          for tool in node npm npx; do
+            sudo ln -sfn "$trusted_root/bin/$tool" "/usr/bin/$tool"
+            validate_trusted_chain "/usr/bin/$tool"
           done
-          [[ "$(/usr/local/bin/node --version)" = "$selected_version" ]]
-          [[ "$(/usr/local/bin/npm --version)" = "$("$trusted_root/bin/npm" --version)" ]]
-          [[ "$(/usr/local/bin/npx --version)" = "$("$trusted_root/bin/npx" --version)" ]]
+          [[ "$(/usr/bin/node --version)" = "$selected_version" ]]
+          [[ "$(/usr/bin/npm --version)" = "$("$trusted_root/bin/npm" --version)" ]]
+          [[ "$(/usr/bin/npx --version)" = "$("$trusted_root/bin/npx" --version)" ]]
       - name: Exercise managed local installer migration orchestration
         working-directory: .
         run: bash scripts/test-install-managed-migrations.sh
