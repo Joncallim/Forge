@@ -2,15 +2,16 @@ services:
   postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-forge}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-forge}
+      # The bootstrap identity is never used by the web or worker services.
+      POSTGRES_USER: ${POSTGRES_USER:-forge_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD for forge_admin}
       POSTGRES_DB: ${POSTGRES_DB:-forge}
     ports:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-forge}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-forge_admin}"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -43,7 +44,8 @@ services:
       redis:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-forge}:${POSTGRES_PASSWORD:-forge}@postgres:5432/${POSTGRES_DB:-forge}
+      DATABASE_URL: postgresql://forge:${FORGE_APP_DATABASE_PASSWORD:?set FORGE_APP_DATABASE_PASSWORD}@postgres:5432/${POSTGRES_DB:-forge}
+      FORGE_DATABASE_ADMIN_URL: postgresql://forge_admin:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-forge}
       REDIS_URL: redis://redis:6379/0
       NEXT_PUBLIC_APP_URL: ${NEXT_PUBLIC_APP_URL:-http://localhost:3000}
       FORGE_WORKSPACE_ROOT: /forge-workspace
@@ -71,7 +73,8 @@ services:
       redis:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-forge}:${POSTGRES_PASSWORD:-forge}@postgres:5432/${POSTGRES_DB:-forge}
+      DATABASE_URL: postgresql://forge:${FORGE_APP_DATABASE_PASSWORD:?set FORGE_APP_DATABASE_PASSWORD}@postgres:5432/${POSTGRES_DB:-forge}
+      FORGE_DATABASE_ADMIN_URL: postgresql://forge_admin:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-forge}
       REDIS_URL: redis://redis:6379/0
       FORGE_WORKER_CLAIM_TIMEOUT_SECONDS: ${FORGE_WORKER_CLAIM_TIMEOUT_SECONDS:-5}
       FORGE_WORKSPACE_ROOT: /forge-workspace
