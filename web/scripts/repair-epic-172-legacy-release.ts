@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import postgres from 'postgres'
-import { resolveBootstrapAdminUrl } from './ci/bootstrap-database-urls'
+import { openBootstrapAdmin, type BootstrapAdminInput } from './ci/bootstrap-database-urls'
 
 const legacy0023 = 'bf855fc0d4f110864badedf287c987adbe7913059b3673d385c81b1dbc2d9d31'
 const current0023 = 'e8234134bb5356d2c0093d4618a6e60251e2c16b8bdf8dcacfd5673cbbafbe85'
@@ -1403,16 +1403,16 @@ async function durableRepairedFingerprint(
     && await exactReleaseRoleBoundary(sql, true)
 }
 
-async function loadRepairArtifact(): Promise<string> {
-  const source = await readFile(repairArtifact, 'utf8')
+async function loadRepairArtifact(sourceOverride?: string): Promise<string> {
+  const source = sourceOverride ?? await readFile(repairArtifact, 'utf8')
   if (createHash('sha256').update(source).digest('hex') !== repairArtifactSha256) {
     throw new Error('Refusing legacy release repair: fixed repair artifact integrity check failed.')
   }
   return source
 }
 
-export async function runEpic172LegacyReleaseRepair(explicit?: Readonly<{ adminUrl: string }>): Promise<void> {
-  const client = postgres(resolveBootstrapAdminUrl(explicit), { max: 1, onnotice: () => {} })
+export async function runEpic172LegacyReleaseRepair(explicit?: BootstrapAdminInput & Readonly<{ repairArtifactSource?: string }>): Promise<void> {
+  const { admin: client, close } = openBootstrapAdmin(explicit)
   try {
     const outcome = await client.begin(async (sql) => {
       await sql.unsafe('LOCK TABLE pg_catalog.pg_authid IN SHARE ROW EXCLUSIVE MODE')
@@ -1536,7 +1536,7 @@ export async function runEpic172LegacyReleaseRepair(explicit?: Readonly<{ adminU
         throw new Error('Refusing legacy release repair: physical catalog fingerprint is not the exact known legacy state.')
       }
 
-      const repairSql = await loadRepairArtifact()
+      const repairSql = await loadRepairArtifact(explicit?.repairArtifactSource)
       await sql.unsafe(repairSql)
       const ledgerAfter = await sql<readonly { hash: string; created_at: number }[]>`
         SELECT hash, created_at
@@ -1567,7 +1567,7 @@ export async function runEpic172LegacyReleaseRepair(explicit?: Readonly<{ adminU
       console.log('✓ Epic 172 legacy release repair is not needed.')
     }
   } finally {
-    await client.end({ timeout: 5 })
+    await close()
   }
 }
 if (process.argv[1]?.endsWith('repair-epic-172-legacy-release.ts')) runEpic172LegacyReleaseRepair().catch((error) => {

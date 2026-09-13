@@ -174,6 +174,10 @@ FOR UPDATE OF attribute;
 GRANT USAGE, CREATE ON SCHEMA public TO forge;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO forge;
 GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO forge;
+-- Controller recovery state is never application data. Close this exception
+-- in the same transaction as the broad legacy grant, so existing app sessions
+-- cannot observe a writable handoff row between reconciliation steps.
+REVOKE ALL PRIVILEGES ON TABLE public.forge_protected_migration_handoffs FROM PUBLIC, forge, forge_runtime_api, forge_runtime_api_login;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public
   GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO forge;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public

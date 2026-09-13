@@ -1,6 +1,5 @@
 import '../lib/load-env'
-import postgres from 'postgres'
-import { resolveBootstrapDatabaseUrls, type BootstrapDatabaseUrls } from './ci/bootstrap-database-urls'
+import { openBootstrapDatabaseContext, type BootstrapDatabaseUrls } from './ci/bootstrap-database-urls'
 
 const ROUTINES_OWNER = 'forge_release_routines_owner'
 const RELEASE_ROLES = [
@@ -14,19 +13,11 @@ function quotedLiteral(value: string): string {
 }
 
 export async function runEpic172S3OwnerBootstrap(explicitUrls?: BootstrapDatabaseUrls): Promise<void> {
-  const { adminUrl, migrationUrl } = resolveBootstrapDatabaseUrls(explicitUrls)
-
-  const migrationClient = postgres(migrationUrl, { max: 1, onnotice: () => {} })
-  const [{ migrationRole }] = await migrationClient<{ migrationRole: string }[]>`
-    select session_user as "migrationRole"
-  `
-  await migrationClient.end({ timeout: 5 })
-  if (!migrationRole || RELEASE_ROLES.includes(migrationRole as typeof RELEASE_ROLES[number])) {
-    throw new Error('The S3 migration login must be an ordinary role distinct from every release principal.')
-  }
-
-  const client = postgres(adminUrl, { max: 1, onnotice: () => {} })
+  const { admin: client, migrationRole, close } = await openBootstrapDatabaseContext(explicitUrls)
   try {
+    if (!migrationRole || RELEASE_ROLES.includes(migrationRole as typeof RELEASE_ROLES[number])) {
+      throw new Error('The S3 migration login must be an ordinary role distinct from every release principal.')
+    }
     const [authority] = await client<{
       currentUser: string
       canCreateRole: boolean
@@ -360,7 +351,7 @@ export async function runEpic172S3OwnerBootstrap(explicitUrls?: BootstrapDatabas
     console.log(`✓ Installed the migration-0026-only S3 owner handoff for ${migrationRole}.`)
     console.log(`  Migration 0026 will grant, use, and revoke ${ROUTINES_OWNER} in one transaction.`)
   } finally {
-    await client.end({ timeout: 5 })
+    await close()
   }
 }
 

@@ -1,6 +1,5 @@
 import '../lib/load-env'
-import postgres from 'postgres'
-import { resolveBootstrapDatabaseUrls, type BootstrapDatabaseUrls } from './ci/bootstrap-database-urls'
+import { openBootstrapDatabaseContext, type BootstrapDatabaseUrls } from './ci/bootstrap-database-urls'
 
 const BEGIN = 'public.forge_begin_epic_172_s4_owner_bootstrap_v1()'
 const FINALIZE = 'public.forge_finalize_epic_172_s4_owner_bootstrap_v1()'
@@ -11,11 +10,7 @@ function identifier(value: string): string {
 }
 
 export async function runEpic172S5OwnerBootstrap(cleanup = false, explicitUrls?: BootstrapDatabaseUrls): Promise<void> {
-  const { adminUrl, migrationUrl } = resolveBootstrapDatabaseUrls(explicitUrls)
-  const migration = postgres(migrationUrl, { max: 1, onnotice: () => {} })
-  const [{ migrationRole }] = await migration<{ migrationRole: string }[]>`select current_user as "migrationRole"`
-  await migration.end({ timeout: 5 })
-  const admin = postgres(adminUrl, { max: 1, onnotice: () => {} })
+  const { admin, migrationRole, close } = await openBootstrapDatabaseContext(explicitUrls)
   try {
     if (cleanup) {
       // This is deliberately idempotent. A failed protected migration can
@@ -70,7 +65,7 @@ export async function runEpic172S5OwnerBootstrap(cleanup = false, explicitUrls?:
     `
     if (grants !== 2) throw new Error('The protected migration did not receive both exact handoff execute grants.')
   } finally {
-    await admin.end({ timeout: 5 })
+    await close()
   }
   console.log('✓ Granted the migration login the bounded protected-owner handoff routines.')
 }

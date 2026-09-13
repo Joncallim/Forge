@@ -199,7 +199,7 @@ export async function prepareProtectedMigrationController(
           and not auth.rolsuper and not auth.rolcreatedb and not auth.rolcreaterole and not auth.rolreplication
           and not auth.rolbypassrls and auth.rolconnlimit=1 and auth.rolpassword is not null and auth.rolvaliduntil is not null) as safe,
         exists(select 1 from pg_catalog.pg_auth_members membership join pg_catalog.pg_roles parent on parent.oid=membership.roleid
-          where (membership.member=auth.oid and (parent.rolname not in ('forge_schema_owner','forge_runtime_routines_owner')
+          where (membership.member=auth.oid and (parent.rolname not in ('forge_schema_owner','forge_release_routines_owner','forge_runtime_routines_owner')
             or membership.admin_option or not membership.inherit_option or not membership.set_option))
             or membership.roleid=auth.oid) as "unexpectedMembership"
       from pg_catalog.pg_authid auth where auth.oid=${existing.migrationRoleOid}::oid and auth.rolname=${existing.migrationRole}
@@ -261,7 +261,7 @@ export async function prepareProtectedMigrationController(
           and not auth.rolsuper and not auth.rolcreatedb and not auth.rolcreaterole and not auth.rolreplication
           and not auth.rolbypassrls and auth.rolconnlimit=1 and auth.rolpassword is not null and auth.rolvaliduntil is not null) as safe,
           exists(select 1 from pg_catalog.pg_auth_members membership join pg_catalog.pg_roles parent on parent.oid=membership.roleid
-            where (membership.member=auth.oid and (parent.rolname not in ('forge_schema_owner','forge_runtime_routines_owner')
+            where (membership.member=auth.oid and (parent.rolname not in ('forge_schema_owner','forge_release_routines_owner','forge_runtime_routines_owner')
               or membership.admin_option or not membership.inherit_option or not membership.set_option))
               or membership.roleid=auth.oid) as "unexpectedMembership"
         from pg_catalog.pg_authid auth where auth.rolname=${existing.migrationRole}
@@ -314,7 +314,7 @@ export async function prepareProtectedMigrationController(
 }
 
 function safeRecoveryParent(value: string): string {
-  if (value !== 'forge_schema_owner' && value !== 'forge_runtime_routines_owner') {
+  if (!['forge_schema_owner', 'forge_release_routines_owner', 'forge_runtime_routines_owner'].includes(value)) {
     throw new Error('Protected migration recovery found an unexpected ephemeral role membership.')
   }
   return `"${value}"`

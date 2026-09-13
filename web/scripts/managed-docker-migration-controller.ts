@@ -2,8 +2,8 @@
  * complete fence: application quiescence through verified cleanup. */
 import { createHash, randomUUID } from 'node:crypto'
 import { execFile } from 'node:child_process'
-import { createRequire } from 'node:module'
-import { chmod, chown, mkdtemp, readFile, readdir, rm, stat } from 'node:fs/promises'
+import { chmod, chown, lstat, mkdtemp, readFile, readdir, rm, stat } from 'node:fs/promises'
+import { createConnection } from 'node:net'
 import { resolve } from 'node:path'
 import { promisify } from 'node:util'
 import postgres from 'postgres'
@@ -16,6 +16,7 @@ import { runEpic172S3OwnerBootstrap } from './bootstrap-epic-172-s3-release-owne
 import { runEpic172S4RoleBootstrap } from './bootstrap-epic-172-s4-roles'
 import { runEpic172LegacyReleaseRepair } from './repair-epic-172-legacy-release'
 import { runEpic172S5OwnerBootstrap } from './bootstrap-epic-172-s5-recovery-owner'
+import migrationJournal from '../db/migrations/meta/_journal.json'
 
 const LOCK = 334001
 const RUNTIME_MIGRATION_TAG = '0034_vnext_phase0_a1_runtime_foundation'
@@ -23,7 +24,27 @@ const RUNTIME_MIGRATION_CREATED_AT = 1786838400000
 const OWNER = 'forge_runtime_routines_owner'
 const API = 'forge_runtime_api'
 const execFileAsync = promisify(execFile)
-const tsxCli = createRequire(import.meta.url).resolve('tsx/cli')
+const NATIVE_AUTHORITY_LOST = 'Managed native controller lost its one reserved peer administrator connection; reconnect is forbidden.'
+let nativeAuthorityConnectionLost = false
+type SqlClient = ReturnType<typeof postgres>
+
+function reservedAdminClient(connection: Awaited<ReturnType<SqlClient['reserve']>>): SqlClient {
+  const sql = connection as unknown as SqlClient
+  if (typeof sql.begin !== 'function') {
+    Object.defineProperty(sql, 'begin', { value: async <T>(operation: (transaction: SqlClient) => Promise<T>) => {
+      await sql.unsafe('begin')
+      try {
+        const value = await operation(sql)
+        await sql.unsafe('commit')
+        return value
+      } catch (error) {
+        await sql.unsafe('rollback').catch(() => {})
+        throw error
+      }
+    } })
+  }
+  return sql
+}
 const safe = (value: string) => { if (!/^[a-z_][a-z0-9_]*$/i.test(value)) throw new Error('Unsafe PostgreSQL identifier.'); return `"${value}"` }
 type DatabaseAcl = Array<{ grantorOid: number; grantor: string; granteeOid: number; grantee: string; privilege: string; grantable: boolean }>
 const quoteCatalogIdentifier = (value: string) => `"${value.replaceAll('"', '""')}"`
@@ -229,14 +250,28 @@ export async function runManagedDockerMigration(): Promise<void> {
   const ephemeralMigrationUrl = createEphemeralMigrationUrl(applicationUrl, migrator, migratorPassword)
   const operationId = randomUUID()
   if (process.getuid?.() !== 0) throw new Error('Managed migration controller must retain root while migration children run under a distinct unprivileged identity.')
-  const childUid = await selectEphemeralChildUid(native?.peerUid ?? 0)
-  const childGid = await validatedReadOnlyTraversalGid(process.cwd())
-  const childIdentity = { uid: childUid, gid: childGid ?? childUid }
+  const childIdentity = await (async () => {
+    if (!native) return await dockerMigrationChildIdentity()
+    const uid = await selectEphemeralChildUid(native.peerUid)
+    return { uid, gid: (await validatedReadOnlyTraversalGid(process.cwd())) ?? uid }
+  })()
+  const childNode = native?.childNode ?? process.execPath
+  const childTsxCli = native?.childTsxCli ?? resolve(process.cwd(), 'node_modules/tsx/dist/cli.mjs')
   process.setgroups?.([])
   const childPrivateDirectory = await mkdtemp('/tmp/forge-migration-child-')
   await chown(childPrivateDirectory, childIdentity.uid, childIdentity.gid)
   await chmod(childPrivateDirectory, 0o700)
-  const pool = postgres(adminUrl, { max: 1, onnotice: () => {}, backoff: false })
+  let nativeAdminSocketOpened = false
+  const pool = postgres(adminUrl, {
+    max: 1, onnotice: () => {}, backoff: false,
+    ...(native ? { socket: () => {
+      if (nativeAdminSocketOpened) throw new Error(NATIVE_AUTHORITY_LOST)
+      nativeAdminSocketOpened = true
+      const socket = createConnection(resolve(native.socket, `.s.PGSQL.${native.port}`))
+      socket.once('close', () => { nativeAuthorityConnectionLost = true })
+      return socket
+    } } : {}),
+  })
   let reserved: Awaited<ReturnType<typeof pool.reserve>> | null = null
   let sql = pool
   if (native) {
@@ -245,7 +280,7 @@ export async function runManagedDockerMigration(): Promise<void> {
     process.seteuid(native.peerUid)
     try {
       reserved = await pool.reserve()
-      sql = reserved as unknown as typeof pool
+      sql = reservedAdminClient(reserved)
       const [authority] = await sql<{ sessionUser: string; superuser: boolean }[]>`
         select session_user as "sessionUser", rolsuper as superuser from pg_catalog.pg_roles where rolname=session_user
       `
@@ -254,6 +289,7 @@ export async function runManagedDockerMigration(): Promise<void> {
       process.seteuid(0)
       process.setegid(0)
     }
+    if (native.proofPauseAfterReserveMs > 0) await new Promise((resolvePause) => setTimeout(resolvePause, native.proofPauseAfterReserveMs))
   }
   let locked = false
   let fenced = false
@@ -264,8 +300,10 @@ export async function runManagedDockerMigration(): Promise<void> {
   let lifecycleGeneration: bigint | null = null
   let primaryFailure: unknown = null
   try {
-    const journal = JSON.parse(await readFile(resolve(process.cwd(), 'db/migrations/meta/_journal.json'), 'utf8')) as { entries: Array<{ tag: string; when: number }> }
-    await assertProtectedMigrationMarkers(resolve(process.cwd(), 'db/migrations'), journal.entries.map((entry) => entry.tag))
+    const journal = migrationJournal as { entries: Array<{ tag: string; when: number }> }
+    // Native helper bytes and their journal are bundled and digest-verified
+    // before privilege acquisition. Docker uses the immutable image tree.
+    if (!native) await assertProtectedMigrationMarkers(resolve(process.cwd(), 'db/migrations'), journal.entries.map((entry) => entry.tag))
     const targetEntry = journal.entries.find((entry) => entry.tag === RUNTIME_MIGRATION_TAG)
     const protectedMigration = protectedMigrationForTag(RUNTIME_MIGRATION_TAG)
     if (!protectedMigration || !targetEntry) throw new Error('The managed migration is absent from the checked-in journal or registry.')
@@ -295,7 +333,7 @@ export async function runManagedDockerMigration(): Promise<void> {
     if (preparation.mode === 'complete') {
       await sql.unsafe(`${runtimePassword ? `alter role forge_runtime_api_login password '${runtimePassword.replaceAll("'", "''")}';` : ''}
         grant ${API} to forge_runtime_api_login with inherit true;`)
-      await sql.unsafe(await readFile('../scripts/reconcile-forge-app-privileges.sql', 'utf8'))
+      await sql.unsafe(await readFile(native?.reconcileSql ?? '../scripts/reconcile-forge-app-privileges.sql', 'utf8'))
       await ensureProtectedMigrationState(sql)
       await assertProtectedMigrationLiveAttestation(sql, protectedMigration, preparation.completedMigrationRole!)
       return
@@ -338,14 +376,14 @@ export async function runManagedDockerMigration(): Promise<void> {
 
     const childEnv = createMigrationChildEnvironment(ephemeralMigrationUrl, process.env, childPrivateDirectory)
     const childProcess = { cwd: process.cwd(), env: childEnv, ...childIdentity }
-    const runChild = (script: string) => execFileAsync(process.execPath, [tsxCli, script], childProcess)
-    await execFileAsync(process.execPath, [tsxCli, 'scripts/ci/assert-migration-child-boundary.ts',
+    const runChild = (script: string) => execFileAsync(childNode, [childTsxCli, script], childProcess)
+    await execFileAsync(childNode, [childTsxCli, 'scripts/ci/assert-migration-child-boundary.ts',
       '--controller-pid', String(process.pid),
       '--admin-host', native ? new URL(adminUrl).searchParams.get('host') ?? 'localhost' : new URL(adminUrl).hostname,
-      '--admin-port', native ? new URL(adminUrl).searchParams.get('port') ?? '' : new URL(adminUrl).port,
+      '--admin-port', native ? String(native.port) : new URL(adminUrl).port,
       '--admin-user', native?.adminUser ?? new URL(adminUrl).username,
       '--database', new URL(adminUrl).pathname.slice(1)], childProcess)
-    const bootstrapUrls = { adminUrl, migrationUrl: childEnv.DATABASE_URL }
+    const bootstrapUrls = { adminUrl, migrationUrl: childEnv.DATABASE_URL, adminClient: sql, migrationRole: migrator }
 
     // Preserve the historical order and bootstrap invariants.  These calls
     // run in this locked controller, not as children carrying admin secrets.
@@ -353,7 +391,8 @@ export async function runManagedDockerMigration(): Promise<void> {
     await runChild('scripts/ci/migrate-through-0025.ts')
     await runWithDatabaseUrlSentinel(() => runEpic172S3OwnerBootstrap(bootstrapUrls))
     await runChild('scripts/ci/migrate-through-0026.ts')
-    await runWithDatabaseUrlSentinel(() => runEpic172LegacyReleaseRepair({ adminUrl }))
+    const legacyRepairArtifactSource = native ? await readFile(native.legacyRepairSql, 'utf8') : undefined
+    await runWithDatabaseUrlSentinel(() => runEpic172LegacyReleaseRepair({ adminUrl, adminClient: sql, repairArtifactSource: legacyRepairArtifactSource }))
     await runWithDatabaseUrlSentinel(() => runEpic172S4RoleBootstrap(bootstrapUrls))
     await runChild('scripts/ci/migrate-through-0027.ts')
     await runWithDatabaseUrlSentinel(() => runEpic172S5OwnerBootstrap(false, bootstrapUrls))
@@ -376,7 +415,7 @@ export async function runManagedDockerMigration(): Promise<void> {
     handoffOpened = true
     // This second child applies only 0034 (the ledger has the prefix).  It
     // receives neither administrator authority nor the application passwords.
-    await execFileAsync(process.execPath, [tsxCli, 'scripts/ci/migrate-through-0034.ts'], {
+    await execFileAsync(childNode, [childTsxCli, 'scripts/ci/migrate-through-0034.ts'], {
       ...childProcess,
     })
     lifecycleGeneration = await closeRuntimeHandoff(sql, migrator, operationId, lifecycleGeneration)
@@ -387,7 +426,7 @@ export async function runManagedDockerMigration(): Promise<void> {
     // migration objects have already moved to their dedicated owner roles.
     await sql.unsafe(`reassign owned by ${safe(migrator)} to forge_schema_owner;`)
     // The reconciler is mandatory, not a best-effort repair after reconnect.
-    await sql.unsafe(await readFile('../scripts/reconcile-forge-app-privileges.sql', 'utf8'))
+    await sql.unsafe(await readFile(native?.reconcileSql ?? '../scripts/reconcile-forge-app-privileges.sql', 'utf8'))
     // The shared reconciler grants legacy app access to ordinary public
     // tables.  Reapply the controller-only state ACL after that broad pass.
     await ensureProtectedMigrationState(sql)
@@ -423,7 +462,9 @@ export async function runManagedDockerMigration(): Promise<void> {
       } catch (error) { cleanupFailures.push(error) }
     }
     if (s5HandoffOpened) {
-      await runWithDatabaseUrlSentinel(() => runEpic172S5OwnerBootstrap(true, { adminUrl, migrationUrl: ephemeralMigrationUrl }))
+      await runWithDatabaseUrlSentinel(() => runEpic172S5OwnerBootstrap(true, {
+        adminUrl, migrationUrl: ephemeralMigrationUrl, adminClient: sql, migrationRole: migrator,
+      }))
         .catch((error) => cleanupFailures.push(error))
     }
     const [migrationRoleState] = await sql<{ exists: boolean }[]>`
@@ -431,10 +472,18 @@ export async function runManagedDockerMigration(): Promise<void> {
     `.catch((error) => { cleanupFailures.push(error); return [{ exists: true }] })
     if (migrationRoleState.exists) {
       await sql.unsafe(`revoke forge_schema_owner from ${safe(migrator)}`).catch((error) => cleanupFailures.push(error))
-      // REASSIGN above moved relations; DROP OWNED now removes only residual
-      // grants/dependencies that would otherwise keep this expiring login alive.
-      await sql.unsafe(`drop owned by ${safe(migrator)}`).catch((error) => cleanupFailures.push(error))
-      await sql.unsafe(`drop role ${safe(migrator)}`).catch((error) => cleanupFailures.push(error))
+      // An earlier child can commit ordinary objects before a later stage
+      // fails. Preserve them and their ledger continuity on every graceful
+      // exit, then remove only residual grants and dependencies.
+      let reassigned = false
+      try {
+        await sql.unsafe(`reassign owned by ${safe(migrator)} to forge_schema_owner`)
+        reassigned = true
+      } catch (error) { cleanupFailures.push(error) }
+      if (reassigned) {
+        await sql.unsafe(`drop owned by ${safe(migrator)}`).catch((error) => cleanupFailures.push(error))
+        await sql.unsafe(`drop role ${safe(migrator)}`).catch((error) => cleanupFailures.push(error))
+      }
     }
     let restoreFailure: unknown = null
     if (cleanupFailures.length === 0 && fenced && databaseAcl) {
@@ -464,7 +513,26 @@ type NativeControllerInputs = Readonly<{
   peerUid: number
   peerGid: number
   adminUser: string
+  childNode: string
+  childTsxCli: string
+  reconcileSql: string
+  legacyRepairSql: string
+  socket: string
+  port: number
+  proofPauseAfterReserveMs: number
 }>
+
+async function assertInstalledHelperFile(path: string, label: string): Promise<void> {
+  let current = resolve(path)
+  const leaf = await lstat(current)
+  if (!leaf.isFile() || leaf.isSymbolicLink()) throw new Error(`Managed native ${label} is not a regular installed file.`)
+  while (true) {
+    const metadata = await lstat(current)
+    if (metadata.uid !== 0 || (metadata.mode & 0o022) !== 0) throw new Error(`Managed native ${label} path is not root-owned and non-writable: ${current}`)
+    if (current === '/') break
+    current = resolve(current, '..')
+  }
+}
 
 function parseProtectedEnvFile(raw: string): Map<string, string> {
   const values = new Map<string, string>()
@@ -498,6 +566,14 @@ async function nativeControllerInputs(args: string[]): Promise<NativeControllerI
   const databaseName = option('--native-database')
   const envFile = option('--native-env-file')
   const repoRoot = option('--native-repo-root')
+  const childNode = option('--native-child-node')
+  const childTsxCli = option('--native-child-tsx')
+  const reconcileSql = option('--native-reconcile-sql')
+  const legacyRepairSql = option('--native-legacy-repair-sql')
+  const proofPauseRaw = option('--proof-pause-after-admin-reserve-ms')
+  if (proofPauseRaw && (process.env.CI !== 'true' || !proofPauseRaw.match(/^\d{1,5}$/) || Number(proofPauseRaw) > 60_000)) {
+    throw new Error('Managed native controller proof pause requires CI=true and a bounded millisecond value.')
+  }
   const integerOption = (name: string) => {
     const value = option(name)
     if (!value?.match(/^\d+$/) || Number(value) < 1) throw new Error(`Managed native controller option ${name} requires a non-root numeric identity.`)
@@ -507,9 +583,13 @@ async function nativeControllerInputs(args: string[]): Promise<NativeControllerI
   const peerGid = integerOption('--native-peer-gid')
   if (!socket.startsWith('/') || !port?.match(/^\d{1,5}$/) || Number(port) < 1 || Number(port) > 65535
     || !databaseName?.match(/^[a-z_][a-z0-9_]*$/i)
-    || !envFile?.startsWith('/') || !repoRoot?.startsWith('/')) {
+    || !envFile?.startsWith('/') || !repoRoot?.startsWith('/') || !childNode?.startsWith('/')
+    || !childTsxCli?.startsWith('/') || !reconcileSql?.startsWith('/') || !legacyRepairSql?.startsWith('/')) {
     throw new Error('Managed native controller received invalid non-secret routing arguments.')
   }
+  await assertInstalledHelperFile(childNode, 'Node executable')
+  await assertInstalledHelperFile(reconcileSql, 'reconciler')
+  await assertInstalledHelperFile(legacyRepairSql, 'legacy repair artifact')
   process.chdir(resolve(repoRoot, 'web'))
   if (process.getuid?.() !== 0) throw new Error('Managed native controller requires root with distinct peer-admin and migration-child identities.')
   const protectedValues = parseProtectedEnvFile(await readFile(envFile, 'utf8'))
@@ -521,13 +601,13 @@ async function nativeControllerInputs(args: string[]): Promise<NativeControllerI
   const configuredApplication = new URL(configuredUrl)
   if (!['postgres:', 'postgresql:'].includes(configuredApplication.protocol) || configuredApplication.username !== 'forge'
     || configuredApplication.pathname.slice(1) !== databaseName || !configuredApplication.password
+    || configuredApplication.hostname !== 'localhost'
+    || (configuredApplication.port && configuredApplication.port !== port)
     || configuredApplication.hash || Array.from(configuredApplication.searchParams).length > 0) {
     throw new Error('Managed native controller database binding or URL options disagree with its protected environment file.')
   }
   const appCredential = decodeURIComponent(configuredApplication.password)
-  const application = new URL(`postgresql://forge:${encodeURIComponent(appCredential)}@localhost/${databaseName}`)
-  application.searchParams.set('host', socket)
-  application.searchParams.set('port', port)
+  const application = new URL(`postgresql://forge:${encodeURIComponent(appCredential)}@localhost:${port}/${databaseName}`)
   const admin = new URL(application)
   admin.username = adminUser
   admin.password = ''
@@ -543,12 +623,23 @@ async function nativeControllerInputs(args: string[]): Promise<NativeControllerI
     peerUid,
     peerGid,
     adminUser,
+    childNode,
+    childTsxCli,
+    reconcileSql,
+    legacyRepairSql,
+    socket,
+    port: Number(port),
+    proofPauseAfterReserveMs: Number(proofPauseRaw ?? 0),
   }
 }
 
 async function selectEphemeralChildUid(forbiddenUid: number): Promise<number> {
   const active = new Set<number>()
-  for (const entry of await readdir('/proc', { withFileTypes: true })) {
+  const procEntries = await readdir('/proc', { withFileTypes: true }).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === 'ENOENT' && process.platform === 'darwin') return []
+    throw error
+  })
+  for (const entry of procEntries) {
     if (!entry.isDirectory() || !entry.name.match(/^\d+$/)) continue
     try {
       const status = await readFile(`/proc/${entry.name}/status`, 'utf8')
@@ -558,18 +649,34 @@ async function selectEphemeralChildUid(forbiddenUid: number): Promise<number> {
   }
   const passwd = await readFile('/etc/passwd', 'utf8')
   const mapped = new Set(passwd.split(/\r?\n/).map((line) => Number(line.split(':')[2])).filter(Number.isInteger))
+  if (process.platform === 'darwin') {
+    const { stdout } = await execFileAsync('/bin/ps', ['-axo', 'uid='])
+    for (const value of stdout.split(/\s+/)) if (value.match(/^\d+$/)) active.add(Number(value))
+  }
   for (let uid = 60000; uid < 65000; uid += 1) {
     if (uid !== forbiddenUid && !active.has(uid) && !mapped.has(uid)) {
       try {
-        await execFileAsync('/usr/bin/getent', ['passwd', String(uid)])
+        if (process.platform === 'darwin') await execFileAsync('/usr/bin/dscl', ['.', '-search', '/Users', 'UniqueID', String(uid)])
+        else await execFileAsync('/usr/bin/getent', ['passwd', String(uid)])
       } catch (error) {
         const code = (error as { code?: unknown }).code
-        if (code === 2) return uid
-        throw new Error(`Managed migration controller could not verify child UID ${uid} against NSS (getent status ${String(code)}).`)
+        if ((!process.platform.startsWith('darwin') && code === 2) || (process.platform === 'darwin' && code === 1)) return uid
+        throw new Error(`Managed migration controller could not verify child UID ${uid} against the operating-system identity service (status ${String(code)}).`)
       }
     }
   }
   throw new Error('Managed migration controller could not select an unmapped inactive child UID.')
+}
+
+async function dockerMigrationChildIdentity(): Promise<Readonly<{ uid: number; gid: number }>> {
+  const passwd = await readFile('/etc/passwd', 'utf8')
+  const nodeEntry = passwd.split(/\r?\n/).find((line) => line.startsWith('node:'))?.split(':')
+  const uid = Number(nodeEntry?.[2])
+  const gid = Number(nodeEntry?.[3])
+  if (!Number.isInteger(uid) || !Number.isInteger(gid) || uid <= 0 || gid <= 0 || uid === process.getuid?.()) {
+    throw new Error('Managed Docker controller requires the image\'s dedicated non-root node UID/GID for migration children.')
+  }
+  return { uid, gid }
 }
 
 async function validatedReadOnlyTraversalGid(start: string, proposed?: number): Promise<number | undefined> {
@@ -591,4 +698,15 @@ async function validatedReadOnlyTraversalGid(start: string, proposed?: number): 
   return required ?? proposed
 }
 
-if (process.argv.includes('--run')) runManagedDockerMigration().then(() => console.log('✓ Managed Docker migration completed under the serialized controller.')).catch((error) => { console.error(`✗ ${error instanceof Error ? error.message : String(error)}`); process.exit(1) })
+if (process.argv.includes('--run')) {
+  process.once('uncaughtException', (error) => {
+    console.error(`✗ ${nativeAuthorityConnectionLost ? NATIVE_AUTHORITY_LOST : error instanceof Error ? error.message : String(error)}`)
+    process.exit(1)
+  })
+  runManagedDockerMigration()
+    .then(() => console.log('✓ Managed migration completed under the serialized controller.'))
+    .catch((error) => {
+      console.error(`✗ ${nativeAuthorityConnectionLost ? NATIVE_AUTHORITY_LOST : error instanceof Error ? error.message : String(error)}`)
+      process.exit(1)
+    })
+}

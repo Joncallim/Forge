@@ -1,0 +1,5 @@
+FROM postgres:16-alpine
+
+COPY --chmod=0555 scripts/ci/upgrade-compose-postgres-admin.sh /usr/local/lib/forge/upgrade-compose-postgres-admin.sh
+
+ENTRYPOINT ["/usr/local/lib/forge/upgrade-compose-postgres-admin.sh"]

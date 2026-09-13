@@ -45,16 +45,13 @@ describe('managed migration child environment', () => {
     )
   })
 
-  it('encodes native socket routing without leaking an administrator identity or PG environment', () => {
+  it('keeps the native child on its ephemeral TCP identity without administrator or PG environment', () => {
     const result = createEphemeralMigrationUrl(
-      'postgresql:///forge?user=application&password=application-secret',
+      'postgresql://application:application-secret@localhost:55441/forge',
       'forge_migrator_0123456789abcdef0123456789abcdef',
       'child-secret',
-      { PGHOST: '/var/run/postgresql', PGPORT: '55441' },
     )
-    expect(result).toContain('postgresql://forge_migrator_0123456789abcdef0123456789abcdef:child-secret@localhost/forge')
-    expect(result).toContain('host=%2Fvar%2Frun%2Fpostgresql')
-    expect(result).toContain('port=55441')
+    expect(result).toBe('postgresql://forge_migrator_0123456789abcdef0123456789abcdef:child-secret@localhost:55441/forge')
     expect(result).not.toContain('application')
   })
 

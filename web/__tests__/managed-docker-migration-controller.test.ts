@@ -39,6 +39,14 @@ describe('managed Docker migration authority', () => {
     expect(controller).toContain("scripts/ci/assert-migration-child-boundary.ts")
     expect(controller).toContain('process.setgroups?.([])')
     expect(controller).toContain('reserved = await pool.reserve()')
+    expect(controller.match(/const pool = postgres\(/g)).toHaveLength(1)
+    expect(controller).toContain('adminClient: sql, migrationRole: migrator')
+    expect(controller).toContain('if (nativeAdminSocketOpened) throw new Error(NATIVE_AUTHORITY_LOST)')
+    expect(controller).toContain("process.env.CI !== 'true'")
+    for (const source of bootstrapSources) {
+      expect(source).not.toMatch(/postgres\((?:adminUrl|migrationUrl)/)
+      expect(source).toMatch(/openBootstrap(?:Admin|DatabaseContext)/)
+    }
     expect(controller).toContain("usename=any(array['forge','forge_runtime_api_login'])")
     expect(controller.indexOf('revoke connect on database')).toBeLessThan(controller.indexOf('migrate-through-0034.ts'))
     expect(controller.indexOf('migrate-through-0034.ts')).toBeLessThan(controller.lastIndexOf('reconcile-forge-app-privileges.sql'))
@@ -127,7 +135,9 @@ describe('managed Docker migration authority', () => {
     const args = ['tsx', 'scripts/managed-docker-migration-controller.ts', '--run',
       '--native-socket', '/var/run/postgresql', '--native-port', '5432', '--native-database', 'forge',
       '--native-env-file', envFile,
-      '--native-repo-root', dirname(process.cwd()), '--native-peer-uid', '1', '--native-peer-gid', '1']
+      '--native-repo-root', dirname(process.cwd()), '--native-peer-uid', '1', '--native-peer-gid', '1',
+      '--native-child-node', '/usr/bin/gnutrue', '--native-child-tsx', '/usr/bin/gnutrue',
+      '--native-reconcile-sql', '/usr/bin/gnutrue', '--native-legacy-repair-sql', '/usr/bin/gnutrue']
     const invoke = (env: NodeJS.ProcessEnv) => {
       try { execFileSync('npx', args, { cwd: process.cwd(), env, encoding: 'utf8', stdio: 'pipe' }); return '' }
       catch (error) { return `${(error as { stdout?: string }).stdout ?? ''}${(error as { stderr?: string }).stderr ?? ''}` }

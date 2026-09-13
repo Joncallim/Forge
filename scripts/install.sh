@@ -1422,10 +1422,17 @@ write_env_file() {
     fi
   fi
 
-  ensure_env_value POSTGRES_USER forge
+  ensure_env_value POSTGRES_USER forge_admin
   ensure_env_value POSTGRES_PASSWORD "$DB_PASSWORD" placeholder
   ensure_env_value POSTGRES_DB forge
-  ensure_env_value DATABASE_URL "postgresql://forge:${DB_PASSWORD}@localhost:5432/forge" database_url
+  ensure_env_value FORGE_APP_DATABASE_PASSWORD "$APP_DATABASE_PASSWORD" placeholder
+  ensure_env_value FORGE_RUNTIME_API_DATABASE_PASSWORD "$RUNTIME_API_DATABASE_PASSWORD" placeholder
+  ensure_env_value DATABASE_URL "postgresql://forge:${APP_DATABASE_PASSWORD}@localhost:5432/forge" database_url
+  if [ "$SERVICE_MODE" = docker ]; then
+    # Docker provisioning owns this local endpoint and rotates legacy installs
+    # from the old bootstrap password to the split application credential.
+    set_env_line DATABASE_URL "postgresql://forge:${APP_DATABASE_PASSWORD}@localhost:5432/forge"
+  fi
   ensure_env_value REDIS_URL "redis://localhost:6379/0"
   ensure_env_value NEXT_PUBLIC_APP_URL "http://localhost:3000"
   ensure_env_value NEXT_TELEMETRY_DISABLED "1"
@@ -1609,7 +1616,11 @@ prepare_web_app() {
       bash -c 'cd "$1" && npm install --no-audit --no-fund --progress=true' _ "$REPO_ROOT/web"
     mark_web_node_modules_clean
   fi
-  if managed_local_migrations_enabled; then
+  if [ "$SERVICE_MODE" = docker ]; then
+    local compose
+    compose="$(compose_command)" || die "Docker Compose is required for managed Docker migrations."
+    run "Run the secret-isolated Docker migration image" bash -c 'cd "$1" && FORGE_WORKSPACE_ROOT="$2" $3 --env-file "$4" run --rm migration' _ "$REPO_ROOT" "$WORKSPACE_ROOT" "$compose" "$ENV_FILE"
+  elif managed_local_migrations_enabled; then
     run_managed_local_migrations
   else
     run "Apply database migrations with protected-owner cleanup" bash -c 'cd "$1" && FORGE_WORKSPACE_ROOT="$2" FORGE_ENV_FILE="$3" FORGE_SUPPRESS_MIGRATION_NOTICES=1 bash scripts/ci/apply-vnext-phase0-a1-runtime-foundation.sh' _ "$REPO_ROOT/web" "$WORKSPACE_ROOT" "$ENV_FILE"
@@ -1812,39 +1823,93 @@ run_managed_local_migration_stage() {
 }
 
 run_managed_local_controller() {
-  local description="$1" controlled_path sudo_bin peer_uid peer_gid
-  local controller_script="scripts/managed-docker-migration-controller.ts"
+  local description="$1" sudo_bin peer_uid peer_gid
   peer_uid="$(/usr/bin/id -u "$MANAGED_LOCAL_ADMIN_USER" 2>/dev/null || true)"
   peer_gid="$(/usr/bin/id -g "$MANAGED_LOCAL_ADMIN_USER" 2>/dev/null || true)"
   case "$peer_uid:$peer_gid" in *[!0-9:]*|*::*|0:*|*:0) die "Managed local controller could not establish a non-root peer administrator identity." ;; esac
-  local controller_args=(--run --native-socket "$MANAGED_LOCAL_ADMIN_SOCKET" --native-port "$MANAGED_LOCAL_ADMIN_PORT" --native-database forge --native-env-file "$ENV_FILE" --native-repo-root "$REPO_ROOT" --native-peer-uid "$peer_uid" --native-peer-gid "$peer_gid")
-  prepare_trusted_linux_migration_toolchain
-  controlled_path="$MANAGED_LOCAL_PATH"
+  [ -n "$MANAGED_LOCAL_ADMIN_SOCKET" ] || die "Managed local controller resolved an empty PostgreSQL socket path."
+  local controller_args=(--run --native-socket "$MANAGED_LOCAL_ADMIN_SOCKET" --native-port "$MANAGED_LOCAL_ADMIN_PORT" --native-database forge --native-env-file "$ENV_FILE" --native-repo-root "$REPO_ROOT" --native-peer-uid "$peer_uid" --native-peer-gid "$peer_gid" --native-child-node "$MANAGED_HELPER_ROOT/node" --native-child-tsx "$REPO_ROOT/web/node_modules/tsx/dist/cli.mjs" --native-reconcile-sql "$MANAGED_HELPER_ROOT/reconcile-forge-app-privileges.sql" --native-legacy-repair-sql "$MANAGED_HELPER_ROOT/epic-172-legacy-0023-0025-v1.sql")
   case "$MANAGED_LOCAL_ADMIN_MODE" in
     current)
       if [ "${EUID:-$(/usr/bin/id -u)}" -eq 0 ]; then
-        run "$description" /usr/bin/env -i PATH="$controlled_path" HOME=/root "$MANAGED_LOCAL_BASH" -c 'cd "$1"; shift; exec "$@"' _ \
-          "$REPO_ROOT/web" "$MANAGED_LOCAL_NPX" tsx "$controller_script" "${controller_args[@]}"
+        run "$description" /usr/bin/env -i HOME=/root "$MANAGED_HELPER_ROOT/node" "$MANAGED_HELPER_ROOT/controller.mjs" "${controller_args[@]}"
       else
-        sudo_bin="$(trusted_linux_tool sudo)" || die "Managed local migrations require passwordless root controller launch."
-        run "$description" "$sudo_bin" -n -- /usr/bin/env -i PATH="$controlled_path" HOME=/root "$MANAGED_LOCAL_BASH" -c 'cd "$1"; shift; exec "$@"' _ \
-          "$REPO_ROOT/web" "$MANAGED_LOCAL_NPX" tsx "$controller_script" "${controller_args[@]}"
+        if [ "$OS_NAME" = Darwin ]; then sudo_bin=/usr/bin/sudo; else sudo_bin="$(trusted_linux_tool sudo)" || die "Managed local migrations require a trusted sudo."; fi
+        run "$description" "$sudo_bin" -- /usr/bin/env -i HOME=/root "$MANAGED_HELPER_ROOT/node" "$MANAGED_HELPER_ROOT/controller.mjs" "${controller_args[@]}"
       fi
       ;;
     sudo)
       sudo_bin="$(trusted_linux_tool sudo)" || die "Could not find a root-owned non-writable sudo for elevated managed migrations."
-      run "$description" "$sudo_bin" -n -- /usr/bin/env -i PATH="$controlled_path" HOME=/root \
-        "$MANAGED_LOCAL_BASH" -c 'cd "$1"; shift; exec "$@"' _ "$REPO_ROOT/web" \
-        "$MANAGED_LOCAL_NPX" tsx "$controller_script" "${controller_args[@]}"
+      run "$description" "$sudo_bin" -n -- /usr/bin/env -i HOME=/root "$MANAGED_HELPER_ROOT/node" "$MANAGED_HELPER_ROOT/controller.mjs" "${controller_args[@]}"
       ;;
     runuser)
       [ "${EUID:-$(/usr/bin/id -u)}" -eq 0 ] || die "runuser administration requires a root controller."
-      run "$description" /usr/bin/env -i PATH="$controlled_path" HOME=/root \
-        "$MANAGED_LOCAL_BASH" -c 'cd "$1"; shift; exec "$@"' _ "$REPO_ROOT/web" \
-        "$MANAGED_LOCAL_NPX" tsx "$controller_script" "${controller_args[@]}"
-      ;;
+      run "$description" /usr/bin/env -i HOME=/root "$MANAGED_HELPER_ROOT/node" "$MANAGED_HELPER_ROOT/controller.mjs" "${controller_args[@]}"
+    ;;
     *) die "Managed local PostgreSQL administrator mode is unavailable." ;;
   esac
+}
+
+install_managed_migration_helper() {
+  local build_dir source_node digest target staging install_bin root_group canonical_target elevator=()
+  build_dir="$(mktemp -d "${TMPDIR:-/tmp}/forge-managed-helper.XXXXXX")"
+  if [ "$OS_NAME" = Linux ]; then
+    source_node="$(trusted_linux_tool node)" || die "Managed migration helper requires a trusted Node.js 22 executable."
+  else
+    source_node="$(command -v node 2>/dev/null || true)"
+    case "$source_node" in /*) ;; *) die "Managed migration helper requires an absolute Node.js executable." ;; esac
+    trusted_darwin_candidate "$source_node" \
+      || die "Managed migration helper requires a root-owned, non-writable, non-symlinked Node.js executable on macOS; Homebrew/user-owned Node cannot cross the privileged helper boundary."
+  fi
+  /usr/bin/env -i HOME="${TMPDIR:-/tmp}" PATH=/usr/bin:/bin "$source_node" "$REPO_ROOT/web/scripts/ci/build-managed-migration-helper.mjs" "$build_dir"
+  digest="$($source_node -e 'const fs=require("fs"),c=require("crypto").createHash("sha256"); for(const p of process.argv.slice(1))c.update(fs.readFileSync(p)); process.stdout.write(c.digest("hex"))' "$build_dir/controller.mjs" "$build_dir/reconcile-forge-app-privileges.sql" "$build_dir/epic-172-legacy-0023-0025-v1.sql" "$source_node")"
+  target="/var/lib/forge-managed-migration-helper/v1-$digest"
+  staging="${target}.next.$$"
+  if [ "${EUID:-$(/usr/bin/id -u)}" -ne 0 ]; then
+    if [ "$OS_NAME" = Darwin ]; then elevator=(/usr/bin/sudo); else elevator=("$(trusted_linux_tool sudo)"); fi
+  fi
+  root_group="$(/usr/bin/id -gn 0)"
+  [ -n "$root_group" ] || die "Managed migration helper could not resolve the root account's primary group."
+  install_bin=/usr/bin/install
+  "${elevator[@]}" "$install_bin" -d -o root -g "$root_group" -m 0755 /var/lib/forge-managed-migration-helper
+  if ! "${elevator[@]}" /usr/bin/test -d "$target"; then
+    "${elevator[@]}" "$install_bin" -d -o root -g "$root_group" -m 0755 "$staging"
+    "${elevator[@]}" "$install_bin" -o root -g "$root_group" -m 0555 "$source_node" "$staging/node"
+    "${elevator[@]}" "$install_bin" -o root -g "$root_group" -m 0444 "$build_dir/controller.mjs" "$staging/controller.mjs"
+    "${elevator[@]}" "$install_bin" -o root -g "$root_group" -m 0444 "$build_dir/reconcile-forge-app-privileges.sql" "$staging/reconcile-forge-app-privileges.sql"
+    "${elevator[@]}" "$install_bin" -o root -g "$root_group" -m 0444 "$build_dir/epic-172-legacy-0023-0025-v1.sql" "$staging/epic-172-legacy-0023-0025-v1.sql"
+    "${elevator[@]}" /bin/mv "$staging" "$target"
+  fi
+  canonical_target="$(cd -P "$target" && pwd -P)" \
+    || die "Managed migration helper could not resolve its installed system directory."
+  "${elevator[@]}" "$canonical_target/node" -e '
+    const fs=require("fs"),path=require("path"),crypto=require("crypto")
+    const expected=process.argv[1], files=process.argv.slice(2), digest=crypto.createHash("sha256")
+    for(const file of files){
+      const leaf=fs.lstatSync(file); if(!leaf.isFile()||leaf.isSymbolicLink())process.exit(1); digest.update(fs.readFileSync(file))
+      for(let current=file;;current=path.dirname(current)){const stat=fs.lstatSync(current);if(stat.uid!==0||(stat.mode&0o22)!==0)process.exit(1);if(current==="/")break}
+    }
+    if(digest.digest("hex")!==expected)process.exit(1)
+  ' "$digest" "$canonical_target/controller.mjs" "$canonical_target/reconcile-forge-app-privileges.sql" "$canonical_target/epic-172-legacy-0023-0025-v1.sql" "$canonical_target/node" \
+    || die "Installed managed migration helper digest does not match its pre-privilege bundle."
+  MANAGED_HELPER_ROOT="$canonical_target"
+}
+
+trusted_darwin_candidate() {
+  local candidate="$1" current owner mode physical_parent
+  [ "$OS_NAME" = Darwin ] || return 1
+  [ -x "$candidate" ] && [ -f "$candidate" ] && [ ! -L "$candidate" ] || return 1
+  physical_parent="$(cd -P "${candidate%/*}" 2>/dev/null && pwd -P)" || return 1
+  [ "$physical_parent/${candidate##*/}" = "$candidate" ] || return 1
+  current="$candidate"
+  while :; do
+    owner="$(/usr/bin/stat -f '%Su' "$current" 2>/dev/null || true)"
+    mode="$(/usr/bin/stat -f '%Lp' "$current" 2>/dev/null || true)"
+    [ "$owner" = root ] && [ -n "$mode" ] && [ $((8#$mode & 022)) -eq 0 ] || return 1
+    [ "$current" = / ] && return 0
+    current="${current%/*}"
+    [ -n "$current" ] || current=/
+  done
 }
 
 trusted_linux_path_chain() {
@@ -1979,6 +2044,11 @@ run_managed_local_migrations() {
     return 0
   fi
 
+  # Package and verify the finite privileged helper before opening any peer
+  # administrator connection or loading migration credentials.
+  if [ "${FORGE_INSTALL_TEST_HOOK:-}" != managed-local-migrations ]; then
+    install_managed_migration_helper
+  fi
   resolve_managed_local_admin || die "Could not establish passwordless local PostgreSQL administrator access for managed migrations. Use a native local PostgreSQL peer login, or run the documented operator migration procedure for a custom database."
 
   [ -n "$(env_value DATABASE_URL)" ] || die "Managed local migrations require DATABASE_URL in the local Forge environment file."
@@ -2323,6 +2393,8 @@ if [ "${FORGE_INSTALL_TEST_HOOK:-}" = "managed-local-migrations" ]; then
       MANAGED_LOCAL_ADMIN_RESOLUTION=resolved
       MANAGED_LOCAL_ADMIN_MODE=current
       MANAGED_LOCAL_ADMIN_USER="$(/usr/bin/id -un)"
+      MANAGED_LOCAL_ADMIN_SOCKET="${FORGE_INSTALL_TEST_PSQL_SOCKET:-/tmp}"
+      MANAGED_LOCAL_ADMIN_PORT="${FORGE_INSTALL_TEST_PSQL_PORT:-5432}"
       ;;
     unavailable)
       MANAGED_LOCAL_ADMIN_RESOLUTION=resolved
@@ -2378,6 +2450,16 @@ if placeholder_value "$DB_PASSWORD"; then
   DB_PASSWORD=""
 fi
 DB_PASSWORD="${DB_PASSWORD:-$(random_hex 16)}"
+APP_DATABASE_PASSWORD="$(initial_env_value FORGE_APP_DATABASE_PASSWORD)"
+if placeholder_value "$APP_DATABASE_PASSWORD"; then
+  APP_DATABASE_PASSWORD=""
+fi
+APP_DATABASE_PASSWORD="${APP_DATABASE_PASSWORD:-$(random_hex 16)}"
+RUNTIME_API_DATABASE_PASSWORD="$(initial_env_value FORGE_RUNTIME_API_DATABASE_PASSWORD)"
+if placeholder_value "$RUNTIME_API_DATABASE_PASSWORD"; then
+  RUNTIME_API_DATABASE_PASSWORD=""
+fi
+RUNTIME_API_DATABASE_PASSWORD="${RUNTIME_API_DATABASE_PASSWORD:-$(random_hex 16)}"
 SESSION_SECRET="$(initial_env_value SESSION_SECRET)"
 if placeholder_value "$SESSION_SECRET"; then
   SESSION_SECRET=""

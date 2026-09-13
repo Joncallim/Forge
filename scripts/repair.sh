@@ -105,7 +105,8 @@ workspace_root() {
 
 env_key_allowed() {
   case "$1" in
-    DATABASE_URL|REDIS_URL|SESSION_SECRET|FORGE_ENCRYPTION_KEY|\
+    DATABASE_URL|FORGE_APP_DATABASE_PASSWORD|FORGE_RUNTIME_API_DATABASE_PASSWORD|FORGE_RUNTIME_DATABASE_URL|\
+    REDIS_URL|SESSION_SECRET|FORGE_ENCRYPTION_KEY|\
     NEXT_PUBLIC_APP_URL|NEXT_TELEMETRY_DISABLED|\
     WEBAUTHN_RP_ID|WEBAUTHN_RP_NAME|WEBAUTHN_ORIGIN|\
     FORGE_EMBED_WORKER|FORGE_AGENT_WEB_SEARCH|FORGE_WORKER_CLAIM_TIMEOUT_SECONDS|\
@@ -643,7 +644,21 @@ load_database_url_from_local_fallbacks
 
 if [ "$SKIP_MIGRATE" = "1" ]; then
   warn "Skipping database migrations by request."
+elif is_native_forge_database_url "${DATABASE_URL:-}" && installed_service_mode_is_native; then
+  # Reuse the installer's one controlled native controller. Repair never hands
+  # the demoted app URL to a protected bootstrap and never fabricates a second
+  # administrator/migration path.
+  run "Applying migrations through the shared native controller" bash -c '
+    export FORGE_INSTALL_LIBRARY=1 FORGE_ENV_FILE="$2"
+    source "$1/scripts/install.sh"
+    SERVICE_MODE=native
+    MANAGE_LOCAL_DB=1
+    DRY_RUN=0
+    WORKSPACE_ROOT="$3"
+    run_managed_local_migrations
+  ' _ "$REPO_ROOT" "$ENV_FILE" "$WORKSPACE_ROOT"
 elif [ -n "${DATABASE_URL:-}" ]; then
+  [ -n "${FORGE_DATABASE_ADMIN_URL:-}" ] || die "Custom database repair requires a controlled FORGE_DATABASE_ADMIN_URL for protected migrations."
   run "Applying database migrations with protected-owner cleanup" bash -c 'cd "$1" && bash scripts/ci/apply-vnext-phase0-a1-runtime-foundation.sh' _ "$WEB_DIR"
 else
   warn "DATABASE_URL is not set; skipping database migrations."

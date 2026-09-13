@@ -1,6 +1,5 @@
 import '../lib/load-env'
-import postgres from 'postgres'
-import { resolveBootstrapDatabaseUrls, type BootstrapDatabaseUrls } from './ci/bootstrap-database-urls'
+import { openBootstrapDatabaseContext, type BootstrapDatabaseUrls } from './ci/bootstrap-database-urls'
 
 const LOGIN_ROLES = [
   'forge_architect_plan_writer',
@@ -71,13 +70,7 @@ function literal(value: string): string {
 }
 
 export async function runEpic172S4RoleBootstrap(explicitUrls?: BootstrapDatabaseUrls): Promise<void> {
-  const { adminUrl, migrationUrl } = resolveBootstrapDatabaseUrls(explicitUrls)
-
-  const migration = postgres(migrationUrl, { max: 1, onnotice: () => {} })
-  const [{ migrationRole }] = await migration<{ migrationRole: string }[]>`select current_user as "migrationRole"`
-  await migration.end({ timeout: 5 })
-
-  const admin = postgres(adminUrl, { max: 1, onnotice: () => {} })
+  const { admin, migrationRole, close } = await openBootstrapDatabaseContext(explicitUrls)
   try {
     const [{ canCreateRole, isSuperuser, serverVersion }] = await admin<{
       canCreateRole: boolean
@@ -902,7 +895,7 @@ export async function runEpic172S4RoleBootstrap(explicitUrls?: BootstrapDatabase
       : `✓ Installed the migration-0027-only S4 ownership fence for ${migrationRole}; migration 0027 revokes it.`)
     console.log('  Configure certificate authentication and role-specific connection URLs before enabling S4 producers.')
   } finally {
-    await admin.end({ timeout: 5 })
+    await close()
   }
 }
 

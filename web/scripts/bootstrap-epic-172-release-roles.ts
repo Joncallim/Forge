@@ -1,6 +1,5 @@
 import '../lib/load-env'
-import postgres from 'postgres'
-import { resolveBootstrapDatabaseUrls, type BootstrapDatabaseUrls } from './ci/bootstrap-database-urls'
+import { openBootstrapDatabaseContext, type BootstrapDatabaseUrls } from './ci/bootstrap-database-urls'
 
 const ROLE_NAMES = [
   'forge_release_evidence_writer',
@@ -32,15 +31,7 @@ function roleIsUnsafe(role: ReleaseRoleRow): boolean {
 }
 
 export async function runEpic172ReleaseRoleBootstrap(explicitUrls?: BootstrapDatabaseUrls): Promise<void> {
-  const { adminUrl, migrationUrl } = resolveBootstrapDatabaseUrls(explicitUrls)
-
-  const migrationClient = postgres(migrationUrl, { max: 1, onnotice: () => {} })
-  const [{ migrationRole }] = await migrationClient<{ migrationRole: string }[]>`
-    select current_user as "migrationRole"
-  `
-  await migrationClient.end({ timeout: 5 })
-
-  const client = postgres(adminUrl, { max: 1, onnotice: () => {} })
+  const { admin: client, migrationRole, close } = await openBootstrapDatabaseContext(explicitUrls)
   try {
     const [authority] = await client<{
       currentUser: string
@@ -238,7 +229,7 @@ export async function runEpic172ReleaseRoleBootstrap(explicitUrls?: BootstrapDat
     }
     console.log('  Configure certificate authentication and role-specific connection URLs outside Forge before recording evidence.')
   } finally {
-    await client.end({ timeout: 5 })
+    await close()
   }
 }
 
