@@ -125,7 +125,12 @@ describe('managed Docker migration authority', () => {
     expect(dispatch).not.toContain('FORGE_DATABASE_ADMIN_URL')
     expect(dispatch).not.toMatch(/PG(?:HOST|PORT|USER)/)
     expect(installer).not.toMatch(/controller\) FORGE_MANAGED_DOCKER_MIGRATIONS=1 npm run db:migrate/)
-    expect(controller).toContain('process.chdir(resolve(repoRoot, \'web\'))')
+    expect(controller).toContain('process.chdir(helperRoot)')
+    expect(controller).toContain("execFileAsync('/usr/bin/id', ['-nu', String(peerUid)])")
+    expect(controller).toContain('resolvedPeerUid !== peerUid || resolvedPeerGid !== peerGid')
+    expect(dispatch).toContain('--native-helper-root')
+    expect(dispatch).not.toContain('--native-repo-root')
+    expect(dispatch).not.toContain('--native-child-tsx')
     expect(controller).toContain("const protectedValues = parseProtectedEnvFile(await readFile(envFile, 'utf8'))")
     expect(controller).toContain("key === 'DATABASE_URL' || key === 'FORGE_DATABASE_ADMIN_URL' || key.startsWith('PG')")
   })
@@ -137,8 +142,8 @@ describe('managed Docker migration authority', () => {
     const args = ['tsx', 'scripts/managed-docker-migration-controller.ts', '--run',
       '--native-socket', '/var/run/postgresql', '--native-port', '5432', '--native-database', 'forge',
       '--native-env-file', envFile,
-      '--native-repo-root', dirname(process.cwd()), '--native-peer-uid', '1', '--native-peer-gid', '1',
-      '--native-child-node', '/usr/bin/gnutrue', '--native-child-tsx', '/usr/bin/gnutrue',
+      '--native-helper-root', dirname(process.cwd()), '--native-peer-uid', '1', '--native-peer-gid', '1',
+      '--native-child-node', '/usr/bin/gnutrue',
       '--native-reconcile-sql', '/usr/bin/gnutrue', '--native-legacy-repair-sql', '/usr/bin/gnutrue']
     const invoke = (env: NodeJS.ProcessEnv) => {
       try { execFileSync('npx', args, { cwd: process.cwd(), env, encoding: 'utf8', stdio: 'pipe' }); return '' }
@@ -146,7 +151,7 @@ describe('managed Docker migration authority', () => {
     }
     try {
       const cleanOutput = invoke({ PATH: process.env.PATH, NODE_ENV: 'test' })
-      expect(cleanOutput).toContain('database binding or URL options disagree with its protected environment file')
+      expect(cleanOutput).toContain('Managed native assert-migration-child-boundary child is not a regular installed file')
       expect(cleanOutput).not.toContain('inherited a forbidden database authority environment')
       expect(invoke({ PATH: process.env.PATH, NODE_ENV: 'test', DATABASE_URL: 'postgresql://ambient-admin:secret@host/forge' }))
         .toContain('inherited a forbidden database authority environment')

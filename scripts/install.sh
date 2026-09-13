@@ -1832,7 +1832,7 @@ run_managed_local_controller() {
   peer_gid="$(/usr/bin/id -g "$MANAGED_LOCAL_ADMIN_USER" 2>/dev/null || true)"
   case "$peer_uid:$peer_gid" in *[!0-9:]*|*::*|0:*|*:0) die "Managed local controller could not establish a non-root peer administrator identity." ;; esac
   [ -n "$MANAGED_LOCAL_ADMIN_SOCKET" ] || die "Managed local controller resolved an empty PostgreSQL socket path."
-  local controller_args=(--run --native-socket "$MANAGED_LOCAL_ADMIN_SOCKET" --native-port "$MANAGED_LOCAL_ADMIN_PORT" --native-database forge --native-env-file "$ENV_FILE" --native-repo-root "$REPO_ROOT" --native-peer-uid "$peer_uid" --native-peer-gid "$peer_gid" --native-child-node "$MANAGED_HELPER_ROOT/node" --native-child-tsx "$REPO_ROOT/web/node_modules/tsx/dist/cli.mjs" --native-reconcile-sql "$MANAGED_HELPER_ROOT/reconcile-forge-app-privileges.sql" --native-legacy-repair-sql "$MANAGED_HELPER_ROOT/epic-172-legacy-0023-0025-v1.sql")
+  local controller_args=(--run --native-socket "$MANAGED_LOCAL_ADMIN_SOCKET" --native-port "$MANAGED_LOCAL_ADMIN_PORT" --native-database forge --native-env-file "$ENV_FILE" --native-helper-root "$MANAGED_HELPER_ROOT" --native-peer-uid "$peer_uid" --native-peer-gid "$peer_gid" --native-child-node "$MANAGED_HELPER_ROOT/node" --native-reconcile-sql "$MANAGED_HELPER_ROOT/reconcile-forge-app-privileges.sql" --native-legacy-repair-sql "$MANAGED_HELPER_ROOT/epic-172-legacy-0023-0025-v1.sql")
   case "$MANAGED_LOCAL_ADMIN_MODE" in
     current)
       if [ "${EUID:-$(/usr/bin/id -u)}" -eq 0 ]; then
@@ -1855,19 +1855,35 @@ run_managed_local_controller() {
 }
 
 install_managed_migration_helper() {
-  local build_dir source_node digest target staging install_bin root_group canonical_target elevator=()
+  local build_dir source_node digest node_digest installed_node_digest target staging install_bin hash_tool root_group canonical_target name name_list computed elevator=()
   build_dir="$(mktemp -d "${TMPDIR:-/tmp}/forge-managed-helper.XXXXXX")"
   if [ "$OS_NAME" = Linux ]; then
     source_node="$(trusted_linux_tool node)" || die "Managed migration helper requires a trusted Node.js 22 executable."
   else
-    source_node="$(command -v node 2>/dev/null || true)"
-    case "$source_node" in /*) ;; *) die "Managed migration helper requires an absolute Node.js executable." ;; esac
-    trusted_darwin_candidate "$source_node" \
-      || die "Managed migration helper requires a root-owned, non-writable, non-symlinked Node.js executable on macOS; Homebrew/user-owned Node cannot cross the privileged helper boundary."
+    source_node="$(prepare_pinned_darwin_managed_node)" || die "Managed migration helper could not prepare the pinned official Node.js runtime for macOS."
   fi
   /usr/bin/env -i HOME="${TMPDIR:-/tmp}" PATH=/usr/bin:/bin "$source_node" "$REPO_ROOT/web/scripts/ci/build-managed-migration-helper.mjs" "$build_dir"
-  digest="$($source_node -e 'const fs=require("fs"),c=require("crypto").createHash("sha256"); for(const p of process.argv.slice(1))c.update(fs.readFileSync(p)); process.stdout.write(c.digest("hex"))' "$build_dir/controller.mjs" "$build_dir/reconcile-forge-app-privileges.sql" "$build_dir/epic-172-legacy-0023-0025-v1.sql" "$source_node")"
-  target="/var/lib/forge-managed-migration-helper/v1-$digest"
+  # Release-pinned digest of the complete helper closure. This value lives in
+  # the installer, outside the writable build script and controller inputs.
+  digest='c9ca7ddb2e3d8427f55016c92b6f2fc3793433fa6ceb85d5623cdb5062067a52'
+  computed="$($source_node -e '
+    const fs=require("fs"),path=require("path"),crypto=require("crypto"),root=process.argv[1]
+    const manifest=JSON.parse(fs.readFileSync(path.join(root,"closure-manifest.json"),"utf8"))
+    if(manifest.version!==1||!Array.isArray(manifest.files)||manifest.files.length===0)process.exit(2)
+    const names=manifest.files.map(x=>x.name)
+    if(JSON.stringify(names)!==JSON.stringify([...names].sort())||new Set(names).size!==names.length)process.exit(3)
+    const digest=crypto.createHash("sha256")
+    for(const entry of manifest.files){
+      if(typeof entry.name!=="string"||!entry.name.match(/^[A-Za-z0-9_./-]+$/)||entry.name.startsWith("/")||entry.name.split("/").includes(".."))process.exit(4)
+      const bytes=fs.readFileSync(path.join(root,entry.name)), sha=crypto.createHash("sha256").update(bytes).digest("hex")
+      if(bytes.length!==entry.bytes||sha!==entry.sha256)process.exit(5)
+      digest.update(`${entry.name}\0${entry.bytes}\0${entry.sha256}\n`)
+    }
+    process.stdout.write(digest.digest("hex"))
+  ' "$build_dir")" || die "Managed migration helper closure manifest is invalid."
+  [ "$computed" = "$digest" ] || die "Managed migration helper bytes do not match the independently pinned release digest. Refusing elevation."
+  node_digest="$($source_node -e 'const fs=require("fs"),c=require("crypto").createHash("sha256");c.update(fs.readFileSync(process.argv[1]));process.stdout.write(c.digest("hex"))' "$source_node")"
+  target="/var/lib/forge-managed-migration-helper/v2-$digest-$node_digest"
   staging="${target}.next.$$"
   if [ "${EUID:-$(/usr/bin/id -u)}" -ne 0 ]; then
     if [ "$OS_NAME" = Darwin ]; then elevator=(/usr/bin/sudo); else elevator=("$(trusted_linux_tool sudo)"); fi
@@ -1879,24 +1895,79 @@ install_managed_migration_helper() {
   if ! "${elevator[@]}" /usr/bin/test -d "$target"; then
     "${elevator[@]}" "$install_bin" -d -o root -g "$root_group" -m 0755 "$staging"
     "${elevator[@]}" "$install_bin" -o root -g "$root_group" -m 0555 "$source_node" "$staging/node"
-    "${elevator[@]}" "$install_bin" -o root -g "$root_group" -m 0444 "$build_dir/controller.mjs" "$staging/controller.mjs"
-    "${elevator[@]}" "$install_bin" -o root -g "$root_group" -m 0444 "$build_dir/reconcile-forge-app-privileges.sql" "$staging/reconcile-forge-app-privileges.sql"
-    "${elevator[@]}" "$install_bin" -o root -g "$root_group" -m 0444 "$build_dir/epic-172-legacy-0023-0025-v1.sql" "$staging/epic-172-legacy-0023-0025-v1.sql"
+    name_list="$(make_temp_file)"
+    "$source_node" -e 'const m=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));for(const x of m.files)console.log(x.name)' "$build_dir/closure-manifest.json" > "$name_list"
+    while IFS= read -r name; do
+      case "$name" in ''|/*|*[!A-Za-z0-9_./-]*|..|../*|*/../*|*/..) die "Managed migration helper manifest changed to an unsafe installed path." ;; esac
+      case "$name" in
+        */*) "${elevator[@]}" "$install_bin" -d -o root -g "$root_group" -m 0755 "$staging/${name%/*}" ;;
+      esac
+      "${elevator[@]}" "$install_bin" -o root -g "$root_group" -m 0444 "$build_dir/$name" "$staging/$name"
+    done < "$name_list"
+    "${elevator[@]}" "$install_bin" -o root -g "$root_group" -m 0444 "$build_dir/closure-manifest.json" "$staging/closure-manifest.json"
     "${elevator[@]}" /bin/mv "$staging" "$target"
+  fi
+  if [ "$OS_NAME" = Darwin ]; then hash_tool=/usr/bin/shasum; else hash_tool="$(trusted_linux_tool sha256sum)" || die "Managed migration helper requires a trusted SHA-256 tool."; fi
+  if [ "$OS_NAME" = Darwin ]; then
+    installed_node_digest="$("${elevator[@]}" "$hash_tool" -a 256 "$target/node" | /usr/bin/awk '{print $1}')"
+  else
+    installed_node_digest="$("${elevator[@]}" "$hash_tool" "$target/node" | /usr/bin/awk '{print $1}')"
+  fi
+  if [ "$installed_node_digest" != "$node_digest" ]; then
+    "${elevator[@]}" /bin/rm -rf -- "$target"
+    die "Installed managed migration helper Node.js digest changed during privileged copy."
   fi
   canonical_target="$(cd -P "$target" && pwd -P)" \
     || die "Managed migration helper could not resolve its installed system directory."
-  "${elevator[@]}" "$canonical_target/node" -e '
+  if ! "${elevator[@]}" "$canonical_target/node" -e '
     const fs=require("fs"),path=require("path"),crypto=require("crypto")
-    const expected=process.argv[1], files=process.argv.slice(2), digest=crypto.createHash("sha256")
-    for(const file of files){
-      const leaf=fs.lstatSync(file); if(!leaf.isFile()||leaf.isSymbolicLink())process.exit(1); digest.update(fs.readFileSync(file))
-      for(let current=file;;current=path.dirname(current)){const stat=fs.lstatSync(current);if(stat.uid!==0||(stat.mode&0o22)!==0)process.exit(1);if(current==="/")break}
+    const expected=process.argv[1],root=process.argv[2],manifest=JSON.parse(fs.readFileSync(path.join(root,"closure-manifest.json"),"utf8")),digest=crypto.createHash("sha256")
+    if(manifest.version!==1||!Array.isArray(manifest.files)||manifest.files.length===0)process.exit(5)
+    const names=manifest.files.map(x=>x.name)
+    if(JSON.stringify(names)!==JSON.stringify([...names].sort())||new Set(names).size!==names.length)process.exit(6)
+    const expectedFiles=new Set(["node","closure-manifest.json",...manifest.files.map(x=>x.name)])
+    const walk=(dir,prefix="")=>{for(const d of fs.readdirSync(dir,{withFileTypes:true})){const name=prefix?`${prefix}/${d.name}`:d.name;if(d.isDirectory())walk(path.join(dir,d.name),name);else if(!expectedFiles.has(name))process.exit(7)}};walk(root)
+    for(const entry of manifest.files){
+      if(typeof entry.name!=="string"||!entry.name.match(/^[A-Za-z0-9_./-]+$/)||entry.name.startsWith("/")||entry.name.split("/").includes(".."))process.exit(8)
+      const file=path.join(root,entry.name),leaf=fs.lstatSync(file); if(!leaf.isFile()||leaf.isSymbolicLink())process.exit(1)
+      const bytes=fs.readFileSync(file),sha=crypto.createHash("sha256").update(bytes).digest("hex");if(bytes.length!==entry.bytes||sha!==entry.sha256)process.exit(2)
+      digest.update(`${entry.name}\0${entry.bytes}\0${entry.sha256}\n`)
+      for(let current=file;;current=path.dirname(current)){const stat=fs.lstatSync(current);if(stat.uid!==0||(stat.mode&0o22)!==0)process.exit(3);if(current==="/")break}
     }
-    if(digest.digest("hex")!==expected)process.exit(1)
-  ' "$digest" "$canonical_target/controller.mjs" "$canonical_target/reconcile-forge-app-privileges.sql" "$canonical_target/epic-172-legacy-0023-0025-v1.sql" "$canonical_target/node" \
-    || die "Installed managed migration helper digest does not match its pre-privilege bundle."
+    if(digest.digest("hex")!==expected)process.exit(4)
+  ' "$digest" "$canonical_target"; then
+    "${elevator[@]}" /bin/rm -rf -- "$canonical_target"
+    die "Installed managed migration helper digest does not match its independently pinned release bundle."
+  fi
   MANAGED_HELPER_ROOT="$canonical_target"
+  if [ "$OS_NAME" = Darwin ]; then
+    case "$source_node" in
+      "${TMPDIR:-/tmp}"/forge-node-darwin.*/node-v22.23.2-darwin-*/bin/node)
+        /bin/rm -rf "${source_node%/node-v22.23.2-darwin-*/bin/node}" ;;
+    esac
+  fi
+}
+
+prepare_pinned_darwin_managed_node() {
+  local version=22.23.2 architecture archive expected actual effective root node_path url
+  [ "$OS_NAME" = Darwin ] || return 1
+  case "$(/usr/bin/uname -m)" in
+    arm64) architecture=arm64; expected=5eff7a9011895aae3f29d06f167b84a62b028a591370c7cafb59103559fd26e1 ;;
+    x86_64) architecture=x64; expected=96dff79f4e19a78715da559ec7cac2028f4985a175ea0c3454625a269c21deb7 ;;
+    *) return 1 ;;
+  esac
+  root="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/forge-node-darwin.XXXXXX")" || return 1
+  archive="$root/node.tar.xz"
+  url="https://nodejs.org/download/release/v$version/node-v$version-darwin-$architecture.tar.xz"
+  effective="$(/usr/bin/curl -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 --write-out '%{url_effective}' "$url" -o "$archive")" \
+    || { /bin/rm -rf "$root"; return 1; }
+  [ "$effective" = "$url" ] || { /bin/rm -rf "$root"; return 1; }
+  actual="$(/usr/bin/shasum -a 256 "$archive" | /usr/bin/awk '{print $1}')"
+  [ "$actual" = "$expected" ] || { /bin/rm -rf "$root"; return 1; }
+  /usr/bin/tar -xJf "$archive" -C "$root" || { /bin/rm -rf "$root"; return 1; }
+  node_path="$root/node-v$version-darwin-$architecture/bin/node"
+  [ -f "$node_path" ] && [ ! -L "$node_path" ] && [ -x "$node_path" ] || { /bin/rm -rf "$root"; return 1; }
+  printf '%s\n' "$node_path"
 }
 
 trusted_darwin_candidate() {

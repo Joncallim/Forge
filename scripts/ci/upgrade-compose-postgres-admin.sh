@@ -24,7 +24,7 @@ validate_legacy_role() {
 }
 
 attest_legacy() {
-  [ "$(psql -h "$POSTGRES_HOST" -p "$POSTGRES_PORT" -U "$legacy_role" -d "$POSTGRES_DB" -v legacy_role="$legacy_role" -Atqc "select r.rolsuper and r.rolinherit and r.rolcanlogin and r.rolcreatedb and r.rolcreaterole and r.rolreplication and r.rolbypassrls and r.rolconnlimit=-1 and r.rolvaliduntil is null and r.rolpassword is not null and d.datdba=r.oid and not exists(select 1 from pg_auth_members m where m.roleid=r.oid or m.member=r.oid) from pg_authid r join pg_database d on d.datname=current_database() where r.rolname=:'legacy_role'")" = t ] \
+  [ "$(printf '%s\n' "select r.rolsuper and r.rolinherit and r.rolcanlogin and r.rolcreatedb and r.rolcreaterole and r.rolreplication and r.rolbypassrls and r.rolconnlimit=-1 and r.rolvaliduntil is null and r.rolpassword is not null and d.datdba=r.oid and not exists(select 1 from pg_auth_members m where m.roleid=r.oid or m.member=r.oid) from pg_authid r join pg_database d on d.datname=current_database() where r.rolname=:'legacy_role';" | psql -h "$POSTGRES_HOST" -p "$POSTGRES_PORT" -U "$legacy_role" -d "$POSTGRES_DB" -v legacy_role="$legacy_role" -Atq)" = t ] \
     || { echo 'Configured prior POSTGRES_USER failed exact administrator attestation.' >&2; exit 1; }
 }
 

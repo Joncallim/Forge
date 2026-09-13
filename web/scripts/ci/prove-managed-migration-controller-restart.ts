@@ -129,16 +129,36 @@ async function main(): Promise<void> {
       reset role;
       grant forge_acl_parent to forge_runtime_api_login with inherit true;
     `)
-    const aclBefore = await readAcl(admin)
-
     const controllerEnv = {
       ...process.env,
       FORGE_DATABASE_ADMIN_URL: adminUrl,
       DATABASE_URL: appUrl,
       FORGE_RUNTIME_API_DATABASE_PASSWORD: runtimePassword,
       FORGE_MANAGED_DOCKER_MIGRATIONS: '1',
+      CI: 'true',
+      FORGE_MANAGED_MIGRATION_PROOF_HOST_CHILD: '1',
       FORGE_MANAGED_MIGRATION_PAUSE_AFTER_FENCE_MS: '60000',
     }
+    // REASSIGN OWNED reaches shared objects. Prove a forge-owned second
+    // database causes a pre-snapshot refusal and remains completely unchanged.
+    await admin.unsafe('alter database forge owner to forge')
+    await admin.unsafe('create database forge_foreign_owner_proof owner forge')
+    let foreignOwnerRejected = false
+    try {
+      await executeController([controllerScript, '--run'], { ...controllerEnv, FORGE_MANAGED_MIGRATION_PAUSE_AFTER_FENCE_MS: '0' }, { timeout: 30_000, maxBuffer: 8 * 1024 * 1024 })
+    } catch (error) {
+      foreignOwnerRejected = String(error).includes('Controller process group failed')
+    }
+    const [foreignScope] = await admin<{ currentOwner: string; foreignOwner: string; stateExists: boolean }[]>`
+      select (select pg_catalog.pg_get_userbyid(datdba) from pg_catalog.pg_database where datname='forge') as "currentOwner",
+        (select pg_catalog.pg_get_userbyid(datdba) from pg_catalog.pg_database where datname='forge_foreign_owner_proof') as "foreignOwner",
+        pg_catalog.to_regclass('public.forge_protected_migration_handoffs') is not null as "stateExists"
+    `
+    if (!foreignOwnerRejected || foreignScope.currentOwner !== 'forge' || foreignScope.foreignOwner !== 'forge' || foreignScope.stateExists) {
+      throw new Error(`Foreign forge-owned database did not fail closed before ownership/state mutation: ${JSON.stringify({ foreignOwnerRejected, ...foreignScope })}`)
+    }
+    await admin.unsafe('alter database forge_foreign_owner_proof owner to postgres')
+    await admin.unsafe('drop database forge_foreign_owner_proof')
     const firstLaunch = controllerLaunch(['-e', `import('./${controllerScript}').then((module) => module.default.runManagedDockerMigration()).catch((error) => { console.error(error.stack); process.exit(1) })`], controllerEnv)
     const first = spawn(firstLaunch.command, firstLaunch.args, {
       cwd: process.cwd(), env: firstLaunch.env, detached: true, stdio: ['ignore', 'pipe', 'pipe'],
@@ -238,7 +258,7 @@ async function main(): Promise<void> {
     await predecessor.end({ timeout: 1 })
 
     const { stdout, stderr } = await executeController([controllerScript, '--run'], retryEnv, { timeout: 180_000, maxBuffer: 8 * 1024 * 1024 })
-    if (!`${stdout}${stderr}`.includes('Managed Docker migration completed')) throw new Error('The restarted controller omitted its success evidence.')
+    if (!`${stdout}${stderr}`.includes('Managed migration completed under the serialized controller.')) throw new Error('The restarted controller omitted its success evidence.')
 
     const [closed] = await admin<{ phase: string; cleanup: boolean; oldRoleExists: boolean; migrators: number }[]>`
       select handoff.controller_phase as phase, handoff.cleanup_completed_at is not null as cleanup,
@@ -249,7 +269,9 @@ async function main(): Promise<void> {
     if (closed.phase !== 'complete' || !closed.cleanup || closed.oldRoleExists || closed.migrators !== 0) {
       throw new Error('Restart did not CAS-close the durable handoff and remove every ephemeral login.')
     }
-    if (JSON.stringify(await readAcl(admin)) !== JSON.stringify(aclBefore)) throw new Error('Restart did not restore the exact grantor-aware database ACL.')
+    const restoredAcl = await readAcl(admin)
+    const comparableAcl = (value: unknown) => (value as AclEntry[]).map((entry) => [entry.grantorOid, entry.grantor, entry.granteeOid, entry.grantee, entry.privilege, entry.grantable])
+    if (JSON.stringify(comparableAcl(restoredAcl)) !== JSON.stringify(comparableAcl(durable.acl))) throw new Error('Restart did not restore the exact normalized grantor-aware database ACL.')
     const appAfter = postgres(appUrl, { max: 1, connect_timeout: 2 })
     try { await appAfter`select 1` } finally { await appAfter.end({ timeout: 1 }) }
 

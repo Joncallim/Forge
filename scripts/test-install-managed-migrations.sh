@@ -17,7 +17,7 @@ PROTECTED_OWNER_BOOTSTRAP="$SCRIPT_DIR/../web/scripts/bootstrap-epic-172-s5-reco
 MIGRATE_THROUGH_0028="$SCRIPT_DIR/../web/scripts/ci/migrate-through-0028.ts"
 MIGRATE_THROUGH_0033="$SCRIPT_DIR/../web/scripts/ci/migrate-through-0033.ts"
 TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/forge-managed-migrations.XXXXXX")"
-trap 'rm -rf "$TEST_ROOT"' EXIT
+trap '[ "${FORGE_KEEP_INSTALL_TEST_ROOT:-0}" = 1 ] || rm -rf "$TEST_ROOT"' EXIT
 TEST_SECRET='TEST_APP_DATABASE_URL_MUST_NOT_APPEAR'
 
 fail() {
@@ -828,10 +828,10 @@ EOF
     FORGE_REPAIR_TEST_RECONCILER_CALLS="$case_dir/reconciler-calls" \
     FORGE_REPAIR_TEST_NPM_CALLS="$case_dir/npm-calls" \
     FORGE_REPAIR_TEST_SENTINEL="$case_dir/sentinel" \
-    FORGE_REPAIR_TEST_EXPECTED_SOCKET="$REPAIR_EXPECTED_SOCKET" \
+    FORGE_REPAIR_TEST_EXPECTED_SOCKET="$REPAIR_TEST_SOCKET" \
     FORGE_REPAIR_TEST_PROBE_EXIT="${REPAIR_CASE_PROBE_EXIT:-0}" \
     FORGE_REPAIR_TEST_PSQL_BIN="$case_dir/bin/psql" \
-    FORGE_REPAIR_TEST_PSQL_SOCKET="$REPAIR_EXPECTED_SOCKET" \
+    FORGE_REPAIR_TEST_PSQL_SOCKET="$REPAIR_TEST_SOCKET" \
     FORGE_REPAIR_TEST_PSQL_PORT=5432 \
     FORGE_REPAIR_CASE_DRY_RUN="$repair_dry_run" \
     FORGE_REPAIR_CASE_SKIP_MIGRATE="$repair_skip_migrate" \
@@ -861,9 +861,13 @@ EOF
 }
 
 managed_repair_url="postgresql://forge:${TEST_SECRET}@localhost:5432/forge"
-case "$(uname -s)" in Darwin|Linux) ;; *) fail 'unsupported repair process-test operating system' ;; esac
-REPAIR_EXPECTED_SOCKET="$TEST_ROOT/repair-socket"
-mkdir -p "$REPAIR_EXPECTED_SOCKET"
+case "$(uname -s)" in
+  Darwin) REPAIR_EXPECTED_SOCKET=/tmp ;;
+  Linux) REPAIR_EXPECTED_SOCKET=/var/run/postgresql ;;
+  *) fail 'unsupported repair process-test operating system' ;;
+esac
+REPAIR_TEST_SOCKET="$TEST_ROOT/repair-socket"
+mkdir -p "$REPAIR_TEST_SOCKET"
 
 run_repair_process_case dry-run "$managed_repair_url" native --dry-run
 [ "$CASE_STATUS" -eq 0 ] || fail 'full-process repair dry-run should succeed'
@@ -910,8 +914,8 @@ run_repair_process_case managed "$managed_repair_url" native
 [ "$(wc -l < "$CASE_DIR/reconciler-calls" | tr -d '[:space:]')" = 1 ] \
   || fail 'managed local repair must invoke the shared reconciler exactly once'
 assert_not_contains 'must_not_leak_into_library_routing' "$CASE_DIR/psql-calls"
-assert_contains "-X -h $REPAIR_EXPECTED_SOCKET -p 5432 -d postgres" "$CASE_DIR/psql-calls"
-assert_contains "-X -h $REPAIR_EXPECTED_SOCKET -p 5432 -d forge" "$CASE_DIR/psql-calls"
+assert_contains "-X -h $REPAIR_TEST_SOCKET -p 5432 -d postgres" "$CASE_DIR/psql-calls"
+assert_contains "-X -h $REPAIR_TEST_SOCKET -p 5432 -d forge" "$CASE_DIR/psql-calls"
 assert_not_contains 'ambient-' "$CASE_DIR/psql-calls"
 
 REPAIR_CASE_PROBE_EXIT=74
@@ -949,6 +953,7 @@ for bypass_case in manifest-docker nonlocal-2; do
   bypass_root="$TEST_ROOT/repair-process-$bypass_case"
   : > "$bypass_root/psql-calls"
   printf 'untouched\n' > "$bypass_root/sentinel"
+  set +e
   env -u DATABASE_URL \
     PATH="$bypass_root/bin:$PATH" \
     HOME="$bypass_root/home" \
@@ -967,6 +972,19 @@ for bypass_case in manifest-docker nonlocal-2; do
     FORGE_REPAIR_TEST_EXPECTED_SOCKET="$REPAIR_EXPECTED_SOCKET" \
     /bin/bash "$bypass_root/repo/scripts/repair.sh" --skip-install --skip-doctor \
       > "$bypass_root/executable-stdout" 2> "$bypass_root/executable-stderr"
+  bypass_status=$?
+  set -e
+  case "$bypass_case" in
+    manifest-docker)
+      [ "$bypass_status" -eq 0 ] \
+        || fail 'normal executable docker-manifest repair should succeed'
+      ;;
+    nonlocal-2)
+      [ "$bypass_status" -ne 0 ] \
+        || fail 'normal executable custom-database repair must require controlled administrator access'
+      assert_contains 'requires a controlled FORGE_DATABASE_ADMIN_URL' "$bypass_root/executable-stderr"
+      ;;
+  esac
   [ ! -s "$bypass_root/psql-calls" ] \
     || fail "normal executable repair let test routing bypass $bypass_case gates"
   [ "$(<"$bypass_root/sentinel")" = untouched ] \
@@ -1216,6 +1234,7 @@ MANAGED_LOCAL_ADMIN_MODE=current
 MANAGED_LOCAL_ADMIN_USER=nobody
 MANAGED_LOCAL_ADMIN_SOCKET=/var/run/postgresql
 MANAGED_LOCAL_ADMIN_PORT=5432
+MANAGED_HELPER_ROOT=/opt/forge-managed-migration-helper-test
 run_managed_local_controller 'controller environment proof'
 EOF
   chmod +x "$case_dir/driver.sh"

@@ -278,7 +278,7 @@ export async function runManagedDockerMigration(): Promise<void> {
     return { uid, gid: (await validatedReadOnlyTraversalGid(process.cwd())) ?? uid }
   })()
   const childNode = native?.childNode ?? process.execPath
-  const childTsxCli = native?.childTsxCli ?? resolve(process.cwd(), 'node_modules/tsx/dist/cli.mjs')
+  const childTsxCli = native ? null : resolve(process.cwd(), 'node_modules/tsx/dist/cli.mjs')
   process.setgroups?.([])
   const childPrivateDirectory = await mkdtemp('/tmp/forge-migration-child-')
   await chown(childPrivateDirectory, childIdentity.uid, childIdentity.gid)
@@ -415,13 +415,20 @@ export async function runManagedDockerMigration(): Promise<void> {
     }
 
     const childEnv = createMigrationChildEnvironment(ephemeralMigrationUrl, process.env, childPrivateDirectory)
-    const childProcess = { cwd: process.cwd(), env: childEnv, ...childIdentity }
-    const runChild = (script: string) => execFileAsync(childNode, [childTsxCli, script], childProcess)
-    await execFileAsync(childNode, [childTsxCli, 'scripts/ci/assert-migration-child-boundary.ts',
+    const childRoot = native?.helperRoot ?? process.cwd()
+    const childProcess = { cwd: childRoot, env: childEnv, ...childIdentity }
+    const installedChild = (script: string) => resolve(childRoot, `${script.split('/').at(-1)?.replace(/\.ts$/, '')}.mjs`)
+    const runChild = (script: string) => execFileAsync(childNode, native ? [installedChild(script)] : [childTsxCli!, script], childProcess)
+    await execFileAsync(childNode, native ? [installedChild('assert-migration-child-boundary.ts'),
       '--controller-pid', String(process.pid),
-      '--admin-host', native ? new URL(adminUrl).searchParams.get('host') ?? 'localhost' : new URL(adminUrl).hostname,
-      '--admin-port', native ? String(native.port) : new URL(adminUrl).port,
-      '--admin-user', native?.adminUser ?? new URL(adminUrl).username,
+      '--admin-host', new URL(adminUrl).searchParams.get('host') ?? 'localhost',
+      '--admin-port', String(native.port),
+      '--admin-user', native.adminUser,
+      '--database', new URL(adminUrl).pathname.slice(1)] : [childTsxCli!, 'scripts/ci/assert-migration-child-boundary.ts',
+      '--controller-pid', String(process.pid),
+      '--admin-host', new URL(adminUrl).hostname,
+      '--admin-port', new URL(adminUrl).port,
+      '--admin-user', new URL(adminUrl).username,
       '--database', new URL(adminUrl).pathname.slice(1)], childProcess)
     const bootstrapUrls = { adminUrl, migrationUrl: childEnv.DATABASE_URL, adminClient: sql, migrationRole: migrator }
 
@@ -455,9 +462,7 @@ export async function runManagedDockerMigration(): Promise<void> {
     handoffOpened = true
     // This second child applies only 0034 (the ledger has the prefix).  It
     // receives neither administrator authority nor the application passwords.
-    await execFileAsync(childNode, [childTsxCli, 'scripts/ci/migrate-through-0034.ts'], {
-      ...childProcess,
-    })
+    await runChild('scripts/ci/migrate-through-0034.ts')
     lifecycleGeneration = await closeRuntimeHandoff(sql, migrator, operationId, lifecycleGeneration)
     handoffOpened = false
     // Historical ordinary migrations execute as the disposable session so
@@ -554,7 +559,7 @@ type NativeControllerInputs = Readonly<{
   peerGid: number
   adminUser: string
   childNode: string
-  childTsxCli: string
+  helperRoot: string
   reconcileSql: string
   legacyRepairSql: string
   socket: string
@@ -564,7 +569,8 @@ type NativeControllerInputs = Readonly<{
 
 async function assertInstalledHelperFile(path: string, label: string): Promise<void> {
   let current = resolve(path)
-  const leaf = await lstat(current)
+  const leaf = await lstat(current).catch(() => null)
+  if (!leaf) throw new Error(`Managed native ${label} is not a regular installed file.`)
   if (!leaf.isFile() || leaf.isSymbolicLink()) throw new Error(`Managed native ${label} is not a regular installed file.`)
   while (true) {
     const metadata = await lstat(current)
@@ -605,9 +611,8 @@ async function nativeControllerInputs(args: string[]): Promise<NativeControllerI
   const port = option('--native-port')
   const databaseName = option('--native-database')
   const envFile = option('--native-env-file')
-  const repoRoot = option('--native-repo-root')
+  const helperRoot = option('--native-helper-root')
   const childNode = option('--native-child-node')
-  const childTsxCli = option('--native-child-tsx')
   const reconcileSql = option('--native-reconcile-sql')
   const legacyRepairSql = option('--native-legacy-repair-sql')
   const proofPauseRaw = option('--proof-pause-after-admin-reserve-ms')
@@ -623,19 +628,24 @@ async function nativeControllerInputs(args: string[]): Promise<NativeControllerI
   const peerGid = integerOption('--native-peer-gid')
   if (!socket.startsWith('/') || !port?.match(/^\d{1,5}$/) || Number(port) < 1 || Number(port) > 65535
     || !databaseName?.match(/^[a-z_][a-z0-9_]*$/i)
-    || !envFile?.startsWith('/') || !repoRoot?.startsWith('/') || !childNode?.startsWith('/')
-    || !childTsxCli?.startsWith('/') || !reconcileSql?.startsWith('/') || !legacyRepairSql?.startsWith('/')) {
+    || !envFile?.startsWith('/') || !helperRoot?.startsWith('/') || !childNode?.startsWith('/')
+    || !reconcileSql?.startsWith('/') || !legacyRepairSql?.startsWith('/')) {
     throw new Error('Managed native controller received invalid non-secret routing arguments.')
   }
   await assertInstalledHelperFile(childNode, 'Node executable')
+  for (const child of ['assert-migration-child-boundary','migrate-through-0025','migrate-through-0026','migrate-through-0027','migrate-through-0028','migrate-through-0033','migrate-through-0034']) {
+    await assertInstalledHelperFile(resolve(helperRoot, `${child}.mjs`), `${child} child`)
+  }
   await assertInstalledHelperFile(reconcileSql, 'reconciler')
   await assertInstalledHelperFile(legacyRepairSql, 'legacy repair artifact')
-  process.chdir(resolve(repoRoot, 'web'))
+  process.chdir(helperRoot)
   if (process.getuid?.() !== 0) throw new Error('Managed native controller requires root with distinct peer-admin and migration-child identities.')
   const protectedValues = parseProtectedEnvFile(await readFile(envFile, 'utf8'))
-  const passwd = await readFile('/etc/passwd', 'utf8')
-  const adminUser = passwd.split(/\r?\n/).map((line) => line.split(':')).find((fields) => Number(fields[2]) === peerUid)?.[0] ?? ''
+  const adminUser = (await execFileAsync('/usr/bin/id', ['-nu', String(peerUid)])).stdout.trim()
   if (!adminUser.match(/^[a-z_][a-z0-9_]*$/i)) throw new Error('Managed native controller could not derive a safe peer administrator identity.')
+  const resolvedPeerUid = Number((await execFileAsync('/usr/bin/id', ['-u', adminUser])).stdout.trim())
+  const resolvedPeerGid = Number((await execFileAsync('/usr/bin/id', ['-g', adminUser])).stdout.trim())
+  if (resolvedPeerUid !== peerUid || resolvedPeerGid !== peerGid) throw new Error('Managed native controller peer identity changed during operating-system resolution.')
   const configuredUrl = protectedValues.get('DATABASE_URL')
   if (!configuredUrl) throw new Error('Managed native controller environment file has no DATABASE_URL.')
   const configuredApplication = new URL(configuredUrl)
@@ -664,7 +674,7 @@ async function nativeControllerInputs(args: string[]): Promise<NativeControllerI
     peerGid,
     adminUser,
     childNode,
-    childTsxCli,
+    helperRoot,
     reconcileSql,
     legacyRepairSql,
     socket,
@@ -713,6 +723,10 @@ async function dockerMigrationChildIdentity(): Promise<Readonly<{ uid: number; g
   const nodeEntry = passwd.split(/\r?\n/).find((line) => line.startsWith('node:'))?.split(':')
   const uid = Number(nodeEntry?.[2])
   const gid = Number(nodeEntry?.[3])
+  if (process.env.CI === 'true' && process.env.FORGE_MANAGED_MIGRATION_PROOF_HOST_CHILD === '1') {
+    const proofUid = await selectEphemeralChildUid(0)
+    return { uid: proofUid, gid: (await validatedReadOnlyTraversalGid(process.cwd())) ?? proofUid }
+  }
   if (!Number.isInteger(uid) || !Number.isInteger(gid) || uid <= 0 || gid <= 0 || uid === process.getuid?.()) {
     throw new Error('Managed Docker controller requires the image\'s dedicated non-root node UID/GID for migration children.')
   }

@@ -1,5 +1,6 @@
 import { execFileSync, spawnSync } from 'node:child_process'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { appendFileSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { builtinModules } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -57,6 +58,11 @@ describe('installer-managed migration proof', () => {
       expect(metafile.forgeVerifiedVirtualInputs).toEqual(['forge-managed-helper:explicit-environment'])
       expect(Object.values(metafile.outputs).flatMap((outputEntry) => outputEntry.imports ?? [])
         .every((entry) => entry.external && allowedBuiltins.has(entry.path))).toBe(true)
+      const closure = JSON.parse(readFileSync(join(output, 'closure-manifest.json'), 'utf8')) as { files: Array<{ name: string }> }
+      const closureNames = closure.files.map((entry) => entry.name)
+      expect(closureNames).toContain('migrate-through-0034.mjs')
+      expect(closureNames).toContain('db/migrations/meta/_journal.json')
+      expect(closureNames).toContain('db/migrations/0034_vnext_phase0_a1_runtime_foundation.sql')
       const startup = spawnSync(process.execPath, [join(output, 'controller.mjs'), '--run'], {
         cwd: tmpdir(), env: { NODE_ENV: 'test' }, encoding: 'utf8',
       })
@@ -76,11 +82,44 @@ describe('installer-managed migration proof', () => {
     expect(helperInstall).toBeGreaterThan(preAuthorityBoundary)
     expect(adminResolution).toBeGreaterThan(helperInstall)
     expect(installer).toContain('--native-legacy-repair-sql "$MANAGED_HELPER_ROOT/epic-172-legacy-0023-0025-v1.sql"')
-    expect(installer).toContain('"$canonical_target/epic-172-legacy-0023-0025-v1.sql" "$canonical_target/node"')
+    expect(installer).toContain('--native-helper-root "$MANAGED_HELPER_ROOT"')
+    expect(installer).toContain('closure-manifest.json')
+    expect(installer).toContain('Managed migration helper bytes do not match the independently pinned release digest')
     expect(installer).toContain('digest.digest("hex")!==expected')
-    expect(installer).toContain('Homebrew/user-owned Node cannot cross the privileged helper boundary')
+    expect(installer).toContain('node-v$version-darwin-$architecture.tar.xz')
+    expect(installer).toContain('5eff7a9011895aae3f29d06f167b84a62b028a591370c7cafb59103559fd26e1')
+    expect(installer).toContain('96dff79f4e19a78715da559ec7cac2028f4985a175ea0c3454625a269c21deb7')
+    expect(installer).toContain('root="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/forge-node-darwin.XXXXXX")" || return 1')
+    expect(installer.match(/\/bin\/rm -rf "\$root"/g)?.length).toBeGreaterThanOrEqual(5)
     expect(installer).toContain('root_group="$(/usr/bin/id -gn 0)"')
     expect(controller).toContain("assertInstalledHelperFile(legacyRepairSql, 'legacy repair artifact')")
+    expect(controller).toContain('process.chdir(helperRoot)')
+    expect(controller).not.toContain('--native-child-tsx')
+  })
+
+  it('rejects modified helper bytes against the release pin before elevation', () => {
+    const output = mkdtempSync(join(tmpdir(), 'forge-managed-helper-hostile-'))
+    try {
+      execFileSync(process.execPath, [pathFor('../scripts/ci/build-managed-migration-helper.mjs'), output], { cwd: pathFor('..'), env: { HOME: tmpdir(), PATH: '/usr/bin:/bin', NODE_ENV: 'test' } })
+      const pin = installer.match(/digest='([0-9a-f]{64})'/)?.[1]
+      expect(readFileSync(join(output, 'bundle.sha256'), 'utf8').trim()).toBe(pin)
+      appendFileSync(join(output, 'controller.mjs'), '\n// hostile checkout mutation\n')
+      const manifest = JSON.parse(readFileSync(join(output, 'closure-manifest.json'), 'utf8')) as { files: Array<{ name: string; bytes: number; sha256: string }> }
+      const controllerEntry = manifest.files.find((entry) => entry.name === 'controller.mjs')!
+      const changed = readFileSync(join(output, 'controller.mjs'))
+      controllerEntry.bytes = changed.length
+      controllerEntry.sha256 = createHash('sha256').update(changed).digest('hex')
+      const changedRoot = createHash('sha256')
+      for (const entry of manifest.files) changedRoot.update(`${entry.name}\0${entry.bytes}\0${entry.sha256}\n`)
+      expect(changedRoot.digest('hex')).not.toBe(pin)
+      const installStart = installer.indexOf('install_managed_migration_helper()')
+      expect(installer.indexOf('[ "$computed" = "$digest" ]', installStart)).toBeLessThan(installer.indexOf('if [ "${EUID:-$(/usr/bin/id -u)}" -ne 0 ]', installStart))
+      expect(installer).toContain('Installed managed migration helper Node.js digest changed during privileged copy.')
+      expect(installer).toContain('Installed managed migration helper digest does not match its independently pinned release bundle.')
+      expect(installer.indexOf('installed_node_digest=', installStart)).toBeLessThan(installer.indexOf('"$canonical_target/node" -e', installStart))
+      expect(installer.indexOf('MANAGED_HELPER_ROOT="$canonical_target"', installStart)).toBeGreaterThan(installer.indexOf('digest does not match its independently pinned release bundle', installStart))
+      expect(installer).toContain('/*|*[!A-Za-z0-9_./-]*|..|../*|*/../*|*/..)')
+    } finally { rmSync(output, { recursive: true, force: true }) }
   })
 
   it('keeps Docker dependency installation credential-free and children distinct from the controller', () => {
