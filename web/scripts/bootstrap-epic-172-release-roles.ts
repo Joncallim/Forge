@@ -31,7 +31,7 @@ function roleIsUnsafe(role: ReleaseRoleRow): boolean {
     || role.bypassesRls
 }
 
-async function main(): Promise<void> {
+export async function runEpic172ReleaseRoleBootstrap(): Promise<void> {
   const adminUrl = process.env.FORGE_DATABASE_ADMIN_URL?.trim()
   if (!adminUrl) {
     throw new Error(
@@ -247,7 +247,7 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((error) => {
+if (process.argv[1]?.endsWith('bootstrap-epic-172-release-roles.ts')) runEpic172ReleaseRoleBootstrap().catch((error) => {
   console.error(`✗ ${error instanceof Error ? error.message : String(error)}`)
   process.exit(1)
 })

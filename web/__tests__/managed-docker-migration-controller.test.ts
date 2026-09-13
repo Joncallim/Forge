@@ -16,10 +16,16 @@ describe('managed Docker migration authority', () => {
     expect(controller).toContain('connection limit 1')
     expect(controller).toContain('pg_advisory_lock')
     expect(controller).toContain('reassign owned by forge to forge_schema_owner')
+    for (const bootstrap of [
+      'runEpic172ReleaseRoleBootstrap', 'runEpic172S3OwnerBootstrap',
+      'runEpic172LegacyReleaseRepair', 'runEpic172S4RoleBootstrap', 'runEpic172S5OwnerBootstrap',
+    ]) expect(controller).toContain(bootstrap)
+    expect(controller).toContain('withControllerMigrationIdentity')
+    expect(controller).toContain("env: childEnv")
     expect(controller).toContain("usename=any(array['forge','forge_runtime_api_login'])")
     expect(controller.indexOf('revoke connect on database')).toBeLessThan(controller.indexOf('migrate-through-0034.ts'))
-    expect(controller.indexOf('migrate-through-0034.ts')).toBeLessThan(controller.indexOf('reconcile-forge-app-privileges.sql'))
-    expect(controller.indexOf('reconcile-forge-app-privileges.sql')).toBeLessThan(controller.indexOf('await assertProtectedMigrationLiveAttestation'))
+    expect(controller.indexOf('migrate-through-0034.ts')).toBeLessThan(controller.lastIndexOf('reconcile-forge-app-privileges.sql'))
+    expect(controller.lastIndexOf('reconcile-forge-app-privileges.sql')).toBeLessThan(controller.lastIndexOf('await assertProtectedMigrationLiveAttestation'))
     expect(controller.indexOf('await assertProtectedMigrationLiveAttestation')).toBeLessThan(controller.indexOf('await closeLifecycleCas'))
     expect(controller.indexOf('await closeLifecycleCas')).toBeLessThan(controller.lastIndexOf('grant connect on database'))
     expect(compose).toContain('POSTGRES_USER: ${POSTGRES_USER:-forge_admin}')

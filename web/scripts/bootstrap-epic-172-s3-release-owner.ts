@@ -13,7 +13,7 @@ function quotedLiteral(value: string): string {
   return `'${value.replaceAll("'", "''")}'`
 }
 
-async function main(): Promise<void> {
+export async function runEpic172S3OwnerBootstrap(): Promise<void> {
   const adminUrl = process.env.FORGE_DATABASE_ADMIN_URL?.trim()
   if (!adminUrl) {
     throw new Error(
@@ -369,7 +369,7 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((error) => {
+if (process.argv[1]?.endsWith('bootstrap-epic-172-s3-release-owner.ts')) runEpic172S3OwnerBootstrap().catch((error) => {
   console.error(`✗ ${error instanceof Error ? error.message : String(error)}`)
   process.exit(1)
 })

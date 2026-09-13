@@ -8,8 +8,13 @@ import { resolve } from 'node:path'
 import { promisify } from 'node:util'
 import postgres from 'postgres'
 import { getRequiredEnv } from '@/lib/env'
-import { assertProtectedMigrationLiveAttestation, recordProtectedMigrationCleanup, recordProtectedMigrationHandoff } from './ci/protected-migration-state'
+import { assertProtectedMigrationLiveAttestation, ensureProtectedMigrationState, recordProtectedMigrationCleanup, recordProtectedMigrationHandoff } from './ci/protected-migration-state'
 import { assertProtectedMigrationMarkers, protectedMigrationForTag } from './ci/protected-migration-registry'
+import { runEpic172ReleaseRoleBootstrap } from './bootstrap-epic-172-release-roles'
+import { runEpic172S3OwnerBootstrap } from './bootstrap-epic-172-s3-release-owner'
+import { runEpic172S4RoleBootstrap } from './bootstrap-epic-172-s4-roles'
+import { runEpic172LegacyReleaseRepair } from './repair-epic-172-legacy-release'
+import { runEpic172S5OwnerBootstrap } from './bootstrap-epic-172-s5-recovery-owner'
 
 const LOCK = 334001
 const RUNTIME_MIGRATION_TAG = '0034_vnext_phase0_a1_runtime_foundation'
@@ -23,6 +28,18 @@ function migrationUrl(adminUrl: string, migrationRole: string, migrationPassword
   result.username = migrationRole
   result.password = migrationPassword
   return result.toString()
+}
+
+/** The trusted historical bootstrap modules keep their own exact catalog
+ * verification.  Calling them here keeps the administrator secret in the
+ * one-shot controller process; no migration child inherits it. */
+async function withControllerMigrationIdentity<T>(url: string, run: () => Promise<T>): Promise<T> {
+  const previous = process.env.DATABASE_URL
+  process.env.DATABASE_URL = url
+  try { return await run() } finally {
+    if (previous === undefined) delete process.env.DATABASE_URL
+    else process.env.DATABASE_URL = previous
+  }
 }
 
 async function closeLifecycleCas(sql: ReturnType<typeof postgres>, migrationRole: string, attestedGeneration: bigint): Promise<void> {
@@ -56,9 +73,13 @@ async function closeRuntimeHandoff(sql: ReturnType<typeof postgres>, migrationRo
   if (!protectedMigration) throw new Error('The managed Docker protected migration is absent from the checked-in registry.')
   await sql.unsafe(`revoke ${OWNER} from ${safe(migrationRole)};
     revoke create on schema public, forge from ${OWNER};
-    revoke grant option for usage on schema public, forge from ${OWNER};
+    -- 0034 re-grants forge usage to the API group while the owner handoff is
+    -- open.  Remove that dependent grant along with the temporary grant
+    -- option, then re-issue the exact API usage below as controller/admin.
+    revoke grant option for usage on schema public, forge from ${OWNER} cascade;
     revoke select, update, references on table public.users, public.sessions, public.tasks, public.projects from ${OWNER};
     grant usage on schema forge to ${OWNER};
+    grant usage on schema forge to ${API};
     grant select, update on table public.sessions to ${OWNER};
     grant select (id, project_id, submitted_by) on table public.tasks to ${OWNER};
     grant select (id, submitted_by, root_ref, root_binding_revision, archived_at) on table public.projects to ${OWNER};`)
@@ -79,8 +100,9 @@ export async function runManagedDockerMigration(): Promise<void> {
   let locked = false
   let fenced = false
   let handoffOpened = false
+  let s5HandoffOpened = false
   try {
-    const journal = JSON.parse(await readFile(resolve(process.cwd(), 'db/migrations/meta/_journal.json'), 'utf8')) as { entries: Array<{ tag: string }> }
+    const journal = JSON.parse(await readFile(resolve(process.cwd(), 'db/migrations/meta/_journal.json'), 'utf8')) as { entries: Array<{ tag: string; when: number }> }
     await assertProtectedMigrationMarkers(resolve(process.cwd(), 'db/migrations'), journal.entries.map((entry) => entry.tag))
     await sql`select pg_advisory_lock(${LOCK})`
     locked = true
@@ -114,19 +136,69 @@ export async function runManagedDockerMigration(): Promise<void> {
     `
     if (authority?.appSuper || authority?.appOwnsObjects) throw new Error('Managed Docker app ownership reconciliation did not reach the required boundary.')
 
-    // First establish the ordinary historical schema under the non-login
-    // schema owner.  The protected 0034 owner is not granted until its source
-    // tables and forge schema exist.
+    // A normal managed-service restart must not reopen a completed protected
+    // handoff under a new disposable login.  Its durable row identifies the
+    // original login for the same catalog attestation instead.
+    const targetEntry = journal.entries.find((entry) => entry.tag === RUNTIME_MIGRATION_TAG)
+    let completedMigrationRole: string | undefined
+    if (targetEntry) {
+      try {
+        const [completed] = await sql<{ migrationRole: string }[]>`
+          select handoff.migration_role::text as "migrationRole"
+          from public.forge_protected_migration_handoffs handoff
+          where handoff.migration_tag=${RUNTIME_MIGRATION_TAG}
+            and handoff.cleanup_completed_at is not null
+            and exists(select 1 from drizzle.__drizzle_migrations where created_at=${targetEntry.when})
+        `
+        completedMigrationRole = completed?.migrationRole
+      } catch (error) {
+        if ((error as { code?: string }).code !== '42P01') throw error
+      }
+    }
+    if (completedMigrationRole) {
+      await sql.unsafe(`alter role forge password '${appPassword.replaceAll("'", "''")}'; alter role forge_runtime_api_login password '${runtimePassword.replaceAll("'", "''")}'; grant ${API} to forge_runtime_api_login with inherit true;`)
+      await sql.unsafe(await readFile('../scripts/reconcile-forge-app-privileges.sql', 'utf8'))
+      await ensureProtectedMigrationState(sql)
+      const protectedMigration = protectedMigrationForTag(RUNTIME_MIGRATION_TAG)
+      if (!protectedMigration) throw new Error('The managed Docker protected migration is absent from the checked-in registry.')
+      await assertProtectedMigrationLiveAttestation(sql, protectedMigration, completedMigrationRole)
+      return
+    }
+
     const childEnv = {
       PATH: process.env.PATH ?? '',
       NODE_ENV: process.env.NODE_ENV ?? 'production',
       DATABASE_URL: migrationUrl(adminUrl, migrator, migratorPassword),
       FORGE_MANAGED_DOCKER_MIGRATIONS: '0',
     }
-    await execFileAsync('npx', ['tsx', 'scripts/ci/migrate-through-0034.ts', '--through-0033'], {
-      cwd: process.cwd(),
-      env: childEnv,
-    })
+    const runChild = (script: string) => execFileAsync('npx', ['tsx', script], { cwd: process.cwd(), env: childEnv })
+    const runControllerBootstrap = <T>(bootstrap: () => Promise<T>) => withControllerMigrationIdentity(childEnv.DATABASE_URL, bootstrap)
+
+    // Preserve the historical order and bootstrap invariants.  These calls
+    // run in this locked controller, not as children carrying admin secrets.
+    await runControllerBootstrap(runEpic172ReleaseRoleBootstrap)
+    await runChild('scripts/ci/migrate-through-0025.ts')
+    await runControllerBootstrap(runEpic172S3OwnerBootstrap)
+    await runChild('scripts/ci/migrate-through-0026.ts')
+    await runControllerBootstrap(runEpic172LegacyReleaseRepair)
+    await runControllerBootstrap(runEpic172S4RoleBootstrap)
+    await runChild('scripts/ci/migrate-through-0027.ts')
+    await runControllerBootstrap(runEpic172S5OwnerBootstrap)
+    s5HandoffOpened = true
+    await runChild('scripts/ci/migrate-through-0028.ts')
+    await runControllerBootstrap(() => runEpic172S5OwnerBootstrap(true))
+    s5HandoffOpened = false
+    await runControllerBootstrap(runEpic172S5OwnerBootstrap)
+    s5HandoffOpened = true
+    await runChild('scripts/ci/migrate-through-0033.ts')
+    await runControllerBootstrap(() => runEpic172S5OwnerBootstrap(true))
+    s5HandoffOpened = false
+
+    // The protected 0034 owner is not granted until all source objects exist.
+    // It also makes the ordinary Drizzle ledger/schema available to the
+    // schema-owner context used by the final child without retaining the
+    // disposable login as an owner.
+    await sql.unsafe(`reassign owned by ${safe(migrator)} to forge_schema_owner;`)
     await openRuntimeHandoff(sql, migrator, runtimePassword)
     handoffOpened = true
     // This second child applies only 0034 (the ledger has the prefix).  It
@@ -137,8 +209,16 @@ export async function runManagedDockerMigration(): Promise<void> {
     })
     await closeRuntimeHandoff(sql, migrator)
     handoffOpened = false
+    // Historical ordinary migrations execute as the disposable session so
+    // their exact `current_user` bootstrap guards remain valid.  Transfer any
+    // residual ordinary objects before the login is destroyed; protected
+    // migration objects have already moved to their dedicated owner roles.
+    await sql.unsafe(`reassign owned by ${safe(migrator)} to forge_schema_owner;`)
     // The reconciler is mandatory, not a best-effort repair after reconnect.
     await sql.unsafe(await readFile('../scripts/reconcile-forge-app-privileges.sql', 'utf8'))
+    // The shared reconciler grants legacy app access to ordinary public
+    // tables.  Reapply the controller-only state ACL after that broad pass.
+    await ensureProtectedMigrationState(sql)
     const protectedMigration = protectedMigrationForTag(RUNTIME_MIGRATION_TAG)
     if (!protectedMigration) throw new Error('The managed Docker protected migration is absent from the checked-in registry.')
     const attestedGeneration = await assertProtectedMigrationLiveAttestation(sql, protectedMigration, migrator)
@@ -147,6 +227,11 @@ export async function runManagedDockerMigration(): Promise<void> {
     // Success and every failure path remove the ephemeral login before app
     // reconnect authority is restored; no process receives its credential.
     if (handoffOpened) await closeRuntimeHandoff(sql, migrator).catch(() => {})
+    if (s5HandoffOpened) await withControllerMigrationIdentity(migrationUrl(adminUrl, migrator, migratorPassword), () => runEpic172S5OwnerBootstrap(true)).catch(() => {})
+    await sql.unsafe(`revoke forge_schema_owner from ${safe(migrator)}`).catch(() => {})
+    // REASSIGN above moved relations; DROP OWNED now removes only residual
+    // grants/dependencies that would otherwise keep this expiring login alive.
+    await sql.unsafe(`drop owned by ${safe(migrator)}`).catch(() => {})
     await sql.unsafe(`drop role if exists ${safe(migrator)}`).catch(() => {})
     if (fenced) await sql.unsafe(`grant connect on database ${database} to forge, forge_runtime_api_login;`).catch(() => {})
     if (locked) await sql`select pg_advisory_unlock(${LOCK})`.catch(() => {})

@@ -70,7 +70,7 @@ function literal(value: string): string {
   return `'${value.replaceAll("'", "''")}'`
 }
 
-async function main(): Promise<void> {
+export async function runEpic172S4RoleBootstrap(): Promise<void> {
   const adminUrl = process.env.FORGE_DATABASE_ADMIN_URL?.trim()
   if (!adminUrl) {
     throw new Error('FORGE_DATABASE_ADMIN_URL is required; the ordinary Forge login must not create S4 principals.')
@@ -909,7 +909,7 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((error) => {
+if (process.argv[1]?.endsWith('bootstrap-epic-172-s4-roles.ts')) runEpic172S4RoleBootstrap().catch((error) => {
   console.error(`✗ ${error instanceof Error ? error.message : String(error)}`)
   process.exit(1)
 })

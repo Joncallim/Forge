@@ -1411,7 +1411,7 @@ async function loadRepairArtifact(): Promise<string> {
   return source
 }
 
-async function main(): Promise<void> {
+export async function runEpic172LegacyReleaseRepair(): Promise<void> {
   const client = postgres(process.env.FORGE_DATABASE_ADMIN_URL ?? getRequiredEnv('DATABASE_URL'), { max: 1, onnotice: () => {} })
   try {
     const outcome = await client.begin(async (sql) => {
@@ -1570,7 +1570,7 @@ async function main(): Promise<void> {
     await client.end({ timeout: 5 })
   }
 }
-main().catch((error) => {
+if (process.argv[1]?.endsWith('repair-epic-172-legacy-release.ts')) runEpic172LegacyReleaseRepair().catch((error) => {
   console.error(`✗ ${error instanceof Error ? error.message : String(error)}`)
   process.exit(1)
 })

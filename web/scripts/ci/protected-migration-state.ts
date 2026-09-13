@@ -94,7 +94,9 @@ export async function assertProtectedMigrationLiveAttestation(client: SqlClient,
     select handoff.generation::text as generation,
       (
         exists(select 1 from pg_catalog.pg_roles where rolname=${migration.protectedOwner})
-        and not pg_catalog.pg_has_role(${migrationRole}::name, ${migration.protectedOwner}::name, 'member')
+        and case when exists(select 1 from pg_catalog.pg_roles where rolname=${migrationRole})
+          then not pg_catalog.pg_has_role(${migrationRole}::name, ${migration.protectedOwner}::name, 'member')
+          else true end
         and not exists (
           select 1 from pg_catalog.pg_auth_members edge
           join pg_catalog.pg_roles owner_role on owner_role.oid=edge.roleid
@@ -104,7 +106,7 @@ export async function assertProtectedMigrationLiveAttestation(client: SqlClient,
         )
         and not exists (
           select 1 from unnest(${client.array(protectedOwners)}::name[]) owner_name
-          left join pg_catalog.pg_roles owner_role on owner_role.rolname=owner_name
+          left join pg_catalog.pg_authid owner_role on owner_role.rolname=owner_name
           where owner_role.oid is null or owner_role.rolcanlogin or owner_role.rolinherit or owner_role.rolsuper
              or owner_role.rolcreatedb or owner_role.rolcreaterole or owner_role.rolreplication or owner_role.rolbypassrls
              or owner_role.rolpassword is not null or owner_role.rolvaliduntil is not null
