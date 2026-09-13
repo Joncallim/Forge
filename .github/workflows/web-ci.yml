@@ -79,6 +79,33 @@ jobs:
           cache-dependency-path: web/package-lock.json
 
       - run: npm install
+      - name: Stage a root-owned Node 22 toolchain for native migration children
+        working-directory: .
+        run: |
+          set -euo pipefail
+          selected_node="$(readlink -f "$(command -v node)")"
+          selected_version="$($selected_node --version)"
+          [[ "$selected_version" =~ ^v22\. ]] || { echo "Expected setup-node to select Node 22, got $selected_version" >&2; exit 1; }
+          selected_root="$(dirname "$(dirname "$selected_node")")"
+          trusted_root=/usr/local/lib/forge-ci-node22
+          sudo install -d -o root -g root -m 0755 "$trusted_root"
+          sudo cp -a "$selected_root/." "$trusted_root/"
+          sudo chown -R root:root "$trusted_root"
+          sudo chmod -R go-w "$trusted_root"
+          for tool in node npm npx; do
+            sudo ln -sfn "$trusted_root/bin/$tool" "/usr/local/bin/$tool"
+            canonical="$(readlink -f "/usr/local/bin/$tool")"
+            [[ "$canonical" = "$trusted_root/"* && -f "$canonical" ]] || { echo "Trusted $tool target escaped its fixed tree" >&2; exit 1; }
+            while [[ "$canonical" != / ]]; do
+              [[ "$(stat -c '%U' "$canonical")" = root ]] || { echo "$canonical is not root-owned" >&2; exit 1; }
+              [[ $((8#$(stat -c '%a' "$canonical") & 022)) -eq 0 ]] || { echo "$canonical is group/other writable" >&2; exit 1; }
+              canonical="${canonical%/*}"
+              [[ -n "$canonical" ]] || canonical=/
+            done
+          done
+          [[ "$(/usr/local/bin/node --version)" = "$selected_version" ]]
+          [[ "$(/usr/local/bin/npm --version)" = "$("$trusted_root/bin/npm" --version)" ]]
+          [[ "$(/usr/local/bin/npx --version)" = "$("$trusted_root/bin/npx" --version)" ]]
       - name: Exercise managed local installer migration orchestration
         working-directory: .
         run: bash scripts/test-install-managed-migrations.sh
@@ -127,28 +154,22 @@ jobs:
           CREATE DATABASE forge_installer_legacy_repair_test OWNER forge_migration_test;
           CREATE DATABASE forge_s4_ci_test OWNER forge_migration_test;
           SQL
-      - name: Run executable VNext Phase 0 A1 conformance contract
-        run: npm run test:vnext-phase0-conformance
-        env:
-          FORGE_VNEXT_RUNTIME_HANDOFF_RECOVERY_TEST_URL: postgresql://forge_e2e:forge@localhost:5432/postgres
       - name: Prove populated migration 0025 to 0026 upgrade
         run: bash scripts/ci/prove-migration-0026-upgrade.sh
         env:
           FORGE_MIGRATION_0026_DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_migration_0026_upgrade_test
           FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_migration_0026_upgrade_test
-      - name: Prove real installer-managed migration sequence and S5 cleanup
+      - name: Prove shared Docker/TCP migration controller and idempotent rerun
         working-directory: .
         run: bash scripts/ci/prove-installer-managed-migrations.sh
         env:
-          FORGE_INSTALLER_MANAGED_DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_installer_managed_migration_test
-          FORGE_INSTALLER_MANAGED_FAILURE_DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_installer_managed_s5_failure_test
+          FORGE_INSTALLER_MANAGED_APP_URL: postgresql://forge:forge_registry_test@localhost:5432/forge_installer_managed_migration_test
           FORGE_INSTALLER_MANAGED_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_installer_managed_migration_test
-          FORGE_INSTALLER_MANAGED_FAILURE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_installer_managed_s5_failure_test
           FORGE_INSTALLER_MANAGED_ADMIN_HOST: localhost
           FORGE_INSTALLER_MANAGED_ADMIN_USER: forge_e2e
           FORGE_INSTALLER_MANAGED_ADMIN_PASSWORD: forge
           FORGE_INSTALLER_MANAGED_ADMIN_DATABASE: forge_installer_managed_migration_test
-          FORGE_INSTALLER_MANAGED_FAILURE_ADMIN_DATABASE: forge_installer_managed_s5_failure_test
+          FORGE_RUNTIME_API_DATABASE_PASSWORD: forge_runtime_api_test
       - name: Prove exact legacy 0023/0025 DBR-1 repair and managed sequence
         working-directory: web
         run: |
@@ -360,6 +381,13 @@ jobs:
         env:
           DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_epic_172_ci_test
           FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_epic_172_ci_test
+      - name: Run executable VNext Phase 0 A1 conformance contract
+        run: npm run test:vnext-phase0-conformance
+        env:
+          FORGE_VNEXT_RUNTIME_HANDOFF_RECOVERY_TEST_URL: postgresql://forge_e2e:forge@localhost:5432/postgres
+          FORGE_VNEXT_RUNTIME_POSTGRES_APP_TEST_URL: postgresql://forge:forge_registry_test@localhost:5432/forge_epic_172_ci_test
+          FORGE_VNEXT_RUNTIME_POSTGRES_API_TEST_URL: postgresql://forge_runtime_api_login:forge_runtime_api_test@localhost:5432/forge_epic_172_ci_test
+          FORGE_VNEXT_RUNTIME_POSTGRES_ADMIN_TEST_URL: postgresql://forge_e2e:forge@localhost:5432/forge_epic_172_ci_test
       - name: Configure disposable release and S4 principal passwords
         working-directory: .
         env:

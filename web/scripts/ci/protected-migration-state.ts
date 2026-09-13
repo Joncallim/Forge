@@ -1,4 +1,5 @@
 import type postgres from 'postgres'
+import { createHash } from 'node:crypto'
 import type { ProtectedMigration } from './protected-migration-registry'
 
 export const protectedMigrationStateTable = 'public.forge_protected_migration_handoffs'
@@ -89,6 +90,87 @@ function safeRole(value: string): string {
   return `"${value}"`
 }
 
+type DurableAclEntry = Readonly<{
+  grantorOid: number
+  grantor: string
+  granteeOid: number
+  grantee: string
+  privilege: string
+  grantable: boolean
+}>
+
+function normalizedDurableAcl(value: unknown): DurableAclEntry[] {
+  if (!Array.isArray(value)) throw new Error('Protected migration durable database ACL is not an array.')
+  return value.map((candidate) => {
+    const entry = candidate as Partial<DurableAclEntry>
+    if (!Number.isInteger(entry.grantorOid) || Number(entry.grantorOid) <= 0 || typeof entry.grantor !== 'string' || entry.grantor.length === 0
+      || !Number.isInteger(entry.granteeOid) || Number(entry.granteeOid) < 0 || typeof entry.grantee !== 'string' || entry.grantee.length === 0
+      || (entry.granteeOid === 0) !== (entry.grantee === 'PUBLIC')
+      || !['CONNECT', 'CREATE', 'TEMPORARY'].includes(entry.privilege ?? '') || typeof entry.grantable !== 'boolean') {
+      throw new Error('Protected migration durable database ACL contains an invalid entry.')
+    }
+    return entry as DurableAclEntry
+  })
+}
+
+function durableAclDigest(databaseName: string, databaseOid: number, databaseOwnerOid: number, acl: unknown): string {
+  const normalized = normalizedDurableAcl(acl).map((entry) => [entry.grantorOid, entry.grantor, entry.granteeOid, entry.grantee, entry.privilege, entry.grantable])
+  return createHash('sha256').update(JSON.stringify([databaseName, databaseOid, databaseOwnerOid, normalized])).digest('hex')
+}
+
+type ExistingControllerState = Readonly<{
+  migrationRole: string
+  migrationRoleOid: number | null
+  operationId: string | null
+  phase: string
+  databaseName: string
+  databaseOid: number | null
+  databaseOwnerOid: number | null
+  databaseAcl: unknown
+  databaseAclDigest: string | null
+  generation: string
+  cleanupComplete: boolean
+}>
+
+async function lockAndValidateExistingControllerState(
+  tx: SqlClient,
+  migration: ProtectedMigration,
+  databaseSnapshot: ProtectedMigrationDatabaseSnapshot,
+  ledgerApplied: boolean,
+): Promise<ExistingControllerState | undefined> {
+  const [existing] = await tx<ExistingControllerState[]>`
+    select handoff.migration_role::text as "migrationRole", handoff.operation_id::text as "operationId",
+      handoff.controller_phase as phase, handoff.database_name::text as "databaseName",
+      handoff.database_oid::integer as "databaseOid", handoff.database_owner_oid::integer as "databaseOwnerOid",
+      handoff.database_acl as "databaseAcl", handoff.database_acl_digest as "databaseAclDigest",
+      handoff.migration_role_oid::integer as "migrationRoleOid", handoff.generation,
+      handoff.cleanup_completed_at is not null as "cleanupComplete"
+    from public.forge_protected_migration_handoffs handoff
+    where handoff.migration_tag=${migration.migrationTag}
+    for update
+  `
+  if (!existing) return undefined
+  const legacyCompleted = existing.phase === 'handoff_open' && existing.cleanupComplete && ledgerApplied
+    && existing.operationId == null && existing.databaseOid == null && existing.databaseOwnerOid == null
+    && existing.databaseAcl == null && existing.databaseAclDigest == null && existing.migrationRoleOid == null
+  if (legacyCompleted) return existing
+  if (existing.databaseName !== databaseSnapshot.databaseName || existing.databaseOid !== databaseSnapshot.databaseOid
+    || existing.databaseOwnerOid !== databaseSnapshot.databaseOwnerOid || existing.databaseAcl == null
+    || existing.databaseAclDigest == null
+    || durableAclDigest(existing.databaseName, existing.databaseOid, existing.databaseOwnerOid, existing.databaseAcl) !== existing.databaseAclDigest
+    || (existing.phase === 'complete' ? !ledgerApplied : ledgerApplied !== ['handoff_open', 'cleanup_complete', 'restore_pending'].includes(existing.phase))) {
+    throw new Error(`Protected migration '${migration.migrationTag}' prepared state disagrees with its database, ACL, or ledger phase.`)
+  }
+  for (const entry of normalizedDurableAcl(existing.databaseAcl)) {
+    const [identity] = await tx<{ grantor: boolean; grantee: boolean }[]>`
+      select exists(select 1 from pg_catalog.pg_roles where oid=${entry.grantorOid}::oid and rolname=${entry.grantor}) as grantor,
+        (${entry.granteeOid}=0 or exists(select 1 from pg_catalog.pg_roles where oid=${entry.granteeOid}::oid and rolname=${entry.grantee})) as grantee
+    `
+    if (!identity?.grantor || !identity.grantee) throw new Error(`Protected migration '${migration.migrationTag}' durable ACL role identity changed.`)
+  }
+  return existing
+}
+
 /** Establish the sole durable controller row before CONNECT is revoked. A
  * restart may adopt it only after the prior ephemeral login is demonstrably
  * absent and the observed ledger state still matches. */
@@ -103,27 +185,30 @@ export async function prepareProtectedMigrationController(
   ledgerApplied: boolean,
 ): Promise<ProtectedMigrationControllerPreparation> {
   await ensureProtectedMigrationState(client)
-  // NOLOGIN must commit before backend termination. Keeping it inside the
-  // adoption transaction would leave the old password able to reconnect until
-  // the same transaction attempted DROP ROLE.
-  const [pendingRole] = await client<{ migrationRole: string; migrationRoleOid: number; canLogin: boolean; safe: boolean; unexpectedMembership: boolean }[]>`
-    select auth.rolname as "migrationRole", auth.oid::integer as "migrationRoleOid", auth.rolcanlogin as "canLogin",
-      (auth.rolname=handoff.migration_role and auth.oid=handoff.migration_role_oid
-        and auth.rolname ~ '^forge_migrator_[0-9a-f]{32}$' and not auth.rolinherit
-        and not auth.rolsuper and not auth.rolcreatedb and not auth.rolcreaterole and not auth.rolreplication
-        and not auth.rolbypassrls and auth.rolconnlimit=1 and auth.rolpassword is not null and auth.rolvaliduntil is not null) as safe,
-      exists(select 1 from pg_catalog.pg_auth_members membership join pg_catalog.pg_roles parent on parent.oid=membership.roleid
-        where (membership.member=auth.oid and (parent.rolname not in ('forge_schema_owner','forge_runtime_routines_owner')
-          or membership.admin_option or not membership.inherit_option or not membership.set_option))
-          or membership.roleid=auth.oid) as "unexpectedMembership"
-    from public.forge_protected_migration_handoffs handoff
-    join pg_catalog.pg_authid auth on auth.oid=handoff.migration_role_oid and auth.rolname=handoff.migration_role
-    where handoff.migration_tag=${migration.migrationTag} and handoff.controller_phase<>'complete'
-      and handoff.operation_id is not null and handoff.migration_role_oid is not null
-  `
+  // Validate every durable binding while the handoff row is locked before
+  // disabling a prior login. NOLOGIN commits with that validation, so a direct
+  // row mutation cannot slip between validation and the destructive action.
+  const pendingRole = await client.begin(async (transaction) => {
+    const tx = transaction as unknown as SqlClient
+    const existing = await lockAndValidateExistingControllerState(tx, migration, databaseSnapshot, ledgerApplied)
+    if (!existing || existing.phase === 'complete' || existing.operationId == null || existing.migrationRoleOid == null) return undefined
+    const [role] = await tx<{ migrationRole: string; migrationRoleOid: number; canLogin: boolean; safe: boolean; unexpectedMembership: boolean }[]>`
+      select auth.rolname as "migrationRole", auth.oid::integer as "migrationRoleOid", auth.rolcanlogin as "canLogin",
+        (auth.rolname=${existing.migrationRole} and auth.oid=${existing.migrationRoleOid}::oid
+          and auth.rolname ~ '^forge_migrator_[0-9a-f]{32}$' and not auth.rolinherit
+          and not auth.rolsuper and not auth.rolcreatedb and not auth.rolcreaterole and not auth.rolreplication
+          and not auth.rolbypassrls and auth.rolconnlimit=1 and auth.rolpassword is not null and auth.rolvaliduntil is not null) as safe,
+        exists(select 1 from pg_catalog.pg_auth_members membership join pg_catalog.pg_roles parent on parent.oid=membership.roleid
+          where (membership.member=auth.oid and (parent.rolname not in ('forge_schema_owner','forge_runtime_routines_owner')
+            or membership.admin_option or not membership.inherit_option or not membership.set_option))
+            or membership.roleid=auth.oid) as "unexpectedMembership"
+      from pg_catalog.pg_authid auth where auth.oid=${existing.migrationRoleOid}::oid and auth.rolname=${existing.migrationRole}
+    `
+    if (role && (!role.safe || role.unexpectedMembership)) throw new Error(`Protected migration '${migration.migrationTag}' cannot adopt an unverified prior controller login.`)
+    if (role?.canLogin) await tx.unsafe(`alter role ${safeRole(role.migrationRole)} nologin`)
+    return role
+  })
   if (pendingRole) {
-    if (!pendingRole.safe || pendingRole.unexpectedMembership) throw new Error(`Protected migration '${migration.migrationTag}' cannot adopt an unverified prior controller login.`)
-    if (pendingRole.canLogin) await client.unsafe(`alter role ${safeRole(pendingRole.migrationRole)} nologin`)
     await client`
       select pg_catalog.pg_terminate_backend(pid, 2000) from pg_catalog.pg_stat_activity
       where usename=${pendingRole.migrationRole} and pid<>pg_catalog.pg_backend_pid()
@@ -144,20 +229,9 @@ export async function prepareProtectedMigrationController(
       if (!createdRole) throw new Error('Protected migration ephemeral login was not created transactionally with its durable state.')
       return createdRole.oid
     }
-    const [existing] = await tx<{ migrationRole: string; migrationRoleOid: number | null; operationId: string | null; phase: string; databaseName: string; databaseOid: number | null; databaseOwnerOid: number | null; databaseAcl: unknown; databaseAclDigest: string | null; generation: string; cleanupComplete: boolean; ledgerApplied: boolean }[]>`
-      select handoff.migration_role::text as "migrationRole", handoff.operation_id::text as "operationId",
-        handoff.controller_phase as phase, handoff.database_name::text as "databaseName",
-        handoff.database_oid::integer as "databaseOid", handoff.database_owner_oid::integer as "databaseOwnerOid",
-        handoff.database_acl as "databaseAcl", handoff.database_acl_digest as "databaseAclDigest",
-        handoff.migration_role_oid::integer as "migrationRoleOid", handoff.generation,
-        handoff.cleanup_completed_at is not null as "cleanupComplete",
-        ${ledgerApplied}::boolean as "ledgerApplied"
-      from public.forge_protected_migration_handoffs handoff
-      where handoff.migration_tag=${migration.migrationTag}
-      for update
-    `
+    const existing = await lockAndValidateExistingControllerState(tx, migration, databaseSnapshot, ledgerApplied)
     if (existing) {
-      const legacyCompleted = existing.phase === 'handoff_open' && existing.cleanupComplete && existing.ledgerApplied
+      const legacyCompleted = existing.phase === 'handoff_open' && existing.cleanupComplete && ledgerApplied
         && existing.operationId == null && existing.databaseOid == null && existing.databaseOwnerOid == null
         && existing.databaseAcl == null && existing.databaseAclDigest == null && existing.migrationRoleOid == null
       if (legacyCompleted) {
@@ -174,17 +248,12 @@ export async function prepareProtectedMigrationController(
         if (!upgraded) throw new Error(`Protected migration '${migration.migrationTag}' legacy completion upgrade lost its generation fence.`)
         return { mode: 'complete', databaseSnapshot, generation: BigInt(upgraded.generation), ledgerApplied: true, completedMigrationRole: existing.migrationRole }
       }
-      if (existing.phase === 'complete' && existing.cleanupComplete && existing.ledgerApplied) {
+      if (existing.phase === 'complete' && existing.cleanupComplete && ledgerApplied) {
         if (existing.databaseName !== databaseSnapshot.databaseName || existing.databaseOid !== databaseSnapshot.databaseOid
           || existing.databaseOwnerOid !== databaseSnapshot.databaseOwnerOid || existing.databaseAclDigest !== databaseSnapshot.aclDigest) {
           throw new Error(`Protected migration '${migration.migrationTag}' completed state disagrees with the live database ACL identity.`)
         }
         return { mode: 'complete', databaseSnapshot: { databaseName: existing.databaseName, databaseOid: existing.databaseOid, databaseOwnerOid: existing.databaseOwnerOid, acl: existing.databaseAcl, aclDigest: existing.databaseAclDigest }, generation: BigInt(existing.generation), ledgerApplied: true, completedMigrationRole: existing.migrationRole }
-      }
-      if (existing.databaseName !== databaseSnapshot.databaseName || existing.databaseOid !== databaseSnapshot.databaseOid
-        || existing.databaseOwnerOid !== databaseSnapshot.databaseOwnerOid || existing.databaseAcl == null
-        || existing.databaseAclDigest == null || existing.ledgerApplied !== ['handoff_open','cleanup_complete','restore_pending'].includes(existing.phase)) {
-        throw new Error(`Protected migration '${migration.migrationTag}' prepared state disagrees with its database or ledger phase.`)
       }
       const [oldRole] = await tx<{ safe: boolean; unexpectedMembership: boolean }[]>`
         select (auth.oid=${existing.migrationRoleOid}::oid and auth.rolname=${existing.migrationRole}
@@ -224,7 +293,7 @@ export async function prepareProtectedMigrationController(
         returning generation
       `
       if (!adopted) throw new Error(`Protected migration '${migration.migrationTag}' controller adoption lost its operation/generation fence.`)
-      return { mode: 'adopted', databaseSnapshot: { databaseName: existing.databaseName, databaseOid: existing.databaseOid, databaseOwnerOid: existing.databaseOwnerOid, acl: existing.databaseAcl, aclDigest: existing.databaseAclDigest }, generation: BigInt(adopted.generation), ledgerApplied: existing.ledgerApplied }
+      return { mode: 'adopted', databaseSnapshot: { databaseName: existing.databaseName, databaseOid: existing.databaseOid, databaseOwnerOid: existing.databaseOwnerOid, acl: existing.databaseAcl, aclDigest: existing.databaseAclDigest }, generation: BigInt(adopted.generation), ledgerApplied }
     }
     const migrationRoleOid = await createMigrationRole()
     const [created] = await tx<{ generation: string | bigint }[]>`

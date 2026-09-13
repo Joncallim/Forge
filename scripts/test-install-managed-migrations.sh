@@ -2,6 +2,10 @@
 # Focused executable coverage for managed-local migration orchestration.
 set -Eeuo pipefail
 
+# CI diagnostics deliberately disclose only location and status. Never print
+# the failing command: this harness exercises credential-bearing boundaries.
+trap 'status=$?; if [ "$status" -eq 127 ]; then printf "FAIL-TRACE line=%s status=%s\n" "$LINENO" "$status" >&2; fi' ERR
+
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALLER="$SCRIPT_DIR/install.sh"
 REPAIR="$SCRIPT_DIR/repair.sh"
@@ -713,12 +717,18 @@ run_repair_process_case() {
   local repo_dir="$case_dir/repo"
   mkdir -p \
     "$repo_dir/scripts" \
+    "$repo_dir/web/scripts/ci" \
     "$repo_dir/web/node_modules/next/dist/client" \
     "$case_dir/bin" \
     "$case_dir/home" \
     "$case_dir/workspace/runtime/install"
   cp "$REPAIR" "$repo_dir/scripts/repair.sh"
   cp "$PRIVILEGE_SQL" "$repo_dir/scripts/reconcile-forge-app-privileges.sql"
+  cat > "$repo_dir/web/scripts/ci/apply-vnext-phase0-a1-runtime-foundation.sh" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' 'apply-vnext-phase0-a1-runtime-foundation' >> "$FORGE_REPAIR_TEST_NPM_CALLS"
+EOF
+  chmod +x "$repo_dir/web/scripts/ci/apply-vnext-phase0-a1-runtime-foundation.sh"
   printf '{}\n' > "$repo_dir/web/package.json"
   for required_file in \
     flight-data-helpers.js \
@@ -1181,43 +1191,34 @@ run_installer_privilege_routing_case docker-native-url "$managed_repair_url" doc
 [ ! -s "$CASE_DIR/psql-calls" ] || fail 'docker service mode invoked native psql administration'
 [ "$(<"$CASE_DIR/sentinel")" = untouched ] || fail 'docker service mode touched the native psql sentinel'
 
-run_runuser_environment_case() {
-  local case_dir="$TEST_ROOT/runuser-environment"
+run_controller_environment_case() {
+  local case_dir="$TEST_ROOT/controller-environment"
   mkdir -p "$case_dir/bin" "$case_dir/state"
   printf 'DATABASE_URL=postgresql://forge:%s@localhost:5432/forge\n' "$TEST_SECRET" > "$case_dir/forge.env"
-  cat > "$case_dir/bin/runuser" <<'EOF'
-#!/bin/bash
-marker_dir="${FORGE_ENV_FILE%/*}"
-if [ -n "${UNRELATED_SECRET_SENTINEL+x}" ]; then
-  printf 'unrelated-secret-leaked\n' > "$marker_dir/runuser-result"
-  exit 1
-fi
-compgen -e > "$marker_dir/runuser-environment-names"
-printf 'clean\n' > "$marker_dir/runuser-result"
-while [ "$1" != "--" ]; do shift; done
-shift
-exec "$@"
-EOF
-  cat > "$case_dir/bin/bash" <<'EOF'
-#!/bin/bash
-exit 0
-EOF
-  for command in node npm npx; do
+  for command in node npm npx bash sudo; do
     printf '#!/usr/bin/env bash\nexit 0\n' > "$case_dir/bin/$command"
   done
-  chmod +x "$case_dir/bin/runuser" "$case_dir/bin/bash" "$case_dir/bin/node" "$case_dir/bin/npm" "$case_dir/bin/npx"
+  chmod +x "$case_dir/bin"/*
   cat > "$case_dir/driver.sh" <<'EOF'
 #!/bin/bash
 FORGE_INSTALL_LIBRARY=1 source "$INSTALLER"
 test_toolchain_dir="$FORGE_TEST_TOOLCHAIN_DIR"
 trusted_linux_tool() { printf '%s/%s\n' "$test_toolchain_dir" "$1"; }
+prepare_trusted_linux_migration_toolchain() {
+  MANAGED_LOCAL_BASH="$test_toolchain_dir/bash"
+  MANAGED_LOCAL_NODE="$test_toolchain_dir/node"
+  MANAGED_LOCAL_NPM="$test_toolchain_dir/npm"
+  MANAGED_LOCAL_NPX="$test_toolchain_dir/npx"
+  MANAGED_LOCAL_PATH="$test_toolchain_dir"
+}
+run() { printf '%s\n' "$@" > "$FORGE_CONTROLLER_DISPATCH_LOG"; }
 OS_NAME=Linux
-SERVICE_MODE=native
 DRY_RUN=0
-MANAGED_LOCAL_ADMIN_RESOLUTION=resolved
-MANAGED_LOCAL_ADMIN_MODE=runuser
-MANAGED_LOCAL_ADMIN_USER=postgres
-run_managed_local_migrations
+MANAGED_LOCAL_ADMIN_MODE=current
+MANAGED_LOCAL_ADMIN_USER=nobody
+MANAGED_LOCAL_ADMIN_SOCKET=/var/run/postgresql
+MANAGED_LOCAL_ADMIN_PORT=5432
+run_managed_local_controller 'controller environment proof'
 EOF
   chmod +x "$case_dir/driver.sh"
   set +e
@@ -1225,26 +1226,36 @@ EOF
     FORGE_TEST_TOOLCHAIN_DIR="$case_dir/bin" \
     PATH="$case_dir/bin:$PATH" \
     UNRELATED_SECRET_SENTINEL='unrelated-value-must-not-reach-postgres' \
+    DATABASE_URL='postgresql://ambient-admin:must-not-cross@invalid/forge' \
+    FORGE_DATABASE_ADMIN_URL='postgresql://ambient-admin:must-not-cross@invalid/forge' \
+    PGHOST='ambient-host' PGUSER='ambient-admin' \
     FORGE_ENV_FILE="$case_dir/forge.env" \
     FORGE_INSTALL_STATE_DIR="$case_dir/state" \
+    FORGE_CONTROLLER_DISPATCH_LOG="$case_dir/dispatch" \
     /bin/bash "$case_dir/driver.sh" > "$case_dir/stdout" 2> "$case_dir/stderr"
   local driver_status=$?
   set -e
   if [ "$driver_status" -ne 0 ]; then
     sed -n '1,80p' "$case_dir/stderr" >&2
-    fail 'runuser environment driver failed'
+    fail 'controller environment driver failed'
   fi
   CASE_DIR="$case_dir"
 }
 
-run_runuser_environment_case
-assert_contains 'clean' "$CASE_DIR/runuser-result"
-assert_not_contains 'UNRELATED_SECRET_SENTINEL' "$CASE_DIR/runuser-environment-names"
-assert_contains 'DATABASE_URL' "$CASE_DIR/runuser-environment-names"
-assert_contains 'FORGE_DATABASE_ADMIN_URL' "$CASE_DIR/runuser-environment-names"
-assert_contains 'PGHOST' "$CASE_DIR/runuser-environment-names"
-assert_contains 'PGUSER' "$CASE_DIR/runuser-environment-names"
-assert_not_contains "$TEST_SECRET" "$CASE_DIR/runuser-environment-names"
+run_controller_environment_case
+assert_contains '/usr/bin/env' "$CASE_DIR/dispatch"
+assert_contains '-i' "$CASE_DIR/dispatch"
+assert_contains '--native-socket' "$CASE_DIR/dispatch"
+assert_contains '--native-peer-uid' "$CASE_DIR/dispatch"
+assert_contains '--native-peer-gid' "$CASE_DIR/dispatch"
+assert_not_contains 'preserve-environment' "$CASE_DIR/dispatch"
+assert_not_contains 'preserve-env=' "$CASE_DIR/dispatch"
+assert_not_contains 'DATABASE_URL' "$CASE_DIR/dispatch"
+assert_not_contains 'FORGE_DATABASE_ADMIN_URL' "$CASE_DIR/dispatch"
+assert_not_contains 'PGHOST' "$CASE_DIR/dispatch"
+assert_not_contains 'PGUSER' "$CASE_DIR/dispatch"
+assert_not_contains 'must-not-cross' "$CASE_DIR/dispatch"
+assert_not_contains "$TEST_SECRET" "$CASE_DIR/dispatch"
 
 run_shadow_refusal_case() {
   local case_dir="$TEST_ROOT/shadow-refusal"

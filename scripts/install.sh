@@ -1779,6 +1779,11 @@ run_managed_local_migration_stage() {
     return 0
   fi
 
+  if [ "$stage" = controller ]; then
+    run_managed_local_controller "$description"
+    return
+  fi
+
   case "$MANAGED_LOCAL_ADMIN_MODE" in
     current)
       run "$description" bash -c 'cd "$1"; case "$2" in
@@ -1792,7 +1797,6 @@ run_managed_local_migration_stage() {
         s5) bash scripts/ci/apply-epic-172-s5-recovery-migration.sh ;;
         registry) bash scripts/ci/apply-verification-goal-registry-migration.sh ;;
         runtime) bash scripts/ci/apply-vnext-phase0-a1-runtime-foundation.sh ;;
-        controller) FORGE_MANAGED_DOCKER_MIGRATIONS=1 npm run db:migrate ;;
         latest) npm run db:migrate ;;
         *) exit 64 ;;
       esac' _ "$REPO_ROOT/web" "$stage"
@@ -1802,6 +1806,42 @@ run_managed_local_migration_stage() {
       ;;
     runuser)
       run_managed_local_migration_as_runuser "$description" "$stage"
+      ;;
+    *) die "Managed local PostgreSQL administrator mode is unavailable." ;;
+  esac
+}
+
+run_managed_local_controller() {
+  local description="$1" controlled_path sudo_bin peer_uid peer_gid
+  local controller_script="scripts/managed-docker-migration-controller.ts"
+  peer_uid="$(/usr/bin/id -u "$MANAGED_LOCAL_ADMIN_USER" 2>/dev/null || true)"
+  peer_gid="$(/usr/bin/id -g "$MANAGED_LOCAL_ADMIN_USER" 2>/dev/null || true)"
+  case "$peer_uid:$peer_gid" in *[!0-9:]*|*::*|0:*|*:0) die "Managed local controller could not establish a non-root peer administrator identity." ;; esac
+  local controller_args=(--run --native-socket "$MANAGED_LOCAL_ADMIN_SOCKET" --native-port "$MANAGED_LOCAL_ADMIN_PORT" --native-database forge --native-env-file "$ENV_FILE" --native-repo-root "$REPO_ROOT" --native-peer-uid "$peer_uid" --native-peer-gid "$peer_gid")
+  prepare_trusted_linux_migration_toolchain
+  controlled_path="$MANAGED_LOCAL_PATH"
+  case "$MANAGED_LOCAL_ADMIN_MODE" in
+    current)
+      if [ "${EUID:-$(/usr/bin/id -u)}" -eq 0 ]; then
+        run "$description" /usr/bin/env -i PATH="$controlled_path" HOME=/root "$MANAGED_LOCAL_BASH" -c 'cd "$1"; shift; exec "$@"' _ \
+          "$REPO_ROOT/web" "$MANAGED_LOCAL_NPX" tsx "$controller_script" "${controller_args[@]}"
+      else
+        sudo_bin="$(trusted_linux_tool sudo)" || die "Managed local migrations require passwordless root controller launch."
+        run "$description" "$sudo_bin" -n -- /usr/bin/env -i PATH="$controlled_path" HOME=/root "$MANAGED_LOCAL_BASH" -c 'cd "$1"; shift; exec "$@"' _ \
+          "$REPO_ROOT/web" "$MANAGED_LOCAL_NPX" tsx "$controller_script" "${controller_args[@]}"
+      fi
+      ;;
+    sudo)
+      sudo_bin="$(trusted_linux_tool sudo)" || die "Could not find a root-owned non-writable sudo for elevated managed migrations."
+      run "$description" "$sudo_bin" -n -- /usr/bin/env -i PATH="$controlled_path" HOME=/root \
+        "$MANAGED_LOCAL_BASH" -c 'cd "$1"; shift; exec "$@"' _ "$REPO_ROOT/web" \
+        "$MANAGED_LOCAL_NPX" tsx "$controller_script" "${controller_args[@]}"
+      ;;
+    runuser)
+      [ "${EUID:-$(/usr/bin/id -u)}" -eq 0 ] || die "runuser administration requires a root controller."
+      run "$description" /usr/bin/env -i PATH="$controlled_path" HOME=/root \
+        "$MANAGED_LOCAL_BASH" -c 'cd "$1"; shift; exec "$@"' _ "$REPO_ROOT/web" \
+        "$MANAGED_LOCAL_NPX" tsx "$controller_script" "${controller_args[@]}"
       ;;
     *) die "Managed local PostgreSQL administrator mode is unavailable." ;;
   esac
@@ -1878,10 +1918,8 @@ run_managed_local_migration_as_runuser() {
   controlled_path="$MANAGED_LOCAL_PATH"
   runuser_bin="$(trusted_linux_tool runuser)" || die "Could not find a root-owned non-writable runuser for elevated managed migrations."
 
-  # `runuser --preserve-environment` is needed so the child receives the
-  # process-only socket/admin context without serialising a credential into an
-  # argv value. Constrain its parent environment first: this subshell exports
-  # exactly the migration inputs and a controlled executable path.
+  # Historical non-controller stages retain their narrow legacy wrapper. The
+  # controller has a separate env-empty dispatch above and never enters here.
   (
     local name
     for name in $(compgen -e); do
@@ -1903,7 +1941,6 @@ run_managed_local_migration_as_runuser() {
       s5) bash scripts/ci/apply-epic-172-s5-recovery-migration.sh ;;
       registry) bash scripts/ci/apply-verification-goal-registry-migration.sh ;;
       runtime) bash scripts/ci/apply-vnext-phase0-a1-runtime-foundation.sh ;;
-      controller) FORGE_MANAGED_DOCKER_MIGRATIONS=1 npm run db:migrate ;;
       latest) npm run db:migrate ;;
       *) exit 64 ;;
     esac' _ "$REPO_ROOT/web" "$stage"
@@ -1929,7 +1966,6 @@ run_managed_local_migration_as_sudo() {
       s5) bash scripts/ci/apply-epic-172-s5-recovery-migration.sh ;;
       registry) bash scripts/ci/apply-verification-goal-registry-migration.sh ;;
       runtime) bash scripts/ci/apply-vnext-phase0-a1-runtime-foundation.sh ;;
-      controller) FORGE_MANAGED_DOCKER_MIGRATIONS=1 npm run db:migrate ;;
       latest) npm run db:migrate ;;
       *) exit 64 ;;
     esac' _ "$REPO_ROOT/web" "$stage"
@@ -1945,18 +1981,7 @@ run_managed_local_migrations() {
 
   resolve_managed_local_admin || die "Could not establish passwordless local PostgreSQL administrator access for managed migrations. Use a native local PostgreSQL peer login, or run the documented operator migration procedure for a custom database."
 
-  local DATABASE_URL FORGE_DATABASE_ADMIN_URL PGHOST PGPORT PGUSER FORGE_WORKSPACE_ROOT FORGE_ENV_FILE FORGE_SUPPRESS_MIGRATION_NOTICES
-  clear_postgres_routing_environment
-  DATABASE_URL="$(env_value DATABASE_URL)"
-  [ -n "$DATABASE_URL" ] || die "Managed local migrations require DATABASE_URL in the local Forge environment file."
-  FORGE_DATABASE_ADMIN_URL="postgresql:///forge"
-  PGHOST="$MANAGED_LOCAL_ADMIN_SOCKET"
-  PGPORT="$MANAGED_LOCAL_ADMIN_PORT"
-  PGUSER="$MANAGED_LOCAL_ADMIN_USER"
-  FORGE_WORKSPACE_ROOT="$WORKSPACE_ROOT"
-  FORGE_ENV_FILE="$ENV_FILE"
-  FORGE_SUPPRESS_MIGRATION_NOTICES=1
-  export DATABASE_URL FORGE_DATABASE_ADMIN_URL PGHOST PGPORT PGUSER FORGE_WORKSPACE_ROOT FORGE_ENV_FILE FORGE_SUPPRESS_MIGRATION_NOTICES
+  [ -n "$(env_value DATABASE_URL)" ] || die "Managed local migrations require DATABASE_URL in the local Forge environment file."
 
   run_managed_local_migration_sequence
 }

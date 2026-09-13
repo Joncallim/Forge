@@ -1,13 +1,12 @@
 /** Managed-Docker protected migration lifecycle. This controller owns the
  * complete fence: application quiescence through verified cleanup. */
-import '../lib/load-env'
 import { createHash, randomUUID } from 'node:crypto'
 import { execFile } from 'node:child_process'
-import { readFile } from 'node:fs/promises'
+import { createRequire } from 'node:module'
+import { chmod, chown, mkdtemp, readFile, readdir, rm, stat } from 'node:fs/promises'
 import { resolve } from 'node:path'
 import { promisify } from 'node:util'
 import postgres from 'postgres'
-import { getRequiredEnv } from '@/lib/env'
 import { assertProtectedMigrationLiveAttestation, ensureProtectedMigrationState, markProtectedMigrationControllerFenced, prepareProtectedMigrationController, recordProtectedMigrationCleanup, recordProtectedMigrationHandoff, type ProtectedMigrationDatabaseSnapshot } from './ci/protected-migration-state'
 import { assertProtectedMigrationMarkers, protectedMigrationForTag } from './ci/protected-migration-registry'
 import { createEphemeralMigrationUrl, createMigrationChildEnvironment } from './ci/managed-migration-child-environment'
@@ -24,6 +23,7 @@ const RUNTIME_MIGRATION_CREATED_AT = 1786838400000
 const OWNER = 'forge_runtime_routines_owner'
 const API = 'forge_runtime_api'
 const execFileAsync = promisify(execFile)
+const tsxCli = createRequire(import.meta.url).resolve('tsx/cli')
 const safe = (value: string) => { if (!/^[a-z_][a-z0-9_]*$/i.test(value)) throw new Error('Unsafe PostgreSQL identifier.'); return `"${value}"` }
 type DatabaseAcl = Array<{ grantorOid: number; grantor: string; granteeOid: number; grantee: string; privilege: string; grantable: boolean }>
 const quoteCatalogIdentifier = (value: string) => `"${value.replaceAll('"', '""')}"`
@@ -210,11 +210,17 @@ async function closeRuntimeHandoff(sql: ReturnType<typeof postgres>, migrationRo
 /** Runs the shared native/Docker controller. There is intentionally no public
  * prepare command: releasing the fence before the child has finished is unsafe. */
 export async function runManagedDockerMigration(): Promise<void> {
-  const adminUrl = getRequiredEnv('FORGE_DATABASE_ADMIN_URL')
-  const applicationUrl = getRequiredEnv('DATABASE_URL')
-  const appPassword = process.env.FORGE_APP_DATABASE_PASSWORD?.trim() || new URL(applicationUrl).password
-  const runtimePassword = process.env.FORGE_RUNTIME_API_DATABASE_PASSWORD?.trim()
-    || (process.env.FORGE_RUNTIME_DATABASE_URL?.trim() ? new URL(process.env.FORGE_RUNTIME_DATABASE_URL).password : null)
+  const native = await nativeControllerInputs(process.argv.slice(2))
+  const required = (key: string) => {
+    const value = process.env[key]?.trim()
+    if (!value) throw new Error(`Missing required controller environment value: ${key}.`)
+    return value
+  }
+  const adminUrl = native?.adminUrl ?? required('FORGE_DATABASE_ADMIN_URL')
+  const applicationUrl = native?.applicationUrl ?? required('DATABASE_URL')
+  const appPassword = native ? native.appPassword : (process.env.FORGE_APP_DATABASE_PASSWORD?.trim() || new URL(applicationUrl).password)
+  const runtimePassword = native ? native.runtimePassword : (process.env.FORGE_RUNTIME_API_DATABASE_PASSWORD?.trim()
+    || (process.env.FORGE_RUNTIME_DATABASE_URL?.trim() ? new URL(process.env.FORGE_RUNTIME_DATABASE_URL).password : null))
   if (!appPassword) throw new Error('Managed migration requires the application database password from its URL or controller-only environment.')
   const database = safe(new URL(adminUrl).pathname.slice(1))
   const migratorPassword = randomUUID()
@@ -222,7 +228,33 @@ export async function runManagedDockerMigration(): Promise<void> {
   const migratorExpiresAt = new Date(Date.now() + 10 * 60_000).toISOString()
   const ephemeralMigrationUrl = createEphemeralMigrationUrl(applicationUrl, migrator, migratorPassword)
   const operationId = randomUUID()
-  const sql = postgres(adminUrl, { max: 1, onnotice: () => {} })
+  if (process.getuid?.() !== 0) throw new Error('Managed migration controller must retain root while migration children run under a distinct unprivileged identity.')
+  const childUid = await selectEphemeralChildUid(native?.peerUid ?? 0)
+  const childGid = await validatedReadOnlyTraversalGid(process.cwd())
+  const childIdentity = { uid: childUid, gid: childGid ?? childUid }
+  process.setgroups?.([])
+  const childPrivateDirectory = await mkdtemp('/tmp/forge-migration-child-')
+  await chown(childPrivateDirectory, childIdentity.uid, childIdentity.gid)
+  await chmod(childPrivateDirectory, 0o700)
+  const pool = postgres(adminUrl, { max: 1, onnotice: () => {}, backoff: false })
+  let reserved: Awaited<ReturnType<typeof pool.reserve>> | null = null
+  let sql = pool
+  if (native) {
+    if (!process.setegid || !process.seteuid) throw new Error('Managed native controller cannot establish a bounded peer-admin connection on this platform.')
+    process.setegid(native.peerGid)
+    process.seteuid(native.peerUid)
+    try {
+      reserved = await pool.reserve()
+      sql = reserved as unknown as typeof pool
+      const [authority] = await sql<{ sessionUser: string; superuser: boolean }[]>`
+        select session_user as "sessionUser", rolsuper as superuser from pg_catalog.pg_roles where rolname=session_user
+      `
+      if (authority?.sessionUser !== native.adminUser || !authority.superuser) throw new Error('Managed native controller peer session is not the expected administrator.')
+    } finally {
+      process.seteuid(0)
+      process.setegid(0)
+    }
+  }
   let locked = false
   let fenced = false
   let handoffOpened = false
@@ -304,8 +336,15 @@ export async function runManagedDockerMigration(): Promise<void> {
       return
     }
 
-    const childEnv = createMigrationChildEnvironment(ephemeralMigrationUrl)
-    const runChild = (script: string) => execFileAsync('npx', ['tsx', script], { cwd: process.cwd(), env: childEnv })
+    const childEnv = createMigrationChildEnvironment(ephemeralMigrationUrl, process.env, childPrivateDirectory)
+    const childProcess = { cwd: process.cwd(), env: childEnv, ...childIdentity }
+    const runChild = (script: string) => execFileAsync(process.execPath, [tsxCli, script], childProcess)
+    await execFileAsync(process.execPath, [tsxCli, 'scripts/ci/assert-migration-child-boundary.ts',
+      '--controller-pid', String(process.pid),
+      '--admin-host', native ? new URL(adminUrl).searchParams.get('host') ?? 'localhost' : new URL(adminUrl).hostname,
+      '--admin-port', native ? new URL(adminUrl).searchParams.get('port') ?? '' : new URL(adminUrl).port,
+      '--admin-user', native?.adminUser ?? new URL(adminUrl).username,
+      '--database', new URL(adminUrl).pathname.slice(1)], childProcess)
     const bootstrapUrls = { adminUrl, migrationUrl: childEnv.DATABASE_URL }
 
     // Preserve the historical order and bootstrap invariants.  These calls
@@ -337,9 +376,8 @@ export async function runManagedDockerMigration(): Promise<void> {
     handoffOpened = true
     // This second child applies only 0034 (the ledger has the prefix).  It
     // receives neither administrator authority nor the application passwords.
-    await execFileAsync('npx', ['tsx', 'scripts/ci/migrate-through-0034.ts'], {
-      cwd: process.cwd(),
-      env: childEnv,
+    await execFileAsync(process.execPath, [tsxCli, 'scripts/ci/migrate-through-0034.ts'], {
+      ...childProcess,
     })
     lifecycleGeneration = await closeRuntimeHandoff(sql, migrator, operationId, lifecycleGeneration)
     handoffOpened = false
@@ -406,7 +444,9 @@ export async function runManagedDockerMigration(): Promise<void> {
       try { await finalizeLifecycleCas(sql, operationId, restoreGeneration) } catch (error) { restoreFailure = error }
     }
     if (locked) await sql`select pg_advisory_unlock(${LOCK})`.catch(() => {})
-    await sql.end({ timeout: 5 })
+    reserved?.release()
+    await pool.end({ timeout: 5 })
+    await rm(childPrivateDirectory, { recursive: true, force: true })
     if (primaryFailure && (cleanupFailures.length > 0 || restoreFailure)) {
       throw new AggregateError([primaryFailure, ...cleanupFailures, ...(restoreFailure ? [restoreFailure] : [])], 'Managed migration failed and cleanup could not safely restore application reconnect authority.')
     }
@@ -414,6 +454,141 @@ export async function runManagedDockerMigration(): Promise<void> {
     if (cleanupFailures.length > 0) throw new AggregateError(cleanupFailures, 'Managed migration cleanup failed; application reconnect authority remains fenced.')
     if (restoreFailure) throw restoreFailure
   }
+}
+
+type NativeControllerInputs = Readonly<{
+  adminUrl: string
+  applicationUrl: string
+  appPassword: string
+  runtimePassword: string | null
+  peerUid: number
+  peerGid: number
+  adminUser: string
+}>
+
+function parseProtectedEnvFile(raw: string): Map<string, string> {
+  const values = new Map<string, string>()
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.trim()
+    if (!trimmed || trimmed.startsWith('#')) continue
+    const separator = trimmed.indexOf('=')
+    if (separator <= 0) continue
+    const key = trimmed.slice(0, separator).trim()
+    if (!/^[A-Z_][A-Z0-9_]*$/.test(key)) continue
+    let value = trimmed.slice(separator + 1).trim()
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) value = value.slice(1, -1)
+    values.set(key, value)
+  }
+  return values
+}
+
+async function nativeControllerInputs(args: string[]): Promise<NativeControllerInputs | null> {
+  const option = (name: string): string | undefined => {
+    const index = args.indexOf(name)
+    if (index < 0) return undefined
+    const value = args[index + 1]
+    if (!value || value.startsWith('--')) throw new Error(`Managed native controller option ${name} requires a value.`)
+    return value
+  }
+  const socket = option('--native-socket')
+  if (!socket) return null
+  const inheritedAuthority = Object.keys(process.env).filter((key) => key === 'DATABASE_URL' || key === 'FORGE_DATABASE_ADMIN_URL' || key.startsWith('PG'))
+  if (inheritedAuthority.length > 0) throw new Error('Managed native controller inherited a forbidden database authority environment.')
+  const port = option('--native-port')
+  const databaseName = option('--native-database')
+  const envFile = option('--native-env-file')
+  const repoRoot = option('--native-repo-root')
+  const integerOption = (name: string) => {
+    const value = option(name)
+    if (!value?.match(/^\d+$/) || Number(value) < 1) throw new Error(`Managed native controller option ${name} requires a non-root numeric identity.`)
+    return Number(value)
+  }
+  const peerUid = integerOption('--native-peer-uid')
+  const peerGid = integerOption('--native-peer-gid')
+  if (!socket.startsWith('/') || !port?.match(/^\d{1,5}$/) || Number(port) < 1 || Number(port) > 65535
+    || !databaseName?.match(/^[a-z_][a-z0-9_]*$/i)
+    || !envFile?.startsWith('/') || !repoRoot?.startsWith('/')) {
+    throw new Error('Managed native controller received invalid non-secret routing arguments.')
+  }
+  process.chdir(resolve(repoRoot, 'web'))
+  if (process.getuid?.() !== 0) throw new Error('Managed native controller requires root with distinct peer-admin and migration-child identities.')
+  const protectedValues = parseProtectedEnvFile(await readFile(envFile, 'utf8'))
+  const passwd = await readFile('/etc/passwd', 'utf8')
+  const adminUser = passwd.split(/\r?\n/).map((line) => line.split(':')).find((fields) => Number(fields[2]) === peerUid)?.[0] ?? ''
+  if (!adminUser.match(/^[a-z_][a-z0-9_]*$/i)) throw new Error('Managed native controller could not derive a safe peer administrator identity.')
+  const configuredUrl = protectedValues.get('DATABASE_URL')
+  if (!configuredUrl) throw new Error('Managed native controller environment file has no DATABASE_URL.')
+  const configuredApplication = new URL(configuredUrl)
+  if (!['postgres:', 'postgresql:'].includes(configuredApplication.protocol) || configuredApplication.username !== 'forge'
+    || configuredApplication.pathname.slice(1) !== databaseName || !configuredApplication.password
+    || configuredApplication.hash || Array.from(configuredApplication.searchParams).length > 0) {
+    throw new Error('Managed native controller database binding or URL options disagree with its protected environment file.')
+  }
+  const appCredential = decodeURIComponent(configuredApplication.password)
+  const application = new URL(`postgresql://forge:${encodeURIComponent(appCredential)}@localhost/${databaseName}`)
+  application.searchParams.set('host', socket)
+  application.searchParams.set('port', port)
+  const admin = new URL(application)
+  admin.username = adminUser
+  admin.password = ''
+  admin.searchParams.delete('user')
+  admin.searchParams.delete('password')
+  const runtimeUrl = protectedValues.get('FORGE_RUNTIME_DATABASE_URL')
+  return {
+    adminUrl: admin.toString(),
+    applicationUrl: application.toString(),
+    appPassword: protectedValues.get('FORGE_APP_DATABASE_PASSWORD')?.trim() || appCredential,
+    runtimePassword: protectedValues.get('FORGE_RUNTIME_API_DATABASE_PASSWORD')?.trim()
+      || (runtimeUrl ? new URL(runtimeUrl).password : null),
+    peerUid,
+    peerGid,
+    adminUser,
+  }
+}
+
+async function selectEphemeralChildUid(forbiddenUid: number): Promise<number> {
+  const active = new Set<number>()
+  for (const entry of await readdir('/proc', { withFileTypes: true })) {
+    if (!entry.isDirectory() || !entry.name.match(/^\d+$/)) continue
+    try {
+      const status = await readFile(`/proc/${entry.name}/status`, 'utf8')
+      const ids = status.match(/^Uid:\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)/m)
+      if (ids) for (const value of ids.slice(1)) active.add(Number(value))
+    } catch {}
+  }
+  const passwd = await readFile('/etc/passwd', 'utf8')
+  const mapped = new Set(passwd.split(/\r?\n/).map((line) => Number(line.split(':')[2])).filter(Number.isInteger))
+  for (let uid = 60000; uid < 65000; uid += 1) {
+    if (uid !== forbiddenUid && !active.has(uid) && !mapped.has(uid)) {
+      try {
+        await execFileAsync('/usr/bin/getent', ['passwd', String(uid)])
+      } catch (error) {
+        const code = (error as { code?: unknown }).code
+        if (code === 2) return uid
+        throw new Error(`Managed migration controller could not verify child UID ${uid} against NSS (getent status ${String(code)}).`)
+      }
+    }
+  }
+  throw new Error('Managed migration controller could not select an unmapped inactive child UID.')
+}
+
+async function validatedReadOnlyTraversalGid(start: string, proposed?: number): Promise<number | undefined> {
+  let current = resolve(start)
+  let required: number | undefined
+  while (true) {
+    const metadata = await stat(current)
+    if ((metadata.mode & 0o022) !== 0) throw new Error(`Managed migration child path is group/other writable: ${current}`)
+    if ((metadata.mode & 0o001) === 0) {
+      if ((metadata.mode & 0o010) === 0 || (required !== undefined && required !== metadata.gid)) {
+        throw new Error(`Managed migration child cannot obtain one read-only repository traversal group at ${current}.`)
+      }
+      required = metadata.gid
+    }
+    if (current === '/') break
+    current = resolve(current, '..')
+  }
+  if (proposed !== undefined && required !== undefined && proposed !== required) throw new Error('Managed native child GID does not match the repository traversal boundary.')
+  return required ?? proposed
 }
 
 if (process.argv.includes('--run')) runManagedDockerMigration().then(() => console.log('✓ Managed Docker migration completed under the serialized controller.')).catch((error) => { console.error(`✗ ${error instanceof Error ? error.message : String(error)}`); process.exit(1) })

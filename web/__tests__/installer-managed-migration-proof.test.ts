@@ -22,6 +22,15 @@ const journal = JSON.parse(sourceFor('../db/migrations/meta/_journal.json')) as 
 }
 
 describe('installer-managed migration proof', () => {
+  it('routes the hosted TCP fixture through the shared Docker controller', () => {
+    expect(managedInstallerProof).toContain('scripts/managed-docker-migration-controller.ts --run')
+    expect(managedInstallerProof).toContain('FORGE_MANAGED_DOCKER_MIGRATIONS=1')
+    expect(managedInstallerProof).toContain('/usr/bin/sudo -n')
+    expect(managedInstallerProof).not.toContain('run_managed_local_migration_sequence')
+    expect(managedInstallerProof).not.toContain('FORGE_S5_FORCE_HANDOFF_FAILURE')
+    expect(managedInstallerProof).not.toContain('FORGE_REGISTRY_FORCE_HANDOFF_FAILURE')
+  })
+
   it('derives the exact current ledger once from the authoritative Drizzle journal', () => {
     const expectations = execFileSync(
       'bash',

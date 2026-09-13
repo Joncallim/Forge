@@ -1,9 +1,69 @@
 import { execFile, spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
+import { createRequire } from 'node:module'
+import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import postgres from 'postgres'
 
 const execFileAsync = promisify(execFile)
+const tsxCli = createRequire(import.meta.url).resolve('tsx/cli')
+const proofScript = fileURLToPath(import.meta.url)
+const controllerScript = 'scripts/managed-docker-migration-controller.ts'
+const proofEnvironmentNames = ['CI', 'GITHUB_ACTIONS'] as const
+
+function controllerLaunch(args: string[], environment: NodeJS.ProcessEnv) {
+  if (process.getuid?.() !== 0) throw new Error('The controller proof must establish its root boundary before launching a controller.')
+  return { command: process.execPath, args: [tsxCli, ...args], env: environment }
+}
+
+async function reexecProofAsRoot(): Promise<boolean> {
+  if (process.getuid?.() === 0) return false
+  const preserved = proofEnvironmentNames.join(',')
+  const environment = Object.fromEntries(proofEnvironmentNames.map((name) => [name, process.env[name]]).filter((entry) => entry[1] !== undefined))
+  const { stdout, stderr } = await execFileAsync('/usr/bin/sudo', [
+    '-n', `--preserve-env=${preserved}`, process.execPath, tsxCli, proofScript,
+  ], { cwd: process.cwd(), env: environment, maxBuffer: 16 * 1024 * 1024 })
+  process.stdout.write(stdout)
+  process.stderr.write(stderr)
+  return true
+}
+
+async function executeController(args: string[], environment: NodeJS.ProcessEnv, options: { timeout: number; maxBuffer: number }) {
+  const launch = controllerLaunch(args, environment)
+  return new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+    const child = spawn(launch.command, launch.args, {
+      cwd: process.cwd(), env: launch.env, detached: true, stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    let stdout = ''
+    let stderr = ''
+    let outputBytes = 0
+    let timedOut = false
+    let overflowed = false
+    const terminateGroup = () => {
+      if (!child.pid) return
+      try { process.kill(-child.pid, 'SIGKILL') } catch { child.kill('SIGKILL') }
+    }
+    const append = (target: 'stdout' | 'stderr', chunk: Buffer) => {
+      outputBytes += chunk.byteLength
+      if (outputBytes > options.maxBuffer) {
+        overflowed = true
+        terminateGroup()
+        return
+      }
+      if (target === 'stdout') stdout += String(chunk)
+      else stderr += String(chunk)
+    }
+    child.stdout.on('data', (chunk: Buffer) => append('stdout', chunk))
+    child.stderr.on('data', (chunk: Buffer) => append('stderr', chunk))
+    child.once('error', reject)
+    const timer = setTimeout(() => { timedOut = true; terminateGroup() }, options.timeout)
+    child.once('exit', (code, signal) => {
+      clearTimeout(timer)
+      if (code === 0 && !timedOut && !overflowed) resolve({ stdout, stderr })
+      else reject(new Error(`Controller process group failed (code=${code ?? 'null'}, signal=${signal ?? 'null'}, timeout=${timedOut}, outputOverflow=${overflowed}).`))
+    })
+  })
+}
 const container = `forge-334-${randomUUID().replaceAll('-', '')}`
 const adminPassword = `admin_${randomUUID().replaceAll('-', '')}`
 const appPassword = `app_${randomUUID().replaceAll('-', '')}`
@@ -79,8 +139,9 @@ async function main(): Promise<void> {
       FORGE_MANAGED_DOCKER_MIGRATIONS: '1',
       FORGE_MANAGED_MIGRATION_PAUSE_AFTER_FENCE_MS: '60000',
     }
-    const first = spawn('npx', ['tsx', '-e', "import('./scripts/managed-docker-migration-controller.ts').then((module) => module.default.runManagedDockerMigration()).catch((error) => { console.error(error.stack); process.exit(1) })"], {
-      cwd: process.cwd(), env: controllerEnv, detached: true, stdio: ['ignore', 'pipe', 'pipe'],
+    const firstLaunch = controllerLaunch(['-e', `import('./${controllerScript}').then((module) => module.default.runManagedDockerMigration()).catch((error) => { console.error(error.stack); process.exit(1) })`], controllerEnv)
+    const first = spawn(firstLaunch.command, firstLaunch.args, {
+      cwd: process.cwd(), env: firstLaunch.env, detached: true, stdio: ['ignore', 'pipe', 'pipe'],
     })
     let firstOutput = ''
     first.stdout.on('data', (chunk) => { firstOutput += String(chunk) })
@@ -124,9 +185,59 @@ async function main(): Promise<void> {
     if (!crashedRole.exists || !crashedRole.login) throw new Error('SIGKILL did not leave the live ephemeral identity required by the adoption proof.')
 
     const retryEnv = { ...controllerEnv, FORGE_MANAGED_MIGRATION_PAUSE_AFTER_FENCE_MS: '0' }
-    const { stdout, stderr } = await execFileAsync('npx', ['tsx', 'scripts/managed-docker-migration-controller.ts', '--run'], {
-      cwd: process.cwd(), env: retryEnv, timeout: 180_000, maxBuffer: 8 * 1024 * 1024,
-    })
+    const predecessorPassword = `predecessor_${randomUUID().replaceAll('-', '')}`
+    await admin.unsafe(`alter role "${fenced.migrationRole}" password '${predecessorPassword}'`)
+    const predecessorUrl = new URL(adminUrl)
+    predecessorUrl.username = fenced.migrationRole
+    predecessorUrl.password = predecessorPassword
+    await admin.unsafe(`grant connect on database forge to "${fenced.migrationRole}"`)
+    const predecessor = postgres(predecessorUrl.toString(), { max: 1, connect_timeout: 2 })
+    const [{ pid: predecessorPid }] = await predecessor<{ pid: number }[]>`select pg_catalog.pg_backend_pid()::integer as pid`
+    await admin.unsafe(`revoke connect on database forge from "${fenced.migrationRole}"`)
+    const [durable] = await admin<{ databaseName: string; databaseOid: number; ownerOid: number; acl: unknown; aclDigest: string; roleOid: number; phase: string }[]>`
+      select database_name::text as "databaseName", database_oid::integer as "databaseOid",
+        database_owner_oid::integer as "ownerOid", database_acl as acl, database_acl_digest as "aclDigest",
+        migration_role_oid::integer as "roleOid", controller_phase as phase
+      from public.forge_protected_migration_handoffs where migration_tag=${tag}
+    `
+    const restoreDurable = async () => admin!`
+      update public.forge_protected_migration_handoffs set database_name=${durable.databaseName}::name,
+        database_oid=${durable.databaseOid}::oid, database_owner_oid=${durable.ownerOid}::oid,
+        database_acl=${admin!.json(durable.acl as never)}, database_acl_digest=${durable.aclDigest},
+        migration_role_oid=${durable.roleOid}::oid, controller_phase=${durable.phase}
+      where migration_tag=${tag}
+    `
+    const rejectTamperWithoutMutation = async (label: string, tamper: () => Promise<unknown>) => {
+      await tamper()
+      let rejected = false
+      try {
+        await executeController([controllerScript, '--run'], retryEnv, { timeout: 30_000, maxBuffer: 8 * 1024 * 1024 })
+      } catch { rejected = true }
+      const [preserved] = await admin!<{ login: boolean; session: boolean; roleOid: number }[]>`
+        select auth.rolcanlogin as login, auth.oid::integer as "roleOid",
+          exists(select 1 from pg_catalog.pg_stat_activity where pid=${predecessorPid} and usename=${fenced.migrationRole}) as session
+        from pg_catalog.pg_authid auth where auth.rolname=${fenced.migrationRole}
+      `
+      await predecessor`select 1`
+      await restoreDurable()
+      if (!rejected || !preserved?.login || !preserved.session || preserved.roleOid !== durable.roleOid) {
+        throw new Error(`Tampered ${label} state did not reject before preserving the predecessor login, session, and role. diagnostics=${JSON.stringify({ rejected, login: preserved?.login ?? false, session: preserved?.session ?? false, expectedRoleOid: durable.roleOid, actualRoleOid: preserved?.roleOid ?? null })}`)
+      }
+    }
+    await rejectTamperWithoutMutation('database name', () => admin!`
+      update public.forge_protected_migration_handoffs set database_name='forge_wrong' where migration_tag=${tag}`)
+    await rejectTamperWithoutMutation('database OID', () => admin!`
+      update public.forge_protected_migration_handoffs set database_oid=${durable.databaseOid + 1}::oid where migration_tag=${tag}`)
+    await rejectTamperWithoutMutation('ACL digest', () => admin!`
+      update public.forge_protected_migration_handoffs set database_acl_digest=${'0'.repeat(64)} where migration_tag=${tag}`)
+    const [{ oid: postgresOid }] = await admin<{ oid: number }[]>`select oid::integer as oid from pg_catalog.pg_roles where rolname='postgres'`
+    await rejectTamperWithoutMutation('role OID mapping', () => admin!`
+      update public.forge_protected_migration_handoffs set migration_role_oid=${postgresOid}::oid where migration_tag=${tag}`)
+    await rejectTamperWithoutMutation('ledger/phase', () => admin!`
+      update public.forge_protected_migration_handoffs set controller_phase='handoff_open' where migration_tag=${tag}`)
+    await predecessor.end({ timeout: 1 })
+
+    const { stdout, stderr } = await executeController([controllerScript, '--run'], retryEnv, { timeout: 180_000, maxBuffer: 8 * 1024 * 1024 })
     if (!`${stdout}${stderr}`.includes('Managed Docker migration completed')) throw new Error('The restarted controller omitted its success evidence.')
 
     const [closed] = await admin<{ phase: string; cleanup: boolean; oldRoleExists: boolean; migrators: number }[]>`
@@ -151,9 +262,7 @@ async function main(): Promise<void> {
         database_acl=null, database_acl_digest=null, migration_role_oid=null, generation=generation+1
       where migration_tag=${tag}
     `
-    await execFileAsync('npx', ['tsx', 'scripts/managed-docker-migration-controller.ts', '--run'], {
-      cwd: process.cwd(), env: retryEnv, timeout: 60_000, maxBuffer: 8 * 1024 * 1024,
-    })
+    await executeController([controllerScript, '--run'], retryEnv, { timeout: 60_000, maxBuffer: 8 * 1024 * 1024 })
     const [upgraded] = await admin<{ phase: string; operationId: string | null; aclDigest: string | null; rows: number }[]>`
       select controller_phase as phase, operation_id::text as "operationId", database_acl_digest as "aclDigest",
         (select count(*)::integer from public.forge_protected_migration_handoffs where migration_tag=${tag}) as rows
@@ -170,7 +279,9 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((error) => {
-  console.error(error instanceof Error ? error.message : String(error))
-  process.exit(1)
-})
+reexecProofAsRoot()
+  .then((reexecuted) => reexecuted ? undefined : main())
+  .catch((error) => {
+    console.error(error instanceof Error ? error.message : String(error))
+    process.exit(1)
+  })

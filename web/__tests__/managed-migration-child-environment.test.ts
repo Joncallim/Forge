@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process'
 import { describe, expect, it } from 'vitest'
 import { createEphemeralMigrationUrl, createMigrationChildEnvironment } from '@/scripts/ci/managed-migration-child-environment'
 import { resolveBootstrapDatabaseUrls, runWithDatabaseUrlSentinel } from '@/scripts/ci/bootstrap-database-urls'
@@ -23,6 +24,19 @@ describe('managed migration child environment', () => {
       DATABASE_URL: 'postgresql://forge_migrator_0123456789abcdef0123456789abcdef:child-only@db/forge',
       FORGE_MANAGED_DOCKER_MIGRATIONS: '0',
     })
+  })
+
+  it('is the exact environment observed by an actual child through procfs', () => {
+    const childEnvironment = createMigrationChildEnvironment(
+      'postgresql://forge_migrator_0123456789abcdef0123456789abcdef:child-only@db/forge',
+      { PATH: process.env.PATH, NODE_ENV: 'test', FORGE_DATABASE_ADMIN_URL: 'must-not-cross', PGUSER: 'postgres' },
+      '/tmp/private-migration-child',
+    )
+    const observed = execFileSync(process.execPath, ['-e', "const fs=require('fs'); process.stdout.write(fs.readFileSync('/proc/self/environ').toString().split('\\0').filter(Boolean).map(v=>v.split('=')[0]).sort().join(','))"], {
+      env: childEnvironment,
+      encoding: 'utf8',
+    })
+    expect(observed).toBe('DATABASE_URL,FORGE_MANAGED_DOCKER_MIGRATIONS,HOME,NODE_ENV,PATH,TMPDIR')
   })
 
   it('rejects a non-ephemeral database identity', () => {

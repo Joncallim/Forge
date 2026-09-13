@@ -3,6 +3,8 @@ export type MigrationChildEnvironment = NodeJS.ProcessEnv & Readonly<{
   NODE_ENV: 'development' | 'production' | 'test'
   DATABASE_URL: string
   FORGE_MANAGED_DOCKER_MIGRATIONS: '0'
+  HOME?: string
+  TMPDIR?: string
 }>
 
 /** Build the complete child environment from an allowlist. The caller's
@@ -11,17 +13,21 @@ export type MigrationChildEnvironment = NodeJS.ProcessEnv & Readonly<{
 export function createMigrationChildEnvironment(
   migrationUrl: string,
   ambient: Readonly<Record<string, string | undefined>> = process.env,
+  privateDirectory?: string,
 ): MigrationChildEnvironment {
   const environment: MigrationChildEnvironment = {
     PATH: ambient.PATH ?? '',
     NODE_ENV: ambient.NODE_ENV === 'development' || ambient.NODE_ENV === 'test' ? ambient.NODE_ENV : 'production',
     DATABASE_URL: migrationUrl,
     FORGE_MANAGED_DOCKER_MIGRATIONS: '0',
+    ...(privateDirectory ? { HOME: privateDirectory, TMPDIR: privateDirectory } : {}),
   }
   const keys = Object.keys(environment).sort()
   if (keys.some((key) => key === 'FORGE_DATABASE_ADMIN_URL' || key.startsWith('PG'))
     || !new URL(environment.DATABASE_URL).username.match(/^forge_migrator_[0-9a-f]{32}$/)
-    || keys.join(',') !== 'DATABASE_URL,FORGE_MANAGED_DOCKER_MIGRATIONS,NODE_ENV,PATH') {
+    || keys.join(',') !== (privateDirectory
+      ? 'DATABASE_URL,FORGE_MANAGED_DOCKER_MIGRATIONS,HOME,NODE_ENV,PATH,TMPDIR'
+      : 'DATABASE_URL,FORGE_MANAGED_DOCKER_MIGRATIONS,NODE_ENV,PATH')) {
     throw new Error('Managed migration child environment crossed the administrator authority boundary.')
   }
   return environment
