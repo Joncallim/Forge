@@ -49,6 +49,7 @@ function assertSyntheticFutureProtectedMigration(): void {
     journalTags: [syntheticFutureProtectedMigration.migrationTag],
     appliedTags: new Set(),
     cleanupPendingTags: new Set(),
+    cleanupStateTags: new Set(),
     registry: [syntheticFutureProtectedMigration],
   })
   if (recoveryPlan.length !== 1 || recoveryPlan[0] !== syntheticFutureProtectedMigration) {
@@ -118,6 +119,7 @@ async function main(): Promise<void> {
           exists(select 1 from public.forge_protected_migration_handoffs where migration_tag = ${migration.tag} and migration_role = ${migrationRole}::name) as "matchingMigrationRole"
       `
       if (!before?.applied || !before.cleanupPending || !before.matchingMigrationRole) throw new Error('The forced failure did not leave the expected committed-ledger/open-cleanup recovery state.')
+      console.log('VNEXT_A1_PROTECTED_CLEANUP_FAILURE_PASSED')
     } finally {
       await proof.end({ timeout: 5 })
     }
@@ -135,6 +137,7 @@ async function main(): Promise<void> {
       `
       if (!after?.cleanupCompletedAt || !after.handoffOpenedAt) throw new Error('Public db:migrate did not finish the durable protected-owner cleanup.')
       firstRecovery = { ledgerCount: after.ledgerCount, handoffOpenedAt: after.handoffOpenedAt, cleanupCompletedAt: after.cleanupCompletedAt }
+      console.log('VNEXT_A1_PROTECTED_RESTART_PASSED')
     } finally {
       await recoveredOnce.end({ timeout: 5 })
     }
@@ -156,7 +159,36 @@ async function main(): Promise<void> {
     } finally {
       await recovered.end({ timeout: 5 })
     }
+    const expectFailClosedRestart = async (): Promise<void> => {
+      try {
+        await execFileAsync('npx', ['tsx', 'db/migrate.ts'], { cwd: process.cwd(), env: childEnv })
+        throw new Error('A partial restore without durable protected-migration state unexpectedly restarted.')
+      } catch (error) {
+        const stderr = typeof (error as { stderr?: unknown }).stderr === 'string' ? (error as { stderr: string }).stderr : ''
+        if (!stderr.includes("Applied protected migration '0034_vnext_phase0_a1_runtime_foundation' has no durable handoff state")) {
+          throw new Error(stderr || (error instanceof Error ? error.message : String(error)))
+        }
+      }
+    }
+    const corruptState = postgres(proofAdminUrl, { max: 1, onnotice: () => {} })
+    try {
+      // A partially restored table without the committed handoff row must not
+      // be mistaken for a completed cleanup.
+      await corruptState`delete from public.forge_protected_migration_handoffs where migration_tag = '0034_vnext_phase0_a1_runtime_foundation'`
+    } finally {
+      await corruptState.end({ timeout: 5 })
+    }
+    await expectFailClosedRestart()
+    const missingTable = postgres(proofAdminUrl, { max: 1, onnotice: () => {} })
+    try {
+      // Neither may a restored ledger with the state table entirely absent.
+      await missingTable`drop table public.forge_protected_migration_handoffs`
+    } finally {
+      await missingTable.end({ timeout: 5 })
+    }
+    await expectFailClosedRestart()
     assertSyntheticFutureProtectedMigration()
+    console.log('VNEXT_A1_PROTECTED_REUPGRADE_PASSED')
     console.log('✓ Protected migration cleanup failure, restart, re-upgrade, and future-registry recovery proof passed.')
   } finally {
     if (proofAdminUrl) {

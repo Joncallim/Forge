@@ -13,6 +13,7 @@ describe('protected migration registry', () => {
       journalTags: [runtime.migrationTag],
       appliedTags: new Set([runtime.migrationTag]),
       cleanupPendingTags: new Set([runtime.migrationTag]),
+      cleanupStateTags: new Set([runtime.migrationTag]),
     })
     expect(plan).toEqual([runtime])
   })
@@ -22,6 +23,7 @@ describe('protected migration registry', () => {
       journalTags: [runtime.migrationTag],
       appliedTags: new Set([runtime.migrationTag]),
       cleanupPendingTags: new Set(),
+      cleanupStateTags: new Set([runtime.migrationTag]),
     })
     expect(plan).toEqual([])
   })
@@ -31,6 +33,7 @@ describe('protected migration registry', () => {
       journalTags: [runtime.migrationTag],
       appliedTags: new Set(),
       cleanupPendingTags: new Set(),
+      cleanupStateTags: new Set(),
     })
     expect(plan).toEqual([runtime])
   })
@@ -40,6 +43,7 @@ describe('protected migration registry', () => {
       journalTags: [syntheticFutureProtectedMigration.migrationTag],
       appliedTags: new Set(),
       cleanupPendingTags: new Set(),
+      cleanupStateTags: new Set(),
       registry: [syntheticFutureProtectedMigration],
     })
     expect(plan).toEqual([syntheticFutureProtectedMigration])
@@ -48,5 +52,26 @@ describe('protected migration registry', () => {
       protectedOwner: 'forge_synthetic_future_routines_owner',
     })
     expect(syntheticFutureProtectedMigration.migrationTag).not.toContain('0035')
+  })
+
+  it('orders multiple protected migrations by the journal rather than registry declaration', () => {
+    const later = { ...syntheticFutureProtectedMigration, id: 'later', migrationTag: '0040_later_protected_migration' }
+    const plan = protectedMigrationRecoveryPlan({
+      journalTags: [runtime.migrationTag, later.migrationTag],
+      appliedTags: new Set(),
+      cleanupPendingTags: new Set(),
+      cleanupStateTags: new Set(),
+      registry: [later, runtime],
+    })
+    expect(plan).toEqual([runtime, later])
+  })
+
+  it('fails closed when the ledger has a protected migration without durable handoff state', () => {
+    expect(() => protectedMigrationRecoveryPlan({
+      journalTags: [runtime.migrationTag],
+      appliedTags: new Set([runtime.migrationTag]),
+      cleanupPendingTags: new Set(),
+      cleanupStateTags: new Set(),
+    })).toThrow(`Applied protected migration '${runtime.migrationTag}' has no durable handoff state`)
   })
 })

@@ -23,10 +23,22 @@ describe('VNext Phase 0 conformance manifest', () => {
       expect(proof.scenarioIds).toHaveLength(1)
     }
     for (const binding of manifest.runnerBindings) {
-      expect(binding.runner).toBe('vitest')
-      expect(binding.command).toContain('vitest')
+      expect(['vitest', 'command']).toContain(binding.runner)
+      expect(binding.command).toBeTruthy()
       expect(binding.forbidSkipped).toBe(true)
       expect(binding.executionKeys.length).toBeGreaterThan(0)
     }
+  })
+
+  it('keeps recovery execution markers and the conformance gate anti-skip checks', () => {
+    const recovery = manifest.runnerBindings.find((binding) => binding.id === 'a1-protected-migration-recovery')
+    const proof = readFileSync(fileURLToPath(new URL('../scripts/ci/prove-vnext-protected-migration-handoff-recovery.ts', import.meta.url)), 'utf8')
+    const gate = readFileSync(fileURLToPath(new URL('../scripts/ci/run-vnext-phase0-contract.mjs', import.meta.url)), 'utf8')
+    expect(recovery).toMatchObject({ command: 'npm run test:vnext-protected-migration-recovery', forbidSkipped: true })
+    for (const marker of ['VNEXT_A1_PROTECTED_CLEANUP_FAILURE_PASSED', 'VNEXT_A1_PROTECTED_RESTART_PASSED', 'VNEXT_A1_PROTECTED_REUPGRADE_PASSED']) {
+      expect(proof).toContain(marker)
+    }
+    expect(gate).toContain('access(proof.file)')
+    expect(gate).toContain('A1 protected-migration recovery runner rejected execution, skip state, or scenario identity.')
   })
 })

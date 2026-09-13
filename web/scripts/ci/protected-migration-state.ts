@@ -5,6 +5,11 @@ export const protectedMigrationStateTable = 'public.forge_protected_migration_ha
 
 type SqlClient = ReturnType<typeof postgres>
 
+export type ProtectedMigrationCleanupState = Readonly<{
+  stateTags: Set<string>
+  pendingTags: Set<string>
+}>
+
 export async function ensureProtectedMigrationState(client: SqlClient): Promise<void> {
   await client.unsafe(`
     create table if not exists ${protectedMigrationStateTable} (
@@ -60,21 +65,26 @@ export async function recordProtectedMigrationCleanup(
   if (!row) throw new Error(`Protected migration '${migration.migrationTag}' has no matching durable handoff state to close.`)
 }
 
-export async function pendingProtectedMigrationCleanup(
+export async function protectedMigrationCleanupState(
   client: SqlClient,
   migrationTags: readonly string[],
-): Promise<Set<string>> {
-  if (migrationTags.length === 0) return new Set()
+): Promise<ProtectedMigrationCleanupState> {
+  if (migrationTags.length === 0) return { stateTags: new Set(), pendingTags: new Set() }
   try {
-    const rows = await client<{ migrationTag: string }[]>`
-      select migration_tag as "migrationTag"
+    const rows = await client<{ migrationTag: string; cleanupPending: boolean }[]>`
+      select migration_tag as "migrationTag", cleanup_completed_at is null as "cleanupPending"
       from public.forge_protected_migration_handoffs
       where migration_tag = any(${client.array([...migrationTags])}::text[])
-        and cleanup_completed_at is null
     `
-    return new Set(rows.map((row) => row.migrationTag))
+    return {
+      stateTags: new Set(rows.map((row) => row.migrationTag)),
+      pendingTags: new Set(rows.filter((row) => row.cleanupPending).map((row) => row.migrationTag)),
+    }
   } catch (error) {
-    if ((error as { code?: string }).code === '42P01') return new Set()
+    // An older database legitimately has no handoff table before its first
+    // protected migration. The recovery planner rejects this same empty state
+    // if its ledger says a protected migration already committed.
+    if ((error as { code?: string }).code === '42P01') return { stateTags: new Set(), pendingTags: new Set() }
     throw error
   }
 }

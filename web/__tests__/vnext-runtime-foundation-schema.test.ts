@@ -63,7 +63,7 @@ describe('VNext Phase 0 A1 protected persistence foundation', () => {
   it('keeps ordinary latest migration and repair on the documented bounded handoff', () => {
     expect(migrator).toContain('pendingProtectedMigrations')
     expect(migrator).toContain('protectedMigrationRecoveryPlan')
-    expect(migrator).toContain('pendingProtectedMigrationCleanup')
+    expect(migrator).toContain('protectedMigrationCleanupState')
     expect(migrator).not.toContain('RUNTIME_FOUNDATION_MIGRATION_AT')
     expect(bootstrap).toContain('recordProtectedMigrationHandoff')
     expect(bootstrap).toContain('recordProtectedMigrationCleanup')

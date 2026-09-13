@@ -22,7 +22,7 @@ import { migrate } from 'drizzle-orm/postgres-js/migrator'
 import postgres from 'postgres'
 import { getRequiredEnv } from '@/lib/env'
 import { protectedMigrationRecoveryPlan } from '@/scripts/ci/protected-migration-registry'
-import { pendingProtectedMigrationCleanup } from '@/scripts/ci/protected-migration-state'
+import { protectedMigrationCleanupState } from '@/scripts/ci/protected-migration-state'
 
 const MIGRATIONS_FOLDER = './db/migrations'
 const execFileAsync = promisify(execFile)
@@ -38,10 +38,12 @@ async function pendingProtectedMigrations(client: ReturnType<typeof postgres>): 
     `
     const appliedAt = new Set(rows.map((row) => Number(row.createdAt)))
     const appliedTags = new Set(journal.entries.filter((entry) => appliedAt.has(entry.when)).map((entry) => entry.tag))
+    const cleanupState = await protectedMigrationCleanupState(client, protectedTags)
     return protectedMigrationRecoveryPlan({
       journalTags: protectedTags,
       appliedTags,
-      cleanupPendingTags: await pendingProtectedMigrationCleanup(client, protectedTags),
+      cleanupPendingTags: cleanupState.pendingTags,
+      cleanupStateTags: cleanupState.stateTags,
     })
   } catch (error) {
     // A new database has neither the Drizzle ledger nor durable handoff rows.
@@ -49,7 +51,7 @@ async function pendingProtectedMigrations(client: ReturnType<typeof postgres>): 
     // wrapper, which establishes both prerequisites and the handoff state.
     if ((error as { code?: string }).code === '42P01') {
       const journal = JSON.parse(await readFile(fileURLToPath(new URL('./migrations/meta/_journal.json', import.meta.url)), 'utf8')) as MigrationJournal
-      return protectedMigrationRecoveryPlan({ journalTags: journal.entries.map((entry) => entry.tag), appliedTags: new Set(), cleanupPendingTags: new Set() })
+      return protectedMigrationRecoveryPlan({ journalTags: journal.entries.map((entry) => entry.tag), appliedTags: new Set(), cleanupPendingTags: new Set(), cleanupStateTags: new Set() })
     }
     throw error
   }

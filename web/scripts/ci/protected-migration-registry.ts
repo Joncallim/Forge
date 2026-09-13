@@ -36,17 +36,27 @@ export function protectedMigrationForTag(tag: string, registry: readonly Protect
 }
 
 export function protectedMigrationsInJournal(journalTags: readonly string[], registry: readonly ProtectedMigration[] = protectedMigrationRegistry): ProtectedMigration[] {
-  const tags = new Set(journalTags)
-  return registry.filter((migration) => tags.has(migration.migrationTag))
+  const migrationsByTag = new Map(registry.map((migration) => [migration.migrationTag, migration]))
+  return journalTags.flatMap((tag) => {
+    const migration = migrationsByTag.get(tag)
+    return migration ? [migration] : []
+  })
 }
 
 export function protectedMigrationRecoveryPlan(input: Readonly<{
   journalTags: readonly string[]
   appliedTags: ReadonlySet<string>
   cleanupPendingTags: ReadonlySet<string>
+  cleanupStateTags: ReadonlySet<string>
   registry?: readonly ProtectedMigration[]
 }>): ProtectedMigration[] {
-  return protectedMigrationsInJournal(input.journalTags, input.registry).filter((migration) => (
+  const protectedMigrations = protectedMigrationsInJournal(input.journalTags, input.registry)
+  for (const migration of protectedMigrations) {
+    if (input.appliedTags.has(migration.migrationTag) && !input.cleanupStateTags.has(migration.migrationTag)) {
+      throw new Error(`Applied protected migration '${migration.migrationTag}' has no durable handoff state; refusing an automatic migration restart.`)
+    }
+  }
+  return protectedMigrations.filter((migration) => (
     !input.appliedTags.has(migration.migrationTag) || input.cleanupPendingTags.has(migration.migrationTag)
   ))
 }
