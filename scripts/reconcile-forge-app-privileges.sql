@@ -140,12 +140,13 @@ $boundary$;
 
 ALTER ROLE forge NOINHERIT;
 
--- The runtime owner needs a narrow, permanent read to verify that a Task
--- compatibility binding belongs to its submitted-by principal. It cannot read
--- prompt, title, Project, or other Task data, and the ordinary app login never
--- receives membership in the protected owner role.
-REVOKE ALL PRIVILEGES ON TABLE public.tasks FROM forge_runtime_routines_owner;
-GRANT SELECT (id, submitted_by) ON TABLE public.tasks TO forge_runtime_routines_owner;
+-- PostgreSQL requires table SELECT and UPDATE to hold the resolver's live
+-- session row lock. That is the sole table-wide source authority; Task and
+-- Project remain column-scoped compatibility sources.
+REVOKE ALL PRIVILEGES ON TABLE public.sessions, public.tasks, public.projects FROM forge_runtime_routines_owner;
+GRANT SELECT, UPDATE ON TABLE public.sessions TO forge_runtime_routines_owner;
+GRANT SELECT (id, project_id, submitted_by) ON TABLE public.tasks TO forge_runtime_routines_owner;
+GRANT SELECT (id, submitted_by, root_ref, root_binding_revision, archived_at) ON TABLE public.projects TO forge_runtime_routines_owner;
 
 SELECT relation.oid, relation.relname
 FROM pg_catalog.pg_class relation
@@ -234,11 +235,7 @@ GRANT SELECT ON TABLE
   public.work_package_local_projection_heads,
   public.verification_goal_registry_revisions,
   public.verification_goal_registry_entries,
-  public.verification_goal_registry_heads,
-  public.missions,
-  public.executions,
-  public.task_mission_bindings,
-  public.runtime_transition_audits
+  public.verification_goal_registry_heads
 TO forge, forge_runtime_api;
 REVOKE ALL ON FUNCTION public.forge_commit_verification_goal_registry_revision_v1(
   uuid,uuid,uuid,uuid,timestamptz,text,uuid,bigint,bigint,timestamptz,text,jsonb
@@ -246,15 +243,10 @@ REVOKE ALL ON FUNCTION public.forge_commit_verification_goal_registry_revision_v
 GRANT EXECUTE ON FUNCTION public.forge_commit_verification_goal_registry_revision_v1(
   uuid,uuid,uuid,uuid,timestamptz,text,uuid,bigint,bigint,timestamptz,text,jsonb
 ) TO forge;
-REVOKE ALL ON FUNCTION forge.create_vnext_mission_v1(uuid,uuid,uuid,uuid,text,text,jsonb,text,jsonb,text) FROM PUBLIC, forge;
-REVOKE ALL ON FUNCTION forge.transition_vnext_mission_v1(uuid,bigint,text,text,uuid,text,text) FROM PUBLIC, forge;
-REVOKE ALL ON FUNCTION forge.transition_vnext_execution_v1(uuid,bigint,text,text,text,uuid,text,text) FROM PUBLIC, forge;
-REVOKE ALL ON FUNCTION forge.advance_task_execution_pointer_v1(uuid,bigint,uuid,uuid,text) FROM PUBLIC, forge;
+REVOKE ALL ON FUNCTION forge.resolve_vnext_operator_session_v1(bytea),forge.create_vnext_mission_v1(uuid,uuid,uuid,uuid,text,text,jsonb,text,jsonb,text),forge.transition_vnext_mission_v1(uuid,bigint,text,text,uuid,text,text),forge.transition_vnext_execution_v1(uuid,bigint,text,text,text,uuid,text,text),forge.advance_task_execution_pointer_v1(uuid,bigint,uuid,uuid,text) FROM PUBLIC, forge, forge_runtime_api;
+REVOKE ALL ON FUNCTION forge.create_vnext_generic_zero_mission_v1(bytea,uuid,uuid,text,text),forge.create_vnext_task_mission_v1(bytea,uuid,uuid,uuid,text,text),forge.read_vnext_mission_v1(bytea,uuid),forge.transition_vnext_mission_for_session_v1(bytea,uuid,bigint,text,text,text,text),forge.transition_vnext_execution_for_session_v1(bytea,uuid,bigint,text,text,text,text,text),forge.advance_task_execution_pointer_for_session_v1(bytea,uuid,bigint,uuid,text) FROM PUBLIC, forge;
 GRANT USAGE ON SCHEMA forge TO forge_runtime_api;
-GRANT EXECUTE ON FUNCTION forge.create_vnext_mission_v1(uuid,uuid,uuid,uuid,text,text,jsonb,text,jsonb,text) TO forge_runtime_api;
-GRANT EXECUTE ON FUNCTION forge.transition_vnext_mission_v1(uuid,bigint,text,text,uuid,text,text) TO forge_runtime_api;
-GRANT EXECUTE ON FUNCTION forge.transition_vnext_execution_v1(uuid,bigint,text,text,text,uuid,text,text) TO forge_runtime_api;
-GRANT EXECUTE ON FUNCTION forge.advance_task_execution_pointer_v1(uuid,bigint,uuid,uuid,text) TO forge_runtime_api;
+GRANT EXECUTE ON FUNCTION forge.create_vnext_generic_zero_mission_v1(bytea,uuid,uuid,text,text),forge.create_vnext_task_mission_v1(bytea,uuid,uuid,uuid,text,text),forge.read_vnext_mission_v1(bytea,uuid),forge.transition_vnext_mission_for_session_v1(bytea,uuid,bigint,text,text,text,text),forge.transition_vnext_execution_for_session_v1(bytea,uuid,bigint,text,text,text,text,text),forge.advance_task_execution_pointer_for_session_v1(bytea,uuid,bigint,uuid,text) TO forge_runtime_api;
 
 DO $verify$
 DECLARE
@@ -320,19 +312,35 @@ BEGIN
   ) THEN
     RAISE EXCEPTION 'protected owner roles changed during reconciliation';
   END IF;
-  IF pg_catalog.has_table_privilege('forge_runtime_routines_owner', 'public.tasks', 'SELECT')
+  IF NOT pg_catalog.has_table_privilege('forge_runtime_routines_owner', 'public.sessions', 'SELECT')
+     OR NOT pg_catalog.has_table_privilege('forge_runtime_routines_owner', 'public.sessions', 'UPDATE')
+     OR pg_catalog.has_table_privilege('forge_runtime_routines_owner', 'public.tasks', 'SELECT')
      OR NOT pg_catalog.has_column_privilege('forge_runtime_routines_owner', 'public.tasks', 'id', 'SELECT')
+     OR NOT pg_catalog.has_column_privilege('forge_runtime_routines_owner', 'public.tasks', 'project_id', 'SELECT')
      OR NOT pg_catalog.has_column_privilege('forge_runtime_routines_owner', 'public.tasks', 'submitted_by', 'SELECT')
+     OR pg_catalog.has_table_privilege('forge_runtime_routines_owner', 'public.projects', 'SELECT')
+     OR NOT pg_catalog.has_column_privilege('forge_runtime_routines_owner', 'public.projects', 'id', 'SELECT')
+     OR NOT pg_catalog.has_column_privilege('forge_runtime_routines_owner', 'public.projects', 'submitted_by', 'SELECT')
+     OR NOT pg_catalog.has_column_privilege('forge_runtime_routines_owner', 'public.projects', 'root_ref', 'SELECT')
+     OR NOT pg_catalog.has_column_privilege('forge_runtime_routines_owner', 'public.projects', 'root_binding_revision', 'SELECT')
+     OR NOT pg_catalog.has_column_privilege('forge_runtime_routines_owner', 'public.projects', 'archived_at', 'SELECT')
      OR EXISTS (
        SELECT 1
        FROM pg_catalog.pg_attribute attribute
-       WHERE attribute.attrelid = 'public.tasks'::pg_catalog.regclass
+       WHERE attribute.attrelid IN ('public.sessions'::pg_catalog.regclass, 'public.tasks'::pg_catalog.regclass, 'public.projects'::pg_catalog.regclass)
          AND attribute.attnum > 0
          AND NOT attribute.attisdropped
-         AND attribute.attname NOT IN ('id', 'submitted_by')
+         AND NOT (
+           attribute.attrelid = 'public.sessions'::pg_catalog.regclass OR
+           (attribute.attrelid = 'public.tasks'::pg_catalog.regclass AND attribute.attname IN ('id', 'project_id', 'submitted_by')) OR
+           (attribute.attrelid = 'public.projects'::pg_catalog.regclass AND attribute.attname IN ('id', 'submitted_by', 'root_ref', 'root_binding_revision', 'archived_at'))
+         )
          AND pg_catalog.has_column_privilege('forge_runtime_routines_owner', attribute.attrelid, attribute.attname, 'SELECT')
      ) THEN
-    RAISE EXCEPTION 'runtime owner Task read boundary is outside the exact compatibility check';
+    RAISE EXCEPTION 'runtime owner source read boundary is outside the exact session and Task compatibility checks';
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_proc routine WHERE routine.oid = 'forge.resolve_vnext_operator_session_v1(bytea)'::pg_catalog.regprocedure AND routine.proowner = 'forge_runtime_routines_owner'::pg_catalog.regrole AND routine.prosecdef AND NOT pg_catalog.has_function_privilege('forge', routine.oid, 'EXECUTE') AND NOT pg_catalog.has_function_privilege('forge_runtime_api', routine.oid, 'EXECUTE')) THEN
+    RAISE EXCEPTION 'VNext session resolver execute boundary is invalid';
   END IF;
   IF NOT EXISTS (
     SELECT 1
@@ -358,21 +366,23 @@ BEGIN
   END IF;
   IF (SELECT count(*) FROM pg_catalog.pg_proc routine
       WHERE routine.oid IN (
-        'forge.create_vnext_mission_v1(uuid,uuid,uuid,uuid,text,text,jsonb,text,jsonb,text)'::pg_catalog.regprocedure,
-        'forge.transition_vnext_mission_v1(uuid,bigint,text,text,uuid,text,text)'::pg_catalog.regprocedure,
-        'forge.transition_vnext_execution_v1(uuid,bigint,text,text,text,uuid,text,text)'::pg_catalog.regprocedure,
-        'forge.advance_task_execution_pointer_v1(uuid,bigint,uuid,uuid,text)'::pg_catalog.regprocedure
+        'forge.create_vnext_generic_zero_mission_v1(bytea,uuid,uuid,text,text)'::pg_catalog.regprocedure,
+        'forge.create_vnext_task_mission_v1(bytea,uuid,uuid,uuid,text,text)'::pg_catalog.regprocedure,
+        'forge.read_vnext_mission_v1(bytea,uuid)'::pg_catalog.regprocedure,
+        'forge.transition_vnext_mission_for_session_v1(bytea,uuid,bigint,text,text,text,text)'::pg_catalog.regprocedure,
+        'forge.transition_vnext_execution_for_session_v1(bytea,uuid,bigint,text,text,text,text,text)'::pg_catalog.regprocedure,
+        'forge.advance_task_execution_pointer_for_session_v1(bytea,uuid,bigint,uuid,text)'::pg_catalog.regprocedure
       )
         AND routine.proowner = 'forge_runtime_routines_owner'::pg_catalog.regrole
         AND routine.prosecdef
-        AND routine.proconfig = ARRAY['search_path=pg_catalog']
-        AND pg_catalog.has_function_privilege('forge', routine.oid, 'EXECUTE')
+        AND pg_catalog.has_function_privilege('forge_runtime_api', routine.oid, 'EXECUTE')
+        AND NOT pg_catalog.has_function_privilege('forge', routine.oid, 'EXECUTE')
         AND NOT EXISTS (
           SELECT 1 FROM pg_catalog.aclexplode(COALESCE(routine.proacl, pg_catalog.acldefault('f', routine.proowner))) privilege
           WHERE privilege.privilege_type = 'EXECUTE'
-            AND privilege.grantee NOT IN ('forge'::pg_catalog.regrole, 'forge_runtime_routines_owner'::pg_catalog.regrole)
+            AND privilege.grantee NOT IN ('forge_runtime_api'::pg_catalog.regrole, 'forge_runtime_routines_owner'::pg_catalog.regrole)
         )
-  ) <> 4 THEN
+  ) <> 6 THEN
     RAISE EXCEPTION 'VNext runtime routine owner, search path, or execute boundary is invalid';
   END IF;
   IF EXISTS (
@@ -415,11 +425,7 @@ BEGIN
           'work_package_local_projection_heads',
           'verification_goal_registry_revisions',
           'verification_goal_registry_entries',
-          'verification_goal_registry_heads',
-          'missions',
-          'executions',
-          'task_mission_bindings',
-          'runtime_transition_audits'
+          'verification_goal_registry_heads'
         )
         OR privilege.privilege_type <> 'SELECT'
         OR privilege.is_grantable
@@ -502,11 +508,7 @@ BEGIN
             'work_package_local_projection_heads',
             'verification_goal_registry_revisions',
             'verification_goal_registry_entries',
-            'verification_goal_registry_heads',
-            'missions',
-            'executions',
-            'task_mission_bindings',
-            'runtime_transition_audits'
+            'verification_goal_registry_heads'
           )
           AND (
             pg_catalog.has_table_privilege(forge_role.oid, relation.oid, 'SELECT')
@@ -522,11 +524,7 @@ BEGIN
     'work_package_local_projection_heads',
     'verification_goal_registry_revisions',
     'verification_goal_registry_entries',
-    'verification_goal_registry_heads',
-    'missions',
-    'executions',
-    'task_mission_bindings',
-    'runtime_transition_audits'
+    'verification_goal_registry_heads'
   ]
   LOOP
     IF (

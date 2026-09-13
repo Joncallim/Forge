@@ -14,7 +14,7 @@ describe('VNext Phase 0 A1 protected persistence foundation', () => {
   it('uses the bounded non-login protected-owner handoff rather than application DML', () => {
     expect(migration).toContain('SET ROLE forge_runtime_routines_owner;')
     expect(migration).not.toContain('forge_s4_routines_owner')
-    expect(migration).toContain('REVOKE ALL ON TABLE public.missions,public.executions,public.task_mission_bindings,public.runtime_transition_audits FROM PUBLIC,forge;')
+    expect(migration).toContain('REVOKE ALL ON TABLE public.missions,public.executions,public.task_mission_bindings,public.runtime_transition_audits FROM PUBLIC,forge,forge_runtime_api;')
     expect(migration).toContain("NOT pg_catalog.pg_has_role(session_user,'forge_runtime_api','member') OR current_user<>'forge_runtime_routines_owner'")
     expect(migration).toContain("NOT pg_catalog.pg_has_role(session_user,'forge_runtime_api','member') THEN RAISE EXCEPTION 'VNext mission creation requires the dedicated authenticated server boundary'")
     expect(migration).toContain('TO forge_runtime_api;')
@@ -101,10 +101,11 @@ describe('VNext Phase 0 A1 protected persistence foundation', () => {
       expect(reconciler).toContain(`public.${table}`)
     }
     expect(reconciler).toContain("routine.proowner = 'forge_runtime_routines_owner'::pg_catalog.regrole")
-    expect(reconciler).toContain('forge.create_vnext_mission_v1')
-    expect(reconciler).toContain('forge.transition_vnext_execution_v1')
-    expect(reconciler).toContain("GRANT SELECT (id, submitted_by) ON TABLE public.tasks TO forge_runtime_routines_owner;")
-    expect(bootstrap).toContain('grant select (id, submitted_by) on table public.tasks')
+    expect(reconciler).toContain('forge.resolve_vnext_operator_session_v1')
+    expect(reconciler).toContain('forge.create_vnext_generic_zero_mission_v1')
+    expect(reconciler).toContain('GRANT SELECT, UPDATE ON TABLE public.sessions TO forge_runtime_routines_owner;')
+    expect(reconciler).toContain("GRANT SELECT (id, project_id, submitted_by) ON TABLE public.tasks TO forge_runtime_routines_owner;")
+    expect(bootstrap).toContain('grant select, update on table public.sessions')
   })
 
   it('makes Task current execution pointers forward-only and non-terminal', () => {

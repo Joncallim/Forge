@@ -371,7 +371,7 @@ jobs:
           ALTER ROLE forge_packet_issuer PASSWORD 'forge_packet_issuer_test';
           ALTER ROLE forge_local_evidence_reader PASSWORD 'forge_local_evidence_reader_test';
           ALTER ROLE forge_project_root_reconciler PASSWORD 'forge_project_root_reconciler_test';
-          GRANT forge_runtime_api TO forge_runtime_api_login;
+          GRANT forge_runtime_api TO forge_runtime_api_login WITH INHERIT TRUE;
           SQL
       - name: Materialize legacy root references through the dedicated principal
         env:

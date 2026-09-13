@@ -1,9 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-const { getSession } = vi.hoisted(() => ({ getSession: vi.fn() }))
-const { getAccessibleTask } = vi.hoisted(() => ({ getAccessibleTask: vi.fn() }))
-vi.mock('@/lib/session', () => ({ getSession }))
-vi.mock('@/lib/task-access', () => ({ getAccessibleTask }))
+const { readSessionCredential } = vi.hoisted(() => ({ readSessionCredential: vi.fn() }))
+vi.mock('@/lib/session', () => ({ readSessionCredential }))
 
 import {
   createMissionForAuthorizedSession,
@@ -15,77 +13,60 @@ import {
 } from '@/lib/runtime/v1/server-service'
 
 const digest = 'a'.repeat(64)
+const credential = '018f2a70-9d7b-4cc2-8c74-9ab3a301cf2f'
 const request = new Request('https://forge.test') as never
 
 describe('VNext runtime server service', () => {
   const store: RuntimeStore = {
-  createForUser: vi.fn(async ({ missionId, executionId }) => ({ missionId, executionId })),
-  readMissionForUser: vi.fn(async () => null),
-  transitionMissionForUser: vi.fn(async () => {}),
-  transitionForUser: vi.fn(async () => {}),
+    createGeneric: vi.fn(async ({ missionId, executionId }) => ({ missionId, executionId })),
+    createTask: vi.fn(async ({ missionId, executionId }) => ({ missionId, executionId })),
+    readMission: vi.fn(async () => null),
+    transitionMission: vi.fn(async () => {}),
+    transitionExecution: vi.fn(async () => {}),
   }
 
   beforeEach(() => {
     vi.clearAllMocks()
-    getSession.mockResolvedValue({ sessionId: 'session', userId: '018f2a70-9d7b-7cc2-8c74-9ab3a301cf2f' })
-    getAccessibleTask.mockResolvedValue({ submittedBy: '018f2a70-9d7b-7cc2-8c74-9ab3a301cf2f' })
+    readSessionCredential.mockReturnValue(credential)
   })
 
-  it('rejects forged owner input and derives the owner from the authorized session', async () => {
+  it('rejects every caller-supplied authority field', async () => {
     await expect(createMissionForAuthorizedSession(request, {
-      version: 'v1', desiredOutcomeDigest: digest, constraintsDigest: digest, resourceBindings: [],
-      compatibilityPins: { version: 'v1', workflowRevision: 'zero', policyRevision: 'zero', budgetEnvelopeRevision: 'zero', compatibilityMode: 'software_engineering_legacy_v1' },
-      ownerUserId: '018f2a70-9d7b-7cc2-8c74-9ab3a301cf2f',
+      version: 'v1', desiredOutcomeDigest: digest, constraintsDigest: digest,
+      ownerUserId: '018f2a70-9d7b-4cc2-8c74-9ab3a301cf2f', resourceBindings: [],
+      compatibilityPins: { version: 'v1' }, workflowRevision: 'rev:v1:forged',
     }, store)).rejects.toThrow()
-    await createMissionForAuthorizedSession(request, {
-      version: 'v1', desiredOutcomeDigest: digest, constraintsDigest: digest, resourceBindings: [],
-      compatibilityPins: { version: 'v1', workflowRevision: 'zero', policyRevision: 'zero', budgetEnvelopeRevision: 'zero', compatibilityMode: 'software_engineering_legacy_v1' },
-    }, store)
-    expect(store.createForUser).toHaveBeenCalledWith(expect.objectContaining({
-      ownerUserId: '018f2a70-9d7b-7cc2-8c74-9ab3a301cf2f',
-    }))
+    expect(store.createGeneric).not.toHaveBeenCalled()
   })
 
-  it('passes the authenticated user to reads and transitions, never a client actor', async () => {
-    await readMissionForAuthorizedSession(request, '018f2a70-9d7b-7cc2-8c74-9ab3a301cf2f', store)
-    await expect(transitionExecutionForAuthorizedSession(request, '018f2a70-9d7b-7cc2-8c74-9ab3a301cf2f', {
-      expectedRevision: '0', lifecycle: 'admitted', outcome: null, blockerReasonCode: null,
-      reasonCode: 'execution.admitted', evidenceDigest: null, actorUserId: 'forged',
-    }, store)).rejects.toThrow()
-    expect(store.readMissionForUser).toHaveBeenCalledWith(expect.any(String), '018f2a70-9d7b-7cc2-8c74-9ab3a301cf2f')
+  it('passes the opaque cookie credential, then clears the prepared buffer', async () => {
+    let captured: Buffer | undefined
+    const observingStore: RuntimeStore = { ...store, createGeneric: vi.fn(async (input) => {
+      const liveCredential = input.sessionCredential
+      captured = liveCredential
+      expect(liveCredential.toString('ascii')).toBe(credential)
+      return { missionId: input.missionId, executionId: input.executionId }
+    }) }
+    await createMissionForAuthorizedSession(request, { version: 'v1', desiredOutcomeDigest: digest, constraintsDigest: digest }, observingStore)
+    expect(captured).toBeDefined()
+    expect(captured?.every((value) => value === 0)).toBe(true)
   })
 
-  it('does not let a second session read or transition the first user’s Mission', async () => {
-    const owner = '018f2a70-9d7b-7cc2-8c74-9ab3a301cf2f'
-    const other = '018f2a70-9d7b-7cc2-8c74-9ab3a301cf30'
-    const isolatedStore: RuntimeStore = {
-      createForUser: vi.fn(),
-      readMissionForUser: vi.fn(async (_missionId, userId) => userId === owner ? { id: 'mission' } : null),
-      transitionMissionForUser: vi.fn(async (_missionId, userId) => {
-        if (userId !== owner) throw new Error('owner authorization failed')
-      }),
-      transitionForUser: vi.fn(async (_executionId, userId) => {
-        if (userId !== owner) throw new Error('owner authorization failed')
-      }),
-    }
-    getSession.mockResolvedValue({ sessionId: 'other-session', userId: other })
-    expect(await readMissionForAuthorizedSession(request, '018f2a70-9d7b-7cc2-8c74-9ab3a301cf2f', isolatedStore)).toBeNull()
-    await expect(transitionExecutionForAuthorizedSession(request, '018f2a70-9d7b-7cc2-8c74-9ab3a301cf2f', {
+  it('uses the same credential-only boundary for read, transitions, and Task creation', async () => {
+    await readMissionForAuthorizedSession(request, '018f2a70-9d7b-4cc2-8c74-9ab3a301cf2f', store)
+    await transitionExecutionForAuthorizedSession(request, '018f2a70-9d7b-4cc2-8c74-9ab3a301cf2f', {
       expectedRevision: '0', lifecycle: 'admitted', outcome: null, blockerReasonCode: null,
       reasonCode: 'execution.admitted', evidenceDigest: null,
-    }, isolatedStore)).rejects.toThrow('owner authorization failed')
+    }, store)
+    await createTaskMissionForAuthorizedSession(request, '018f2a70-9d7b-4cc2-8c74-9ab3a301cf2f', { version: 'v1', desiredOutcomeDigest: digest, constraintsDigest: digest }, store)
+    expect(store.readMission).toHaveBeenCalledWith(expect.any(String), expect.any(Buffer))
+    expect(store.transitionExecution).toHaveBeenCalledWith(expect.any(String), expect.any(Buffer), expect.any(Object))
+    expect(store.createTask).toHaveBeenCalledWith(expect.objectContaining({ taskId: expect.any(String), sessionCredential: expect.any(Buffer) }))
   })
 
-  it('derives Task compatibility ownership from the existing Task authority', async () => {
-    getAccessibleTask.mockResolvedValue({ submittedBy: '018f2a70-9d7b-7cc2-8c74-9ab3a301cf30' })
-    await expect(createTaskMissionForAuthorizedSession(request, '018f2a70-9d7b-7cc2-8c74-9ab3a301cf2f', {
-      version: 'v1', desiredOutcomeDigest: digest, constraintsDigest: digest, resourceBindings: [],
-      compatibilityPins: { version: 'v1', workflowRevision: 'zero', policyRevision: 'zero', budgetEnvelopeRevision: 'zero', compatibilityMode: 'software_engineering_legacy_v1' },
-    }, store)).rejects.toThrow('Runtime compatibility task not found')
-  })
-
-  it('rejects calls without an authorized session', async () => {
-    getSession.mockResolvedValue(null)
-    await expect(readMissionForAuthorizedSession(request, '018f2a70-9d7b-7cc2-8c74-9ab3a301cf2f', store)).rejects.toBeInstanceOf(RuntimeAuthorizationError)
+  it('rejects calls without a canonical session cookie before invoking SQL', async () => {
+    readSessionCredential.mockReturnValue(null)
+    await expect(readMissionForAuthorizedSession(request, '018f2a70-9d7b-4cc2-8c74-9ab3a301cf2f', store)).rejects.toBeInstanceOf(RuntimeAuthorizationError)
+    expect(store.readMission).not.toHaveBeenCalled()
   })
 })

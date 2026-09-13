@@ -32,6 +32,9 @@ export async function prepareManagedDockerMigration(): Promise<{ migrator: strin
     await sql.unsafe(`do $$ begin
       if not exists(select 1 from pg_roles where rolname='forge_schema_owner') then create role forge_schema_owner nologin noinherit nosuperuser nocreatedb nocreaterole noreplication nobypassrls; end if;
       if not exists(select 1 from pg_roles where rolname='forge') then create role forge login noinherit nosuperuser nocreatedb nocreaterole noreplication nobypassrls; end if;
+      -- The bootstrap records the one inheritable API-group membership edge.
+      -- This login itself stays NOINHERIT and never receives protected-owner
+      -- membership; its session identity is checked by the SQL boundary.
       if not exists(select 1 from pg_roles where rolname='forge_runtime_api_login') then create role forge_runtime_api_login login noinherit connection limit 5 nosuperuser nocreatedb nocreaterole noreplication nobypassrls; end if;
       alter role forge password '${appPassword.replaceAll("'", "''")}';
       create role ${safe(migrator)} login noinherit connection limit 1 password '${migratorPassword}' valid until (clock_timestamp() + interval '10 minutes') nosuperuser nocreatedb nocreaterole noreplication nobypassrls;

@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import postgres from 'postgres'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { computeCredentialDigest } from '@/lib/session-credential-digest'
 
 const required = process.env.FORGE_VNEXT_RUNTIME_REQUIRE_POSTGRES_TEST === '1'
 const appUrl = process.env.FORGE_VNEXT_RUNTIME_POSTGRES_APP_TEST_URL?.trim()
@@ -8,198 +9,89 @@ const apiUrl = process.env.FORGE_VNEXT_RUNTIME_POSTGRES_API_TEST_URL?.trim()
 const adminUrl = process.env.FORGE_VNEXT_RUNTIME_POSTGRES_ADMIN_TEST_URL?.trim()
 const enabled = Boolean(appUrl && apiUrl && adminUrl)
 
-if (required && !enabled) {
-  throw new Error('FORGE_VNEXT_RUNTIME_REQUIRE_POSTGRES_TEST=1 requires disposable legacy-app, runtime-API, and administrator PostgreSQL URLs.')
-}
+if (required && !enabled) throw new Error('FORGE_VNEXT_RUNTIME_REQUIRE_POSTGRES_TEST=1 requires disposable legacy-app, runtime-API, and administrator PostgreSQL URLs.')
 
-describe.skipIf(!enabled)('VNext runtime protected PostgreSQL foundation', () => {
-  let app: ReturnType<typeof postgres>
+describe.skipIf(!enabled)('VNext runtime session authority', () => {
+  let api: ReturnType<typeof postgres>
   let legacy: ReturnType<typeof postgres>
   let admin: ReturnType<typeof postgres>
   const actor = randomUUID()
   const otherActor = randomUUID()
-  const mission = randomUUID()
-  const execution = randomUUID()
+  const credential = randomUUID()
+  const otherCredential = randomUUID()
   const digest = 'a'.repeat(64)
 
-  async function create(): Promise<void> {
-    await app`
-      select * from forge.create_vnext_mission_v1(
-        ${mission}::uuid, ${execution}::uuid, null::uuid, ${actor}::uuid,
-        ${digest}, ${digest}, ${app.json({ version: 'v1', workflowRevision: 'zero-capability-v1', policyRevision: 'zero-capability-v1', budgetEnvelopeRevision: 'zero-capability-v1', compatibilityMode: 'software_engineering_legacy_v1' })},
-        'zero-capability-v1', ${app.json([])}, 'mission.created'
-      )
-    `
-  }
+  const generic = (sessionCredential: string, mission = randomUUID(), execution = randomUUID()) => api`
+    select * from forge.create_vnext_generic_zero_mission_v1(${Buffer.from(sessionCredential, 'ascii')}::bytea, ${mission}::uuid, ${execution}::uuid, ${digest}, ${digest})
+  `
 
   beforeAll(async () => {
-    app = postgres(apiUrl!, { max: 4, onnotice: () => {} })
+    api = postgres(apiUrl!, { max: 4, onnotice: () => {} })
     legacy = postgres(appUrl!, { max: 2, onnotice: () => {} })
     admin = postgres(adminUrl!, { max: 1, onnotice: () => {} })
     await admin`insert into users (id, display_name) values (${actor}::uuid, 'runtime owner'), (${otherActor}::uuid, 'other runtime owner')`
+    await admin`insert into sessions (user_id, credential_digest_v1, expires_at, credential_storage_version) values (${actor}::uuid, ${computeCredentialDigest(credential)}, clock_timestamp() + interval '1 hour', 1), (${otherActor}::uuid, ${computeCredentialDigest(otherCredential)}, clock_timestamp() + interval '1 hour', 1)`
   })
-  afterAll(async () => { await legacy?.end({ timeout: 5 }); await app?.end({ timeout: 5 }); await admin?.end({ timeout: 5 }) })
+  afterAll(async () => { await legacy?.end({ timeout: 5 }); await api?.end({ timeout: 5 }); await admin?.end({ timeout: 5 }) })
 
-  it('denies direct app DML but permits the protected atomic creator', async () => {
+  it('exposes neither protected tables nor caller-shaped routines to either app role', async () => {
     await expect(legacy`insert into missions (id, owner_principal_type, owner_principal_id, desired_outcome_digest, constraints_digest, compatibility_pins) values (${randomUUID()}::uuid, 'operator', ${actor}::uuid, ${digest}, ${digest}, '{}'::jsonb)`).rejects.toMatchObject({ code: '42501' })
-    await expect(legacy`select * from forge.create_vnext_mission_v1(${randomUUID()}::uuid, ${randomUUID()}::uuid, null::uuid, ${otherActor}::uuid, ${digest}, ${digest}, ${legacy.json({ version: 'v1', workflowRevision: 'zero-capability-v1', policyRevision: 'zero-capability-v1', budgetEnvelopeRevision: 'zero-capability-v1', compatibilityMode: 'generic_zero_capability_v1' })}, 'zero-capability-v1', ${legacy.json([])}, 'mission.created')`).rejects.toMatchObject({ code: '42501' })
-    const projectId = randomUUID()
-    const taskId = randomUUID()
-    await admin`insert into projects (id, name, submitted_by) values (${projectId}::uuid, 'runtime task-owner hostile fixture', ${actor}::uuid)`
-    await admin`insert into tasks (id, project_id, submitted_by, title, prompt) values (${taskId}::uuid, ${projectId}::uuid, ${otherActor}::uuid, 'runtime task-owner hostile fixture', 'runtime task-owner hostile fixture')`
-    await expect(app`
-      select * from forge.create_vnext_mission_v1(
-        ${randomUUID()}::uuid, ${randomUUID()}::uuid, ${taskId}::uuid, ${actor}::uuid,
-        ${digest}, ${digest}, ${app.json({ version: 'v1', workflowRevision: 'zero-capability-v1', policyRevision: 'zero-capability-v1', budgetEnvelopeRevision: 'zero-capability-v1', compatibilityMode: 'software_engineering_legacy_v1' })},
-        'zero-capability-v1', ${app.json([])}, 'mission.created'
-      )
-    `).rejects.toMatchObject({ code: '22023' })
-    await expect(app`
-      select * from forge.create_vnext_mission_v1(
-        ${randomUUID()}::uuid, ${randomUUID()}::uuid, null::uuid, ${actor}::uuid,
-        ${digest}, ${digest}, ${app.json({ version: 'v1', workflowRevision: 'zero-capability-v1', policyRevision: 'zero-capability-v1', budgetEnvelopeRevision: 'zero-capability-v1', compatibilityMode: 'software_engineering_legacy_v1' })},
-        'zero-capability-v1', ${app.json([{ version: 'v1', resource: { version: 'v1', id: null, type: 'service', revision: '1', classification: 'unknown' }, selectorDigest: digest, provenance: 'system' }])}, 'mission.created'
-      )
-    `).rejects.toMatchObject({ code: '22023' })
-    await expect(app`
-      select * from forge.create_vnext_mission_v1(
-        ${randomUUID()}::uuid, ${randomUUID()}::uuid, null::uuid, ${actor}::uuid,
-        ${digest}, ${digest}, ${app.json({ version: 'v1', workflowRevision: 'zero-capability-v1', policyRevision: 'zero-capability-v1', budgetEnvelopeRevision: 'zero-capability-v1', compatibilityMode: 'software_engineering_legacy_v1' })},
-        'zero-capability-v1', 'true'::jsonb, 'mission.created'
-      )
-    `).rejects.toMatchObject({ code: '22023' })
-    await expect(app`
-      select * from forge.create_vnext_mission_v1(
-        ${randomUUID()}::uuid, ${randomUUID()}::uuid, null::uuid, ${actor}::uuid,
-        ${digest}, ${digest}, ${app.json({ version: 'v1', workflowRevision: 'zero-capability-v1', policyRevision: 'zero-capability-v1', budgetEnvelopeRevision: 'zero-capability-v1', compatibilityMode: 'software_engineering_legacy_v1', unexpected: 'reject' })},
-        'zero-capability-v1', ${app.json([])}, 'mission.created'
-      )
-    `).rejects.toMatchObject({ code: '22023' })
-    await create()
-    const rows = await admin<{ missionAuditCount: string; executionAuditCount: string }[]>`
-      select
-        count(*) filter (where entity_kind = 'mission')::text as "missionAuditCount",
-        count(*) filter (where entity_kind = 'execution')::text as "executionAuditCount"
-      from runtime_transition_audits where entity_id in (${mission}::uuid, ${execution}::uuid)
+    await expect(api`select * from forge.create_vnext_mission_v1(${randomUUID()}::uuid, ${randomUUID()}::uuid, null::uuid, ${actor}::uuid, ${digest}, ${digest}, '{}'::jsonb, 'rev:v1:forged', '[]'::jsonb, 'mission.created')`).rejects.toMatchObject({ code: '42501' })
+    const [acl] = await admin<{ apiRead: boolean; apiCreate: boolean; apiResolver: boolean; legacyCreate: boolean }[]>`
+      select pg_catalog.has_table_privilege('forge_runtime_api_login', 'public.missions', 'select') as "apiRead",
+        pg_catalog.has_function_privilege('forge_runtime_api_login', 'forge.create_vnext_generic_zero_mission_v1(bytea,uuid,uuid,text,text)'::regprocedure, 'execute') as "apiCreate",
+        pg_catalog.has_function_privilege('forge_runtime_api_login', 'forge.resolve_vnext_operator_session_v1(bytea)'::regprocedure, 'execute') as "apiResolver",
+        pg_catalog.has_function_privilege('forge', 'forge.create_vnext_generic_zero_mission_v1(bytea,uuid,uuid,text,text)'::regprocedure, 'execute') as "legacyCreate"
     `
-    expect(rows[0]).toEqual({ missionAuditCount: '1', executionAuditCount: '1' })
+    expect(acl).toEqual({ apiRead: false, apiCreate: true, apiResolver: false, legacyCreate: false })
   })
 
-  it('gives only the dedicated runtime login the group-backed read and routine boundary', async () => {
-    const [acl] = await admin<{ apiExecute: boolean; apiRead: boolean; legacyExecute: boolean; legacyMembership: boolean }[]>`
-      select
-        pg_catalog.has_function_privilege('forge_runtime_api_login', 'forge.create_vnext_mission_v1(uuid,uuid,uuid,uuid,text,text,jsonb,text,jsonb,text)'::regprocedure, 'execute') as "apiExecute",
-        pg_catalog.has_table_privilege('forge_runtime_api_login', 'public.missions', 'select') as "apiRead",
-        pg_catalog.has_function_privilege('forge', 'forge.create_vnext_mission_v1(uuid,uuid,uuid,uuid,text,text,jsonb,text,jsonb,text)'::regprocedure, 'execute') as "legacyExecute",
-        pg_catalog.pg_has_role('forge', 'forge_runtime_api', 'member') as "legacyMembership"
-    `
-    expect(acl).toEqual({ apiExecute: true, apiRead: true, legacyExecute: false, legacyMembership: false })
+  it('uses one indistinguishable database failure for malformed, random, revoked, and expired credentials', async () => {
+    const revoked = randomUUID()
+    const expired = randomUUID()
+    await admin`insert into sessions (user_id, credential_digest_v1, expires_at, revoked_at, credential_storage_version) values (${actor}::uuid, ${computeCredentialDigest(revoked)}, clock_timestamp() + interval '1 hour', clock_timestamp(), 1), (${actor}::uuid, ${computeCredentialDigest(expired)}, clock_timestamp() - interval '1 second', null, 1)`
+    for (const candidate of [Buffer.from('bad', 'ascii'), Buffer.from(randomUUID(), 'ascii'), Buffer.from(revoked, 'ascii'), Buffer.from(expired, 'ascii')]) {
+      await expect(api`select * from forge.create_vnext_generic_zero_mission_v1(${candidate}::bytea, ${randomUUID()}::uuid, ${randomUUID()}::uuid, ${digest}, ${digest})`).rejects.toMatchObject({ code: '28000', message: expect.stringContaining('VNext session authorization failed') })
+    }
   })
 
-  it('records that the protected 0034 handoff was cleaned after the migration ledger committed', async () => {
-    const [handoff] = await admin<{ migrationTag: string; cleanupCompletedAt: Date | string | null }[]>`
-      select migration_tag as "migrationTag", cleanup_completed_at as "cleanupCompletedAt"
-      from public.forge_protected_migration_handoffs
-      where migration_tag = '0034_vnext_phase0_a1_runtime_foundation'
-    `
-    expect(handoff?.migrationTag).toBe('0034_vnext_phase0_a1_runtime_foundation')
-    expect(handoff?.cleanupCompletedAt).not.toBeNull()
+  it('derives ownership from the locked session for creation, reads, and transitions', async () => {
+    const mission = randomUUID()
+    const execution = randomUUID()
+    await generic(credential, mission, execution)
+    const [created] = await admin`select compatibility_pins, resource_bindings from missions join executions on executions.mission_id=missions.id where missions.id=${mission}::uuid`
+    expect(created.compatibility_pins).toMatchObject({ compatibilityMode: 'generic_zero_capability_v1', policyRevision: 'rev:v1:generic-zero-v1' })
+    expect(created.resource_bindings).toEqual([])
+    expect(await api`select * from forge.read_vnext_mission_v1(${Buffer.from(otherCredential, 'ascii')}::bytea, ${mission}::uuid)`).toEqual([])
+    await expect(api`select * from forge.transition_vnext_execution_for_session_v1(${Buffer.from(otherCredential, 'ascii')}::bytea, ${execution}::uuid, 0::bigint, 'terminal', 'cancelled', null, 'execution.cancelled', null)`).rejects.toMatchObject({ code: 'P3345' })
+    await api`select * from forge.transition_vnext_execution_for_session_v1(${Buffer.from(credential, 'ascii')}::bytea, ${execution}::uuid, 0::bigint, 'terminal', 'cancelled', null, 'execution.cancelled', null)`
   })
 
-  it('keeps the generic project-less profile distinct and strictly zero-capability', async () => {
-    const genericPins = { version: 'v1', workflowRevision: 'zero-capability-v1', policyRevision: 'zero-capability-v1', budgetEnvelopeRevision: 'zero-capability-v1', compatibilityMode: 'generic_zero_capability_v1' }
-    await app`
-      select * from forge.create_vnext_mission_v1(
-        ${randomUUID()}::uuid, ${randomUUID()}::uuid, null::uuid, ${actor}::uuid,
-        ${digest}, ${digest}, ${app.json(genericPins)}, 'zero-capability-v1', ${app.json([])}, 'mission.created'
-      )
-    `
-    await expect(app`
-      select * from forge.create_vnext_mission_v1(
-        ${randomUUID()}::uuid, ${randomUUID()}::uuid, null::uuid, ${actor}::uuid,
-        ${digest}, ${digest}, ${app.json(genericPins)}, 'zero-capability-v1',
-        ${app.json([{ version: 'v1', resource: { version: 'v1', id: randomUUID(), type: 'service', revision: '1', classification: 'unknown' }, selectorDigest: digest, provenance: 'system' }])},
-        'mission.created'
-      )
-    `).rejects.toMatchObject({ code: '22023' })
-  })
-
-  it('uses CAS so concurrent terminal transitions produce one audit revision', async () => {
-    await expect(app`select * from forge.transition_vnext_execution_v1(${execution}::uuid, 0::bigint, 'running', null, null, ${actor}::uuid, 'execution.running', null)`).rejects.toMatchObject({ code: 'P3346' })
-    await expect(app`select * from forge.transition_vnext_execution_v1(${execution}::uuid, 0::bigint, 'terminal', 'cancelled', null, ${otherActor}::uuid, 'execution.cancelled', null)`).rejects.toMatchObject({ code: 'P3345' })
-    const transition = () => app`select * from forge.transition_vnext_execution_v1(${execution}::uuid, 0::bigint, 'terminal', 'cancelled', null, ${actor}::uuid, 'execution.cancelled', null)`
+  it('keeps compare-and-swap transitions inside the credential-derived owner boundary', async () => {
+    const mission = randomUUID()
+    const execution = randomUUID()
+    await generic(credential, mission, execution)
+    const transition = () => api`select * from forge.transition_vnext_execution_for_session_v1(${Buffer.from(credential, 'ascii')}::bytea, ${execution}::uuid, 0::bigint, 'terminal', 'cancelled', null, 'execution.cancelled', null)`
     const results = await Promise.allSettled([transition(), transition()])
     expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1)
     expect(results.filter((result) => result.status === 'rejected')).toHaveLength(1)
-    await expect(app`select * from forge.transition_vnext_execution_v1(${execution}::uuid, 1::bigint, 'terminal', 'failed', null, ${actor}::uuid, 'execution.failed', null)`).rejects.toMatchObject({ code: 'P3344' })
-    const audits = await admin`select resulting_revision, reason_code from runtime_transition_audits where entity_kind = 'execution' and entity_id = ${execution}::uuid order by resulting_revision`
-    expect(audits).toHaveLength(2)
+    await expect(api`select * from forge.transition_vnext_execution_for_session_v1(${Buffer.from(credential, 'ascii')}::bytea, ${execution}::uuid, 1::bigint, 'terminal', 'failed', null, 'execution.failed', null)`).rejects.toMatchObject({ code: 'P3344' })
+    const audits = await admin`select resulting_revision from runtime_transition_audits where entity_kind='execution' and entity_id=${execution}::uuid order by resulting_revision`
     expect(audits.map((row) => row.resulting_revision)).toEqual(['0', '1'])
   })
 
-  it('persists, loads, and legally transitions a project-less Mission with atomic audits', async () => {
-    const projectlessMission = randomUUID()
-    const projectlessExecution = randomUUID()
-    await app`
-      select * from forge.create_vnext_mission_v1(
-        ${projectlessMission}::uuid, ${projectlessExecution}::uuid, null::uuid, ${actor}::uuid,
-        ${digest}, ${digest}, ${app.json({ version: 'v1', workflowRevision: 'zero-capability-v1', policyRevision: 'zero-capability-v1', budgetEnvelopeRevision: 'zero-capability-v1', compatibilityMode: 'software_engineering_legacy_v1' })},
-        'zero-capability-v1', ${app.json([])}, 'mission.created'
-      )
-    `
-    const [created] = await app`select lifecycle_state, outcome, state_revision::text as revision, task_id from missions left join task_mission_bindings on task_mission_bindings.mission_id=missions.id where missions.id=${projectlessMission}::uuid`
-    expect(created).toEqual({ lifecycle_state: 'draft', outcome: null, revision: '0', task_id: null })
-    await app`select * from forge.transition_vnext_mission_v1(${projectlessMission}::uuid, 0::bigint, 'active', null, ${actor}::uuid, 'mission.activated', null)`
-    await expect(app`select * from forge.transition_vnext_mission_v1(${projectlessMission}::uuid, 1::bigint, 'waiting', null, ${actor}::uuid, 'mission.waiting', null)`).rejects.toMatchObject({ code: 'P3347' })
-    for (const [from, to, revision, reason] of [
-      ['created', 'admitted', 0, 'execution.admitted'],
-      ['admitted', 'queued', 1, 'execution.queued'],
-      ['queued', 'leased', 2, 'execution.leased'],
-      ['leased', 'running', 3, 'execution.running'],
-      ['running', 'waiting', 4, 'execution.waiting'],
-      ['waiting', 'terminal', 5, 'execution.succeeded'],
-    ] as const) {
-      await app`select * from forge.transition_vnext_execution_v1(${projectlessExecution}::uuid, ${revision}::bigint, ${to}, ${to === 'terminal' ? 'succeeded' : null}, null, ${actor}::uuid, ${reason}, null)`
-      void from
+  it('derives Task resources and rejects mismatched, archived, and rootless Task fixtures', async () => {
+    const makeTask = async (options: { taskOwner?: string; projectOwner?: string; archived?: boolean; rootRef?: string | null; rootRevision?: number } = {}) => {
+      const project = randomUUID(); const task = randomUUID()
+      const rootRef = options.rootRef === undefined ? randomUUID() : options.rootRef
+      await admin`insert into projects (id, name, submitted_by, root_ref, root_binding_revision, archived_at) values (${project}::uuid, 'runtime fixture', ${(options.projectOwner ?? actor)}::uuid, ${rootRef}::uuid, ${(options.rootRevision ?? 1)}::bigint, ${options.archived ? new Date() : null})`
+      await admin`insert into tasks (id, project_id, submitted_by, title, prompt) values (${task}::uuid, ${project}::uuid, ${(options.taskOwner ?? actor)}::uuid, 'runtime fixture', 'runtime fixture')`
+      return task
     }
-    await app`select * from forge.transition_vnext_mission_v1(${projectlessMission}::uuid, 1::bigint, 'waiting', null, ${actor}::uuid, 'mission.waiting', null)`
-    await app`select * from forge.transition_vnext_mission_v1(${projectlessMission}::uuid, 2::bigint, 'active', null, ${actor}::uuid, 'mission.activated', null)`
-    await app`select * from forge.transition_vnext_mission_v1(${projectlessMission}::uuid, 3::bigint, 'terminal', 'succeeded', ${actor}::uuid, 'mission.succeeded', null)`
-    await expect(app`select * from forge.transition_vnext_execution_v1(${projectlessExecution}::uuid, 6::bigint, 'terminal', 'failed', null, ${actor}::uuid, 'execution.failed', null)`).rejects.toMatchObject({ code: 'P3348' })
-    const audits = await admin`select entity_kind, resulting_revision, occurred_at from runtime_transition_audits where entity_id in (${projectlessMission}::uuid, ${projectlessExecution}::uuid) order by occurred_at, resulting_revision`
-    expect(audits.length).toBe(12)
-    expect(audits.every((audit) => audit.occurred_at instanceof Date || typeof audit.occurred_at === 'string')).toBe(true)
-  })
-
-  it('serializes Mission waiting against an active Execution instead of admitting an invalid interleaving', async () => {
-    const concurrentMission = randomUUID()
-    const concurrentExecution = randomUUID()
-    await app`
-      select * from forge.create_vnext_mission_v1(
-        ${concurrentMission}::uuid, ${concurrentExecution}::uuid, null::uuid, ${actor}::uuid,
-        ${digest}, ${digest}, ${app.json({ version: 'v1', workflowRevision: 'zero-capability-v1', policyRevision: 'zero-capability-v1', budgetEnvelopeRevision: 'zero-capability-v1', compatibilityMode: 'software_engineering_legacy_v1' })},
-        'zero-capability-v1', ${app.json([])}, 'mission.created'
-      )
-    `
-    await app`select * from forge.transition_vnext_mission_v1(${concurrentMission}::uuid, 0::bigint, 'active', null, ${actor}::uuid, 'mission.activated', null)`
-    const wait = () => app`select * from forge.transition_vnext_mission_v1(${concurrentMission}::uuid, 1::bigint, 'waiting', null, ${actor}::uuid, 'mission.waiting', null)`
-    const terminalize = () => app`select * from forge.transition_vnext_execution_v1(${concurrentExecution}::uuid, 0::bigint, 'terminal', 'cancelled', null, ${actor}::uuid, 'execution.cancelled', null)`
-    const results = await Promise.allSettled([wait(), terminalize()])
-    expect(results.filter((result) => result.status === 'fulfilled').length).toBeGreaterThanOrEqual(1)
-    const [state] = await admin<{ missionState: string; executionState: string }[]>`
-      select mission.lifecycle_state as "missionState", execution.lifecycle_state as "executionState"
-      from missions mission join executions execution on execution.mission_id = mission.id
-      where mission.id = ${concurrentMission}::uuid
-    `
-    expect(state).not.toEqual({ missionState: 'waiting', executionState: 'created' })
-    expect(state).not.toEqual({ missionState: 'terminal', executionState: 'created' })
-  })
-
-  it('stores only typed reasons and safe digests in the authoritative audit shape', async () => {
-    const columns = await admin<{ column_name: string }[]>`
-      select column_name from information_schema.columns
-      where table_schema = 'public' and table_name = 'runtime_transition_audits'
-    `
-    expect(columns.map((column) => column.column_name)).not.toEqual(expect.arrayContaining(['prompt', 'title', 'local_path', 'error_message']))
+    const task = await makeTask()
+    await api`select * from forge.create_vnext_task_mission_v1(${Buffer.from(credential, 'ascii')}::bytea, ${task}::uuid, ${randomUUID()}::uuid, ${randomUUID()}::uuid, ${digest}, ${digest})`
+    for (const taskId of [await makeTask({ taskOwner: otherActor }), await makeTask({ archived: true }), await makeTask({ rootRef: null }), await makeTask({ rootRevision: 0 })]) {
+      await expect(api`select * from forge.create_vnext_task_mission_v1(${Buffer.from(credential, 'ascii')}::bytea, ${taskId}::uuid, ${randomUUID()}::uuid, ${randomUUID()}::uuid, ${digest}, ${digest})`).rejects.toMatchObject({ code: 'P3345' })
+    }
   })
 })

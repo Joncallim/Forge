@@ -121,7 +121,64 @@ END; $$;
 CREATE FUNCTION forge.advance_task_execution_pointer_v1(p_task_id uuid,p_expected_generation bigint,p_next_execution_id uuid,p_actor_user_id uuid,p_reason_code text) RETURNS TABLE(resulting_generation bigint,occurred_at timestamptz) LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog AS $$
 DECLARE v_mission uuid; v_generation bigint; v_owner uuid; v_policy text; v_current_sequence bigint; v_next_sequence bigint; v_next_lifecycle text; v_now timestamptz:=clock_timestamp(); BEGIN IF NOT pg_catalog.pg_has_role(session_user,'forge_runtime_api','member') THEN RAISE EXCEPTION 'VNext binding transition requires the dedicated authenticated server boundary' USING ERRCODE='42501'; END IF; SELECT binding.mission_id,binding.current_execution_generation,mission.owner_principal_id,mission.compatibility_pins->>'policyRevision',current_execution.execution_sequence INTO v_mission,v_generation,v_owner,v_policy,v_current_sequence FROM public.task_mission_bindings binding JOIN public.missions mission ON mission.id=binding.mission_id JOIN public.executions current_execution ON current_execution.id=binding.current_execution_id WHERE binding.task_id=p_task_id FOR UPDATE OF binding,mission,current_execution; IF NOT FOUND OR v_owner IS DISTINCT FROM p_actor_user_id THEN RAISE EXCEPTION 'VNext task binding owner authorization failed' USING ERRCODE='P3345'; END IF; IF p_expected_generation IS NULL OR p_expected_generation<>v_generation THEN RAISE EXCEPTION 'VNext task pointer generation conflict' USING ERRCODE='P3343'; END IF; SELECT execution_sequence,lifecycle_state INTO v_next_sequence,v_next_lifecycle FROM public.executions WHERE id=p_next_execution_id AND mission_id=v_mission FOR UPDATE; IF forge.vnext_reason_code_valid_v1(p_reason_code) IS NOT TRUE OR NOT FOUND OR v_next_lifecycle='terminal' OR v_next_sequence<=v_current_sequence THEN RAISE EXCEPTION 'VNext task pointer requires a newer non-terminal Execution' USING ERRCODE='22023'; END IF; UPDATE public.task_mission_bindings SET current_execution_id=p_next_execution_id,current_execution_generation=current_execution_generation+1 WHERE task_id=p_task_id; INSERT INTO public.runtime_transition_audits(entity_kind,entity_id,to_lifecycle_state,resulting_revision,actor_principal_type,actor_principal_id,reason_code,governing_policy_revision,occurred_at) VALUES('task_binding',p_task_id,'pointer_advanced',v_generation+1,'operator',p_actor_user_id,p_reason_code,v_policy,v_now); RETURN QUERY SELECT v_generation+1,v_now; END; $$;
 --> statement-breakpoint
-REVOKE ALL ON TABLE public.missions,public.executions,public.task_mission_bindings,public.runtime_transition_audits FROM PUBLIC,forge; REVOKE ALL ON FUNCTION forge.guard_vnext_runtime_write_v1() FROM PUBLIC,forge; REVOKE ALL ON FUNCTION forge.create_vnext_mission_v1(uuid,uuid,uuid,uuid,text,text,jsonb,text,jsonb,text),forge.transition_vnext_mission_v1(uuid,bigint,text,text,uuid,text,text),forge.transition_vnext_execution_v1(uuid,bigint,text,text,text,uuid,text,text),forge.advance_task_execution_pointer_v1(uuid,bigint,uuid,uuid,text) FROM PUBLIC,forge;
-GRANT SELECT ON TABLE public.missions,public.executions,public.task_mission_bindings,public.runtime_transition_audits TO forge,forge_runtime_api; GRANT USAGE ON SCHEMA forge TO forge_runtime_api; GRANT EXECUTE ON FUNCTION forge.create_vnext_mission_v1(uuid,uuid,uuid,uuid,text,text,jsonb,text,jsonb,text),forge.transition_vnext_mission_v1(uuid,bigint,text,text,uuid,text,text),forge.transition_vnext_execution_v1(uuid,bigint,text,text,text,uuid,text,text),forge.advance_task_execution_pointer_v1(uuid,bigint,uuid,uuid,text) TO forge_runtime_api;
+-- A1 session authority refinement: callers bring only the opaque cookie
+-- credential. The protected owner resolves and locks its database session, so
+-- a request cannot nominate another operator or mint resource/profile inputs.
+CREATE FUNCTION forge.resolve_vnext_operator_session_v1(p_session_credential bytea) RETURNS uuid LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog AS $$
+DECLARE v_user_id uuid; v_digest bytea; v_hex text;
+BEGIN
+ IF session_user <> 'forge_runtime_api_login' OR current_user <> 'forge_runtime_routines_owner' THEN RAISE EXCEPTION 'VNext session resolver is unavailable' USING ERRCODE='42501'; END IF;
+ v_hex:=encode(p_session_credential,'hex');
+ IF octet_length(p_session_credential)<>36 OR v_hex !~ '^(?:3[0-9]|6[1-6]){8}2d(?:3[0-9]|6[1-6]){4}2d34(?:3[0-9]|6[1-6]){3}2d(?:38|39|61|62)(?:3[0-9]|6[1-6]){3}2d(?:3[0-9]|6[1-6]){12}$' THEN RAISE EXCEPTION 'VNext session authorization failed' USING ERRCODE='28000'; END IF;
+ v_digest:=sha256(decode('666f7267653a7765622d73657373696f6e3a763100','hex') || p_session_credential);
+ SELECT user_id INTO v_user_id FROM public.sessions WHERE credential_digest_v1=v_digest AND revoked_at IS NULL AND expires_at IS NOT NULL AND clock_timestamp()<expires_at FOR UPDATE;
+ IF NOT FOUND THEN RAISE EXCEPTION 'VNext session authorization failed' USING ERRCODE='28000'; END IF;
+ RETURN v_user_id;
+END; $$;
+--> statement-breakpoint
+-- The caller-facing functions accept an opaque session credential and ordinary
+-- concurrency/input values only.  Actor, owner, Task, Project root, profile,
+-- provenance, and policy/workflow revisions are all selected in this owner
+-- boundary rather than copied from a request body.
+CREATE FUNCTION forge.create_vnext_generic_zero_mission_v1(p_session_credential bytea,p_mission_id uuid,p_execution_id uuid,p_desired_outcome_digest text,p_constraints_digest text) RETURNS TABLE(mission_id uuid,execution_id uuid,occurred_at timestamptz) LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog AS $$
+DECLARE v_actor uuid;
+BEGIN
+ v_actor:=forge.resolve_vnext_operator_session_v1(p_session_credential);
+ RETURN QUERY SELECT * FROM forge.create_vnext_mission_v1(p_mission_id,p_execution_id,NULL,v_actor,p_desired_outcome_digest,p_constraints_digest,jsonb_build_object('version','v1','workflowRevision','rev:v1:generic-zero-v1','policyRevision','rev:v1:generic-zero-v1','budgetEnvelopeRevision','rev:v1:generic-zero-v1','compatibilityMode','generic_zero_capability_v1'),'rev:v1:generic-zero-v1','[]'::jsonb,'mission.created');
+END; $$;
+--> statement-breakpoint
+CREATE FUNCTION forge.create_vnext_task_mission_v1(p_session_credential bytea,p_task_id uuid,p_mission_id uuid,p_execution_id uuid,p_desired_outcome_digest text,p_constraints_digest text) RETURNS TABLE(mission_id uuid,execution_id uuid,occurred_at timestamptz) LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog AS $$
+DECLARE v_actor uuid; v_root_ref uuid; v_root_revision bigint;
+BEGIN
+ v_actor:=forge.resolve_vnext_operator_session_v1(p_session_credential);
+ SELECT project.root_ref,project.root_binding_revision INTO v_root_ref,v_root_revision FROM public.tasks task JOIN public.projects project ON project.id=task.project_id WHERE task.id=p_task_id AND task.submitted_by=v_actor AND project.submitted_by=v_actor AND project.archived_at IS NULL;
+ IF NOT FOUND OR v_root_ref IS NULL OR v_root_revision IS NULL OR v_root_revision<=0 THEN RAISE EXCEPTION 'VNext Task compatibility authority is unavailable' USING ERRCODE='P3345'; END IF;
+ RETURN QUERY SELECT * FROM forge.create_vnext_mission_v1(p_mission_id,p_execution_id,p_task_id,v_actor,p_desired_outcome_digest,p_constraints_digest,jsonb_build_object('version','v1','workflowRevision','rev:v1:task-compatibility-v1','policyRevision','rev:v1:task-compatibility-v1','budgetEnvelopeRevision','rev:v1:task-compatibility-v1','compatibilityMode','software_engineering_legacy_v1'),'rev:v1:task-compatibility-v1',jsonb_build_array(jsonb_build_object('version','v1','resource',jsonb_build_object('version','v1','id',v_root_ref::text,'type','repository','revision','rev:v1:root-'||v_root_revision::text,'classification','unknown'),'selectorDigest',encode(sha256(convert_to(p_task_id::text||':'||v_root_ref::text||':'||v_root_revision::text,'UTF8')),'hex'),'provenance','compatibility')),'mission.created');
+END; $$;
+--> statement-breakpoint
+CREATE FUNCTION forge.read_vnext_mission_v1(p_session_credential bytea,p_mission_id uuid) RETURNS TABLE(id uuid,lifecycle_state text,outcome text,state_revision bigint,owner_principal_type text,owner_principal_id uuid,created_at timestamptz,active_at timestamptz,waiting_at timestamptz,paused_at timestamptz,terminal_at timestamptz,updated_at timestamptz) LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog AS $$
+DECLARE v_actor uuid;
+BEGIN
+ v_actor:=forge.resolve_vnext_operator_session_v1(p_session_credential);
+ RETURN QUERY SELECT mission.id,mission.lifecycle_state,mission.outcome,mission.state_revision,mission.owner_principal_type,mission.owner_principal_id,mission.created_at,mission.active_at,mission.waiting_at,mission.paused_at,mission.terminal_at,mission.updated_at FROM public.missions mission WHERE mission.id=p_mission_id AND mission.owner_principal_id=v_actor;
+END; $$;
+--> statement-breakpoint
+CREATE FUNCTION forge.transition_vnext_mission_for_session_v1(p_session_credential bytea,p_mission_id uuid,p_expected_revision bigint,p_to_lifecycle_state text,p_outcome text,p_reason_code text,p_evidence_digest text DEFAULT NULL) RETURNS TABLE(resulting_revision bigint,occurred_at timestamptz) LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog AS $$
+DECLARE v_actor uuid;
+BEGIN v_actor:=forge.resolve_vnext_operator_session_v1(p_session_credential); RETURN QUERY SELECT * FROM forge.transition_vnext_mission_v1(p_mission_id,p_expected_revision,p_to_lifecycle_state,p_outcome,v_actor,p_reason_code,p_evidence_digest); END; $$;
+--> statement-breakpoint
+CREATE FUNCTION forge.transition_vnext_execution_for_session_v1(p_session_credential bytea,p_execution_id uuid,p_expected_revision bigint,p_to_lifecycle_state text,p_outcome text,p_blocker_reason_code text,p_reason_code text,p_evidence_digest text DEFAULT NULL) RETURNS TABLE(resulting_revision bigint,occurred_at timestamptz) LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog AS $$
+DECLARE v_actor uuid;
+BEGIN v_actor:=forge.resolve_vnext_operator_session_v1(p_session_credential); RETURN QUERY SELECT * FROM forge.transition_vnext_execution_v1(p_execution_id,p_expected_revision,p_to_lifecycle_state,p_outcome,p_blocker_reason_code,v_actor,p_reason_code,p_evidence_digest); END; $$;
+--> statement-breakpoint
+CREATE FUNCTION forge.advance_task_execution_pointer_for_session_v1(p_session_credential bytea,p_task_id uuid,p_expected_generation bigint,p_next_execution_id uuid,p_reason_code text) RETURNS TABLE(resulting_generation bigint,occurred_at timestamptz) LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog AS $$
+DECLARE v_actor uuid;
+BEGIN v_actor:=forge.resolve_vnext_operator_session_v1(p_session_credential); RETURN QUERY SELECT * FROM forge.advance_task_execution_pointer_v1(p_task_id,p_expected_generation,p_next_execution_id,v_actor,p_reason_code); END; $$;
+--> statement-breakpoint
+REVOKE ALL ON TABLE public.missions,public.executions,public.task_mission_bindings,public.runtime_transition_audits FROM PUBLIC,forge,forge_runtime_api;
+REVOKE ALL ON FUNCTION forge.guard_vnext_runtime_write_v1(),forge.resolve_vnext_operator_session_v1(bytea),forge.create_vnext_mission_v1(uuid,uuid,uuid,uuid,text,text,jsonb,text,jsonb,text),forge.transition_vnext_mission_v1(uuid,bigint,text,text,uuid,text,text),forge.transition_vnext_execution_v1(uuid,bigint,text,text,text,uuid,text,text),forge.advance_task_execution_pointer_v1(uuid,bigint,uuid,uuid,text) FROM PUBLIC,forge,forge_runtime_api;
+REVOKE ALL ON FUNCTION forge.create_vnext_generic_zero_mission_v1(bytea,uuid,uuid,text,text),forge.create_vnext_task_mission_v1(bytea,uuid,uuid,uuid,text,text),forge.read_vnext_mission_v1(bytea,uuid),forge.transition_vnext_mission_for_session_v1(bytea,uuid,bigint,text,text,text,text),forge.transition_vnext_execution_for_session_v1(bytea,uuid,bigint,text,text,text,text,text),forge.advance_task_execution_pointer_for_session_v1(bytea,uuid,bigint,uuid,text) FROM PUBLIC,forge;
+GRANT USAGE ON SCHEMA forge TO forge_runtime_api;
+GRANT EXECUTE ON FUNCTION forge.create_vnext_generic_zero_mission_v1(bytea,uuid,uuid,text,text),forge.create_vnext_task_mission_v1(bytea,uuid,uuid,uuid,text,text),forge.read_vnext_mission_v1(bytea,uuid),forge.transition_vnext_mission_for_session_v1(bytea,uuid,bigint,text,text,text,text),forge.transition_vnext_execution_for_session_v1(bytea,uuid,bigint,text,text,text,text,text),forge.advance_task_execution_pointer_for_session_v1(bytea,uuid,bigint,uuid,text) TO forge_runtime_api;
 --> statement-breakpoint
 RESET ROLE;
