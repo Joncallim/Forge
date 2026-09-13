@@ -61,9 +61,13 @@ describe('VNext Phase 0 A1 protected persistence foundation', () => {
   })
 
   it('keeps ordinary latest migration and repair on the documented bounded handoff', () => {
-    expect(migrator).toContain('runtimeFoundationIsPending')
-    expect(migrator).toContain('scripts/ci/apply-vnext-phase0-a1-runtime-foundation.sh')
+    expect(migrator).toContain('pendingProtectedMigrations')
+    expect(migrator).toContain('protectedMigrationRecoveryPlan')
+    expect(migrator).toContain('pendingProtectedMigrationCleanup')
     expect(migrator).not.toContain('RUNTIME_FOUNDATION_MIGRATION_AT')
+    expect(bootstrap).toContain('recordProtectedMigrationHandoff')
+    expect(bootstrap).toContain('recordProtectedMigrationCleanup')
+    expect(migrationWrapper).toContain('cleanup\ntrap - EXIT\nnpx tsx db/migrate.ts')
     expect(bootstrap).toContain("process.env.FORGE_DATABASE_ADMIN_URL?.trim() || getRequiredEnv('DATABASE_URL')")
     expect(bootstrap).toContain("const API = 'forge_runtime_api'")
     expect(bootstrap).toContain('from pg_catalog.pg_authid where rolname = ${OWNER}')

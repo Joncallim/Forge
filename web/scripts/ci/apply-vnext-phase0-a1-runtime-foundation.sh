@@ -32,4 +32,8 @@ bash scripts/ci/apply-epic-172-s5-recovery-migration.sh
 bash scripts/ci/apply-verification-goal-registry-migration.sh
 npx tsx scripts/bootstrap-vnext-runtime-owner.ts
 npx tsx scripts/ci/migrate-through-0034.ts
+# Close the durable handoff record before re-entering the public migrator. A
+# retry after an interrupted cleanup sees that record and replays this wrapper.
+cleanup
+trap - EXIT
 npx tsx db/migrate.ts

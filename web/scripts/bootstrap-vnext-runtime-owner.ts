@@ -1,11 +1,18 @@
 import '../lib/load-env'
 import postgres from 'postgres'
 import { getRequiredEnv } from '@/lib/env'
+import { protectedMigrationForTag } from './ci/protected-migration-registry'
+import { recordProtectedMigrationCleanup, recordProtectedMigrationHandoff } from './ci/protected-migration-state'
 
 const OWNER = 'forge_runtime_routines_owner'
 // This is a non-login capability group. The server login is separately
 // provisioned as its member; `forge` never receives that membership.
 const API = 'forge_runtime_api'
+const runtimeFoundationMigration = (() => {
+  const migration = protectedMigrationForTag('0034_vnext_phase0_a1_runtime_foundation')
+  if (!migration) throw new Error('The VNext runtime protected migration is missing from the checked-in registry.')
+  return migration
+})()
 
 function identifier(value: string): string {
   if (!/^[a-z_][a-z0-9_]*$/i.test(value)) throw new Error('The migration login is not a safe PostgreSQL role identifier.')
@@ -32,6 +39,11 @@ async function main(): Promise<void> {
       end if;
     end $$;`)
     if (process.argv.includes('--cleanup')) {
+      // Test-only fault injection covers the process-restart window after the
+      // Drizzle ledger committed but before this cleanup could run.
+      if (process.env.FORGE_VNEXT_RUNTIME_FORCE_CLEANUP_FAILURE === '1') {
+        throw new Error('Forced VNext runtime protected-owner cleanup failure.')
+      }
       await admin.unsafe(`revoke ${OWNER} from ${identifier(migrationRole)};`)
       // The protected creator validates Task compatibility ownership inside its
       // SECURITY DEFINER transaction. Retain exactly the two Task columns it
@@ -54,6 +66,7 @@ async function main(): Promise<void> {
       if (boundary.membership || boundary.publicCreate || boundary.forgeCreate || boundary.userSelect || boundary.userReferences || boundary.taskTableSelect || !boundary.taskIdSelect || !boundary.taskSubmittedBySelect || boundary.taskTitleSelect || boundary.taskReferences || !boundary.forgeUsage) {
         throw new Error('The VNext runtime protected-owner cleanup did not restore the authority boundary.')
       }
+      await recordProtectedMigrationCleanup(admin, runtimeFoundationMigration, migrationRole)
       console.log('✓ Removed and verified the temporary VNext runtime owner handoff.')
       return
     }
@@ -72,6 +85,7 @@ async function main(): Promise<void> {
     // The migration needs only schema creation plus the exact users FK and
     // routine ownership read. Both grants are revoked in the EXIT cleanup.
     await admin.unsafe(`grant ${OWNER} to ${identifier(migrationRole)}; grant usage, create on schema public, forge to ${OWNER}; grant usage on schema forge to ${API}; grant select, references on table public.users, public.tasks to ${OWNER};`)
+    await recordProtectedMigrationHandoff(admin, runtimeFoundationMigration, migrationRole)
   } finally {
     await admin.end({ timeout: 5 })
   }

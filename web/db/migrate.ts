@@ -21,21 +21,36 @@ import { drizzle } from 'drizzle-orm/postgres-js'
 import { migrate } from 'drizzle-orm/postgres-js/migrator'
 import postgres from 'postgres'
 import { getRequiredEnv } from '@/lib/env'
+import { protectedMigrationRecoveryPlan } from '@/scripts/ci/protected-migration-registry'
+import { pendingProtectedMigrationCleanup } from '@/scripts/ci/protected-migration-state'
 
 const MIGRATIONS_FOLDER = './db/migrations'
 const execFileAsync = promisify(execFile)
 
-async function runtimeFoundationIsPending(client: ReturnType<typeof postgres>): Promise<boolean> {
+type MigrationJournal = { entries: Array<{ tag: string; when: number }> }
+
+async function pendingProtectedMigrations(client: ReturnType<typeof postgres>): Promise<ReturnType<typeof protectedMigrationRecoveryPlan>> {
   try {
-    const journal = JSON.parse(await readFile(fileURLToPath(new URL('./migrations/meta/_journal.json', import.meta.url)), 'utf8')) as { entries: Array<{ tag: string; when: number }> }
-    const foundation = journal.entries.find((entry) => entry.tag === '0034_vnext_phase0_a1_runtime_foundation')
-    if (!foundation) throw new Error('Migration journal is missing the VNext runtime foundation entry.')
-    const [row] = await client<{ applied: boolean }[]>`
-      select exists(select 1 from drizzle.__drizzle_migrations where created_at=${foundation.when}) as applied
+    const journal = JSON.parse(await readFile(fileURLToPath(new URL('./migrations/meta/_journal.json', import.meta.url)), 'utf8')) as MigrationJournal
+    const protectedTags = journal.entries.map((entry) => entry.tag)
+    const rows = await client<{ createdAt: number }[]>`
+      select created_at as "createdAt" from drizzle.__drizzle_migrations
     `
-    return !row?.applied
+    const appliedAt = new Set(rows.map((row) => Number(row.createdAt)))
+    const appliedTags = new Set(journal.entries.filter((entry) => appliedAt.has(entry.when)).map((entry) => entry.tag))
+    return protectedMigrationRecoveryPlan({
+      journalTags: protectedTags,
+      appliedTags,
+      cleanupPendingTags: await pendingProtectedMigrationCleanup(client, protectedTags),
+    })
   } catch (error) {
-    if ((error as { code?: string }).code === '42P01') return true
+    // A new database has neither the Drizzle ledger nor durable handoff rows.
+    // The registry still routes its first protected migration through its
+    // wrapper, which establishes both prerequisites and the handoff state.
+    if ((error as { code?: string }).code === '42P01') {
+      const journal = JSON.parse(await readFile(fileURLToPath(new URL('./migrations/meta/_journal.json', import.meta.url)), 'utf8')) as MigrationJournal
+      return protectedMigrationRecoveryPlan({ journalTags: journal.entries.map((entry) => entry.tag), appliedTags: new Set(), cleanupPendingTags: new Set() })
+    }
     throw error
   }
 }
@@ -52,10 +67,11 @@ async function main(): Promise<void> {
   console.log('• Checking the database for pending migrations…')
 
   try {
-    if (await runtimeFoundationIsPending(client)) {
+    const protectedMigrations = await pendingProtectedMigrations(client)
+    if (protectedMigrations.length > 0) {
       await client.end({ timeout: 5 })
       clientClosed = true
-      await execFileAsync('bash', ['scripts/ci/apply-vnext-phase0-a1-runtime-foundation.sh'], { cwd: process.cwd(), env: process.env })
+      await execFileAsync('bash', [protectedMigrations[0].wrapper], { cwd: process.cwd(), env: process.env })
       return
     }
     const db = drizzle(client)

@@ -96,6 +96,16 @@ describe.skipIf(!enabled)('VNext runtime protected PostgreSQL foundation', () =>
     expect(acl).toEqual({ apiExecute: true, apiRead: true, legacyExecute: false, legacyMembership: false })
   })
 
+  it('records that the protected 0034 handoff was cleaned after the migration ledger committed', async () => {
+    const [handoff] = await admin<{ migrationTag: string; cleanupCompletedAt: Date | string | null }[]>`
+      select migration_tag as "migrationTag", cleanup_completed_at as "cleanupCompletedAt"
+      from public.forge_protected_migration_handoffs
+      where migration_tag = '0034_vnext_phase0_a1_runtime_foundation'
+    `
+    expect(handoff?.migrationTag).toBe('0034_vnext_phase0_a1_runtime_foundation')
+    expect(handoff?.cleanupCompletedAt).not.toBeNull()
+  })
+
   it('keeps the generic project-less profile distinct and strictly zero-capability', async () => {
     const genericPins = { version: 'v1', workflowRevision: 'zero-capability-v1', policyRevision: 'zero-capability-v1', budgetEnvelopeRevision: 'zero-capability-v1', compatibilityMode: 'generic_zero_capability_v1' }
     await app`
