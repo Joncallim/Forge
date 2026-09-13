@@ -2,6 +2,8 @@ import { passkeysEnabled } from '@/lib/auth-options'
 
 type EnvVarName =
   | 'DATABASE_URL'
+  | 'FORGE_DATABASE_ADMIN_URL'
+  | 'FORGE_APP_DATABASE_PASSWORD'
   | 'FORGE_RUNTIME_DATABASE_URL'
   | 'REDIS_URL'
   | 'SESSION_SECRET'

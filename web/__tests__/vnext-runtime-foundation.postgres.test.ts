@@ -30,7 +30,7 @@ describe.skipIf(!enabled)('VNext runtime session authority', () => {
     legacy = postgres(appUrl!, { max: 2, onnotice: () => {} })
     admin = postgres(adminUrl!, { max: 1, onnotice: () => {} })
     await admin`insert into users (id, display_name) values (${actor}::uuid, 'runtime owner'), (${otherActor}::uuid, 'other runtime owner')`
-    await admin`insert into sessions (user_id, credential_digest_v1, expires_at, credential_storage_version) values (${actor}::uuid, ${computeCredentialDigest(credential)}, clock_timestamp() + interval '1 hour', 1), (${otherActor}::uuid, ${computeCredentialDigest(otherCredential)}, clock_timestamp() + interval '1 hour', 1)`
+    await admin`insert into sessions (user_id, credential_digest_v1, expires_at, credential_storage_version) values (${actor}::uuid, ${computeCredentialDigest(credential).digest}, clock_timestamp() + interval '1 hour', 1), (${otherActor}::uuid, ${computeCredentialDigest(otherCredential).digest}, clock_timestamp() + interval '1 hour', 1)`
   })
   afterAll(async () => { await legacy?.end({ timeout: 5 }); await api?.end({ timeout: 5 }); await admin?.end({ timeout: 5 }) })
 
@@ -49,7 +49,7 @@ describe.skipIf(!enabled)('VNext runtime session authority', () => {
   it('uses one indistinguishable database failure for malformed, random, revoked, and expired credentials', async () => {
     const revoked = randomUUID()
     const expired = randomUUID()
-    await admin`insert into sessions (user_id, credential_digest_v1, expires_at, revoked_at, credential_storage_version) values (${actor}::uuid, ${computeCredentialDigest(revoked)}, clock_timestamp() + interval '1 hour', clock_timestamp(), 1), (${actor}::uuid, ${computeCredentialDigest(expired)}, clock_timestamp() - interval '1 second', null, 1)`
+    await admin`insert into sessions (user_id, credential_digest_v1, expires_at, revoked_at, credential_storage_version) values (${actor}::uuid, ${computeCredentialDigest(revoked).digest}, clock_timestamp() + interval '1 hour', clock_timestamp(), 1), (${actor}::uuid, ${computeCredentialDigest(expired).digest}, clock_timestamp() - interval '1 second', null, 1)`
     for (const candidate of [Buffer.from('bad', 'ascii'), Buffer.from(randomUUID(), 'ascii'), Buffer.from(revoked, 'ascii'), Buffer.from(expired, 'ascii')]) {
       await expect(api`select * from forge.create_vnext_generic_zero_mission_v1(${candidate}::bytea, ${randomUUID()}::uuid, ${randomUUID()}::uuid, ${digest}, ${digest})`).rejects.toMatchObject({ code: '28000', message: expect.stringContaining('VNext session authorization failed') })
     }

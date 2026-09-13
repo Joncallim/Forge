@@ -237,6 +237,7 @@ GRANT SELECT ON TABLE
   public.verification_goal_registry_entries,
   public.verification_goal_registry_heads
 TO forge, forge_runtime_api;
+REVOKE ALL ON TABLE public.missions, public.executions, public.task_mission_bindings, public.runtime_transition_audits FROM PUBLIC, forge, forge_runtime_api;
 REVOKE ALL ON FUNCTION public.forge_commit_verification_goal_registry_revision_v1(
   uuid,uuid,uuid,uuid,timestamptz,text,uuid,bigint,bigint,timestamptz,text,jsonb
 ) FROM PUBLIC, forge;
