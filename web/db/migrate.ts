@@ -23,6 +23,7 @@ import postgres from 'postgres'
 import { getRequiredEnv } from '@/lib/env'
 import { protectedMigrationRecoveryPlan } from '@/scripts/ci/protected-migration-registry'
 import { protectedMigrationCleanupState } from '@/scripts/ci/protected-migration-state'
+import { runManagedDockerMigration } from '@/scripts/managed-docker-migration-controller'
 
 const MIGRATIONS_FOLDER = './db/migrations'
 const execFileAsync = promisify(execFile)
@@ -73,7 +74,8 @@ async function main(): Promise<void> {
     if (protectedMigrations.length > 0) {
       await client.end({ timeout: 5 })
       clientClosed = true
-      await execFileAsync('bash', [protectedMigrations[0].wrapper], { cwd: process.cwd(), env: process.env })
+      if (process.env.FORGE_MANAGED_DOCKER_MIGRATIONS === '1') await runManagedDockerMigration()
+      else await execFileAsync('bash', [protectedMigrations[0].wrapper], { cwd: process.cwd(), env: process.env })
       return
     }
     const db = drizzle(client)

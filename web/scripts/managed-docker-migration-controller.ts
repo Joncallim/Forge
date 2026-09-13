@@ -2,10 +2,13 @@
  * that may create the short-lived migration login or transfer legacy owners. */
 import '../lib/load-env'
 import { randomUUID } from 'node:crypto'
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
 import postgres from 'postgres'
 import { getRequiredEnv } from '@/lib/env'
 
 const LOCK = 334001
+const execFileAsync = promisify(execFile)
 const roles = ['forge_admin', 'forge_schema_owner', 'forge', 'forge_runtime_api_login'] as const
 const safe = (value: string) => { if (!/^[a-z_][a-z0-9_]*$/i.test(value)) throw new Error('Unsafe PostgreSQL identifier.'); return `"${value}"` }
 
@@ -52,4 +55,14 @@ export async function prepareManagedDockerMigration(): Promise<{ migrator: strin
   }
 }
 
+/** Owns the complete managed path. The app login is fenced before the bounded
+ * wrapper runs; the lock remains held until reconnect authority is restored. */
+export async function runManagedDockerMigration(): Promise<void> {
+  await prepareManagedDockerMigration()
+  await execFileAsync('bash', ['scripts/ci/apply-vnext-phase0-a1-runtime-foundation.sh'], {
+    cwd: process.cwd(), env: process.env,
+  })
+}
+
 if (process.argv.includes('--prepare')) prepareManagedDockerMigration().then(() => console.log('✓ Managed Docker migration authority is prepared.')).catch((error) => { console.error(`✗ ${error instanceof Error ? error.message : String(error)}`); process.exit(1) })
+if (process.argv.includes('--run')) runManagedDockerMigration().then(() => console.log('✓ Managed Docker migration completed under the serialized controller.')).catch((error) => { console.error(`✗ ${error instanceof Error ? error.message : String(error)}`); process.exit(1) })

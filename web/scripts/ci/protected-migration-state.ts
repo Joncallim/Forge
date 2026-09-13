@@ -18,8 +18,10 @@ export async function ensureProtectedMigrationState(client: SqlClient): Promise<
       migration_role name not null,
       handoff_opened_at timestamptz not null default pg_catalog.clock_timestamp(),
       cleanup_completed_at timestamptz,
+      generation bigint not null default 0 check (generation >= 0),
       check (length(btrim(migration_tag)) > 0)
     );
+    alter table ${protectedMigrationStateTable} add column if not exists generation bigint not null default 0;
     revoke all on table ${protectedMigrationStateTable} from public;
     grant select on table ${protectedMigrationStateTable} to public;
   `)
@@ -33,14 +35,15 @@ export async function recordProtectedMigrationHandoff(
   await ensureProtectedMigrationState(client)
   const [row] = await client<{ migrationTag: string }[]>`
     insert into public.forge_protected_migration_handoffs (
-      migration_tag, protected_owner, migration_role, handoff_opened_at, cleanup_completed_at
+      migration_tag, protected_owner, migration_role, handoff_opened_at, cleanup_completed_at, generation
     ) values (
       ${migration.migrationTag}, ${migration.protectedOwner}::name, ${migrationRole}::name,
-      pg_catalog.clock_timestamp(), null
+      pg_catalog.clock_timestamp(), null, 1
     )
     on conflict (migration_tag) do update
       set handoff_opened_at = excluded.handoff_opened_at,
-          cleanup_completed_at = null
+          cleanup_completed_at = null,
+          generation = public.forge_protected_migration_handoffs.generation + 1
       where public.forge_protected_migration_handoffs.protected_owner = excluded.protected_owner
         and public.forge_protected_migration_handoffs.migration_role = excluded.migration_role
     returning migration_tag as "migrationTag"
@@ -63,6 +66,16 @@ export async function recordProtectedMigrationCleanup(
     returning migration_tag as "migrationTag"
   `
   if (!row) throw new Error(`Protected migration '${migration.migrationTag}' has no matching durable handoff state to close.`)
+}
+
+/** A durable row is only a recovery hint. The controller must attest the live
+ * membership/ownership/ACL catalog before treating it as a completed cleanup. */
+export async function assertProtectedMigrationLiveAttestation(client: SqlClient, migration: ProtectedMigration, migrationRole: string): Promise<void> {
+  const [row] = await client<{ ownerMember: boolean; roleMember: boolean }[]>`
+    select pg_catalog.pg_has_role(${migrationRole}::name, ${migration.protectedOwner}::name, 'member') as "roleMember",
+           exists(select 1 from pg_catalog.pg_roles where rolname=${migration.protectedOwner}) as "ownerMember"
+  `
+  if (!row?.ownerMember || row.roleMember) throw new Error(`Protected migration '${migration.migrationTag}' live authority attestation failed.`)
 }
 
 export async function protectedMigrationCleanupState(
