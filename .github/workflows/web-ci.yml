@@ -124,6 +124,10 @@ jobs:
           CREATE DATABASE forge_installer_legacy_repair_test OWNER forge_migration_test;
           CREATE DATABASE forge_s4_ci_test OWNER forge_migration_test;
           SQL
+      - name: Prove durable VNext protected-migration cleanup recovery
+        run: npm run test:vnext-protected-migration-recovery
+        env:
+          FORGE_VNEXT_RUNTIME_HANDOFF_RECOVERY_TEST_URL: postgresql://forge_e2e:forge@localhost:5432/postgres
       - name: Prove populated migration 0025 to 0026 upgrade
         run: bash scripts/ci/prove-migration-0026-upgrade.sh
         env:
