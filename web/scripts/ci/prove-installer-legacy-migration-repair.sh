@@ -1368,9 +1368,9 @@ revoke_forge_contamination
 
 echo 'Proving the full managed sequence normalizes once and is then stable at latest.'
 run_managed_sequence
-# The earlier encoded-password cases deliberately leave the cluster-global
-# forge role with their final hostile fixture password. Prove that the real
-# controller, not test setup, rotates it to the protected environment value.
+# Whatever credential the preceding fixture left on the cluster-global forge
+# role, prove that the real controller provisions the protected environment
+# value before completing the managed sequence.
 assert_managed_app_credential_provisioned
 # A real legacy install ran the broad app grant after reaching latest. Recreate
 # that state before the next upgrade so the 0028 normalizer sees a real shape.
