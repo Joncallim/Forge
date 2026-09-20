@@ -4,6 +4,7 @@ import { createRequire } from 'node:module'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import postgres from 'postgres'
+import { normalizeExistingMigrationLedger } from '../managed-docker-migration-controller'
 
 const execFileAsync = promisify(execFile)
 const tsxCli = createRequire(import.meta.url).resolve('tsx/cli')
@@ -179,10 +180,213 @@ async function proveForgeObjectsWithForeignDatabaseOwner(): Promise<void> {
   }
 }
 
+async function proveHostileLegacyLedgerRefusalAndRestart(): Promise<void> {
+  const proofContainer = `forge-334-ledger-${randomUUID().replaceAll('-', '')}`
+  const proofAdminPassword = `admin_${randomUUID().replaceAll('-', '')}`
+  const proofAppPassword = `app_${randomUUID().replaceAll('-', '')}`
+  const proofRuntimePassword = `runtime_${randomUUID().replaceAll('-', '')}`
+  const proofLegacyPassword = `legacy_${randomUUID().replaceAll('-', '')}`
+  let proofStarted = false
+  let proofAdmin: ReturnType<typeof postgres> | null = null
+  let proofLegacy: ReturnType<typeof postgres> | null = null
+  let proofLegacyRace: ReturnType<typeof postgres> | null = null
+  let proofObserver: ReturnType<typeof postgres> | null = null
+  try {
+    await execFileAsync('docker', ['run', '--rm', '-d', '--name', proofContainer,
+      '-e', `POSTGRES_PASSWORD=${proofAdminPassword}`, '-e', 'POSTGRES_DB=forge',
+      '-p', '127.0.0.1::5432', 'postgres:16-alpine'])
+    proofStarted = true
+    const { stdout } = await execFileAsync('docker', ['port', proofContainer, '5432/tcp'])
+    const port = stdout.trim().match(/:(\d+)$/)?.[1]
+    if (!port) throw new Error('The hostile-ledger PostgreSQL proof did not publish a loopback port.')
+    const proofAdminUrl = `postgresql://postgres:${proofAdminPassword}@127.0.0.1:${port}/forge`
+    const proofAppUrl = `postgresql://forge:${proofAppPassword}@127.0.0.1:${port}/forge`
+    const proofLegacyUrl = `postgresql://forge_legacy_migrator:${proofLegacyPassword}@127.0.0.1:${port}/forge`
+    proofAdmin = postgres(proofAdminUrl, { max: 1, connect_timeout: 2, onnotice: () => {} })
+    await eventually(() => proofAdmin!`select 1 as ready`, (rows) => rows[0]?.ready === 1, 'hostile-ledger PostgreSQL readiness')
+    await proofAdmin.unsafe(`
+      create role forge login noinherit nosuperuser nocreatedb nocreaterole noreplication nobypassrls password '${proofAppPassword}';
+      create role forge_runtime_api_login login noinherit connection limit 5 nosuperuser nocreatedb nocreaterole noreplication nobypassrls password '${proofRuntimePassword}';
+      create role forge_legacy_migrator login noinherit nosuperuser nocreatedb nocreaterole noreplication nobypassrls password '${proofLegacyPassword}';
+      create table public.forge_hostile_ledger_sentinel (id integer primary key);
+      create schema drizzle authorization forge_legacy_migrator;
+      grant create on schema public to forge_legacy_migrator;
+      grant insert on table public.forge_hostile_ledger_sentinel to forge_legacy_migrator;
+      set role forge_legacy_migrator;
+      create table drizzle.__drizzle_migrations (id serial primary key, hash text not null, created_at bigint);
+      create function public.forge_hostile_ledger_trigger_v1() returns trigger language plpgsql security definer as
+        'begin insert into public.forge_hostile_ledger_sentinel values (1); return new; end';
+      reset role;
+      revoke create on schema public from forge_legacy_migrator;
+      create function public.forge_hostile_event_trigger_v1() returns event_trigger language plpgsql as
+        'begin insert into public.forge_hostile_ledger_sentinel values (99); end';
+      create event trigger forge_hostile_event_trigger on ddl_command_start
+        execute function public.forge_hostile_event_trigger_v1();
+    `)
+    proofLegacy = postgres(proofLegacyUrl, { max: 1, connect_timeout: 2, onnotice: () => {} })
+    proofLegacyRace = postgres(proofLegacyUrl, { max: 1, connect_timeout: 2, onnotice: () => {} })
+    proofObserver = postgres(proofAdminUrl, { max: 1, connect_timeout: 2, onnotice: () => {} })
+    const baseEnvironment = {
+      ...process.env, FORGE_DATABASE_ADMIN_URL: proofAdminUrl, DATABASE_URL: proofAppUrl,
+      FORGE_RUNTIME_API_DATABASE_PASSWORD: proofRuntimePassword, FORGE_MANAGED_DOCKER_MIGRATIONS: '1',
+      CI: 'true', FORGE_MANAGED_MIGRATION_PROOF_HOST_CHILD: '1',
+    }
+    const assertRefusalBoundary = async (label: string) => {
+      let rejected = false
+      try {
+        await executeController([controllerScript, '--run'], baseEnvironment, { timeout: 60_000, maxBuffer: 8 * 1024 * 1024 })
+      } catch (error) {
+        rejected = String(error).includes('non-canonical or executable existing Drizzle ledger boundary')
+      }
+      const [boundary] = await proofAdmin!<{ sentinelRows: number; appLogin: boolean; runtimeLogin: boolean; owner: string; ephemeralRoles: number }[]>`
+        select (select count(*)::integer from public.forge_hostile_ledger_sentinel) as "sentinelRows",
+          (select rolcanlogin from pg_catalog.pg_roles where rolname='forge') as "appLogin",
+          (select rolcanlogin from pg_catalog.pg_roles where rolname='forge_runtime_api_login') as "runtimeLogin",
+          pg_catalog.pg_get_userbyid((select relowner from pg_catalog.pg_class where oid='drizzle.__drizzle_migrations'::pg_catalog.regclass)) as owner,
+          (select count(*)::integer from pg_catalog.pg_roles where rolname like 'forge_migrator_%') as "ephemeralRoles"
+      `
+      const appProbe = postgres(proofAppUrl, { max: 1, connect_timeout: 1 })
+      let reconnectRejected = false
+      try { await appProbe`select 1` } catch { reconnectRejected = true } finally { await appProbe.end({ timeout: 1 }) }
+      if (!rejected || boundary.sentinelRows !== 0 || boundary.appLogin || boundary.runtimeLogin
+        || boundary.owner !== 'forge_legacy_migrator' || boundary.ephemeralRoles !== 0 || !reconnectRejected) {
+        throw new Error(`Hostile ${label} ledger did not refuse without mutation under the reconnect fence: ${JSON.stringify({ rejected, reconnectRejected, ...boundary })}`)
+      }
+    }
+
+    let eventTriggerRejected = false
+    try {
+      await executeController([controllerScript, '--run'], baseEnvironment, { timeout: 30_000, maxBuffer: 8 * 1024 * 1024 })
+    } catch (error) {
+      eventTriggerRejected = String(error).includes('refused enabled PostgreSQL event triggers before controller DDL')
+    }
+    const [eventBoundary] = await proofAdmin<{ sentinelRows: number; stateExists: boolean; schemaOwnerExists: boolean; appLogin: boolean }[]>`
+      select (select count(*)::integer from public.forge_hostile_ledger_sentinel) as "sentinelRows",
+        pg_catalog.to_regclass('public.forge_protected_migration_handoffs') is not null as "stateExists",
+        exists(select 1 from pg_catalog.pg_roles where rolname='forge_schema_owner') as "schemaOwnerExists",
+        (select rolcanlogin from pg_catalog.pg_roles where rolname='forge') as "appLogin"
+    `
+    if (!eventTriggerRejected || eventBoundary.sentinelRows !== 0 || eventBoundary.stateExists
+      || eventBoundary.schemaOwnerExists || !eventBoundary.appLogin) {
+      throw new Error(`Enabled event trigger was not rejected before controller DDL: ${JSON.stringify({ eventTriggerRejected, ...eventBoundary })}`)
+    }
+    await proofAdmin.unsafe(`drop event trigger forge_hostile_event_trigger;
+      drop function public.forge_hostile_event_trigger_v1();
+      truncate table public.forge_hostile_ledger_sentinel`)
+
+    await proofLegacy.unsafe(`create trigger forge_hostile_ledger_trigger before insert on drizzle.__drizzle_migrations
+      for each row execute function public.forge_hostile_ledger_trigger_v1()`)
+    await assertRefusalBoundary('trigger')
+    await proofLegacy.unsafe('drop trigger forge_hostile_ledger_trigger on drizzle.__drizzle_migrations')
+
+    await proofLegacy.unsafe(`create rule forge_hostile_ledger_rule as on insert to drizzle.__drizzle_migrations
+      do also insert into public.forge_hostile_ledger_sentinel values (2)`)
+    await assertRefusalBoundary('rewrite-rule')
+    await proofLegacy.unsafe('drop rule forge_hostile_ledger_rule on drizzle.__drizzle_migrations')
+
+    await proofLegacy.unsafe(`alter table drizzle.__drizzle_migrations enable row level security;
+      create policy forge_hostile_ledger_policy on drizzle.__drizzle_migrations using (true) with check (true)`)
+    await assertRefusalBoundary('RLS-policy')
+    await proofLegacy.unsafe(`drop policy forge_hostile_ledger_policy on drizzle.__drizzle_migrations;
+      alter table drizzle.__drizzle_migrations disable row level security`)
+
+    const racedEnvironment = { ...baseEnvironment, FORGE_MANAGED_MIGRATION_PAUSE_AFTER_FENCE_MS: '3000' }
+    const raceLaunch = controllerLaunch([controllerScript, '--run'], racedEnvironment)
+    const race = spawn(raceLaunch.command, raceLaunch.args, {
+      cwd: process.cwd(), env: raceLaunch.env, detached: true, stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    let raceOutput = ''
+    race.stdout.on('data', (chunk) => { raceOutput += String(chunk) })
+    race.stderr.on('data', (chunk) => { raceOutput += String(chunk) })
+    await eventually(async () => {
+      const [row] = await proofAdmin!<{ phase: string }[]>`
+        select controller_phase as phase from public.forge_protected_migration_handoffs where migration_tag=${tag}
+      `
+      return row?.phase
+    }, (phase) => phase === 'fenced', 'hostile ledger DDL race seam')
+    await proofLegacy.unsafe(`create trigger forge_hostile_ledger_trigger before insert on drizzle.__drizzle_migrations
+      for each row execute function public.forge_hostile_ledger_trigger_v1()`)
+    const raceResult = await new Promise<{ code: number | null }>((resolve) => race.once('exit', (code) => resolve({ code })))
+    if (raceResult.code === 0 || !raceOutput.includes('non-canonical or executable existing Drizzle ledger boundary')) {
+      throw new Error(`Concurrent legacy-owner DDL was not refused after the durable fence: ${redactFailureOutput(raceOutput)}`)
+    }
+    await assertRefusalBoundary('concurrent-DDL')
+    await proofLegacy.unsafe('drop trigger forge_hostile_ledger_trigger on drizzle.__drizzle_migrations')
+
+    const priorCi = process.env.CI
+    process.env.CI = 'true'
+    process.env.FORGE_MANAGED_MIGRATION_PAUSE_LEDGER_OWNER_TRANSFER_MS = '3000'
+    const normalization = normalizeExistingMigrationLedger(proofAdmin, [])
+    await eventually(async () => {
+      const [row] = await proofObserver!<{ paused: boolean }[]>`
+        select exists(select 1 from pg_catalog.pg_stat_activity
+          where application_name='forge_ledger_owner_transfer_pause') as paused
+      `
+      return row?.paused
+    }, (paused) => paused === true, 'locked ledger owner-transfer race seam')
+    const schemaRace = proofLegacy.unsafe(`create function drizzle.forge_hostile_schema_race_v1()
+      returns integer language sql as 'select 1'`)
+    const sequenceRace = proofLegacyRace.unsafe('alter sequence drizzle.__drizzle_migrations_id_seq increment by 7')
+    await normalization.finally(() => {
+      delete process.env.FORGE_MANAGED_MIGRATION_PAUSE_LEDGER_OWNER_TRANSFER_MS
+      if (priorCi === undefined) delete process.env.CI
+      else process.env.CI = priorCi
+    })
+    const [schemaRaceResult, sequenceRaceResult] = await Promise.allSettled([schemaRace, sequenceRace])
+    const [normalized] = await proofAdmin<{ schemaOwner: string; tableOwner: string; sequenceOwner: string; schemaProcedures: number; sequenceIncrement: number }[]>`
+      select pg_catalog.pg_get_userbyid((select nspowner from pg_catalog.pg_namespace where nspname='drizzle')) as "schemaOwner",
+        pg_catalog.pg_get_userbyid((select relowner from pg_catalog.pg_class where oid='drizzle.__drizzle_migrations'::pg_catalog.regclass)) as "tableOwner",
+        pg_catalog.pg_get_userbyid((select relowner from pg_catalog.pg_class where oid='drizzle.__drizzle_migrations_id_seq'::pg_catalog.regclass)) as "sequenceOwner",
+        (select count(*)::integer from pg_catalog.pg_proc procedure
+          join pg_catalog.pg_namespace namespace_row on namespace_row.oid=procedure.pronamespace
+          where namespace_row.nspname='drizzle') as "schemaProcedures",
+        (select seqincrement::integer from pg_catalog.pg_sequence
+          where seqrelid='drizzle.__drizzle_migrations_id_seq'::pg_catalog.regclass) as "sequenceIncrement"
+    `
+    let formerOwnerRejected = false
+    try {
+      await proofLegacy.unsafe(`create trigger forge_hostile_ledger_trigger before insert on drizzle.__drizzle_migrations
+        for each row execute function public.forge_hostile_ledger_trigger_v1()`)
+    } catch { formerOwnerRejected = true }
+    if (normalized.schemaOwner !== 'forge_schema_owner' || normalized.tableOwner !== 'forge_schema_owner'
+      || normalized.sequenceOwner !== 'forge_schema_owner' || normalized.schemaProcedures !== 0
+      || normalized.sequenceIncrement !== 1 || schemaRaceResult.status !== 'rejected'
+      || sequenceRaceResult.status !== 'rejected' || !formerOwnerRejected) {
+      throw new Error(`Locked ledger normalization did not serialize former-owner namespace/sequence DDL: ${JSON.stringify({ ...normalized, schemaRace: schemaRaceResult.status, sequenceRace: sequenceRaceResult.status, formerOwnerRejected })}`)
+    }
+
+    // This proof ledger intentionally contains no durable migration rows. Drop
+    // that empty hostile fixture so the restart also proves the ordinary
+    // absent-ledger creation path after repeated fenced refusals.
+    await proofAdmin.unsafe('drop schema drizzle cascade')
+    await executeController([controllerScript, '--run'], baseEnvironment, { timeout: 120_000, maxBuffer: 16 * 1024 * 1024 })
+    const [completed] = await proofAdmin<{ owner: string; sentinelRows: number; appLogin: boolean; runtimeLogin: boolean; ephemeralRoles: number; phase: string }[]>`
+      select pg_catalog.pg_get_userbyid((select relowner from pg_catalog.pg_class where oid='drizzle.__drizzle_migrations'::pg_catalog.regclass)) as owner,
+        (select count(*)::integer from public.forge_hostile_ledger_sentinel) as "sentinelRows",
+        (select rolcanlogin from pg_catalog.pg_roles where rolname='forge') as "appLogin",
+        (select rolcanlogin from pg_catalog.pg_roles where rolname='forge_runtime_api_login') as "runtimeLogin",
+        (select count(*)::integer from pg_catalog.pg_roles where rolname like 'forge_migrator_%') as "ephemeralRoles",
+        (select controller_phase from public.forge_protected_migration_handoffs where migration_tag=${tag}) as phase
+    `
+    if (completed.owner !== 'forge_schema_owner' || completed.sentinelRows !== 0 || !completed.appLogin
+      || !completed.runtimeLogin || completed.ephemeralRoles !== 0 || completed.phase !== 'complete') {
+      throw new Error(`Clean restart did not normalize and complete the hostile-ledger recovery: ${JSON.stringify(completed)}`)
+    }
+  } finally {
+    delete process.env.FORGE_MANAGED_MIGRATION_PAUSE_LEDGER_OWNER_TRANSFER_MS
+    if (proofObserver) await proofObserver.end({ timeout: 1 }).catch(() => {})
+    if (proofLegacyRace) await proofLegacyRace.end({ timeout: 1 }).catch(() => {})
+    if (proofLegacy) await proofLegacy.end({ timeout: 1 }).catch(() => {})
+    if (proofAdmin) await proofAdmin.end({ timeout: 1 }).catch(() => {})
+    if (proofStarted) await execFileAsync('docker', ['stop', '--time', '2', proofContainer]).catch(() => {})
+  }
+}
+
 async function main(): Promise<void> {
   let started = false
   let admin: ReturnType<typeof postgres> | null = null
   try {
+    await proveHostileLegacyLedgerRefusalAndRestart()
     await proveForgeObjectsWithForeignDatabaseOwner()
     await execFileAsync('docker', ['run', '--rm', '-d', '--name', container,
       '-e', `POSTGRES_PASSWORD=${adminPassword}`, '-e', 'POSTGRES_DB=forge',

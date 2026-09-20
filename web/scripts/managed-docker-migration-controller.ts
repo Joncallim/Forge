@@ -243,26 +243,185 @@ async function runFencedReconciler(sql: SqlClient, source: string): Promise<void
   await runWithDurableFencedControllerMarker(sql, async () => { await sql.unsafe(source) })
 }
 
-/** Drizzle always executes its idempotent ledger DDL before reading the
- * ledger.  A legacy native database can still have that schema and table
- * owned by its former installer migration login. Give only the one bounded
- * ephemeral principal the exact temporary access it needs; DROP OWNED removes
- * these grants before application reconnect is restored. */
-async function grantExistingMigrationLedgerAccess(sql: SqlClient, migrationRole: string): Promise<void> {
-  const [ledger] = await sql<{ schemaExists: boolean; tableKind: string | null; sequenceKind: string | null }[]>`
-    select pg_catalog.to_regnamespace('drizzle') is not null as "schemaExists",
-      (select relation.relkind::text from pg_catalog.pg_class relation
-        where relation.oid=pg_catalog.to_regclass('drizzle.__drizzle_migrations')) as "tableKind",
-      (select relation.relkind::text from pg_catalog.pg_class relation
-        where relation.oid=pg_catalog.to_regclass('drizzle.__drizzle_migrations_id_seq')) as "sequenceKind"
-  `
-  if (!ledger?.schemaExists) return
-  if (ledger.tableKind !== 'r' || ledger.sequenceKind !== 'S') {
-    throw new Error('Managed migration refused a non-canonical existing Drizzle ledger relation boundary.')
-  }
-  await sql.unsafe(`grant usage, create on schema drizzle to ${safe(migrationRole)};
-    grant select, insert on table drizzle.__drizzle_migrations to ${safe(migrationRole)};
-    grant usage on sequence drizzle.__drizzle_migrations_id_seq to ${safe(migrationRole)};`)
+type ExpectedLedgerEntry = Readonly<{ hash: string; createdAt: number }>
+
+/** A legacy installer left the Drizzle ledger owned by its long-lived
+ * migration login.  Move only an exact, inert ledger to the canonical schema
+ * owner while holding an ACCESS EXCLUSIVE table lock. The lock serializes
+ * trigger/rule/RLS/column DDL; the schema/table/sequence owner changes in the
+ * same transaction remove the former login's authority before the child can
+ * connect. Any failed attestation rolls the ownership changes back. */
+export async function normalizeExistingMigrationLedger(
+  sql: SqlClient,
+  expected: readonly ExpectedLedgerEntry[],
+  targetCreatedAt = RUNTIME_MIGRATION_CREATED_AT,
+  deferUnsafe = false,
+  allowedSchemaOwnerMember: string | null = null,
+): Promise<boolean | null> {
+  return sql.begin(async (transaction) => {
+    const tx = transaction as unknown as SqlClient
+    const [presence] = await tx<{ schemaExists: boolean; tableExists: boolean; sequenceExists: boolean }[]>`
+      select pg_catalog.to_regnamespace('drizzle') is not null as "schemaExists",
+        pg_catalog.to_regclass('drizzle.__drizzle_migrations') is not null as "tableExists",
+        pg_catalog.to_regclass('drizzle.__drizzle_migrations_id_seq') is not null as "sequenceExists"
+    `
+    if (!presence?.schemaExists && !presence?.tableExists && !presence?.sequenceExists) return false
+    if (!presence?.schemaExists || !presence.tableExists || !presence.sequenceExists) {
+      if (deferUnsafe) return null
+      throw new Error('Managed migration refused an incomplete existing Drizzle ledger boundary.')
+    }
+    await tx.unsafe('lock table drizzle.__drizzle_migrations in access exclusive mode')
+    const [ownerFence] = await tx<{ owner: string; safeOwner: boolean; ownerMemberships: number; ownerExact: boolean; cleanAcls: boolean }[]>`
+      select owner_role.rolname as owner,
+        (owner_role.rolname='forge_schema_owner' or (
+          owner_role.rolcanlogin and not owner_role.rolinherit and not owner_role.rolsuper
+          and not owner_role.rolcreatedb and not owner_role.rolcreaterole and not owner_role.rolreplication
+          and not owner_role.rolbypassrls and owner_role.rolname not like 'forge_migrator_%'
+        )) as "safeOwner",
+        (select count(*)::integer from pg_catalog.pg_auth_members membership
+          left join pg_catalog.pg_roles member_role on member_role.oid=membership.member
+          where (membership.member=owner_role.oid or membership.roleid=owner_role.oid)
+            and not (owner_role.rolname='forge_schema_owner' and membership.roleid=owner_role.oid
+              and member_role.rolname=${allowedSchemaOwnerMember} and not membership.admin_option
+              and membership.inherit_option and membership.set_option)) as "ownerMemberships",
+        (namespace_row.nspowner=table_row.relowner and namespace_row.nspowner=sequence_row.relowner) as "ownerExact",
+        (namespace_row.nspacl is null and table_row.relacl is null and sequence_row.relacl is null) as "cleanAcls"
+      from pg_catalog.pg_namespace namespace_row
+      join pg_catalog.pg_class table_row on table_row.relnamespace=namespace_row.oid and table_row.relname='__drizzle_migrations'
+      join pg_catalog.pg_class sequence_row on sequence_row.relnamespace=namespace_row.oid and sequence_row.relname='__drizzle_migrations_id_seq'
+      join pg_catalog.pg_roles owner_role on owner_role.oid=namespace_row.nspowner
+      where namespace_row.nspname='drizzle'
+    `
+    if (!ownerFence?.safeOwner || ownerFence.ownerMemberships !== 0 || !ownerFence.ownerExact || !ownerFence.cleanAcls) {
+      if (deferUnsafe) return null
+      throw new Error('Managed migration refused the existing Drizzle ledger owner or ACL boundary.')
+    }
+    if (ownerFence.owner !== 'forge_schema_owner' && !deferUnsafe) {
+      // Each owner change holds its object lock through commit. In particular,
+      // the namespace and sequence locks prevent their former owner from
+      // creating a new hook/object or altering sequence behavior between the
+      // exact catalog snapshot and publication of the owner fence.
+      await tx.unsafe(`alter schema drizzle owner to forge_schema_owner;
+        alter table drizzle.__drizzle_migrations owner to forge_schema_owner;
+        alter sequence drizzle.__drizzle_migrations_id_seq owner to forge_schema_owner;`)
+    }
+    if ((process.env.FORGE_MANAGED_MIGRATION_PAUSE_LEDGER_OWNER_TRANSFER_MS ?? '0') !== '0') {
+      await tx`select pg_catalog.set_config('application_name', 'forge_ledger_owner_transfer_pause', false)`
+      await pauseForCiFenceSeam('FORGE_MANAGED_MIGRATION_PAUSE_LEDGER_OWNER_TRANSFER_MS')
+    }
+    const [boundary] = await tx<{
+      owner: string; safeOwner: boolean; ownerMemberships: number; exactRelations: boolean; exactColumns: boolean
+      exactConstraint: boolean; exactSequence: boolean; exactDependency: boolean; executableHooks: number
+      rowPolicies: number; published: number; inheritanceEdges: number; schemaAcl: boolean; tableAcl: boolean; sequenceAcl: boolean
+    }[]>`
+      with identities as (
+        select namespace_row.oid as schema_oid, namespace_row.nspowner,
+          table_row.oid as table_oid, table_row.relowner as table_owner,
+          sequence_row.oid as sequence_oid, sequence_row.relowner as sequence_owner
+        from pg_catalog.pg_namespace namespace_row
+        join pg_catalog.pg_class table_row on table_row.relnamespace=namespace_row.oid
+          and table_row.relname='__drizzle_migrations'
+        join pg_catalog.pg_class sequence_row on sequence_row.relnamespace=namespace_row.oid
+          and sequence_row.relname='__drizzle_migrations_id_seq'
+        where namespace_row.nspname='drizzle'
+      )
+      select owner_role.rolname as owner,
+        (owner_role.rolname='forge_schema_owner' or (
+          owner_role.rolcanlogin and not owner_role.rolinherit and not owner_role.rolsuper
+          and not owner_role.rolcreatedb and not owner_role.rolcreaterole and not owner_role.rolreplication
+          and not owner_role.rolbypassrls and owner_role.rolname not like 'forge_migrator_%'
+        )) as "safeOwner",
+        (select count(*)::integer from pg_catalog.pg_auth_members membership
+          left join pg_catalog.pg_roles member_role on member_role.oid=membership.member
+          where (membership.member=owner_role.oid or membership.roleid=owner_role.oid)
+            and not (owner_role.rolname='forge_schema_owner' and membership.roleid=owner_role.oid
+              and member_role.rolname=${allowedSchemaOwnerMember} and not membership.admin_option
+              and membership.inherit_option and membership.set_option)) as "ownerMemberships",
+        ((select count(*) from pg_catalog.pg_class relation where relation.relnamespace=identity.schema_oid)=3
+          and exists(select 1 from pg_catalog.pg_class relation where relation.oid=identity.table_oid
+            and relation.relkind='r' and relation.relpersistence='p' and not relation.relispartition
+            and not relation.relrowsecurity and not relation.relforcerowsecurity and relation.reloptions is null)
+          and exists(select 1 from pg_catalog.pg_class relation where relation.oid=identity.sequence_oid and relation.relkind='S')
+          and (select count(*) from pg_catalog.pg_class relation where relation.relnamespace=identity.schema_oid
+            and relation.relkind='i' and relation.relname='__drizzle_migrations_pkey')=1
+          and (select count(*) from pg_catalog.pg_proc procedure where procedure.pronamespace=identity.schema_oid)=0
+        ) as "exactRelations",
+        ((select pg_catalog.jsonb_agg(pg_catalog.jsonb_build_array(
+            attribute.attname, attribute.atttypid::pg_catalog.regtype::text, attribute.attnotnull,
+            attribute.attidentity::text, attribute.attgenerated::text,
+            pg_catalog.pg_get_expr(default_row.adbin, default_row.adrelid)
+          ) order by attribute.attnum)
+          from pg_catalog.pg_attribute attribute
+          left join pg_catalog.pg_attrdef default_row on default_row.adrelid=attribute.attrelid and default_row.adnum=attribute.attnum
+          where attribute.attrelid=identity.table_oid and attribute.attnum>0 and not attribute.attisdropped)
+          = pg_catalog.jsonb_build_array(
+            pg_catalog.jsonb_build_array('id','integer',true,'','',
+              'nextval(''drizzle.__drizzle_migrations_id_seq''::regclass)'),
+            pg_catalog.jsonb_build_array('hash','text',true,'','',null),
+            pg_catalog.jsonb_build_array('created_at','bigint',false,'','',null)
+          )) as "exactColumns",
+        ((select count(*) from pg_catalog.pg_constraint constraint_row where constraint_row.conrelid=identity.table_oid)=1
+          and exists(select 1 from pg_catalog.pg_constraint constraint_row
+            where constraint_row.conrelid=identity.table_oid and constraint_row.conname='__drizzle_migrations_pkey'
+              and constraint_row.contype='p' and constraint_row.conkey=ARRAY[1]::smallint[]
+              and constraint_row.convalidated and not constraint_row.condeferrable and not constraint_row.condeferred)
+        ) as "exactConstraint",
+        exists(select 1 from pg_catalog.pg_sequence sequence_row where sequence_row.seqrelid=identity.sequence_oid
+          and sequence_row.seqtypid='integer'::pg_catalog.regtype and sequence_row.seqstart=1 and sequence_row.seqincrement=1
+          and sequence_row.seqmax=2147483647 and sequence_row.seqmin=1 and sequence_row.seqcache=1 and not sequence_row.seqcycle)
+          as "exactSequence",
+        ((select count(*) from pg_catalog.pg_depend dependency
+          join pg_catalog.pg_attrdef default_row on dependency.classid='pg_catalog.pg_attrdef'::pg_catalog.regclass
+            and dependency.objid=default_row.oid and dependency.refclassid='pg_catalog.pg_class'::pg_catalog.regclass
+          where default_row.adrelid=identity.table_oid and default_row.adnum=1
+            and dependency.refobjid=identity.sequence_oid and dependency.deptype='n')=1
+          and (select count(*) from pg_catalog.pg_depend dependency
+            where dependency.classid='pg_catalog.pg_class'::pg_catalog.regclass and dependency.objid=identity.sequence_oid
+              and dependency.refclassid='pg_catalog.pg_class'::pg_catalog.regclass
+              and dependency.refobjid=identity.table_oid and dependency.refobjsubid=1 and dependency.deptype='a')=1
+        ) as "exactDependency",
+        ((select count(*) from pg_catalog.pg_trigger trigger_row where trigger_row.tgrelid=identity.table_oid)
+          + (select count(*) from pg_catalog.pg_rewrite rewrite_row where rewrite_row.ev_class=identity.table_oid)
+          + (select count(*) from pg_catalog.pg_event_trigger event_row where event_row.evtenabled<>'D'))::integer as "executableHooks",
+        (select count(*)::integer from pg_catalog.pg_policy policy_row where policy_row.polrelid=identity.table_oid) as "rowPolicies",
+        (select count(*)::integer from pg_catalog.pg_publication_rel publication_row where publication_row.prrelid=identity.table_oid) as published,
+        (select count(*)::integer from pg_catalog.pg_inherits inheritance
+          where inheritance.inhrelid=identity.table_oid or inheritance.inhparent=identity.table_oid) as "inheritanceEdges",
+        namespace_row.nspacl is null as "schemaAcl", table_row.relacl is null as "tableAcl",
+        sequence_relation.relacl is null as "sequenceAcl"
+      from identities identity
+      join pg_catalog.pg_namespace namespace_row on namespace_row.oid=identity.schema_oid
+      join pg_catalog.pg_class table_row on table_row.oid=identity.table_oid
+      join pg_catalog.pg_class sequence_relation on sequence_relation.oid=identity.sequence_oid
+      join pg_catalog.pg_roles owner_role on owner_role.oid=identity.nspowner
+      where identity.nspowner=identity.table_owner and identity.nspowner=identity.sequence_owner
+    `
+    if (!boundary?.safeOwner || boundary.ownerMemberships !== 0 || !boundary.exactRelations || !boundary.exactColumns
+      || !boundary.exactConstraint || !boundary.exactSequence || !boundary.exactDependency || boundary.executableHooks !== 0
+      || boundary.rowPolicies !== 0 || boundary.published !== 0 || boundary.inheritanceEdges !== 0
+      || !boundary.schemaAcl || !boundary.tableAcl || !boundary.sequenceAcl) {
+      if (deferUnsafe) return null
+      throw new Error('Managed migration refused a non-canonical or executable existing Drizzle ledger boundary.')
+    }
+    const rows = await tx<{ hash: string; createdAt: string; id: number }[]>`
+      select id, hash, created_at as "createdAt" from drizzle.__drizzle_migrations order by created_at, id
+    `
+    if (rows.length > expected.length || rows.some((row, index) => row.hash !== expected[index]?.hash
+      || row.createdAt !== String(expected[index]?.createdAt))) {
+      if (deferUnsafe) return null
+      throw new Error('Managed migration refused existing Drizzle ledger contents that are not an exact journal prefix.')
+    }
+    const targetApplied = rows.some((row) => row.createdAt === String(targetCreatedAt))
+    if (deferUnsafe) return targetApplied
+    const [normalized] = await tx<{ exactOwners: boolean }[]>`
+      select (select nspowner='forge_schema_owner'::pg_catalog.regrole from pg_catalog.pg_namespace where nspname='drizzle')
+        and (select relowner='forge_schema_owner'::pg_catalog.regrole from pg_catalog.pg_class where oid='drizzle.__drizzle_migrations'::pg_catalog.regclass)
+        and (select relowner='forge_schema_owner'::pg_catalog.regrole from pg_catalog.pg_class where oid='drizzle.__drizzle_migrations_id_seq'::pg_catalog.regclass)
+        as "exactOwners"
+    `
+    if (!normalized?.exactOwners) throw new Error('Managed migration could not atomically normalize the Drizzle ledger owner fence.')
+    return targetApplied
+  })
 }
 
 async function restoreDatabaseAcl(sql: ReturnType<typeof postgres>, database: string, snapshot: ProtectedMigrationDatabaseSnapshot): Promise<void> {
@@ -438,6 +597,8 @@ export async function runManagedDockerMigration(): Promise<void> {
   let databaseAcl: ProtectedMigrationDatabaseSnapshot | null = null
   let restoreGeneration: bigint | null = null
   let lifecycleGeneration: bigint | null = null
+  let expectedLedger: ExpectedLedgerEntry[] = []
+  let observedRuntimeLedgerApplied = false
   let primaryFailure: unknown = null
   try {
     const journal = migrationJournal as { entries: Array<{ tag: string; when: number }> }
@@ -448,8 +609,18 @@ export async function runManagedDockerMigration(): Promise<void> {
     const protectedMigration = protectedMigrationForTag(RUNTIME_MIGRATION_TAG)
     if (!protectedMigration || !targetEntry) throw new Error('The managed migration is absent from the checked-in journal or registry.')
     if (targetEntry.when !== RUNTIME_MIGRATION_CREATED_AT) throw new Error('The managed migration journal timestamp changed without a controller contract update.')
+    expectedLedger = await Promise.all(journal.entries.map(async (entry) => ({
+      hash: createHash('sha256').update(await readFile(resolve(process.cwd(), 'db/migrations', `${entry.tag}.sql`))).digest('hex'),
+      createdAt: entry.when,
+    })))
     await sql`select pg_advisory_lock(${LOCK})`
     locked = true
+    const [eventTriggerBoundary] = await sql<{ enabled: number }[]>`
+      select count(*)::integer as enabled from pg_catalog.pg_event_trigger where evtenabled<>'D'
+    `
+    if (eventTriggerBoundary.enabled !== 0) {
+      throw new Error('Managed migration refused enabled PostgreSQL event triggers before controller DDL.')
+    }
     // A blank PostgreSQL cluster has no application roles yet.  Provision the
     // non-privileged identities before the fence references them; PostgreSQL
     // otherwise rejects REVOKE CONNECT for a role that does not exist.
@@ -468,24 +639,44 @@ export async function runManagedDockerMigration(): Promise<void> {
     // written before CONNECT changes, so a crash either leaves the original
     // owner/grants intact or leaves enough evidence for the next controller.
     const currentDatabaseAcl = await snapshotDatabaseAcl(sql)
-    const [ledgerAtStart] = await sql<{ applied: boolean }[]>`
-      select exists(select 1 from drizzle.__drizzle_migrations where created_at=${targetEntry.when}) as applied
-    `.catch((error: unknown) => {
-      if ((error as { code?: string }).code === '42P01') return [{ applied: false }]
-      throw error
-    })
-    const preparation = await prepareProtectedMigrationController(sql, protectedMigration, migrator, migratorPassword, migratorExpiresAt, operationId, currentDatabaseAcl, ledgerAtStart.applied)
+    // A hostile legacy relation is never dereferenced here. Safe ledgers are
+    // locked, fully catalog-attested, and owner-normalized before their rows
+    // are read. Unsafe catalogs defer their final refusal until after the
+    // durable application reconnect fence has been established.
+    const ledgerAtStart = await normalizeExistingMigrationLedger(sql, expectedLedger, targetEntry.when, true)
+    let deferredLedgerApplied = false
+    if (ledgerAtStart === null && (await sql<{ exists: boolean }[]>`
+      select pg_catalog.to_regclass('public.forge_protected_migration_handoffs') is not null as exists
+    `)[0]?.exists) {
+      const [priorState] = await sql<{ complete: boolean }[]>`
+        select controller_phase='complete' as complete from public.forge_protected_migration_handoffs
+        where migration_tag=${protectedMigration.migrationTag}
+      `
+      deferredLedgerApplied = priorState?.complete ?? false
+    }
+    const preparation = await prepareProtectedMigrationController(sql, protectedMigration, migrator, migratorPassword, migratorExpiresAt, operationId, currentDatabaseAcl, ledgerAtStart ?? deferredLedgerApplied)
     // A completed rerun has already proved the exact durable/live ACL and
     // owner snapshot inside prepareProtectedMigrationController. Keep it out
     // of the reconnect fence entirely: fencing a complete row would create no
     // new durable recovery phase, so a hard death could otherwise strand a
     // complete row with live ACLs that no longer match its snapshot.
     if (preparation.mode === 'complete') {
+      if (ledgerAtStart === null) {
+        databaseAcl = preparation.databaseSnapshot
+        fenced = true
+        await suspendApplicationLoginAuthority(sql)
+        await fenceRuntimeConnect(sql, database)
+        await attestRuntimeQuiescence(sql)
+        await normalizeExistingMigrationLedger(sql, expectedLedger, targetEntry.when)
+        throw new Error('Managed migration unexpectedly accepted an unsafe completed Drizzle ledger boundary.')
+      }
       await sql.unsafe(`${runtimePassword ? `alter role forge_runtime_api_login password '${runtimePassword.replaceAll("'", "''")}';` : ''}
         grant ${API} to forge_runtime_api_login with inherit true;`)
       await sql.unsafe(await readFile(native?.reconcileSql ?? '../scripts/reconcile-forge-app-privileges.sql', 'utf8'))
       await ensureProtectedMigrationState(sql)
       await assertProtectedMigrationLiveAttestation(sql, protectedMigration, preparation.completedMigrationRole!)
+      await sql.unsafe(`alter role forge login nosuperuser nocreatedb nocreaterole noreplication nobypassrls noinherit;
+        alter role forge_runtime_api_login login nosuperuser nocreatedb nocreaterole noreplication nobypassrls noinherit;`)
       if ((process.env.FORGE_MANAGED_MIGRATION_PAUSE_COMPLETED_RERUN_MS ?? '0') !== '0') {
         await sql`select pg_catalog.set_config('application_name', 'forge_completed_rerun_pause', false)`
       }
@@ -575,8 +766,8 @@ export async function runManagedDockerMigration(): Promise<void> {
     }
     lifecycleGeneration = await markProtectedMigrationControllerFenced(sql, protectedMigration, operationId, preparation.generation)
     await pauseForCiFenceSeam('FORGE_MANAGED_MIGRATION_PAUSE_AFTER_FENCE_MS')
+    observedRuntimeLedgerApplied = (await normalizeExistingMigrationLedger(sql, expectedLedger, targetEntry.when)) === true
     await sql.unsafe(`grant forge_schema_owner to ${safe(migrator)} with inherit true; grant connect, create on database ${database} to forge_schema_owner; grant usage, create on schema public to forge_schema_owner; grant connect on database ${database} to ${safe(migrator)};`)
-    await grantExistingMigrationLedgerAccess(sql, migrator)
 
     if (preparation.ledgerApplied) {
       lifecycleGeneration = await openRuntimeHandoff(sql, migrator, runtimePassword, operationId, lifecycleGeneration)
@@ -640,6 +831,7 @@ export async function runManagedDockerMigration(): Promise<void> {
     // This second child applies only 0034 (the ledger has the prefix).  It
     // receives neither administrator authority nor the application passwords.
     await runChild('scripts/ci/migrate-through-0034.ts')
+    observedRuntimeLedgerApplied = true
     lifecycleGeneration = await closeRuntimeHandoff(sql, migrator, operationId, lifecycleGeneration)
     handoffOpened = false
     // Historical ordinary migrations execute as the disposable session so
@@ -665,13 +857,12 @@ export async function runManagedDockerMigration(): Promise<void> {
     }
     if (restoreGeneration === null && lifecycleGeneration !== null) {
       try {
-        const [ledger] = await sql<{ applied: boolean }[]>`
-          select exists(select 1 from drizzle.__drizzle_migrations where created_at=${RUNTIME_MIGRATION_CREATED_AT}) as applied
-        `.catch((error: unknown) => {
-          if ((error as { code?: string }).code === '42P01') return [{ applied: false }]
-          throw error
-        })
-        if (!ledger.applied) {
+        if (!observedRuntimeLedgerApplied && expectedLedger.length > 0) {
+          observedRuntimeLedgerApplied = (await normalizeExistingMigrationLedger(
+            sql, expectedLedger, RUNTIME_MIGRATION_CREATED_AT, false, migrator,
+          )) === true
+        }
+        if (!observedRuntimeLedgerApplied) {
           const [rewound] = await sql`
             update public.forge_protected_migration_handoffs
             set controller_phase='fenced', cleanup_completed_at=null, generation=generation+1

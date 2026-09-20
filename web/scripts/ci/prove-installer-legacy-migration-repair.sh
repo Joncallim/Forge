@@ -1310,17 +1310,19 @@ run_managed_sequence() {
 assert_legacy_drizzle_owner_boundary() {
   local owned_count
   owned_count="$(admin_psql --no-align --tuples-only --quiet \
-    --set migration_role="$FORGE_LEGACY_REPAIR_MIGRATION_USER" --command "
-      SELECT
-        (SELECT count(*) FROM pg_catalog.pg_namespace namespace_row
-          WHERE namespace_row.nspname='drizzle'
-            AND namespace_row.nspowner=:'migration_role'::pg_catalog.regrole)
-        + (SELECT count(*) FROM pg_catalog.pg_class relation
-          JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid=relation.relnamespace
-          WHERE namespace_row.nspname='drizzle'
-            AND relation.relname IN ('__drizzle_migrations','__drizzle_migrations_id_seq')
-            AND relation.relkind IN ('r','S')
-            AND relation.relowner=:'migration_role'::pg_catalog.regrole);")"
+    --set migration_role="$FORGE_LEGACY_REPAIR_MIGRATION_USER" <<'SQL'
+SELECT
+  (SELECT count(*) FROM pg_catalog.pg_namespace namespace_row
+    WHERE namespace_row.nspname='drizzle'
+      AND namespace_row.nspowner=:'migration_role'::pg_catalog.regrole)
+  + (SELECT count(*) FROM pg_catalog.pg_class relation
+    JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid=relation.relnamespace
+    WHERE namespace_row.nspname='drizzle'
+      AND relation.relname IN ('__drizzle_migrations','__drizzle_migrations_id_seq')
+      AND relation.relkind IN ('r','S')
+      AND relation.relowner=:'migration_role'::pg_catalog.regrole);
+SQL
+)"
   [ "$owned_count" = 3 ] || {
     echo 'Legacy managed-sequence proof no longer exercises a migration-login-owned Drizzle ledger.' >&2
     exit 1

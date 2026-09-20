@@ -2019,8 +2019,8 @@ install_managed_migration_helper() {
   # install.sh is the operator-trusted entry boundary. Its release pin is
   # independent of the writable builder/controller; a self-hash cannot make a
   # hostile replacement installer trustworthy without an out-of-band root.
-  digest='c574a854631a79e86cfac55647df20c55028b8a4aa3522ff30e456f41eb4f5fd'
-  pack_bytes=3629085
+  digest='4edd2c59fd403da3224788d8e101920c78a5e4fed7318f9ed153b339acee9b09'
+  pack_bytes=3646597
   exec 9< "$build_dir/bundle.pack"
   [ -f /dev/fd/9 ] || die "Managed migration helper pack is not a regular file."
   computed="$($source_node -e 'const fs=require("fs"),c=require("crypto").createHash("sha256");c.update(fs.readFileSync(process.argv[1]));process.stdout.write(c.digest("hex"))' "$build_dir/bundle.pack")"
