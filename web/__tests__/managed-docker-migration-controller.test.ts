@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
+import { managedNativeControllerFailureMessage } from '../scripts/ci/managed-native-controller-diagnostics'
 
 const controller = readFileSync(fileURLToPath(new URL('../scripts/managed-docker-migration-controller.ts', import.meta.url)), 'utf8')
 const state = readFileSync(fileURLToPath(new URL('../scripts/ci/protected-migration-state.ts', import.meta.url)), 'utf8')
@@ -152,6 +153,18 @@ describe('managed Docker migration authority', () => {
     expect(controller).toContain('protected environment snapshot digest disagrees')
     expect(controller).toContain("key === 'DATABASE_URL' || key === 'FORGE_DATABASE_ADMIN_URL' || key.startsWith('PG')")
     expect(controller).not.toContain("option('--native-env-file')")
+  })
+
+  it('preserves primary diagnostics on expected native shutdown but fails closed on an unexpected close', () => {
+    const primary = new Error('primary migration failure')
+    expect(managedNativeControllerFailureMessage(false, primary)).toBe(primary.message)
+    expect(managedNativeControllerFailureMessage(true, primary)).toBe(
+      'Managed native controller lost its one reserved peer administrator connection; reconnect is forbidden.',
+    )
+    const expectedShutdown = controller.indexOf('nativeAdminShutdownExpected = true')
+    expect(expectedShutdown).toBeGreaterThan(controller.indexOf('pg_advisory_unlock'))
+    expect(expectedShutdown).toBeLessThan(controller.indexOf('reserved?.release()'))
+    expect(controller).toContain('if (!nativeAdminShutdownExpected) nativeAuthorityConnectionLost = true')
   })
 
   it('executes the native controller with no inherited database authority environment', () => {

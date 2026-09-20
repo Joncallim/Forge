@@ -10,6 +10,7 @@ import postgres from 'postgres'
 import { assertProtectedMigrationLiveAttestation, ensureProtectedMigrationState, markProtectedMigrationControllerFenced, prepareProtectedMigrationController, recordProtectedMigrationCleanup, recordProtectedMigrationHandoff, type ProtectedMigrationDatabaseSnapshot } from './ci/protected-migration-state'
 import { assertProtectedMigrationMarkers, protectedMigrationForTag } from './ci/protected-migration-registry'
 import { createEphemeralMigrationUrl, createMigrationChildEnvironment } from './ci/managed-migration-child-environment'
+import { managedNativeControllerFailureMessage, NATIVE_AUTHORITY_LOST } from './ci/managed-native-controller-diagnostics'
 import { runWithDatabaseUrlSentinel } from './ci/bootstrap-database-urls'
 import { runEpic172ReleaseRoleBootstrap } from './bootstrap-epic-172-release-roles'
 import { runEpic172S3OwnerBootstrap } from './bootstrap-epic-172-s3-release-owner'
@@ -24,9 +25,9 @@ const RUNTIME_MIGRATION_CREATED_AT = 1786838400000
 const OWNER = 'forge_runtime_routines_owner'
 const API = 'forge_runtime_api'
 const execFileAsync = promisify(execFile)
-const NATIVE_AUTHORITY_LOST = 'Managed native controller lost its one reserved peer administrator connection; reconnect is forbidden.'
 const MAX_NATIVE_ENV_SNAPSHOT_BYTES = 1024 * 1024
 let nativeAuthorityConnectionLost = false
+let nativeAdminShutdownExpected = false
 type SqlClient = ReturnType<typeof postgres>
 
 function reservedAdminClient(connection: Awaited<ReturnType<SqlClient['reserve']>>): SqlClient {
@@ -383,7 +384,9 @@ export async function runManagedDockerMigration(): Promise<void> {
       if (nativeAdminSocketOpened) throw new Error(NATIVE_AUTHORITY_LOST)
       nativeAdminSocketOpened = true
       const socket = createConnection(resolve(native.socket, `.s.PGSQL.${native.port}`))
-      socket.once('close', () => { nativeAuthorityConnectionLost = true })
+      socket.once('close', () => {
+        if (!nativeAdminShutdownExpected) nativeAuthorityConnectionLost = true
+      })
       return socket
     } } : {}),
   })
@@ -695,6 +698,7 @@ export async function runManagedDockerMigration(): Promise<void> {
       } catch (error) { restoreFailure = error }
     }
     if (locked) await sql`select pg_advisory_unlock(${LOCK})`.catch(() => {})
+    nativeAdminShutdownExpected = true
     reserved?.release()
     await pool.end({ timeout: 5 })
     await rm(childPrivateDirectory, { recursive: true, force: true })
@@ -939,13 +943,13 @@ async function validatedReadOnlyTraversalGid(start: string, proposed?: number): 
 
 if (process.argv.includes('--run')) {
   process.once('uncaughtException', (error) => {
-    console.error(`✗ ${nativeAuthorityConnectionLost ? NATIVE_AUTHORITY_LOST : error instanceof Error ? error.message : String(error)}`)
+    console.error(`✗ ${managedNativeControllerFailureMessage(nativeAuthorityConnectionLost, error)}`)
     process.exit(1)
   })
   runManagedDockerMigration()
     .then(() => console.log('✓ Managed migration completed under the serialized controller.'))
     .catch((error) => {
-      console.error(`✗ ${nativeAuthorityConnectionLost ? NATIVE_AUTHORITY_LOST : error instanceof Error ? error.message : String(error)}`)
+      console.error(`✗ ${managedNativeControllerFailureMessage(nativeAuthorityConnectionLost, error)}`)
       process.exit(1)
     })
 }

@@ -175,7 +175,7 @@ describe('installer-managed migration proof', () => {
       expect(receive('oversized', 5, 'oversized').status).not.toBe(0)
       expect(installer).toContain('remaining=30')
       expect(installer).toContain('/bin/kill -TERM "$receiver"')
-      expect(installer).toContain('pack_bytes=3627265')
+      expect(installer).toContain('pack_bytes=3627641')
       expect(installer).toContain('archive_bytes=25950400')
       expect(installer).toContain('archive_bytes=27517304')
     } finally { rmSync(output, { recursive: true, force: true }) }
