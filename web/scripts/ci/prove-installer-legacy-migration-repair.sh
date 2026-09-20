@@ -5,6 +5,7 @@
 set -Eeuo pipefail
 
 : "${FORGE_LEGACY_REPAIR_DATABASE_URL:?Set the disposable migration URL.}"
+: "${FORGE_LEGACY_REPAIR_APP_URL:?Set the disposable Forge application URL.}"
 : "${FORGE_LEGACY_REPAIR_ADMIN_URL:?Set the disposable administrator URL.}"
 : "${FORGE_LEGACY_REPAIR_ADMIN_HOST:?Set the disposable administrator host.}"
 : "${FORGE_LEGACY_REPAIR_ADMIN_USER:?Set the disposable administrator user.}"
@@ -1252,17 +1253,80 @@ migrate_through_0027() {
 }
 
 managed_env="$TEMP_ROOT/managed.env"
-printf 'DATABASE_URL=%s\n' "$FORGE_LEGACY_REPAIR_DATABASE_URL" > "$managed_env"
+printf 'DATABASE_URL=%s\n' "$FORGE_LEGACY_REPAIR_APP_URL" > "$managed_env"
+chmod 0600 "$managed_env"
+
+assert_managed_app_credential_provisioned() {
+  (
+    cd "$WEB_ROOT"
+    FORGE_MANAGED_APP_URL="$FORGE_LEGACY_REPAIR_APP_URL" \
+      FORGE_ENCODED_ADMIN_URL="$FORGE_LEGACY_REPAIR_ADMIN_URL" node <<'NODE'
+const crypto = require('node:crypto')
+const postgres = require('postgres')
+const configured = new URL(process.env.FORGE_MANAGED_APP_URL)
+if (configured.username !== 'forge' || !configured.password) {
+  throw new Error('managed proof application URL is not the canonical forge credential')
+}
+const expected = decodeURIComponent(configured.password)
+const admin = postgres(process.env.FORGE_ENCODED_ADMIN_URL, { max: 1 })
+admin`SELECT rolpassword FROM pg_catalog.pg_authid WHERE rolname = 'forge'`
+  .then((rows) => {
+    const verifier = rows[0]?.rolpassword ?? ''
+    const match = /^SCRAM-SHA-256\$(\d+):([^$]+)\$([^:]+):(.+)$/.exec(verifier)
+    if (!match) throw new Error('managed controller did not leave a SCRAM password verifier for forge')
+    const salted = crypto.pbkdf2Sync(expected, Buffer.from(match[2], 'base64'), Number(match[1]), 32, 'sha256')
+    const clientKey = crypto.createHmac('sha256', salted).update('Client Key').digest()
+    const storedKey = crypto.createHash('sha256').update(clientKey).digest()
+    if (!crypto.timingSafeEqual(storedKey, Buffer.from(match[3], 'base64'))) {
+      throw new Error('managed controller did not provision the protected application credential')
+    }
+  })
+  .then(() => admin.end())
+  .catch(async (error) => {
+    await admin.end().catch(() => {})
+    console.error(error)
+    process.exitCode = 1
+  })
+NODE
+  )
+}
+
 run_managed_sequence() {
   (
-    export DATABASE_URL="$FORGE_LEGACY_REPAIR_DATABASE_URL"
+    export DATABASE_URL="$FORGE_LEGACY_REPAIR_APP_URL"
     export FORGE_DATABASE_ADMIN_URL="$FORGE_LEGACY_REPAIR_ADMIN_URL"
     export FORGE_ENV_FILE="$managed_env"
     export FORGE_INSTALL_LIBRARY=1
+    if [ "${FORGE_LEGACY_REPAIR_PRODUCTION_NATIVE_ROUTE:-0}" != 1 ]; then
+      export FORGE_INSTALL_TEST_ADMIN_MODE=current
+      export FORGE_INSTALL_TEST_PSQL_SOCKET="${FORGE_LEGACY_REPAIR_ADMIN_SOCKET:-/tmp}"
+      export FORGE_INSTALL_TEST_PSQL_PORT="${PGPORT:-5432}"
+    fi
     source "$REPO_ROOT/scripts/install.sh"
-    MANAGED_LOCAL_ADMIN_MODE=current
-    run_managed_local_migration_sequence
+    run_managed_local_migrations
   )
+}
+
+assert_legacy_drizzle_owner_boundary() {
+  local owned_count
+  owned_count="$(admin_psql --no-align --tuples-only --quiet \
+    --set migration_role="$FORGE_LEGACY_REPAIR_MIGRATION_USER" <<'SQL'
+SELECT
+  (SELECT count(*) FROM pg_catalog.pg_namespace namespace_row
+    WHERE namespace_row.nspname='drizzle'
+      AND namespace_row.nspowner=:'migration_role'::pg_catalog.regrole)
+  + (SELECT count(*) FROM pg_catalog.pg_class relation
+    JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid=relation.relnamespace
+    WHERE namespace_row.nspname='drizzle'
+      AND relation.relname IN ('__drizzle_migrations','__drizzle_migrations_id_seq')
+      AND relation.relkind IN ('r','S')
+      AND relation.relowner=:'migration_role'::pg_catalog.regrole);
+SQL
+)"
+  [ "$owned_count" = 3 ] || {
+    echo 'Legacy managed-sequence proof no longer exercises a migration-login-owned Drizzle ledger.' >&2
+    exit 1
+  }
 }
 
 echo 'Proving accepted S4 boundary variants and later-ledger reruns.'
@@ -1325,7 +1389,12 @@ assert_unchanged contaminated-0027-before contaminated-0027-after 'Exact install
 revoke_forge_contamination
 
 echo 'Proving the full managed sequence normalizes once and is then stable at latest.'
+assert_legacy_drizzle_owner_boundary
 run_managed_sequence
+# Whatever credential the preceding fixture left on the cluster-global forge
+# role, prove that the real controller provisions the protected environment
+# value before completing the managed sequence.
+assert_managed_app_credential_provisioned
 # A real legacy install ran the broad app grant after reaching latest. Recreate
 # that state before the next upgrade so the 0028 normalizer sees a real shape.
 grant_exact_forge_contamination
@@ -1336,6 +1405,7 @@ assert_protected_forge_acl_count "$CANONICAL_PROTECTED_DIRECT_READ_COUNT"
 run_managed_sequence
 snapshot managed-latest-twice
 assert_unchanged managed-latest-once managed-latest-twice 'Managed latest rerun'
+assert_managed_app_credential_provisioned
 admin_psql \
   --set expected_migration_count="$FORGE_CURRENT_MIGRATION_COUNT" \
   --set expected_latest_migration_at="$FORGE_CURRENT_LATEST_MIGRATION_AT" <<'SQL'

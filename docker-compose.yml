@@ -2,15 +2,18 @@ services:
   postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-forge}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-forge}
+      # The bootstrap identity is never used by the web or worker services.
+      POSTGRES_USER: ${POSTGRES_USER:-forge_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD for forge_admin}
       POSTGRES_DB: ${POSTGRES_DB:-forge}
     ports:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-forge}"]
+      # Always probe the canonical administrator identity. POSTGRES_USER is
+      # retained only so an existing `forge` volume can be renamed once.
+      test: ["CMD-SHELL", "pg_isready -U forge_admin"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -28,6 +31,44 @@ services:
       retries: 5
     command: redis-server --appendonly yes
 
+  # One-shot bootstrap lane. It alone receives PostgreSQL administrator and
+  # provisioning secrets; it exits before either long-lived application plane
+  # is allowed to connect.
+  migration:
+    build:
+      context: .
+      dockerfile: web/Dockerfile.migration
+    working_dir: /forge/web
+    depends_on:
+      postgres:
+        condition: service_healthy
+      postgres-admin-upgrade:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgresql://forge_admin:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-forge}
+      FORGE_DATABASE_ADMIN_URL: postgresql://forge_admin:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-forge}
+      FORGE_APP_DATABASE_PASSWORD: ${FORGE_APP_DATABASE_PASSWORD:?set FORGE_APP_DATABASE_PASSWORD}
+      FORGE_RUNTIME_API_DATABASE_PASSWORD: ${FORGE_RUNTIME_API_DATABASE_PASSWORD:?set FORGE_RUNTIME_API_DATABASE_PASSWORD}
+      FORGE_MANAGED_DOCKER_MIGRATIONS: "1"
+
+  # Existing Compose volumes used `forge` as their bootstrap superuser. This
+  # bounded one-time lane creates the replacement administrator, transfers
+  # legacy ownership, and retires that exact role before any application or
+  # migration process starts. Fresh volumes already use `forge_admin`.
+  postgres-admin-upgrade:
+    build:
+      context: .
+      dockerfile: Dockerfile.postgres-admin-upgrade
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      LEGACY_POSTGRES_USER: ${POSTGRES_USER:-forge_admin}
+      POSTGRES_DB: ${POSTGRES_DB:-forge}
+      FORGE_ADMIN_UPGRADE_FAIL_AFTER_CREATE: ${FORGE_ADMIN_UPGRADE_FAIL_AFTER_CREATE:-0}
+      FORGE_ADMIN_UPGRADE_FAIL_AFTER_RENAME: ${FORGE_ADMIN_UPGRADE_FAIL_AFTER_RENAME:-0}
+
   web:
     image: node:22-alpine
     working_dir: /app
@@ -40,10 +81,13 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      migration:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-forge}:${POSTGRES_PASSWORD:-forge}@postgres:5432/${POSTGRES_DB:-forge}
+      DATABASE_URL: postgresql://forge:${FORGE_APP_DATABASE_PASSWORD:?set FORGE_APP_DATABASE_PASSWORD}@postgres:5432/${POSTGRES_DB:-forge}
+      FORGE_RUNTIME_DATABASE_URL: postgresql://forge_runtime_api_login:${FORGE_RUNTIME_API_DATABASE_PASSWORD:?set FORGE_RUNTIME_API_DATABASE_PASSWORD}@postgres:5432/${POSTGRES_DB:-forge}
       REDIS_URL: redis://redis:6379/0
       NEXT_PUBLIC_APP_URL: ${NEXT_PUBLIC_APP_URL:-http://localhost:3000}
       FORGE_WORKSPACE_ROOT: /forge-workspace
@@ -68,10 +112,13 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      migration:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-forge}:${POSTGRES_PASSWORD:-forge}@postgres:5432/${POSTGRES_DB:-forge}
+      DATABASE_URL: postgresql://forge:${FORGE_APP_DATABASE_PASSWORD:?set FORGE_APP_DATABASE_PASSWORD}@postgres:5432/${POSTGRES_DB:-forge}
+      FORGE_RUNTIME_DATABASE_URL: postgresql://forge_runtime_api_login:${FORGE_RUNTIME_API_DATABASE_PASSWORD:?set FORGE_RUNTIME_API_DATABASE_PASSWORD}@postgres:5432/${POSTGRES_DB:-forge}
       REDIS_URL: redis://redis:6379/0
       FORGE_WORKER_CLAIM_TIMEOUT_SECONDS: ${FORGE_WORKER_CLAIM_TIMEOUT_SECONDS:-5}
       FORGE_WORKSPACE_ROOT: /forge-workspace

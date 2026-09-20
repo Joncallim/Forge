@@ -1,6 +1,5 @@
 import '../lib/load-env'
-import postgres from 'postgres'
-import { getRequiredEnv } from '@/lib/env'
+import { openBootstrapDatabaseContext, type BootstrapDatabaseUrls } from './ci/bootstrap-database-urls'
 
 const BEGIN = 'public.forge_begin_epic_172_s4_owner_bootstrap_v1()'
 const FINALIZE = 'public.forge_finalize_epic_172_s4_owner_bootstrap_v1()'
@@ -10,15 +9,10 @@ function identifier(value: string): string {
   return `"${value}"`
 }
 
-async function main(): Promise<void> {
-  const adminUrl = process.env.FORGE_DATABASE_ADMIN_URL?.trim()
-  if (!adminUrl) throw new Error('FORGE_DATABASE_ADMIN_URL is required for the one-shot protected-owner handoff.')
-  const migration = postgres(getRequiredEnv('DATABASE_URL'), { max: 1, onnotice: () => {} })
-  const [{ migrationRole }] = await migration<{ migrationRole: string }[]>`select current_user as "migrationRole"`
-  await migration.end({ timeout: 5 })
-  const admin = postgres(adminUrl, { max: 1, onnotice: () => {} })
+export async function runEpic172S5OwnerBootstrap(cleanup = false, explicitUrls?: BootstrapDatabaseUrls): Promise<void> {
+  const { admin, migrationRole, close } = await openBootstrapDatabaseContext(explicitUrls)
   try {
-    if (process.argv.includes('--cleanup')) {
+    if (cleanup) {
       // This is deliberately idempotent. A failed protected migration can
       // leave the migration login or owner holding authority opened by BEGIN;
       // every wrapper invokes this path unconditionally.
@@ -71,9 +65,9 @@ async function main(): Promise<void> {
     `
     if (grants !== 2) throw new Error('The protected migration did not receive both exact handoff execute grants.')
   } finally {
-    await admin.end({ timeout: 5 })
+    await close()
   }
   console.log('✓ Granted the migration login the bounded protected-owner handoff routines.')
 }
 
-main().catch((error) => { console.error(`✗ ${error instanceof Error ? error.message : String(error)}`); process.exit(1) })
+if (process.argv[1]?.endsWith('bootstrap-epic-172-s5-recovery-owner.ts')) runEpic172S5OwnerBootstrap(process.argv.includes('--cleanup')).catch((error) => { console.error(`✗ ${error instanceof Error ? error.message : String(error)}`); process.exit(1) })

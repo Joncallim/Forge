@@ -1,6 +1,5 @@
 import '../lib/load-env'
-import postgres from 'postgres'
-import { getRequiredEnv } from '@/lib/env'
+import { openBootstrapDatabaseContext, type BootstrapDatabaseUrls } from './ci/bootstrap-database-urls'
 
 const ROUTINES_OWNER = 'forge_release_routines_owner'
 const RELEASE_ROLES = [
@@ -13,25 +12,12 @@ function quotedLiteral(value: string): string {
   return `'${value.replaceAll("'", "''")}'`
 }
 
-async function main(): Promise<void> {
-  const adminUrl = process.env.FORGE_DATABASE_ADMIN_URL?.trim()
-  if (!adminUrl) {
-    throw new Error(
-      'FORGE_DATABASE_ADMIN_URL is required. Use a short-lived PostgreSQL administrator connection for the versioned S3 owner handoff.',
-    )
-  }
-
-  const migrationClient = postgres(getRequiredEnv('DATABASE_URL'), { max: 1, onnotice: () => {} })
-  const [{ migrationRole }] = await migrationClient<{ migrationRole: string }[]>`
-    select session_user as "migrationRole"
-  `
-  await migrationClient.end({ timeout: 5 })
-  if (!migrationRole || RELEASE_ROLES.includes(migrationRole as typeof RELEASE_ROLES[number])) {
-    throw new Error('The S3 migration login must be an ordinary role distinct from every release principal.')
-  }
-
-  const client = postgres(adminUrl, { max: 1, onnotice: () => {} })
+export async function runEpic172S3OwnerBootstrap(explicitUrls?: BootstrapDatabaseUrls): Promise<void> {
+  const { admin: client, migrationRole, close } = await openBootstrapDatabaseContext(explicitUrls)
   try {
+    if (!migrationRole || RELEASE_ROLES.includes(migrationRole as typeof RELEASE_ROLES[number])) {
+      throw new Error('The S3 migration login must be an ordinary role distinct from every release principal.')
+    }
     const [authority] = await client<{
       currentUser: string
       canCreateRole: boolean
@@ -365,11 +351,11 @@ async function main(): Promise<void> {
     console.log(`✓ Installed the migration-0026-only S3 owner handoff for ${migrationRole}.`)
     console.log(`  Migration 0026 will grant, use, and revoke ${ROUTINES_OWNER} in one transaction.`)
   } finally {
-    await client.end({ timeout: 5 })
+    await close()
   }
 }
 
-main().catch((error) => {
+if (process.argv[1]?.endsWith('bootstrap-epic-172-s3-release-owner.ts')) runEpic172S3OwnerBootstrap().catch((error) => {
   console.error(`✗ ${error instanceof Error ? error.message : String(error)}`)
   process.exit(1)
 })

@@ -1,0 +1,50 @@
+{
+  "schemaVersion": 2,
+  "contractVersion": "vnext-phase0-v1",
+  "scope": "A1 additive authority foundation",
+  "nonClosing": true,
+  "nonGoals": ["migration write fence", "cutover", "rollback/re-upgrade", "Redis outbox/dispatcher"],
+  "runnerBindings": [
+    {
+      "id": "a1-vitest-static",
+      "runner": "vitest",
+      "command": "npx vitest run __tests__/vnext-phase0-conformance.contract.test.ts",
+      "forbidSkipped": true,
+      "executionKeys": ["vitest::vnext.a1.contracts", "vitest::vnext.a1.schema", "vitest::vnext.a1.service-owner-cas", "vitest::vnext.a1.manifest-identity"]
+    },
+    {
+      "id": "a1-vitest-postgres",
+      "runner": "vitest",
+      "command": "FORGE_VNEXT_RUNTIME_REQUIRE_POSTGRES_TEST=1 npx vitest run __tests__/vnext-runtime-foundation.postgres.test.ts",
+      "forbidSkipped": true,
+      "executionKeys": ["vitest::vnext.a1.protected-postgres", "vitest::vnext.a1.projectless-lifecycle", "vitest::vnext.a1.pointer-concurrency-fixture-boundary"]
+    },
+    {
+      "id": "a1-protected-migration-recovery",
+      "runner": "command",
+      "command": "npm run test:vnext-protected-migration-recovery",
+      "forbidSkipped": true,
+      "executionKeys": ["command::vnext.a1.protected-cleanup-failure", "command::vnext.a1.protected-restart", "command::vnext.a1.protected-reupgrade"]
+    },
+    {
+      "id": "a1-controller-sigkill-restart",
+      "runner": "command",
+      "command": "npm run test:managed-migration-controller-restart",
+      "forbidSkipped": true,
+      "executionKeys": ["command::vnext.a1.controller-sigkill-restart"]
+    }
+  ],
+  "proofs": [
+    { "id": "C1-contracts", "runnerBinding": "a1-vitest-static", "file": "__tests__/vnext-runtime-contracts.test.ts", "scenarioIds": ["vnext.a1.contracts"] },
+    { "id": "C2-schema", "runnerBinding": "a1-vitest-static", "file": "__tests__/vnext-runtime-foundation-schema.test.ts", "scenarioIds": ["vnext.a1.schema"] },
+    { "id": "C4-service-owner-cas", "runnerBinding": "a1-vitest-static", "file": "__tests__/vnext-runtime-service.test.ts", "scenarioIds": ["vnext.a1.service-owner-cas"] },
+    { "id": "C5-protected-postgres", "runnerBinding": "a1-vitest-postgres", "file": "__tests__/vnext-runtime-foundation.postgres.test.ts", "scenarioIds": ["vnext.a1.protected-postgres"] },
+    { "id": "C8-projectless-lifecycle", "runnerBinding": "a1-vitest-postgres", "file": "__tests__/vnext-runtime-foundation.postgres.test.ts", "scenarioIds": ["vnext.a1.projectless-lifecycle"] },
+    { "id": "C5a-protected-cleanup-failure", "runnerBinding": "a1-protected-migration-recovery", "file": "scripts/ci/prove-vnext-protected-migration-handoff-recovery.ts", "scenarioIds": ["vnext.a1.protected-cleanup-failure"] },
+    { "id": "C5b-protected-restart", "runnerBinding": "a1-protected-migration-recovery", "file": "scripts/ci/prove-vnext-protected-migration-handoff-recovery.ts", "scenarioIds": ["vnext.a1.protected-restart"] },
+    { "id": "C5c-protected-reupgrade", "runnerBinding": "a1-protected-migration-recovery", "file": "scripts/ci/prove-vnext-protected-migration-handoff-recovery.ts", "scenarioIds": ["vnext.a1.protected-reupgrade"] },
+    { "id": "C5d-controller-sigkill-restart", "runnerBinding": "a1-controller-sigkill-restart", "file": "scripts/ci/prove-managed-migration-controller-restart.ts", "scenarioIds": ["vnext.a1.controller-sigkill-restart"] },
+    { "id": "C9-pointer-concurrency-boundary", "runnerBinding": "a1-vitest-postgres", "file": "__tests__/vnext-runtime-foundation.postgres.test.ts", "scenarioIds": ["vnext.a1.pointer-concurrency-fixture-boundary"] },
+    { "id": "C0-manifest-identity", "runnerBinding": "a1-vitest-static", "file": "__tests__/vnext-phase0-conformance.contract.test.ts", "scenarioIds": ["vnext.a1.manifest-identity"] }
+  ]
+}

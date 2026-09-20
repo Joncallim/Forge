@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import postgres from 'postgres'
-import { getRequiredEnv } from '@/lib/env'
+import { openBootstrapAdmin, type BootstrapAdminInput } from './ci/bootstrap-database-urls'
 
 const legacy0023 = 'bf855fc0d4f110864badedf287c987adbe7913059b3673d385c81b1dbc2d9d31'
 const current0023 = 'e8234134bb5356d2c0093d4618a6e60251e2c16b8bdf8dcacfd5673cbbafbe85'
@@ -1086,6 +1086,7 @@ async function exactOptionalForgeAppRoleBoundary(
   const [boundary] = await sql<readonly {
     roles: number
     exactRoles: number
+    fencedRole: number
     membershipEdges: number
   }[]>`
     SELECT
@@ -1094,13 +1095,41 @@ async function exactOptionalForgeAppRoleBoundary(
       (SELECT pg_catalog.count(*)::integer FROM pg_catalog.pg_roles
        WHERE rolname = 'forge' AND rolcanlogin AND NOT rolinherit AND NOT rolsuper
          AND NOT rolcreatedb AND NOT rolcreaterole AND NOT rolreplication AND NOT rolbypassrls) AS "exactRoles",
+      (SELECT pg_catalog.count(*)::integer FROM pg_catalog.pg_roles
+       WHERE rolname = 'forge' AND NOT rolcanlogin AND NOT rolinherit AND NOT rolsuper
+         AND NOT rolcreatedb AND NOT rolcreaterole AND NOT rolreplication AND NOT rolbypassrls) AS "fencedRole",
       (SELECT pg_catalog.count(*)::integer
        FROM pg_catalog.pg_auth_members membership
        WHERE membership.roleid = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = 'forge')
           OR membership.member = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = 'forge')) AS "membershipEdges"
   `
-  return boundary?.roles === 0
-    || (boundary?.roles === 1 && boundary.exactRoles === 1 && boundary.membershipEdges === 0)
+  if (boundary?.roles === 0 || (boundary?.roles === 1 && boundary.exactRoles === 1 && boundary.membershipEdges === 0)) return true
+  if (boundary?.roles !== 1 || boundary.fencedRole !== 1 || boundary.membershipEdges !== 0) return false
+  const [marker] = await sql<readonly { enabled: boolean; stateTable: string | null }[]>`
+    select pg_catalog.current_setting('forge.managed_controller_fenced', true) = '1' as enabled,
+      pg_catalog.to_regclass('public.forge_protected_migration_handoffs')::text as "stateTable"
+  `
+  if (!marker?.enabled || !marker.stateTable) return false
+  const [fenced] = await sql<readonly { exact: boolean }[]>`
+    select exists(
+      select 1 from public.forge_protected_migration_handoffs handoff
+      join pg_catalog.pg_database database_row on database_row.datname=pg_catalog.current_database()
+      where handoff.migration_tag='0034_vnext_phase0_a1_runtime_foundation'
+        and handoff.controller_phase in ('fenced','handoff_open','cleanup_complete','restore_pending','complete')
+        and handoff.database_name=database_row.datname and handoff.database_oid=database_row.oid
+        and handoff.database_owner_oid=database_row.datdba and handoff.database_acl is not null
+        and handoff.database_acl_digest ~ '^[0-9a-f]{64}$'
+    ) and not pg_catalog.has_database_privilege('forge', pg_catalog.current_database(), 'connect')
+      and not exists(
+        select 1 from pg_catalog.pg_shdepend dependency
+        where dependency.refclassid='pg_catalog.pg_authid'::pg_catalog.regclass
+          and dependency.refobjid='forge'::pg_catalog.regrole and dependency.deptype='o'
+          and (dependency.dbid=(select oid from pg_catalog.pg_database where datname=pg_catalog.current_database())
+            or (dependency.dbid=0 and dependency.classid='pg_catalog.pg_database'::pg_catalog.regclass
+              and dependency.objid=(select oid from pg_catalog.pg_database where datname=pg_catalog.current_database())))
+      ) as exact
+  `
+  return fenced?.exact === true
 }
 
 async function lockProtectedInstallerAclCatalog(
@@ -1403,16 +1432,16 @@ async function durableRepairedFingerprint(
     && await exactReleaseRoleBoundary(sql, true)
 }
 
-async function loadRepairArtifact(): Promise<string> {
-  const source = await readFile(repairArtifact, 'utf8')
+async function loadRepairArtifact(sourceOverride?: string): Promise<string> {
+  const source = sourceOverride ?? await readFile(repairArtifact, 'utf8')
   if (createHash('sha256').update(source).digest('hex') !== repairArtifactSha256) {
     throw new Error('Refusing legacy release repair: fixed repair artifact integrity check failed.')
   }
   return source
 }
 
-async function main(): Promise<void> {
-  const client = postgres(process.env.FORGE_DATABASE_ADMIN_URL ?? getRequiredEnv('DATABASE_URL'), { max: 1, onnotice: () => {} })
+export async function runEpic172LegacyReleaseRepair(explicit?: BootstrapAdminInput & Readonly<{ repairArtifactSource?: string }>): Promise<void> {
+  const { admin: client, close } = openBootstrapAdmin(explicit)
   try {
     const outcome = await client.begin(async (sql) => {
       await sql.unsafe('LOCK TABLE pg_catalog.pg_authid IN SHARE ROW EXCLUSIVE MODE')
@@ -1536,7 +1565,7 @@ async function main(): Promise<void> {
         throw new Error('Refusing legacy release repair: physical catalog fingerprint is not the exact known legacy state.')
       }
 
-      const repairSql = await loadRepairArtifact()
+      const repairSql = await loadRepairArtifact(explicit?.repairArtifactSource)
       await sql.unsafe(repairSql)
       const ledgerAfter = await sql<readonly { hash: string; created_at: number }[]>`
         SELECT hash, created_at
@@ -1567,10 +1596,10 @@ async function main(): Promise<void> {
       console.log('✓ Epic 172 legacy release repair is not needed.')
     }
   } finally {
-    await client.end({ timeout: 5 })
+    await close()
   }
 }
-main().catch((error) => {
+if (process.argv[1]?.endsWith('repair-epic-172-legacy-release.ts')) runEpic172LegacyReleaseRepair().catch((error) => {
   console.error(`✗ ${error instanceof Error ? error.message : String(error)}`)
   process.exit(1)
 })

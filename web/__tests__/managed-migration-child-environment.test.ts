@@ -1,0 +1,79 @@
+import { execFileSync } from 'node:child_process'
+import { describe, expect, it } from 'vitest'
+import { createEphemeralMigrationUrl, createMigrationChildEnvironment } from '@/scripts/ci/managed-migration-child-environment'
+import { resolveBootstrapDatabaseUrls, runWithDatabaseUrlSentinel } from '@/scripts/ci/bootstrap-database-urls'
+
+describe('managed migration child environment', () => {
+  it('is an exact allowlist even under hostile administrator and libpq ambient input', () => {
+    const result = createMigrationChildEnvironment(
+      'postgresql://forge_migrator_0123456789abcdef0123456789abcdef:child-only@db/forge',
+      {
+        PATH: '/safe/bin',
+        NODE_ENV: 'test',
+        FORGE_DATABASE_ADMIN_URL: 'postgresql://admin:secret@db/forge',
+        PGHOST: 'hostile-host',
+        PGUSER: 'admin',
+        PGPASSWORD: 'secret',
+        DATABASE_URL: 'postgresql://admin:secret@db/forge',
+        UNRELATED_SECRET: 'must-not-cross',
+      },
+    )
+    expect(result).toEqual({
+      PATH: '/safe/bin',
+      NODE_ENV: 'test',
+      DATABASE_URL: 'postgresql://forge_migrator_0123456789abcdef0123456789abcdef:child-only@db/forge',
+      FORGE_MANAGED_DOCKER_MIGRATIONS: '0',
+    })
+  })
+
+  it('is the exact environment observed by an actual child through procfs', () => {
+    const childEnvironment = createMigrationChildEnvironment(
+      'postgresql://forge_migrator_0123456789abcdef0123456789abcdef:child-only@db/forge',
+      { PATH: process.env.PATH, NODE_ENV: 'test', FORGE_DATABASE_ADMIN_URL: 'must-not-cross', PGUSER: 'postgres' },
+      '/tmp/private-migration-child',
+    )
+    const observed = execFileSync(process.execPath, ['-e', "const fs=require('fs'); process.stdout.write(fs.readFileSync('/proc/self/environ').toString().split('\\0').filter(Boolean).map(v=>v.split('=')[0]).sort().join(','))"], {
+      env: childEnvironment,
+      encoding: 'utf8',
+    })
+    expect(observed).toBe('DATABASE_URL,FORGE_MANAGED_DOCKER_MIGRATIONS,HOME,NODE_ENV,PATH,TMPDIR')
+  })
+
+  it('rejects a non-ephemeral database identity', () => {
+    expect(() => createMigrationChildEnvironment('postgresql://forge:secret@db/forge', {})).toThrow(
+      'Managed migration child environment crossed the administrator authority boundary.',
+    )
+  })
+
+  it('keeps the native child on its ephemeral TCP identity without administrator or PG environment', () => {
+    const result = createEphemeralMigrationUrl(
+      'postgresql://application:application-secret@localhost:55441/forge',
+      'forge_migrator_0123456789abcdef0123456789abcdef',
+      'child-secret',
+    )
+    expect(result).toBe('postgresql://forge_migrator_0123456789abcdef0123456789abcdef:child-secret@localhost:55441/forge')
+    expect(result).not.toContain('application')
+  })
+
+  it('keeps the ambient URL stable across concurrent explicit bootstrap work', async () => {
+    const previous = process.env.DATABASE_URL
+    process.env.DATABASE_URL = 'postgresql://ambient-app:sentinel@ambient.invalid/forge'
+    try {
+      const observed = await runWithDatabaseUrlSentinel(async () => {
+        const urls = resolveBootstrapDatabaseUrls({
+          adminUrl: 'postgresql://explicit-admin:secret@admin.invalid/forge',
+          migrationUrl: 'postgresql://forge_migrator_0123456789abcdef0123456789abcdef:secret@migration.invalid/forge',
+        })
+        await Promise.all([Promise.resolve(), new Promise((resolve) => setTimeout(resolve, 5))])
+        expect(process.env.DATABASE_URL).toBe('postgresql://ambient-app:sentinel@ambient.invalid/forge')
+        return urls
+      })
+      expect(observed.adminUrl).toContain('explicit-admin')
+      expect(observed.migrationUrl).toContain('forge_migrator_')
+      expect(JSON.stringify(observed)).not.toContain('ambient-app')
+    } finally {
+      if (previous === undefined) delete process.env.DATABASE_URL
+      else process.env.DATABASE_URL = previous
+    }
+  })
+})

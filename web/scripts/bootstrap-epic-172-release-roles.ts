@@ -1,6 +1,5 @@
 import '../lib/load-env'
-import postgres from 'postgres'
-import { getRequiredEnv } from '@/lib/env'
+import { openBootstrapDatabaseContext, type BootstrapDatabaseUrls } from './ci/bootstrap-database-urls'
 
 const ROLE_NAMES = [
   'forge_release_evidence_writer',
@@ -31,21 +30,8 @@ function roleIsUnsafe(role: ReleaseRoleRow): boolean {
     || role.bypassesRls
 }
 
-async function main(): Promise<void> {
-  const adminUrl = process.env.FORGE_DATABASE_ADMIN_URL?.trim()
-  if (!adminUrl) {
-    throw new Error(
-      'FORGE_DATABASE_ADMIN_URL is required. Use a short-lived PostgreSQL administrator connection; the ordinary Forge application role must not create release principals.',
-    )
-  }
-
-  const migrationClient = postgres(getRequiredEnv('DATABASE_URL'), { max: 1, onnotice: () => {} })
-  const [{ migrationRole }] = await migrationClient<{ migrationRole: string }[]>`
-    select current_user as "migrationRole"
-  `
-  await migrationClient.end({ timeout: 5 })
-
-  const client = postgres(adminUrl, { max: 1, onnotice: () => {} })
+export async function runEpic172ReleaseRoleBootstrap(explicitUrls?: BootstrapDatabaseUrls): Promise<void> {
+  const { admin: client, migrationRole, close } = await openBootstrapDatabaseContext(explicitUrls)
   try {
     const [authority] = await client<{
       currentUser: string
@@ -243,11 +229,11 @@ async function main(): Promise<void> {
     }
     console.log('  Configure certificate authentication and role-specific connection URLs outside Forge before recording evidence.')
   } finally {
-    await client.end({ timeout: 5 })
+    await close()
   }
 }
 
-main().catch((error) => {
+if (process.argv[1]?.endsWith('bootstrap-epic-172-release-roles.ts')) runEpic172ReleaseRoleBootstrap().catch((error) => {
   console.error(`✗ ${error instanceof Error ? error.message : String(error)}`)
   process.exit(1)
 })

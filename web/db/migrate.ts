@@ -13,12 +13,62 @@
  */
 
 import '../lib/load-env'
+import { execFile } from 'node:child_process'
+import { readFile } from 'node:fs/promises'
+import { fileURLToPath } from 'node:url'
+import { promisify } from 'node:util'
 import { drizzle } from 'drizzle-orm/postgres-js'
 import { migrate } from 'drizzle-orm/postgres-js/migrator'
 import postgres from 'postgres'
 import { getRequiredEnv } from '@/lib/env'
+import { assertProtectedMigrationMarkers, protectedMigrationRecoveryPlan } from '@/scripts/ci/protected-migration-registry'
+import { protectedMigrationCleanupState } from '@/scripts/ci/protected-migration-state'
+import { runManagedDockerMigration } from '@/scripts/managed-docker-migration-controller'
 
 const MIGRATIONS_FOLDER = './db/migrations'
+const execFileAsync = promisify(execFile)
+
+type MigrationJournal = { entries: Array<{ tag: string; when: number }> }
+
+async function pendingProtectedMigrations(client: ReturnType<typeof postgres>): Promise<ReturnType<typeof protectedMigrationRecoveryPlan>> {
+  try {
+    const journal = JSON.parse(await readFile(fileURLToPath(new URL('./migrations/meta/_journal.json', import.meta.url)), 'utf8')) as MigrationJournal
+    const protectedTags = journal.entries.map((entry) => entry.tag)
+    await assertProtectedMigrationMarkers(fileURLToPath(new URL('./migrations', import.meta.url)), protectedTags)
+    const rows = await client<{ createdAt: number }[]>`
+      select created_at as "createdAt" from drizzle.__drizzle_migrations
+    `
+    const appliedAt = new Set(rows.map((row) => Number(row.createdAt)))
+    const appliedTags = new Set(journal.entries.filter((entry) => appliedAt.has(entry.when)).map((entry) => entry.tag))
+    // Handoff rows are controller-only.  A normal application connection
+    // must never acquire table access simply so a migration restart can plan
+    // recovery; a documented administrator connection performs this narrow
+    // inspection when one is needed.
+    const stateUrl = process.env.FORGE_DATABASE_ADMIN_URL?.trim()
+    const stateClient = stateUrl ? postgres(stateUrl, { max: 1, onnotice: () => {} }) : client
+    let cleanupState
+    try {
+      cleanupState = await protectedMigrationCleanupState(stateClient, protectedTags)
+    } finally {
+      if (stateClient !== client) await stateClient.end({ timeout: 5 })
+    }
+    return protectedMigrationRecoveryPlan({
+      journalTags: protectedTags,
+      appliedTags,
+      cleanupPendingTags: cleanupState.pendingTags,
+      cleanupStateTags: cleanupState.stateTags,
+    })
+  } catch (error) {
+    // A new database has neither the Drizzle ledger nor durable handoff rows.
+    // The registry still routes its first protected migration through its
+    // wrapper, which establishes both prerequisites and the handoff state.
+    if ((error as { code?: string }).code === '42P01') {
+      const journal = JSON.parse(await readFile(fileURLToPath(new URL('./migrations/meta/_journal.json', import.meta.url)), 'utf8')) as MigrationJournal
+      return protectedMigrationRecoveryPlan({ journalTags: journal.entries.map((entry) => entry.tag), appliedTags: new Set(), cleanupPendingTags: new Set(), cleanupStateTags: new Set() })
+    }
+    throw error
+  }
+}
 
 async function main(): Promise<void> {
   const databaseUrl = getRequiredEnv('DATABASE_URL')
@@ -27,10 +77,27 @@ async function main(): Promise<void> {
   // idempotent statements ("... already exists, skipping"). `max: 1` keeps the
   // migrator on a single connection, which is all it needs.
   const client = postgres(databaseUrl, { max: 1, onnotice: () => {} })
+  let clientClosed = false
 
   console.log('• Checking the database for pending migrations…')
 
   try {
+    // The managed lane owns its administrator connection and must verify the
+    // durable state itself.  Do not probe controller-only state using the
+    // long-lived application URL before handing over to that lane.
+    if (process.env.FORGE_MANAGED_DOCKER_MIGRATIONS === '1') {
+      await client.end({ timeout: 5 })
+      clientClosed = true
+      await runManagedDockerMigration()
+      return
+    }
+    const protectedMigrations = await pendingProtectedMigrations(client)
+    if (protectedMigrations.length > 0) {
+      await client.end({ timeout: 5 })
+      clientClosed = true
+      await execFileAsync('bash', [protectedMigrations[0].wrapper], { cwd: process.cwd(), env: process.env })
+      return
+    }
     const db = drizzle(client)
     await migrate(db, { migrationsFolder: MIGRATIONS_FOLDER })
     console.log('✓ Database schema is up to date.')
@@ -41,7 +108,7 @@ async function main(): Promise<void> {
     console.error('  Check that PostgreSQL is running and DATABASE_URL is correct, then try again.')
     process.exitCode = 1
   } finally {
-    await client.end({ timeout: 5 })
+    if (!clientClosed) await client.end({ timeout: 5 })
   }
 }
 

@@ -52,13 +52,48 @@ INSERT INTO forge_expected_protected_owner_inventory (relation_name, owner_name)
   ('filesystem_mcp_issuance_recovery_actions', 'forge_s4_routines_owner'),
   ('local_effect_recovery_actions', 'forge_s4_routines_owner'),
   ('local_projection_archive_operations', 'forge_s4_routines_owner'),
-  ('local_projection_archive_operation_checkpoints', 'forge_s4_routines_owner');
+  ('local_projection_archive_operation_checkpoints', 'forge_s4_routines_owner'),
+  ('missions', 'forge_runtime_routines_owner'),
+  ('executions', 'forge_runtime_routines_owner'),
+  ('task_mission_bindings', 'forge_runtime_routines_owner'),
+  ('runtime_transition_audits', 'forge_runtime_routines_owner');
 -- canonical-protected-owner-map-end
 
 DO $boundary$
 DECLARE
   protected_count integer;
+  fenced_controller boolean := false;
 BEGIN
+  -- The managed controller may hold `forge` at NOLOGIN while it has already
+  -- removed both CONNECT and ownership.  Accept that narrowly-scoped state
+  -- only for the controller's reserved-session marker plus a durable handoff
+  -- row whose exact current-database identity still matches.
+  IF pg_catalog.current_setting('forge.managed_controller_fenced', true) = '1'
+    AND pg_catalog.to_regclass('public.forge_protected_migration_handoffs') IS NOT NULL THEN
+    EXECUTE $fenced$
+      SELECT EXISTS (
+        SELECT 1 FROM public.forge_protected_migration_handoffs handoff
+        JOIN pg_catalog.pg_database database_row ON database_row.datname = pg_catalog.current_database()
+        WHERE handoff.migration_tag = '0034_vnext_phase0_a1_runtime_foundation'
+          AND handoff.controller_phase IN ('fenced','handoff_open','cleanup_complete','restore_pending','complete')
+          AND handoff.database_name = database_row.datname
+          AND handoff.database_oid = database_row.oid
+          AND handoff.database_owner_oid = database_row.datdba
+          AND handoff.database_acl IS NOT NULL
+          AND handoff.database_acl_digest ~ '^[0-9a-f]{64}$'
+      )
+      AND NOT pg_catalog.has_database_privilege('forge', pg_catalog.current_database(), 'connect')
+      AND NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_shdepend dependency
+        WHERE dependency.refclassid = 'pg_catalog.pg_authid'::pg_catalog.regclass
+          AND dependency.refobjid = 'forge'::pg_catalog.regrole
+          AND dependency.deptype = 'o'
+          AND (dependency.dbid = (SELECT oid FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database())
+            OR (dependency.dbid = 0 AND dependency.classid = 'pg_catalog.pg_database'::pg_catalog.regclass
+              AND dependency.objid = (SELECT oid FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database())))
+      )
+    $fenced$ INTO fenced_controller;
+  END IF;
   IF NOT EXISTS (
     SELECT 1
     FROM pg_catalog.pg_roles role_row
@@ -69,7 +104,7 @@ BEGIN
       AND NOT role_row.rolcreaterole
       AND NOT role_row.rolreplication
       AND NOT role_row.rolbypassrls
-  ) THEN
+  ) AND NOT fenced_controller THEN
     RAISE EXCEPTION 'forge app role is not a safe or known legacy login';
   END IF;
   IF EXISTS (
@@ -83,7 +118,7 @@ BEGIN
   IF (
     SELECT count(*)
     FROM pg_catalog.pg_authid role_row
-    WHERE role_row.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner')
+    WHERE role_row.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner', 'forge_runtime_routines_owner')
       AND NOT role_row.rolcanlogin
       AND NOT role_row.rolinherit
       AND NOT role_row.rolsuper
@@ -94,20 +129,22 @@ BEGIN
       AND role_row.rolconnlimit = -1
       AND role_row.rolpassword IS NULL
       AND role_row.rolvaliduntil IS NULL
-  ) <> 2 OR EXISTS (
+  ) <> 3 OR EXISTS (
     SELECT 1
     FROM pg_catalog.pg_auth_members membership
     WHERE membership.roleid IN (
       'forge_release_routines_owner'::pg_catalog.regrole,
-      'forge_s4_routines_owner'::pg_catalog.regrole
+      'forge_s4_routines_owner'::pg_catalog.regrole,
+      'forge_runtime_routines_owner'::pg_catalog.regrole
     ) OR membership.member IN (
       'forge_release_routines_owner'::pg_catalog.regrole,
-      'forge_s4_routines_owner'::pg_catalog.regrole
+      'forge_s4_routines_owner'::pg_catalog.regrole,
+      'forge_runtime_routines_owner'::pg_catalog.regrole
     )
   ) THEN
     RAISE EXCEPTION 'protected owner roles are outside the exact safe boundary';
   END IF;
-  IF (SELECT count(*) FROM forge_expected_protected_owner_inventory) <> 40 OR EXISTS (
+  IF (SELECT count(*) FROM forge_expected_protected_owner_inventory) <> 44 OR EXISTS (
     SELECT 1
     FROM forge_expected_protected_owner_inventory expected
     LEFT JOIN pg_catalog.pg_class relation
@@ -125,8 +162,8 @@ BEGIN
   JOIN pg_catalog.pg_roles owner_role ON owner_role.oid = relation.relowner
   WHERE namespace_row.nspname = 'public'
     AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
-    AND owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner');
-  IF protected_count < 40 THEN
+    AND owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner', 'forge_runtime_routines_owner');
+  IF protected_count < 44 THEN
     RAISE EXCEPTION 'protected ownership boundary is incomplete';
   END IF;
 END;
@@ -134,13 +171,21 @@ $boundary$;
 
 ALTER ROLE forge NOINHERIT;
 
+-- PostgreSQL requires table SELECT and UPDATE to hold the resolver's live
+-- session row lock. That is the sole table-wide source authority; Task and
+-- Project remain column-scoped compatibility sources.
+REVOKE ALL PRIVILEGES ON TABLE public.sessions, public.tasks, public.projects FROM forge_runtime_routines_owner;
+GRANT SELECT, UPDATE ON TABLE public.sessions TO forge_runtime_routines_owner;
+GRANT SELECT (id, project_id, submitted_by) ON TABLE public.tasks TO forge_runtime_routines_owner;
+GRANT SELECT (id, submitted_by, root_ref, root_binding_revision, archived_at) ON TABLE public.projects TO forge_runtime_routines_owner;
+
 SELECT relation.oid, relation.relname
 FROM pg_catalog.pg_class relation
 JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = relation.relnamespace
 JOIN pg_catalog.pg_roles owner_role ON owner_role.oid = relation.relowner
 WHERE namespace_row.nspname = 'public'
   AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
-  AND owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner')
+  AND owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner', 'forge_runtime_routines_owner')
 ORDER BY relation.oid
 FOR UPDATE OF relation;
 
@@ -151,7 +196,7 @@ JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = relation.relna
 JOIN pg_catalog.pg_roles owner_role ON owner_role.oid = relation.relowner
 WHERE namespace_row.nspname = 'public'
   AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
-  AND owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner')
+  AND owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner', 'forge_runtime_routines_owner')
   AND attribute.attnum > 0
   AND NOT attribute.attisdropped
 ORDER BY attribute.attrelid, attribute.attnum
@@ -160,6 +205,10 @@ FOR UPDATE OF attribute;
 GRANT USAGE, CREATE ON SCHEMA public TO forge;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO forge;
 GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO forge;
+-- Controller recovery state is never application data. Close this exception
+-- in the same transaction as the broad legacy grant, so existing app sessions
+-- cannot observe a writable handoff row between reconciliation steps.
+REVOKE ALL PRIVILEGES ON TABLE public.forge_protected_migration_handoffs FROM PUBLIC, forge, forge_runtime_api, forge_runtime_api_login;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public
   GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO forge;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public
@@ -187,7 +236,7 @@ BEGIN
     JOIN pg_catalog.pg_roles owner_role ON owner_role.oid = relation.relowner
     WHERE namespace_row.nspname = 'public'
       AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
-      AND owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner')
+      AND owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner', 'forge_runtime_routines_owner')
     ORDER BY relation.oid
   LOOP
     EXECUTE pg_catalog.format(
@@ -222,19 +271,25 @@ GRANT SELECT ON TABLE
   public.verification_goal_registry_revisions,
   public.verification_goal_registry_entries,
   public.verification_goal_registry_heads
-TO forge;
+TO forge, forge_runtime_api;
+REVOKE ALL ON TABLE public.missions, public.executions, public.task_mission_bindings, public.runtime_transition_audits FROM PUBLIC, forge, forge_runtime_api;
 REVOKE ALL ON FUNCTION public.forge_commit_verification_goal_registry_revision_v1(
   uuid,uuid,uuid,uuid,timestamptz,text,uuid,bigint,bigint,timestamptz,text,jsonb
 ) FROM PUBLIC, forge;
 GRANT EXECUTE ON FUNCTION public.forge_commit_verification_goal_registry_revision_v1(
   uuid,uuid,uuid,uuid,timestamptz,text,uuid,bigint,bigint,timestamptz,text,jsonb
 ) TO forge;
+REVOKE ALL ON FUNCTION forge.resolve_vnext_operator_session_v1(bytea),forge.create_vnext_mission_v1(uuid,uuid,uuid,uuid,text,text,jsonb,text,jsonb,text),forge.transition_vnext_mission_v1(uuid,bigint,text,text,uuid,text,text),forge.transition_vnext_execution_v1(uuid,bigint,text,text,text,uuid,text,text),forge.advance_task_execution_pointer_v1(uuid,bigint,uuid,uuid,text) FROM PUBLIC, forge, forge_runtime_api;
+REVOKE ALL ON FUNCTION forge.create_vnext_generic_zero_mission_v1(bytea,uuid,uuid,text,text),forge.create_vnext_task_mission_v1(bytea,uuid,uuid,uuid,text,text),forge.read_vnext_mission_v1(bytea,uuid),forge.transition_vnext_mission_for_session_v1(bytea,uuid,bigint,text,text,text,text),forge.transition_vnext_execution_for_session_v1(bytea,uuid,bigint,text,text,text,text,text),forge.advance_task_execution_pointer_for_session_v1(bytea,uuid,bigint,uuid,text) FROM PUBLIC, forge;
+GRANT USAGE ON SCHEMA forge TO forge_runtime_api;
+GRANT EXECUTE ON FUNCTION forge.create_vnext_generic_zero_mission_v1(bytea,uuid,uuid,text,text),forge.create_vnext_task_mission_v1(bytea,uuid,uuid,uuid,text,text),forge.read_vnext_mission_v1(bytea,uuid),forge.transition_vnext_mission_for_session_v1(bytea,uuid,bigint,text,text,text,text),forge.transition_vnext_execution_for_session_v1(bytea,uuid,bigint,text,text,text,text,text),forge.advance_task_execution_pointer_for_session_v1(bytea,uuid,bigint,uuid,text) TO forge_runtime_api;
 
 DO $verify$
 DECLARE
   projection_name text;
+  fenced_controller boolean := false;
 BEGIN
-  IF (SELECT count(*) FROM forge_expected_protected_owner_inventory) <> 40 OR EXISTS (
+  IF (SELECT count(*) FROM forge_expected_protected_owner_inventory) <> 44 OR EXISTS (
     SELECT 1
     FROM forge_expected_protected_owner_inventory expected
     LEFT JOIN pg_catalog.pg_class relation
@@ -245,6 +300,32 @@ BEGIN
     WHERE relation.oid IS NULL OR owner_role.rolname IS DISTINCT FROM expected.owner_name
   ) THEN
     RAISE EXCEPTION 'fixed protected owner inventory changed during reconciliation';
+  END IF;
+  IF pg_catalog.current_setting('forge.managed_controller_fenced', true) = '1'
+    AND pg_catalog.to_regclass('public.forge_protected_migration_handoffs') IS NOT NULL THEN
+    EXECUTE $fenced$
+      SELECT EXISTS (
+        SELECT 1 FROM public.forge_protected_migration_handoffs handoff
+        JOIN pg_catalog.pg_database database_row ON database_row.datname = pg_catalog.current_database()
+        WHERE handoff.migration_tag = '0034_vnext_phase0_a1_runtime_foundation'
+          AND handoff.controller_phase IN ('fenced','handoff_open','cleanup_complete','restore_pending','complete')
+          AND handoff.database_name = database_row.datname
+          AND handoff.database_oid = database_row.oid
+          AND handoff.database_owner_oid = database_row.datdba
+          AND handoff.database_acl IS NOT NULL
+          AND handoff.database_acl_digest ~ '^[0-9a-f]{64}$'
+      )
+      AND NOT pg_catalog.has_database_privilege('forge', pg_catalog.current_database(), 'connect')
+      AND NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_shdepend dependency
+        WHERE dependency.refclassid = 'pg_catalog.pg_authid'::pg_catalog.regclass
+          AND dependency.refobjid = 'forge'::pg_catalog.regrole
+          AND dependency.deptype = 'o'
+          AND (dependency.dbid = (SELECT oid FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database())
+            OR (dependency.dbid = 0 AND dependency.classid = 'pg_catalog.pg_database'::pg_catalog.regclass
+              AND dependency.objid = (SELECT oid FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database())))
+      )
+    $fenced$ INTO fenced_controller;
   END IF;
   IF NOT EXISTS (
     SELECT 1
@@ -257,7 +338,7 @@ BEGIN
       AND NOT role_row.rolcreaterole
       AND NOT role_row.rolreplication
       AND NOT role_row.rolbypassrls
-  ) OR EXISTS (
+  ) AND NOT fenced_controller OR EXISTS (
     SELECT 1
     FROM pg_catalog.pg_auth_members membership
     WHERE membership.roleid = 'forge'::pg_catalog.regrole
@@ -268,7 +349,7 @@ BEGIN
   IF (
     SELECT count(*)
     FROM pg_catalog.pg_authid role_row
-    WHERE role_row.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner')
+    WHERE role_row.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner', 'forge_runtime_routines_owner')
       AND NOT role_row.rolcanlogin
       AND NOT role_row.rolinherit
       AND NOT role_row.rolsuper
@@ -279,18 +360,50 @@ BEGIN
       AND role_row.rolconnlimit = -1
       AND role_row.rolpassword IS NULL
       AND role_row.rolvaliduntil IS NULL
-  ) <> 2 OR EXISTS (
+  ) <> 3 OR EXISTS (
     SELECT 1
     FROM pg_catalog.pg_auth_members membership
     WHERE membership.roleid IN (
       'forge_release_routines_owner'::pg_catalog.regrole,
-      'forge_s4_routines_owner'::pg_catalog.regrole
+      'forge_s4_routines_owner'::pg_catalog.regrole,
+      'forge_runtime_routines_owner'::pg_catalog.regrole
     ) OR membership.member IN (
       'forge_release_routines_owner'::pg_catalog.regrole,
-      'forge_s4_routines_owner'::pg_catalog.regrole
+      'forge_s4_routines_owner'::pg_catalog.regrole,
+      'forge_runtime_routines_owner'::pg_catalog.regrole
     )
   ) THEN
     RAISE EXCEPTION 'protected owner roles changed during reconciliation';
+  END IF;
+  IF NOT pg_catalog.has_table_privilege('forge_runtime_routines_owner', 'public.sessions', 'SELECT')
+     OR NOT pg_catalog.has_table_privilege('forge_runtime_routines_owner', 'public.sessions', 'UPDATE')
+     OR pg_catalog.has_table_privilege('forge_runtime_routines_owner', 'public.tasks', 'SELECT')
+     OR NOT pg_catalog.has_column_privilege('forge_runtime_routines_owner', 'public.tasks', 'id', 'SELECT')
+     OR NOT pg_catalog.has_column_privilege('forge_runtime_routines_owner', 'public.tasks', 'project_id', 'SELECT')
+     OR NOT pg_catalog.has_column_privilege('forge_runtime_routines_owner', 'public.tasks', 'submitted_by', 'SELECT')
+     OR pg_catalog.has_table_privilege('forge_runtime_routines_owner', 'public.projects', 'SELECT')
+     OR NOT pg_catalog.has_column_privilege('forge_runtime_routines_owner', 'public.projects', 'id', 'SELECT')
+     OR NOT pg_catalog.has_column_privilege('forge_runtime_routines_owner', 'public.projects', 'submitted_by', 'SELECT')
+     OR NOT pg_catalog.has_column_privilege('forge_runtime_routines_owner', 'public.projects', 'root_ref', 'SELECT')
+     OR NOT pg_catalog.has_column_privilege('forge_runtime_routines_owner', 'public.projects', 'root_binding_revision', 'SELECT')
+     OR NOT pg_catalog.has_column_privilege('forge_runtime_routines_owner', 'public.projects', 'archived_at', 'SELECT')
+     OR EXISTS (
+       SELECT 1
+       FROM pg_catalog.pg_attribute attribute
+       WHERE attribute.attrelid IN ('public.sessions'::pg_catalog.regclass, 'public.tasks'::pg_catalog.regclass, 'public.projects'::pg_catalog.regclass)
+         AND attribute.attnum > 0
+         AND NOT attribute.attisdropped
+         AND NOT (
+           attribute.attrelid = 'public.sessions'::pg_catalog.regclass OR
+           (attribute.attrelid = 'public.tasks'::pg_catalog.regclass AND attribute.attname IN ('id', 'project_id', 'submitted_by')) OR
+           (attribute.attrelid = 'public.projects'::pg_catalog.regclass AND attribute.attname IN ('id', 'submitted_by', 'root_ref', 'root_binding_revision', 'archived_at'))
+         )
+         AND pg_catalog.has_column_privilege('forge_runtime_routines_owner', attribute.attrelid, attribute.attname, 'SELECT')
+     ) THEN
+    RAISE EXCEPTION 'runtime owner source read boundary is outside the exact session and Task compatibility checks';
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_proc routine WHERE routine.oid = 'forge.resolve_vnext_operator_session_v1(bytea)'::pg_catalog.regprocedure AND routine.proowner = 'forge_runtime_routines_owner'::pg_catalog.regrole AND routine.prosecdef AND NOT pg_catalog.has_function_privilege('forge', routine.oid, 'EXECUTE') AND NOT pg_catalog.has_function_privilege('forge_runtime_api', routine.oid, 'EXECUTE')) THEN
+    RAISE EXCEPTION 'VNext session resolver execute boundary is invalid';
   END IF;
   IF NOT EXISTS (
     SELECT 1
@@ -313,6 +426,27 @@ BEGIN
       )
   ) THEN
     RAISE EXCEPTION 'verification goal registry commit routine owner or execute boundary is invalid';
+  END IF;
+  IF (SELECT count(*) FROM pg_catalog.pg_proc routine
+      WHERE routine.oid IN (
+        'forge.create_vnext_generic_zero_mission_v1(bytea,uuid,uuid,text,text)'::pg_catalog.regprocedure,
+        'forge.create_vnext_task_mission_v1(bytea,uuid,uuid,uuid,text,text)'::pg_catalog.regprocedure,
+        'forge.read_vnext_mission_v1(bytea,uuid)'::pg_catalog.regprocedure,
+        'forge.transition_vnext_mission_for_session_v1(bytea,uuid,bigint,text,text,text,text)'::pg_catalog.regprocedure,
+        'forge.transition_vnext_execution_for_session_v1(bytea,uuid,bigint,text,text,text,text,text)'::pg_catalog.regprocedure,
+        'forge.advance_task_execution_pointer_for_session_v1(bytea,uuid,bigint,uuid,text)'::pg_catalog.regprocedure
+      )
+        AND routine.proowner = 'forge_runtime_routines_owner'::pg_catalog.regrole
+        AND routine.prosecdef
+        AND pg_catalog.has_function_privilege('forge_runtime_api', routine.oid, 'EXECUTE')
+        AND NOT pg_catalog.has_function_privilege('forge', routine.oid, 'EXECUTE')
+        AND NOT EXISTS (
+          SELECT 1 FROM pg_catalog.aclexplode(COALESCE(routine.proacl, pg_catalog.acldefault('f', routine.proowner))) privilege
+          WHERE privilege.privilege_type = 'EXECUTE'
+            AND privilege.grantee NOT IN ('forge_runtime_api'::pg_catalog.regrole, 'forge_runtime_routines_owner'::pg_catalog.regrole)
+        )
+  ) <> 6 THEN
+    RAISE EXCEPTION 'VNext runtime routine owner, search path, or execute boundary is invalid';
   END IF;
   IF EXISTS (
     SELECT 1
@@ -346,7 +480,7 @@ BEGIN
     ) privilege
     WHERE namespace_row.nspname = 'public'
       AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
-      AND owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner')
+      AND owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner', 'forge_runtime_routines_owner')
       AND privilege.grantee = 'forge'::pg_catalog.regrole
       AND (
         relation.relname NOT IN (
@@ -369,7 +503,7 @@ BEGIN
     CROSS JOIN LATERAL pg_catalog.aclexplode(attribute.attacl) privilege
     WHERE namespace_row.nspname = 'public'
       AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
-      AND owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner')
+      AND owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner', 'forge_runtime_routines_owner')
       AND attribute.attnum > 0
       AND NOT attribute.attisdropped
       AND privilege.grantee = 'forge'::pg_catalog.regrole
@@ -386,7 +520,7 @@ BEGIN
     ) privilege
     WHERE namespace_row.nspname = 'public'
       AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
-      AND owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner')
+      AND owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner', 'forge_runtime_routines_owner')
       AND privilege.grantee = 0
       AND (
         relation.relname <> 'forge_epic_172_s3_release_state'
@@ -403,7 +537,7 @@ BEGIN
     CROSS JOIN LATERAL pg_catalog.aclexplode(attribute.attacl) privilege
     WHERE namespace_row.nspname = 'public'
       AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
-      AND owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner')
+      AND owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner', 'forge_runtime_routines_owner')
       AND attribute.attnum > 0
       AND NOT attribute.attisdropped
       AND privilege.grantee = 0
@@ -418,7 +552,7 @@ BEGIN
     CROSS JOIN pg_catalog.pg_roles forge_role
     WHERE namespace_row.nspname = 'public'
       AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
-      AND owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner')
+      AND owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner', 'forge_runtime_routines_owner')
       AND forge_role.rolname = 'forge'
       AND (
         pg_catalog.has_table_privilege(forge_role.oid, relation.oid, 'INSERT')

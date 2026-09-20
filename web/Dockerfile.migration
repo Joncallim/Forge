@@ -1,0 +1,14 @@
+FROM node:22-alpine
+
+WORKDIR /forge/web
+
+# Dependencies are resolved while no database credential exists in the build
+# environment. Lifecycle scripts are disabled because this image needs only
+# the checked-in TypeScript migration runner and its locked dependencies.
+COPY web/package.json web/package-lock.json ./
+RUN npm ci --ignore-scripts --no-audit --no-fund
+
+COPY web/ ./
+COPY scripts/reconcile-forge-app-privileges.sql /forge/scripts/reconcile-forge-app-privileges.sql
+
+CMD ["node", "node_modules/tsx/dist/cli.mjs", "db/migrate.ts"]

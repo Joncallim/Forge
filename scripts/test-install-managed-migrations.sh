@@ -2,6 +2,10 @@
 # Focused executable coverage for managed-local migration orchestration.
 set -Eeuo pipefail
 
+# CI diagnostics deliberately disclose only location and status. Never print
+# the failing command: this harness exercises credential-bearing boundaries.
+trap 'status=$?; if [ "$status" -eq 127 ]; then printf "FAIL-TRACE line=%s status=%s\n" "$LINENO" "$status" >&2; fi' ERR
+
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALLER="$SCRIPT_DIR/install.sh"
 REPAIR="$SCRIPT_DIR/repair.sh"
@@ -13,7 +17,7 @@ PROTECTED_OWNER_BOOTSTRAP="$SCRIPT_DIR/../web/scripts/bootstrap-epic-172-s5-reco
 MIGRATE_THROUGH_0028="$SCRIPT_DIR/../web/scripts/ci/migrate-through-0028.ts"
 MIGRATE_THROUGH_0033="$SCRIPT_DIR/../web/scripts/ci/migrate-through-0033.ts"
 TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/forge-managed-migrations.XXXXXX")"
-trap 'rm -rf "$TEST_ROOT"' EXIT
+trap '[ "${FORGE_KEEP_INSTALL_TEST_ROOT:-0}" = 1 ] || rm -rf "$TEST_ROOT"' EXIT
 TEST_SECRET='TEST_APP_DATABASE_URL_MUST_NOT_APPEAR'
 
 fail() {
@@ -76,6 +80,8 @@ assert_not_contains 'FORGE_REPAIR_TEST_HOOK' "$REPAIR"
 assert_not_contains 'FORGE_REPAIR_PRODUCTION_NATIVE_ROUTE' "$REPAIR"
 assert_not_contains 'postgresql://forge:*@localhost:5432/forge|postgres://forge:*@localhost:5432/forge' "$INSTALLER"
 assert_not_contains 'postgresql://forge:*@localhost:5432/forge|postgres://forge:*@localhost:5432/forge' "$REPAIR"
+assert_not_contains 'exec 9<&- 2>/dev/null' "$INSTALLER"
+assert_not_contains 'exec {NATIVE_ENV_SNAPSHOT_FD}<&- 2>/dev/null' "$INSTALLER"
 assert_contains 'new TextDecoder("utf-8", { fatal: true })' "$INSTALLER"
 assert_contains 'new TextDecoder("utf-8", { fatal: true })' "$REPAIR"
 assert_contains 'readFileSync(0)' "$INSTALLER"
@@ -161,7 +167,7 @@ assert_contains "const TARGET_MIGRATION = '0033_verification_goal_registry_revis
 assert_contains 'routine.oid = any(array[${BEGIN}::regprocedure, ${FINALIZE}::regprocedure])' "$PROTECTED_OWNER_BOOTSTRAP"
 assert_contains "revoke create on schema public, forge from forge_s4_routines_owner" "$PROTECTED_OWNER_BOOTSTRAP"
 assert_contains "grant usage on schema forge to forge_s4_routines_owner" "$PROTECTED_OWNER_BOOTSTRAP"
-assert_contains "owner_role.rolname IN ('forge_release_routines_owner', 'forge_s4_routines_owner')" "$PRIVILEGE_SQL"
+assert_contains "'forge_runtime_routines_owner'" "$PRIVILEGE_SQL"
 assert_contains 'FOR UPDATE OF relation;' "$PRIVILEGE_SQL"
 assert_contains 'FOR UPDATE OF attribute;' "$PRIVILEGE_SQL"
 assert_contains "'REVOKE ALL PRIVILEGES ON TABLE %I.%I FROM forge'" "$PRIVILEGE_SQL"
@@ -191,7 +197,8 @@ esac
 sql_owner_map="$TEST_ROOT/sql-owner-map"
 ts_owner_map="$TEST_ROOT/ts-owner-map"
 sed -n '/canonical-protected-owner-map-begin/,/canonical-protected-owner-map-end/p' "$PRIVILEGE_SQL" \
-  | sed -n "s/^  ('\([^']*\)', '\([^']*\)').*/\1|\2/p" | sort > "$sql_owner_map"
+  | sed -n "s/^  ('\([^']*\)', '\([^']*\)').*/\1|\2/p" \
+  | grep -Ev '^(missions|executions|task_mission_bindings|runtime_transition_audits)\|' | sort > "$sql_owner_map"
 sed -n '/canonical-protected-owner-map-begin/,/canonical-protected-owner-map-end/p' \
   "$SCRIPT_DIR/../web/scripts/repair-epic-172-legacy-release.ts" \
   | sed -n "s/^  { name: '\([^']*\)', owner: \([^,]*\),.*/\1|\2/p" \
@@ -712,12 +719,18 @@ run_repair_process_case() {
   local repo_dir="$case_dir/repo"
   mkdir -p \
     "$repo_dir/scripts" \
+    "$repo_dir/web/scripts/ci" \
     "$repo_dir/web/node_modules/next/dist/client" \
     "$case_dir/bin" \
     "$case_dir/home" \
     "$case_dir/workspace/runtime/install"
   cp "$REPAIR" "$repo_dir/scripts/repair.sh"
   cp "$PRIVILEGE_SQL" "$repo_dir/scripts/reconcile-forge-app-privileges.sql"
+  cat > "$repo_dir/web/scripts/ci/apply-vnext-phase0-a1-runtime-foundation.sh" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' 'apply-vnext-phase0-a1-runtime-foundation' >> "$FORGE_REPAIR_TEST_NPM_CALLS"
+EOF
+  chmod +x "$repo_dir/web/scripts/ci/apply-vnext-phase0-a1-runtime-foundation.sh"
   printf '{}\n' > "$repo_dir/web/package.json"
   for required_file in \
     flight-data-helpers.js \
@@ -817,10 +830,10 @@ EOF
     FORGE_REPAIR_TEST_RECONCILER_CALLS="$case_dir/reconciler-calls" \
     FORGE_REPAIR_TEST_NPM_CALLS="$case_dir/npm-calls" \
     FORGE_REPAIR_TEST_SENTINEL="$case_dir/sentinel" \
-    FORGE_REPAIR_TEST_EXPECTED_SOCKET="$REPAIR_EXPECTED_SOCKET" \
+    FORGE_REPAIR_TEST_EXPECTED_SOCKET="$REPAIR_TEST_SOCKET" \
     FORGE_REPAIR_TEST_PROBE_EXIT="${REPAIR_CASE_PROBE_EXIT:-0}" \
     FORGE_REPAIR_TEST_PSQL_BIN="$case_dir/bin/psql" \
-    FORGE_REPAIR_TEST_PSQL_SOCKET="$REPAIR_EXPECTED_SOCKET" \
+    FORGE_REPAIR_TEST_PSQL_SOCKET="$REPAIR_TEST_SOCKET" \
     FORGE_REPAIR_TEST_PSQL_PORT=5432 \
     FORGE_REPAIR_CASE_DRY_RUN="$repair_dry_run" \
     FORGE_REPAIR_CASE_SKIP_MIGRATE="$repair_skip_migrate" \
@@ -855,6 +868,8 @@ case "$(uname -s)" in
   Linux) REPAIR_EXPECTED_SOCKET=/var/run/postgresql ;;
   *) fail 'unsupported repair process-test operating system' ;;
 esac
+REPAIR_TEST_SOCKET="$TEST_ROOT/repair-socket"
+mkdir -p "$REPAIR_TEST_SOCKET"
 
 run_repair_process_case dry-run "$managed_repair_url" native --dry-run
 [ "$CASE_STATUS" -eq 0 ] || fail 'full-process repair dry-run should succeed'
@@ -901,8 +916,8 @@ run_repair_process_case managed "$managed_repair_url" native
 [ "$(wc -l < "$CASE_DIR/reconciler-calls" | tr -d '[:space:]')" = 1 ] \
   || fail 'managed local repair must invoke the shared reconciler exactly once'
 assert_not_contains 'must_not_leak_into_library_routing' "$CASE_DIR/psql-calls"
-assert_contains "-X -h $REPAIR_EXPECTED_SOCKET -p 5432 -d postgres" "$CASE_DIR/psql-calls"
-assert_contains "-X -h $REPAIR_EXPECTED_SOCKET -p 5432 -d forge" "$CASE_DIR/psql-calls"
+assert_contains "-X -h $REPAIR_TEST_SOCKET -p 5432 -d postgres" "$CASE_DIR/psql-calls"
+assert_contains "-X -h $REPAIR_TEST_SOCKET -p 5432 -d forge" "$CASE_DIR/psql-calls"
 assert_not_contains 'ambient-' "$CASE_DIR/psql-calls"
 
 REPAIR_CASE_PROBE_EXIT=74
@@ -940,6 +955,7 @@ for bypass_case in manifest-docker nonlocal-2; do
   bypass_root="$TEST_ROOT/repair-process-$bypass_case"
   : > "$bypass_root/psql-calls"
   printf 'untouched\n' > "$bypass_root/sentinel"
+  set +e
   env -u DATABASE_URL \
     PATH="$bypass_root/bin:$PATH" \
     HOME="$bypass_root/home" \
@@ -958,6 +974,19 @@ for bypass_case in manifest-docker nonlocal-2; do
     FORGE_REPAIR_TEST_EXPECTED_SOCKET="$REPAIR_EXPECTED_SOCKET" \
     /bin/bash "$bypass_root/repo/scripts/repair.sh" --skip-install --skip-doctor \
       > "$bypass_root/executable-stdout" 2> "$bypass_root/executable-stderr"
+  bypass_status=$?
+  set -e
+  case "$bypass_case" in
+    manifest-docker)
+      [ "$bypass_status" -eq 0 ] \
+        || fail 'normal executable docker-manifest repair should succeed'
+      ;;
+    nonlocal-2)
+      [ "$bypass_status" -ne 0 ] \
+        || fail 'normal executable custom-database repair must require controlled administrator access'
+      assert_contains 'requires a controlled FORGE_DATABASE_ADMIN_URL' "$bypass_root/executable-stderr"
+      ;;
+  esac
   [ ! -s "$bypass_root/psql-calls" ] \
     || fail "normal executable repair let test routing bypass $bypass_case gates"
   [ "$(<"$bypass_root/sentinel")" = untouched ] \
@@ -984,7 +1013,7 @@ run_managed_case() {
   CASE_DIR="$case_dir"
 }
 
-expected_stages=(release migrate-0025 s3 migrate-0026 legacy-repair s4 migrate-0027 s5 registry latest)
+expected_stages=(controller)
 
 run_managed_case current current
 [ "$CASE_STATUS" -eq 0 ] || fail 'current-user managed migration should succeed'
@@ -1005,29 +1034,17 @@ assert_stages "$CASE_DIR/stages" "${expected_stages[@]}"
 
 run_managed_case dry-run current 1
 [ "$CASE_STATUS" -eq 0 ] || fail 'dry-run should succeed'
-assert_contains '[dry-run] Bootstrap release roles, migrate through 0025' "$CASE_DIR/stdout"
+assert_contains '[dry-run] Run the shared managed migration controller once' "$CASE_DIR/stdout"
 [ "$(wc -l < "$CASE_DIR/stages" | tr -d '[:space:]')" = 1 ] || fail 'dry-run must not execute migration stages'
 
 run_managed_case admin-unavailable unavailable
 [ "$CASE_STATUS" -ne 0 ] || fail 'unavailable local admin must fail closed'
 assert_contains 'Could not establish passwordless local PostgreSQL administrator access' "$CASE_DIR/stderr"
 
-run_managed_case s5-failure current 0 s5
-[ "$CASE_STATUS" -ne 0 ] || fail 'S5 migration failure must fail the orchestration'
-assert_contains 's5-cleanup-attempted' "$CASE_DIR/stages"
-assert_not_contains 'latest' "$CASE_DIR/stages"
-assert_contains 'its cleanup wrapper preserves the original migration failure' "$CASE_DIR/stderr"
-
-run_managed_case registry-failure current 0 registry
-[ "$CASE_STATUS" -ne 0 ] || fail 'registry migration failure must fail the orchestration'
-assert_contains 'registry-cleanup-attempted' "$CASE_DIR/stages"
-assert_not_contains 'latest' "$CASE_DIR/stages"
-assert_contains 'verification-goal registry; its cleanup wrapper preserves the original migration failure' "$CASE_DIR/stderr"
-
-run_managed_case legacy-repair-failure current 0 legacy-repair
-[ "$CASE_STATUS" -ne 0 ] || fail 'legacy repair failure must fail the orchestration'
-assert_not_contains s4 "$CASE_DIR/stages"
-assert_contains 'repairing the exact known legacy release catalog drift' "$CASE_DIR/stderr"
+run_managed_case controller-failure current 0 controller
+[ "$CASE_STATUS" -ne 0 ] || fail 'shared managed controller failure must fail the orchestration'
+assert_stages "$CASE_DIR/stages" controller
+assert_contains 'application reconnect remains gated until cleanup and ACL restoration succeed' "$CASE_DIR/stderr"
 
 run_enabled_case() {
   local name="$1" service_mode="$2" database_url="$3"
@@ -1192,70 +1209,91 @@ run_installer_privilege_routing_case docker-native-url "$managed_repair_url" doc
 [ ! -s "$CASE_DIR/psql-calls" ] || fail 'docker service mode invoked native psql administration'
 [ "$(<"$CASE_DIR/sentinel")" = untouched ] || fail 'docker service mode touched the native psql sentinel'
 
-run_runuser_environment_case() {
-  local case_dir="$TEST_ROOT/runuser-environment"
-  mkdir -p "$case_dir/bin" "$case_dir/state"
+run_controller_environment_case() {
+  local case_dir="$TEST_ROOT/controller-environment"
+  local real_node real_sha256sum
+  real_node="$(command -v node)"
+  real_sha256sum="$(command -v sha256sum)"
+  mkdir -p "$case_dir/bin" "$case_dir/state" "$case_dir/helper"
   printf 'DATABASE_URL=postgresql://forge:%s@localhost:5432/forge\n' "$TEST_SECRET" > "$case_dir/forge.env"
-  cat > "$case_dir/bin/runuser" <<'EOF'
-#!/bin/bash
-marker_dir="${FORGE_ENV_FILE%/*}"
-if [ -n "${UNRELATED_SECRET_SENTINEL+x}" ]; then
-  printf 'unrelated-secret-leaked\n' > "$marker_dir/runuser-result"
-  exit 1
-fi
-compgen -e > "$marker_dir/runuser-environment-names"
-printf 'clean\n' > "$marker_dir/runuser-result"
-while [ "$1" != "--" ]; do shift; done
-shift
-exec "$@"
-EOF
-  cat > "$case_dir/bin/bash" <<'EOF'
-#!/bin/bash
-exit 0
-EOF
-  for command in node npm npx; do
+  chmod 600 "$case_dir/forge.env"
+  ln -s "$real_node" "$case_dir/helper/node"
+  for command in node npm npx bash sudo; do
     printf '#!/usr/bin/env bash\nexit 0\n' > "$case_dir/bin/$command"
   done
-  chmod +x "$case_dir/bin/runuser" "$case_dir/bin/bash" "$case_dir/bin/node" "$case_dir/bin/npm" "$case_dir/bin/npx"
+  chmod +x "$case_dir/bin"/*
+  ln -s "$real_sha256sum" "$case_dir/bin/sha256sum"
   cat > "$case_dir/driver.sh" <<'EOF'
 #!/bin/bash
 FORGE_INSTALL_LIBRARY=1 source "$INSTALLER"
 test_toolchain_dir="$FORGE_TEST_TOOLCHAIN_DIR"
 trusted_linux_tool() { printf '%s/%s\n' "$test_toolchain_dir" "$1"; }
+prepare_trusted_linux_migration_toolchain() {
+  MANAGED_LOCAL_BASH="$test_toolchain_dir/bash"
+  MANAGED_LOCAL_NODE="$test_toolchain_dir/node"
+  MANAGED_LOCAL_NPM="$test_toolchain_dir/npm"
+  MANAGED_LOCAL_NPX="$test_toolchain_dir/npx"
+  MANAGED_LOCAL_PATH="$test_toolchain_dir"
+}
+run() { printf '%s\n' "$@" > "$FORGE_CONTROLLER_DISPATCH_LOG"; }
 OS_NAME=Linux
-SERVICE_MODE=native
 DRY_RUN=0
-MANAGED_LOCAL_ADMIN_RESOLUTION=resolved
-MANAGED_LOCAL_ADMIN_MODE=runuser
-MANAGED_LOCAL_ADMIN_USER=postgres
-run_managed_local_migrations
+MANAGED_LOCAL_ADMIN_MODE=current
+MANAGED_LOCAL_ADMIN_USER=nobody
+MANAGED_LOCAL_ADMIN_SOCKET=/var/run/postgresql
+MANAGED_LOCAL_ADMIN_PORT=5432
+MANAGED_HELPER_ROOT="$FORGE_TEST_HELPER_ROOT"
+run_managed_local_controller 'controller environment proof'
 EOF
   chmod +x "$case_dir/driver.sh"
   set +e
   INSTALLER="$INSTALLER" \
     FORGE_TEST_TOOLCHAIN_DIR="$case_dir/bin" \
+    FORGE_TEST_HELPER_ROOT="$case_dir/helper" \
     PATH="$case_dir/bin:$PATH" \
     UNRELATED_SECRET_SENTINEL='unrelated-value-must-not-reach-postgres' \
+    DATABASE_URL='postgresql://ambient-admin:must-not-cross@invalid/forge' \
+    FORGE_DATABASE_ADMIN_URL='postgresql://ambient-admin:must-not-cross@invalid/forge' \
+    PGHOST='ambient-host' PGUSER='ambient-admin' \
     FORGE_ENV_FILE="$case_dir/forge.env" \
     FORGE_INSTALL_STATE_DIR="$case_dir/state" \
+    FORGE_CONTROLLER_DISPATCH_LOG="$case_dir/dispatch" \
     /bin/bash "$case_dir/driver.sh" > "$case_dir/stdout" 2> "$case_dir/stderr"
   local driver_status=$?
   set -e
   if [ "$driver_status" -ne 0 ]; then
     sed -n '1,80p' "$case_dir/stderr" >&2
-    fail 'runuser environment driver failed'
+    fail 'controller environment driver failed'
   fi
   CASE_DIR="$case_dir"
 }
 
-run_runuser_environment_case
-assert_contains 'clean' "$CASE_DIR/runuser-result"
-assert_not_contains 'UNRELATED_SECRET_SENTINEL' "$CASE_DIR/runuser-environment-names"
-assert_contains 'DATABASE_URL' "$CASE_DIR/runuser-environment-names"
-assert_contains 'FORGE_DATABASE_ADMIN_URL' "$CASE_DIR/runuser-environment-names"
-assert_contains 'PGHOST' "$CASE_DIR/runuser-environment-names"
-assert_contains 'PGUSER' "$CASE_DIR/runuser-environment-names"
-assert_not_contains "$TEST_SECRET" "$CASE_DIR/runuser-environment-names"
+run_controller_environment_case
+assert_contains '/usr/bin/env' "$CASE_DIR/dispatch"
+assert_contains '-i' "$CASE_DIR/dispatch"
+assert_contains '--native-socket' "$CASE_DIR/dispatch"
+assert_contains '--native-peer-uid' "$CASE_DIR/dispatch"
+assert_contains '--native-peer-gid' "$CASE_DIR/dispatch"
+assert_contains '--native-env-bytes' "$CASE_DIR/dispatch"
+assert_contains '--native-env-sha256' "$CASE_DIR/dispatch"
+assert_not_contains '--native-env-file' "$CASE_DIR/dispatch"
+assert_not_contains 'preserve-environment' "$CASE_DIR/dispatch"
+assert_not_contains 'preserve-env=' "$CASE_DIR/dispatch"
+assert_not_contains 'DATABASE_URL' "$CASE_DIR/dispatch"
+assert_not_contains 'FORGE_DATABASE_ADMIN_URL' "$CASE_DIR/dispatch"
+assert_not_contains 'PGHOST' "$CASE_DIR/dispatch"
+assert_not_contains 'PGUSER' "$CASE_DIR/dispatch"
+assert_not_contains 'must-not-cross' "$CASE_DIR/dispatch"
+assert_not_contains "$TEST_SECRET" "$CASE_DIR/dispatch"
+
+fd_cleanup_stderr="$TEST_ROOT/fd-cleanup-stderr"
+FORGE_INSTALL_LIBRARY=1 /bin/bash -c '
+  source "$1"
+  exec {NATIVE_ENV_SNAPSHOT_FD}</dev/null
+  close_native_env_snapshot
+  printf "%s\n" fd-cleanup-stderr-preserved >&2
+' _ "$INSTALLER" 2>"$fd_cleanup_stderr"
+assert_contains 'fd-cleanup-stderr-preserved' "$fd_cleanup_stderr"
 
 run_shadow_refusal_case() {
   local case_dir="$TEST_ROOT/shadow-refusal"

@@ -82,6 +82,11 @@ POSTGRES_ENV_UNSET_ARGS=(
 LOCK_DIR="$INSTALL_STATE_DIR/install.lock"
 INSTALL_LOCK_HELD=0
 TEMP_FILES=""
+TEMP_DIRS=""
+NATIVE_ENV_SNAPSHOT_DIR=""
+NATIVE_ENV_SNAPSHOT_FD=""
+NATIVE_ENV_BYTES=""
+NATIVE_ENV_SHA256=""
 
 export FORGE_ZERO_CONFIG_MODEL="$ZERO_CONFIG_MODEL"
 
@@ -167,9 +172,20 @@ on_error() {
 trap 'on_error "$LINENO"' ERR
 
 cleanup() {
-  local file
+  local file directory
+  if [ -n "${NATIVE_ENV_SNAPSHOT_FD:-}" ]; then
+    # This descriptor is allocated by Bash itself below. Closing it here keeps
+    # a failed elevated-controller launch from retaining a secret-bearing FD.
+    { exec {NATIVE_ENV_SNAPSHOT_FD}<&-; } 2>/dev/null || true
+    NATIVE_ENV_SNAPSHOT_FD=""
+  fi
   for file in $TEMP_FILES; do
     [ -n "$file" ] && rm -f "$file" 2>/dev/null || true
+  done
+  for directory in $TEMP_DIRS; do
+    case "$directory" in
+      "${TMPDIR:-/tmp}"/forge-managed-helper.*|"${TMPDIR:-/tmp}"/forge-native-env.*) /bin/rm -rf -- "$directory" 2>/dev/null || true ;;
+    esac
   done
 
   if [ "$DRY_RUN" != "1" ] && [ "$INSTALL_LOCK_HELD" = 1 ] && [ -d "$LOCK_DIR" ]; then
@@ -447,7 +463,7 @@ initial_env_value() {
 
 placeholder_value() {
   case "${1:-}" in
-    ''|change_me|change-me|password|your_password|paste_the_generated_value_here|change_me_generate_with_openssl_rand_hex_32)
+    ''|change_me|change-me|password|your_password|paste_the_generated_value_here|change_me_generate_separately|change_me_generate_with_openssl_rand_hex_32)
       return 0
       ;;
     *)
@@ -458,7 +474,7 @@ placeholder_value() {
 
 placeholder_database_url() {
   case "${1:-}" in
-    *'://forge:change_me@localhost:5432/forge'|*'://forge:password@localhost:5432/forge')
+    *'://forge:change_me@localhost:5432/forge'|*'://forge:change_me_generate_separately@localhost:5432/forge'|*'://forge:password@localhost:5432/forge')
       return 0
       ;;
     *)
@@ -1373,7 +1389,11 @@ ensure_env_value() {
   current="$(env_value "$key")"
 
   if [ -z "$current" ]; then
-    ensure_env_line "$key" "$value"
+    if grep -q "^${key}=" "$ENV_FILE" 2>/dev/null; then
+      set_env_line "$key" "$value"
+    else
+      ensure_env_line "$key" "$value"
+    fi
     return 0
   fi
 
@@ -1422,10 +1442,17 @@ write_env_file() {
     fi
   fi
 
-  ensure_env_value POSTGRES_USER forge
+  ensure_env_value POSTGRES_USER forge_admin
   ensure_env_value POSTGRES_PASSWORD "$DB_PASSWORD" placeholder
   ensure_env_value POSTGRES_DB forge
-  ensure_env_value DATABASE_URL "postgresql://forge:${DB_PASSWORD}@localhost:5432/forge" database_url
+  ensure_env_value FORGE_APP_DATABASE_PASSWORD "$APP_DATABASE_PASSWORD" placeholder
+  ensure_env_value FORGE_RUNTIME_API_DATABASE_PASSWORD "$RUNTIME_API_DATABASE_PASSWORD" placeholder
+  ensure_env_value DATABASE_URL "postgresql://forge:${APP_DATABASE_PASSWORD}@localhost:5432/forge" database_url
+  if [ "$SERVICE_MODE" = docker ]; then
+    # Docker provisioning owns this local endpoint and rotates legacy installs
+    # from the old bootstrap password to the split application credential.
+    set_env_line DATABASE_URL "postgresql://forge:${APP_DATABASE_PASSWORD}@localhost:5432/forge"
+  fi
   ensure_env_value REDIS_URL "redis://localhost:6379/0"
   ensure_env_value NEXT_PUBLIC_APP_URL "http://localhost:3000"
   ensure_env_value NEXT_TELEMETRY_DISABLED "1"
@@ -1609,10 +1636,14 @@ prepare_web_app() {
       bash -c 'cd "$1" && npm install --no-audit --no-fund --progress=true' _ "$REPO_ROOT/web"
     mark_web_node_modules_clean
   fi
-  if managed_local_migrations_enabled; then
+  if [ "$SERVICE_MODE" = docker ]; then
+    local compose
+    compose="$(compose_command)" || die "Docker Compose is required for managed Docker migrations."
+    run "Run the secret-isolated Docker migration image" bash -c 'cd "$1" && FORGE_WORKSPACE_ROOT="$2" $3 --env-file "$4" run --rm migration' _ "$REPO_ROOT" "$WORKSPACE_ROOT" "$compose" "$ENV_FILE"
+  elif managed_local_migrations_enabled; then
     run_managed_local_migrations
   else
-    run "npm run db:migrate" bash -c 'cd "$1" && FORGE_WORKSPACE_ROOT="$2" FORGE_ENV_FILE="$3" FORGE_SUPPRESS_MIGRATION_NOTICES=1 npm run db:migrate --silent' _ "$REPO_ROOT/web" "$WORKSPACE_ROOT" "$ENV_FILE"
+    run "Apply database migrations with protected-owner cleanup" bash -c 'cd "$1" && FORGE_WORKSPACE_ROOT="$2" FORGE_ENV_FILE="$3" FORGE_SUPPRESS_MIGRATION_NOTICES=1 bash scripts/ci/apply-vnext-phase0-a1-runtime-foundation.sh' _ "$REPO_ROOT/web" "$WORKSPACE_ROOT" "$ENV_FILE"
   fi
   grant_forge_privileges
   run "npm run db:seed-agents" bash -c 'cd "$1" && FORGE_WORKSPACE_ROOT="$2" FORGE_ENV_FILE="$3" FORGE_PROMPT_UPGRADE_MODE="$4" npm run db:seed-agents' _ "$REPO_ROOT/web" "$WORKSPACE_ROOT" "$ENV_FILE" "$PROMPT_UPGRADE_MODE"
@@ -1772,11 +1803,16 @@ run_managed_local_migration_stage() {
     printf '%s\n' "$stage" >> "${FORGE_INSTALL_TEST_STAGE_LOG:?}"
     if [ "${FORGE_INSTALL_TEST_FAIL_STAGE:-}" = "$stage" ]; then
       case "$stage" in
-        s5|registry) printf '%s-cleanup-attempted\n' "$stage" >> "${FORGE_INSTALL_TEST_STAGE_LOG:?}" ;;
+        s5|registry|runtime) printf '%s-cleanup-attempted\n' "$stage" >> "${FORGE_INSTALL_TEST_STAGE_LOG:?}" ;;
       esac
       return 1
     fi
     return 0
+  fi
+
+  if [ "$stage" = controller ]; then
+    run_managed_local_controller "$description"
+    return
   fi
 
   case "$MANAGED_LOCAL_ADMIN_MODE" in
@@ -1791,6 +1827,7 @@ run_managed_local_migration_stage() {
         migrate-0027) npx tsx scripts/ci/migrate-through-0027.ts ;;
         s5) bash scripts/ci/apply-epic-172-s5-recovery-migration.sh ;;
         registry) bash scripts/ci/apply-verification-goal-registry-migration.sh ;;
+        runtime) bash scripts/ci/apply-vnext-phase0-a1-runtime-foundation.sh ;;
         latest) npm run db:migrate ;;
         *) exit 64 ;;
       esac' _ "$REPO_ROOT/web" "$stage"
@@ -1803,6 +1840,343 @@ run_managed_local_migration_stage() {
       ;;
     *) die "Managed local PostgreSQL administrator mode is unavailable." ;;
   esac
+}
+
+prepare_native_env_snapshot() {
+  local snapshot hash_tool metadata
+  local max_bytes=1048576
+
+  # The controller receives a byte snapshot, never FORGE_ENV_FILE.  Open the
+  # caller-selected source while still running as the operator, with
+  # O_NOFOLLOW enforced by the already-installed, root-owned helper Node.
+  # This permits the normal operator-owned config location and an explicit
+  # custom location, while rejecting a symlink, directory, special file, or a
+  # non-private file (including one writable by group or other users).
+  NATIVE_ENV_SNAPSHOT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/forge-native-env.XXXXXX")" \
+    || die "Could not create a private native migration environment snapshot."
+  TEMP_DIRS="${TEMP_DIRS} ${NATIVE_ENV_SNAPSHOT_DIR}"
+  chmod 700 "$NATIVE_ENV_SNAPSHOT_DIR" || die "Could not protect the native migration environment snapshot."
+  snapshot="$NATIVE_ENV_SNAPSHOT_DIR/env"
+  metadata="$("$MANAGED_HELPER_ROOT/node" - "$ENV_FILE" "$snapshot" "$max_bytes" <<'NODE'
+const crypto = require('crypto')
+const fs = require('fs')
+
+const [source, snapshot, maximumText] = process.argv.slice(2)
+const maximum = Number(maximumText)
+if (!source || !snapshot || !Number.isSafeInteger(maximum) || maximum < 1) process.exit(64)
+
+let sourceFd
+let snapshotFd
+try {
+  // O_NOFOLLOW is important here: the caller controls the selected pathname,
+  // but root must never be induced to follow it later.
+  sourceFd = fs.openSync(source, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW)
+  const stat = fs.fstatSync(sourceFd)
+  if (!stat.isFile() || (stat.mode & 0o077) !== 0 || stat.size < 1 || stat.size > maximum) process.exit(65)
+  snapshotFd = fs.openSync(snapshot, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, 0o600)
+  const digest = crypto.createHash('sha256')
+  const chunk = Buffer.allocUnsafe(64 * 1024)
+  let total = 0
+  for (;;) {
+    const received = fs.readSync(sourceFd, chunk, 0, chunk.length, null)
+    if (received === 0) break
+    total += received
+    if (total > maximum) process.exit(66)
+    digest.update(chunk.subarray(0, received))
+    let offset = 0
+    while (offset < received) offset += fs.writeSync(snapshotFd, chunk, offset, received - offset)
+  }
+  if (total < 1) process.exit(67)
+  fs.fsyncSync(snapshotFd)
+  process.stdout.write(`${total} ${digest.digest('hex')}\n`)
+} finally {
+  if (snapshotFd !== undefined) fs.closeSync(snapshotFd)
+  if (sourceFd !== undefined) fs.closeSync(sourceFd)
+}
+NODE
+)" || die "Native migration environment must be a private regular non-symlink file of at most 1048576 bytes."
+
+  case "$metadata" in
+    *' '* )
+      NATIVE_ENV_BYTES="${metadata%% *}"
+      NATIVE_ENV_SHA256="${metadata#* }"
+      ;;
+    *) die "Could not snapshot the native migration environment." ;;
+  esac
+  case "$NATIVE_ENV_BYTES:$NATIVE_ENV_SHA256" in
+    *[!0-9a-f:]*|:*|0:*|*::*|*:*:*) die "Could not validate the native migration environment snapshot." ;;
+  esac
+  [ "${#NATIVE_ENV_SHA256}" -eq 64 ] || die "Could not validate the native migration environment snapshot."
+  [ "$NATIVE_ENV_BYTES" -le "$max_bytes" ] || die "Native migration environment is too large."
+
+  # Rehash the completed snapshot with a trusted system hash implementation.
+  # The controller verifies the same digest after elevation, so any same-user
+  # mutation between this point and the pipe is a safe refusal, not authority.
+  if [ "$OS_NAME" = Linux ]; then
+    hash_tool="$(trusted_linux_tool sha256sum)" || die "Managed migrations require a trusted SHA-256 tool."
+    NATIVE_ENV_SHA256="$("$hash_tool" "$snapshot" | /usr/bin/awk '{print $1}')"
+  else
+    hash_tool=/usr/bin/shasum
+    [ -x "$hash_tool" ] || die "Managed migrations require the system SHA-256 tool."
+    NATIVE_ENV_SHA256="$("$hash_tool" -a 256 "$snapshot" | /usr/bin/awk '{print $1}')"
+  fi
+  case "$NATIVE_ENV_SHA256" in
+    ''|*[!0-9a-f]*) die "Could not hash the native migration environment snapshot." ;;
+  esac
+  [ "${#NATIVE_ENV_SHA256}" -eq 64 ] || die "Could not hash the native migration environment snapshot."
+  exec {NATIVE_ENV_SNAPSHOT_FD}< "$snapshot" || die "Could not open the native migration environment snapshot."
+  [ -f "/dev/fd/$NATIVE_ENV_SNAPSHOT_FD" ] || die "Native migration environment snapshot is not a regular file."
+}
+
+close_native_env_snapshot() {
+  if [ -n "${NATIVE_ENV_SNAPSHOT_FD:-}" ]; then
+    { exec {NATIVE_ENV_SNAPSHOT_FD}<&-; } 2>/dev/null || true
+    NATIVE_ENV_SNAPSHOT_FD=""
+  fi
+  if [ -n "${NATIVE_ENV_SNAPSHOT_DIR:-}" ]; then
+    /bin/rm -rf -- "$NATIVE_ENV_SNAPSHOT_DIR" 2>/dev/null || true
+    NATIVE_ENV_SNAPSHOT_DIR=""
+  fi
+}
+
+run_managed_local_controller_with_snapshot() {
+  local description="$1" status
+  shift
+  if run "$description" "$@" <&"$NATIVE_ENV_SNAPSHOT_FD"; then
+    status=0
+  else
+    status="$?"
+  fi
+  close_native_env_snapshot
+  return "$status"
+}
+
+run_managed_local_controller() {
+  local description="$1" sudo_bin peer_uid peer_gid
+  peer_uid="$(/usr/bin/id -u "$MANAGED_LOCAL_ADMIN_USER" 2>/dev/null || true)"
+  peer_gid="$(/usr/bin/id -g "$MANAGED_LOCAL_ADMIN_USER" 2>/dev/null || true)"
+  case "$peer_uid:$peer_gid" in *[!0-9:]*|*::*|0:*|*:0) die "Managed local controller could not establish a non-root peer administrator identity." ;; esac
+  [ -n "$MANAGED_LOCAL_ADMIN_SOCKET" ] || die "Managed local controller resolved an empty PostgreSQL socket path."
+  prepare_native_env_snapshot
+  local controller_args=(--run --native-socket "$MANAGED_LOCAL_ADMIN_SOCKET" --native-port "$MANAGED_LOCAL_ADMIN_PORT" --native-database forge --native-env-bytes "$NATIVE_ENV_BYTES" --native-env-sha256 "$NATIVE_ENV_SHA256" --native-helper-root "$MANAGED_HELPER_ROOT" --native-peer-uid "$peer_uid" --native-peer-gid "$peer_gid" --native-child-node "$MANAGED_HELPER_ROOT/node" --native-reconcile-sql "$MANAGED_HELPER_ROOT/reconcile-forge-app-privileges.sql" --native-legacy-repair-sql "$MANAGED_HELPER_ROOT/epic-172-legacy-0023-0025-v1.sql")
+  case "$MANAGED_LOCAL_ADMIN_MODE" in
+    current)
+      if [ "${EUID:-$(/usr/bin/id -u)}" -eq 0 ]; then
+        run_managed_local_controller_with_snapshot "$description" /usr/bin/env -i HOME=/root "$MANAGED_HELPER_ROOT/node" "$MANAGED_HELPER_ROOT/controller.mjs" "${controller_args[@]}"
+      else
+        if [ "$OS_NAME" = Darwin ]; then sudo_bin=/usr/bin/sudo; else sudo_bin="$(trusted_linux_tool sudo)" || die "Managed local migrations require a trusted sudo."; fi
+        run_managed_local_controller_with_snapshot "$description" "$sudo_bin" -n -- /usr/bin/env -i HOME=/root "$MANAGED_HELPER_ROOT/node" "$MANAGED_HELPER_ROOT/controller.mjs" "${controller_args[@]}"
+      fi
+      ;;
+    sudo)
+      sudo_bin="$(trusted_linux_tool sudo)" || die "Could not find a root-owned non-writable sudo for elevated managed migrations."
+      run_managed_local_controller_with_snapshot "$description" "$sudo_bin" -n -- /usr/bin/env -i HOME=/root "$MANAGED_HELPER_ROOT/node" "$MANAGED_HELPER_ROOT/controller.mjs" "${controller_args[@]}"
+      ;;
+    runuser)
+      [ "${EUID:-$(/usr/bin/id -u)}" -eq 0 ] || die "runuser administration requires a root controller."
+      run_managed_local_controller_with_snapshot "$description" /usr/bin/env -i HOME=/root "$MANAGED_HELPER_ROOT/node" "$MANAGED_HELPER_ROOT/controller.mjs" "${controller_args[@]}"
+    ;;
+    *) die "Managed local PostgreSQL administrator mode is unavailable." ;;
+  esac
+}
+
+receive_bounded_privileged_stream() {
+  local expected_bytes="$1" output="$2"
+  shift 2
+  case "$expected_bytes" in ''|*[!0-9]*) return 64 ;; esac
+  "$@" /bin/sh -c '
+    set -eu
+    expected="$1"; output="$2"; block=1048576
+    blocks=$(((expected + 1 + block - 1) / block))
+    umask 077
+    exec 7<&0
+    /bin/dd bs=$block count=$blocks of="$output" 2>/dev/null <&7 & receiver=$!
+    remaining=30
+    while /bin/kill -0 "$receiver" 2>/dev/null && [ "$remaining" -gt 0 ]; do /bin/sleep 1; remaining=$((remaining - 1)); done
+    timed_out=0
+    if /bin/kill -0 "$receiver" 2>/dev/null; then timed_out=1; /bin/kill -TERM "$receiver" 2>/dev/null || true; fi
+    status=0; wait "$receiver" || status=$?
+    exec 7<&-
+    [ "$timed_out" -eq 0 ] || exit 1
+    [ "$status" -eq 0 ] || exit 1
+    actual=$(/usr/bin/wc -c < "$output" | /usr/bin/tr -d "[:space:]")
+    [ "$actual" = "$expected" ]
+  ' _ "$expected_bytes" "$output"
+}
+
+install_managed_migration_helper() {
+  local build_dir source_node digest pack_bytes node_digest installed_node_digest stream_digest target staging install_bin hash_tool root_group canonical_target computed elevator=()
+  build_dir="$(mktemp -d "${TMPDIR:-/tmp}/forge-managed-helper.XXXXXX")"
+  TEMP_DIRS="${TEMP_DIRS} ${build_dir}"
+  if [ "$OS_NAME" = Linux ]; then
+    source_node="$(trusted_linux_tool node)" || die "Managed migration helper requires a trusted Node.js 22 executable."
+    hash_tool="$(trusted_linux_tool sha256sum)" || die "Managed migration helper requires a trusted SHA-256 tool."
+  else
+    source_node="$(prepare_pinned_darwin_managed_node)" || die "Managed migration helper could not prepare the pinned official Node.js runtime for macOS."
+    hash_tool=/usr/bin/shasum
+  fi
+  /usr/bin/env -i HOME="${TMPDIR:-/tmp}" PATH=/usr/bin:/bin "$source_node" "$REPO_ROOT/web/scripts/ci/build-managed-migration-helper.mjs" "$build_dir"
+  # install.sh is the operator-trusted entry boundary. Its release pin is
+  # independent of the writable builder/controller; a self-hash cannot make a
+  # hostile replacement installer trustworthy without an out-of-band root.
+  digest='4edd2c59fd403da3224788d8e101920c78a5e4fed7318f9ed153b339acee9b09'
+  pack_bytes=3646597
+  exec 9< "$build_dir/bundle.pack"
+  [ -f /dev/fd/9 ] || die "Managed migration helper pack is not a regular file."
+  computed="$($source_node -e 'const fs=require("fs"),c=require("crypto").createHash("sha256");c.update(fs.readFileSync(process.argv[1]));process.stdout.write(c.digest("hex"))' "$build_dir/bundle.pack")"
+  [ "$computed" = "$digest" ] || die "Managed migration helper bytes do not match the independently pinned release digest. Refusing elevation."
+  if [ "$OS_NAME" = Darwin ]; then node_digest="$("$hash_tool" -a 256 "$source_node" | /usr/bin/awk '{print $1}')"; else node_digest="$("$hash_tool" "$source_node" | /usr/bin/awk '{print $1}')"; fi
+  target="/var/lib/forge-managed-migration-helper/v3-$digest-$node_digest"
+  staging="${target}.next.$$"
+  if [ "${EUID:-$(/usr/bin/id -u)}" -ne 0 ]; then
+    if [ "$OS_NAME" = Darwin ]; then elevator=(/usr/bin/sudo); else elevator=("$(trusted_linux_tool sudo)"); fi
+  fi
+  root_group="$(/usr/bin/id -gn 0)"
+  [ -n "$root_group" ] || die "Managed migration helper could not resolve the root account's primary group."
+  install_bin=/usr/bin/install
+  "${elevator[@]}" "$install_bin" -d -o root -g "$root_group" -m 0755 /var/lib/forge-managed-migration-helper
+  if ! "${elevator[@]}" /usr/bin/test -d "$target"; then
+    "${elevator[@]}" "$install_bin" -d -o root -g "$root_group" -m 0700 "$staging"
+    # The invoking shell opens the mutable build result and streams bytes. Root
+    # never follows a checkout/build pathname and authenticates the complete
+    # stream before parsing any attacker-controlled field.
+    receive_bounded_privileged_stream "$pack_bytes" "$staging/bundle.pack" "${elevator[@]}" <&9 \
+      || { exec 9<&-; "${elevator[@]}" /bin/rm -rf -- "$staging"; die "Managed migration helper stream was truncated, oversized, or stalled."; }
+    exec 9<&-
+    if [ "$OS_NAME" = Darwin ]; then stream_digest="$("${elevator[@]}" "$hash_tool" -a 256 "$staging/bundle.pack" | /usr/bin/awk '{print $1}')"; else stream_digest="$("${elevator[@]}" "$hash_tool" "$staging/bundle.pack" | /usr/bin/awk '{print $1}')"; fi
+    [ "$stream_digest" = "$digest" ] || { "${elevator[@]}" /bin/rm -rf -- "$staging"; die "Managed migration helper stream changed after precheck; refusing parse or publication."; }
+    "${elevator[@]}" "$install_bin" -o root -g "$root_group" -m 0555 "$source_node" "$staging/node"
+    if [ "$OS_NAME" = Darwin ]; then installed_node_digest="$("${elevator[@]}" "$hash_tool" -a 256 "$staging/node" | /usr/bin/awk '{print $1}')"; else installed_node_digest="$("${elevator[@]}" "$hash_tool" "$staging/node" | /usr/bin/awk '{print $1}')"; fi
+    [ "$installed_node_digest" = "$node_digest" ] || { "${elevator[@]}" /bin/rm -rf -- "$staging"; die "Managed migration helper Node.js changed before pack parsing."; }
+    "${elevator[@]}" "$staging/node" -e '
+      const fs=require("fs"),path=require("path"),crypto=require("crypto"),root=process.argv[1]
+      const pack=JSON.parse(fs.readFileSync(path.join(root,"bundle.pack"),"utf8"))
+      if(pack.version!==1||!Array.isArray(pack.files)||pack.files.length===0)process.exit(2)
+      const names=pack.files.map(x=>x.name)
+      if(JSON.stringify(names)!==JSON.stringify([...names].sort())||new Set(names).size!==names.length)process.exit(3)
+      const manifest=[]
+      for(const entry of pack.files){
+        if(typeof entry.name!=="string"||!entry.name.match(/^[A-Za-z0-9_./-]+$/)||entry.name.startsWith("/")||entry.name.split("/").includes("..")||typeof entry.content!=="string")process.exit(4)
+        const bytes=Buffer.from(entry.content,"base64"),sha=crypto.createHash("sha256").update(bytes).digest("hex")
+        if(bytes.toString("base64")!==entry.content||bytes.length!==entry.bytes||sha!==entry.sha256)process.exit(5)
+        const output=path.join(root,entry.name),parent=path.dirname(output);fs.mkdirSync(parent,{recursive:true,mode:0o755})
+        for(let directory=parent;directory!==root;directory=path.dirname(directory))fs.chmodSync(directory,0o755)
+        fs.writeFileSync(output,bytes,{mode:0o444,flag:"wx"});fs.chmodSync(output,0o444)
+        manifest.push({name:entry.name,bytes:entry.bytes,sha256:entry.sha256})
+      }
+      const manifestPath=path.join(root,"closure-manifest.json")
+      fs.writeFileSync(manifestPath,`${JSON.stringify({version:1,files:manifest},null,2)}\n`,{mode:0o444,flag:"wx"});fs.chmodSync(manifestPath,0o444)
+    ' "$staging" || { "${elevator[@]}" /bin/rm -rf -- "$staging"; die "Pinned managed migration helper pack was structurally invalid."; }
+    "${elevator[@]}" /bin/rm -f -- "$staging/bundle.pack"
+    "${elevator[@]}" /bin/chmod 0755 "$staging"
+    "${elevator[@]}" /bin/mv "$staging" "$target" \
+      || { "${elevator[@]}" /bin/rm -rf -- "$staging"; die "Managed migration helper publication failed."; }
+  fi
+  { exec 9<&-; } 2>/dev/null || true
+  if [ "$OS_NAME" = Darwin ]; then
+    installed_node_digest="$("${elevator[@]}" "$hash_tool" -a 256 "$target/node" | /usr/bin/awk '{print $1}')"
+  else
+    installed_node_digest="$("${elevator[@]}" "$hash_tool" "$target/node" | /usr/bin/awk '{print $1}')"
+  fi
+  if [ "$installed_node_digest" != "$node_digest" ]; then
+    "${elevator[@]}" /bin/rm -rf -- "$target"
+    die "Installed managed migration helper Node.js digest changed during privileged copy."
+  fi
+  canonical_target="$(cd -P "$target" && pwd -P)" \
+    || die "Managed migration helper could not resolve its installed system directory."
+  if ! "${elevator[@]}" "$canonical_target/node" -e '
+    const fs=require("fs"),path=require("path"),crypto=require("crypto")
+    const expected=process.argv[1],root=process.argv[2],manifest=JSON.parse(fs.readFileSync(path.join(root,"closure-manifest.json"),"utf8")),packed=[]
+    if(manifest.version!==1||!Array.isArray(manifest.files)||manifest.files.length===0)process.exit(5)
+    const names=manifest.files.map(x=>x.name)
+    if(JSON.stringify(names)!==JSON.stringify([...names].sort())||new Set(names).size!==names.length)process.exit(6)
+    const expectedFiles=new Set(["node","closure-manifest.json",...manifest.files.map(x=>x.name)])
+    const walk=(dir,prefix="")=>{for(const d of fs.readdirSync(dir,{withFileTypes:true})){const name=prefix?`${prefix}/${d.name}`:d.name;if(d.isDirectory())walk(path.join(dir,d.name),name);else if(!expectedFiles.has(name))process.exit(7)}};walk(root)
+    for(const entry of manifest.files){
+      if(typeof entry.name!=="string"||!entry.name.match(/^[A-Za-z0-9_./-]+$/)||entry.name.startsWith("/")||entry.name.split("/").includes(".."))process.exit(8)
+      const file=path.join(root,entry.name),leaf=fs.lstatSync(file); if(!leaf.isFile()||leaf.isSymbolicLink())process.exit(1)
+      if((leaf.mode&0o777)!==0o444)process.exit(9)
+      const bytes=fs.readFileSync(file),sha=crypto.createHash("sha256").update(bytes).digest("hex");if(bytes.length!==entry.bytes||sha!==entry.sha256)process.exit(2)
+      packed.push({...entry,content:bytes.toString("base64")})
+      for(let current=file;;current=path.dirname(current)){const stat=fs.lstatSync(current);if(stat.uid!==0||(stat.mode&0o22)!==0)process.exit(3);if(current!==file&&(current===root||current.startsWith(`${root}${path.sep}`))&&(stat.mode&0o777)!==0o755)process.exit(10);if(current==="/")break}
+    }
+    const rebuilt=Buffer.from(`${JSON.stringify({version:1,files:packed})}\n`)
+    if(crypto.createHash("sha256").update(rebuilt).digest("hex")!==expected)process.exit(4)
+  ' "$digest" "$canonical_target"; then
+    "${elevator[@]}" /bin/rm -rf -- "$canonical_target"
+    die "Installed managed migration helper digest does not match its independently pinned release bundle."
+  fi
+  MANAGED_HELPER_ROOT="$canonical_target"
+  /bin/rm -rf -- "$build_dir"
+}
+
+prepare_pinned_darwin_managed_node() {
+  local version=22.23.2 architecture archive archive_bytes expected node_expected actual effective root node_path url target staging root_group installed_digest elevator=()
+  [ "$OS_NAME" = Darwin ] || return 1
+  case "$(/usr/bin/uname -m)" in
+    arm64) architecture=arm64; archive_bytes=25950400; expected=5eff7a9011895aae3f29d06f167b84a62b028a591370c7cafb59103559fd26e1; node_expected=18e387c90ab8a8400183e8bdd396376e1e875b91b4c874b894dcade7b35bf572 ;;
+    x86_64) architecture=x64; archive_bytes=27517304; expected=96dff79f4e19a78715da559ec7cac2028f4985a175ea0c3454625a269c21deb7; node_expected=0b4f059915f3bf3c6cbb02422f4a529bfb21cbbec2d29851c9a5d833f78a04f6 ;;
+    *) return 1 ;;
+  esac
+  root="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/forge-node-darwin.XXXXXX")" || return 1
+  archive="$root/node.tar.xz"
+  url="https://nodejs.org/download/release/v$version/node-v$version-darwin-$architecture.tar.xz"
+  effective="$(/usr/bin/curl -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 --write-out '%{url_effective}' "$url" -o "$archive")" \
+    || { /bin/rm -rf "$root"; return 1; }
+  [ "$effective" = "$url" ] || { /bin/rm -rf "$root"; return 1; }
+  exec 9< "$archive"
+  [ -f /dev/fd/9 ] || { exec 9<&-; /bin/rm -rf "$root"; return 1; }
+  actual="$(/usr/bin/shasum -a 256 "$archive" | /usr/bin/awk '{print $1}')"
+  [ "$actual" = "$expected" ] || { /bin/rm -rf "$root"; return 1; }
+  [ "${EUID:-$(/usr/bin/id -u)}" -eq 0 ] || elevator=(/usr/bin/sudo)
+  root_group="$(/usr/bin/id -gn 0)"; [ -n "$root_group" ] || { /bin/rm -rf "$root"; return 1; }
+  target="/var/lib/forge-managed-node/v$version-$architecture-$expected"
+  staging="${target}.next.$$"
+  "${elevator[@]}" /usr/bin/install -d -o root -g "$root_group" -m 0755 /var/lib/forge-managed-node || { /bin/rm -rf "$root"; return 1; }
+  if ! "${elevator[@]}" /usr/bin/test -d "$target"; then
+    "${elevator[@]}" /usr/bin/install -d -o root -g "$root_group" -m 0700 "$staging" || { /bin/rm -rf "$root"; return 1; }
+    receive_bounded_privileged_stream "$archive_bytes" "$staging/node.tar.xz" "${elevator[@]}" <&9 \
+      || { exec 9<&-; "${elevator[@]}" /bin/rm -rf -- "$staging"; /bin/rm -rf "$root"; return 1; }
+    exec 9<&-
+    actual="$("${elevator[@]}" /usr/bin/shasum -a 256 "$staging/node.tar.xz" | /usr/bin/awk '{print $1}')"
+    [ "$actual" = "$expected" ] || { "${elevator[@]}" /bin/rm -rf -- "$staging"; /bin/rm -rf "$root"; return 1; }
+    "${elevator[@]}" /usr/bin/tar -xJf "$staging/node.tar.xz" -C "$staging" \
+      || { "${elevator[@]}" /bin/rm -rf -- "$staging"; /bin/rm -rf "$root"; return 1; }
+    node_path="$staging/node-v$version-darwin-$architecture/bin/node"
+    "${elevator[@]}" /usr/bin/test -f "$node_path" && ! "${elevator[@]}" /usr/bin/test -L "$node_path" \
+      || { "${elevator[@]}" /bin/rm -rf -- "$staging"; /bin/rm -rf "$root"; return 1; }
+    installed_digest="$("${elevator[@]}" /usr/bin/shasum -a 256 "$node_path" | /usr/bin/awk '{print $1}')"
+    [ "$installed_digest" = "$node_expected" ] || { "${elevator[@]}" /bin/rm -rf -- "$staging"; /bin/rm -rf "$root"; return 1; }
+    "${elevator[@]}" /usr/bin/install -o root -g "$root_group" -m 0555 "$node_path" "$staging/node" \
+      || { "${elevator[@]}" /bin/rm -rf -- "$staging"; /bin/rm -rf "$root"; return 1; }
+    "${elevator[@]}" /bin/rm -rf -- "$staging/node.tar.xz" "$staging/node-v$version-darwin-$architecture"
+    "${elevator[@]}" /bin/chmod 0755 "$staging"
+    "${elevator[@]}" /bin/mv "$staging" "$target" \
+      || { "${elevator[@]}" /bin/rm -rf -- "$staging"; /bin/rm -rf "$root"; return 1; }
+  fi
+  { exec 9<&-; } 2>/dev/null || true
+  installed_digest="$("${elevator[@]}" /usr/bin/shasum -a 256 "$target/node" | /usr/bin/awk '{print $1}')"
+  [ "$installed_digest" = "$node_expected" ] && trusted_darwin_candidate "$target/node" \
+    || { "${elevator[@]}" /bin/rm -rf -- "$target"; /bin/rm -rf "$root"; return 1; }
+  /bin/rm -rf "$root"
+  printf '%s\n' "$target/node"
+}
+
+trusted_darwin_candidate() {
+  local candidate="$1" current owner mode physical_parent
+  [ "$OS_NAME" = Darwin ] || return 1
+  [ -x "$candidate" ] && [ -f "$candidate" ] && [ ! -L "$candidate" ] || return 1
+  physical_parent="$(cd -P "${candidate%/*}" 2>/dev/null && pwd -P)" || return 1
+  [ "$physical_parent/${candidate##*/}" = "$candidate" ] || return 1
+  current="$candidate"
+  while :; do
+    owner="$(/usr/bin/stat -f '%Su' "$current" 2>/dev/null || true)"
+    mode="$(/usr/bin/stat -f '%Lp' "$current" 2>/dev/null || true)"
+    [ "$owner" = root ] && [ -n "$mode" ] && [ $((8#$mode & 022)) -eq 0 ] || return 1
+    [ "$current" = / ] && return 0
+    current="${current%/*}"
+    [ -n "$current" ] || current=/
+  done
 }
 
 trusted_linux_path_chain() {
@@ -1876,10 +2250,8 @@ run_managed_local_migration_as_runuser() {
   controlled_path="$MANAGED_LOCAL_PATH"
   runuser_bin="$(trusted_linux_tool runuser)" || die "Could not find a root-owned non-writable runuser for elevated managed migrations."
 
-  # `runuser --preserve-environment` is needed so the child receives the
-  # process-only socket/admin context without serialising a credential into an
-  # argv value. Constrain its parent environment first: this subshell exports
-  # exactly the migration inputs and a controlled executable path.
+  # Historical non-controller stages retain their narrow legacy wrapper. The
+  # controller has a separate env-empty dispatch above and never enters here.
   (
     local name
     for name in $(compgen -e); do
@@ -1900,6 +2272,7 @@ run_managed_local_migration_as_runuser() {
       migrate-0027) npx tsx scripts/ci/migrate-through-0027.ts ;;
       s5) bash scripts/ci/apply-epic-172-s5-recovery-migration.sh ;;
       registry) bash scripts/ci/apply-verification-goal-registry-migration.sh ;;
+      runtime) bash scripts/ci/apply-vnext-phase0-a1-runtime-foundation.sh ;;
       latest) npm run db:migrate ;;
       *) exit 64 ;;
     esac' _ "$REPO_ROOT/web" "$stage"
@@ -1924,6 +2297,7 @@ run_managed_local_migration_as_sudo() {
       migrate-0027) npx tsx scripts/ci/migrate-through-0027.ts ;;
       s5) bash scripts/ci/apply-epic-172-s5-recovery-migration.sh ;;
       registry) bash scripts/ci/apply-verification-goal-registry-migration.sh ;;
+      runtime) bash scripts/ci/apply-vnext-phase0-a1-runtime-foundation.sh ;;
       latest) npm run db:migrate ;;
       *) exit 64 ;;
     esac' _ "$REPO_ROOT/web" "$stage"
@@ -1933,39 +2307,24 @@ run_managed_local_migration_as_sudo() {
 run_managed_local_migrations() {
   step "Applying managed local database migrations"
   if [ "$DRY_RUN" = "1" ]; then
-    info "[dry-run] Bootstrap release roles, migrate through 0025, bootstrap S3, migrate through 0026, repair an exact known legacy release catalog if needed, bootstrap S4, migrate through 0027, apply S5 through 0028 with cleanup, apply the verification-goal registry through 0033 with cleanup, then run the latest migrator."
+    info "[dry-run] Run the shared managed migration controller once; it owns quiescence, historical bootstraps, protected handoffs, cleanup, and reconnect."
     return 0
   fi
 
+  # Package and verify the finite privileged helper before opening any peer
+  # administrator connection or loading migration credentials.
+  if [ "${FORGE_INSTALL_TEST_HOOK:-}" != managed-local-migrations ]; then
+    install_managed_migration_helper
+  fi
   resolve_managed_local_admin || die "Could not establish passwordless local PostgreSQL administrator access for managed migrations. Use a native local PostgreSQL peer login, or run the documented operator migration procedure for a custom database."
 
-  local DATABASE_URL FORGE_DATABASE_ADMIN_URL PGHOST PGPORT PGUSER FORGE_WORKSPACE_ROOT FORGE_ENV_FILE FORGE_SUPPRESS_MIGRATION_NOTICES
-  clear_postgres_routing_environment
-  DATABASE_URL="$(env_value DATABASE_URL)"
-  [ -n "$DATABASE_URL" ] || die "Managed local migrations require DATABASE_URL in the local Forge environment file."
-  FORGE_DATABASE_ADMIN_URL="postgresql:///forge"
-  PGHOST="$MANAGED_LOCAL_ADMIN_SOCKET"
-  PGPORT="$MANAGED_LOCAL_ADMIN_PORT"
-  PGUSER="$MANAGED_LOCAL_ADMIN_USER"
-  FORGE_WORKSPACE_ROOT="$WORKSPACE_ROOT"
-  FORGE_ENV_FILE="$ENV_FILE"
-  FORGE_SUPPRESS_MIGRATION_NOTICES=1
-  export DATABASE_URL FORGE_DATABASE_ADMIN_URL PGHOST PGPORT PGUSER FORGE_WORKSPACE_ROOT FORGE_ENV_FILE FORGE_SUPPRESS_MIGRATION_NOTICES
+  [ -n "$(env_value DATABASE_URL)" ] || die "Managed local migrations require DATABASE_URL in the local Forge environment file."
 
   run_managed_local_migration_sequence
 }
 
 run_managed_local_migration_sequence() {
-  run_managed_local_migration_stage "Bootstrap release roles for managed local migration" release || die "Managed local migration failed while bootstrapping release roles."
-  run_managed_local_migration_stage "Migrate managed local database through 0025" migrate-0025 || die "Managed local migration failed while applying migrations through 0025."
-  run_managed_local_migration_stage "Bootstrap S3 owner handoff for managed local migration" s3 || die "Managed local migration failed while bootstrapping the S3 owner handoff."
-  run_managed_local_migration_stage "Migrate managed local database through 0026" migrate-0026 || die "Managed local migration failed while applying migrations through 0026."
-  run_managed_local_migration_stage "Repair exact known legacy release catalog drift" legacy-repair || die "Managed local migration failed while repairing the exact known legacy release catalog drift."
-  run_managed_local_migration_stage "Bootstrap S4 owner handoff for managed local migration" s4 || die "Managed local migration failed while bootstrapping the S4 owner handoff."
-  run_managed_local_migration_stage "Migrate managed local database through 0027" migrate-0027 || die "Managed local migration failed while applying migrations through 0027."
-  run_managed_local_migration_stage "Apply S5 managed local migration with mandatory cleanup" s5 || die "Managed local migration failed while applying S5; its cleanup wrapper preserves the original migration failure."
-  run_managed_local_migration_stage "Apply verification-goal registry migration with mandatory cleanup" registry || die "Managed local migration failed while applying the verification-goal registry; its cleanup wrapper preserves the original migration failure."
-  run_managed_local_migration_stage "Run the latest managed local migrator" latest || die "Managed local migration failed while applying the latest migration set."
+  run_managed_local_migration_stage "Run the shared managed database migration controller" controller || die "Managed local migration controller failed; application reconnect remains gated until cleanup and ACL restoration succeed."
 }
 
 run_doctor() {
@@ -2301,6 +2660,8 @@ if [ "${FORGE_INSTALL_TEST_HOOK:-}" = "managed-local-migrations" ]; then
       MANAGED_LOCAL_ADMIN_RESOLUTION=resolved
       MANAGED_LOCAL_ADMIN_MODE=current
       MANAGED_LOCAL_ADMIN_USER="$(/usr/bin/id -un)"
+      MANAGED_LOCAL_ADMIN_SOCKET="${FORGE_INSTALL_TEST_PSQL_SOCKET:-/tmp}"
+      MANAGED_LOCAL_ADMIN_PORT="${FORGE_INSTALL_TEST_PSQL_PORT:-5432}"
       ;;
     unavailable)
       MANAGED_LOCAL_ADMIN_RESOLUTION=resolved
@@ -2356,11 +2717,31 @@ if placeholder_value "$DB_PASSWORD"; then
   DB_PASSWORD=""
 fi
 DB_PASSWORD="${DB_PASSWORD:-$(random_hex 16)}"
+APP_DATABASE_PASSWORD="$(initial_env_value FORGE_APP_DATABASE_PASSWORD)"
+if placeholder_value "$APP_DATABASE_PASSWORD"; then
+  APP_DATABASE_PASSWORD=""
+fi
+APP_DATABASE_PASSWORD="${APP_DATABASE_PASSWORD:-$(random_hex 16)}"
+RUNTIME_API_DATABASE_PASSWORD="$(initial_env_value FORGE_RUNTIME_API_DATABASE_PASSWORD)"
+if placeholder_value "$RUNTIME_API_DATABASE_PASSWORD"; then
+  RUNTIME_API_DATABASE_PASSWORD=""
+fi
+RUNTIME_API_DATABASE_PASSWORD="${RUNTIME_API_DATABASE_PASSWORD:-$(random_hex 16)}"
 SESSION_SECRET="$(initial_env_value SESSION_SECRET)"
 if placeholder_value "$SESSION_SECRET"; then
   SESSION_SECRET=""
 fi
 SESSION_SECRET="${SESSION_SECRET:-$(random_hex 32)}"
+
+# Every generated credential crosses a different trust boundary. Extremely
+# unlikely random collisions are still rejected rather than persisted.
+while [ "$APP_DATABASE_PASSWORD" = "$DB_PASSWORD" ]; do APP_DATABASE_PASSWORD="$(random_hex 16)"; done
+while [ "$RUNTIME_API_DATABASE_PASSWORD" = "$DB_PASSWORD" ] || [ "$RUNTIME_API_DATABASE_PASSWORD" = "$APP_DATABASE_PASSWORD" ]; do
+  RUNTIME_API_DATABASE_PASSWORD="$(random_hex 16)"
+done
+while [ "$SESSION_SECRET" = "$DB_PASSWORD" ] || [ "$SESSION_SECRET" = "$APP_DATABASE_PASSWORD" ] || [ "$SESSION_SECRET" = "$RUNTIME_API_DATABASE_PASSWORD" ]; do
+  SESSION_SECRET="$(random_hex 32)"
+done
 
 write_env_file
 install_cli_entrypoint

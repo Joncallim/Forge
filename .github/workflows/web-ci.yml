@@ -79,14 +79,62 @@ jobs:
           cache-dependency-path: web/package-lock.json
 
       - run: npm install
+      - name: Stage a root-owned Node 22 toolchain for native migration children
+        working-directory: .
+        run: |
+          set -euo pipefail
+          selected_node="$(readlink -f "$(command -v node)")"
+          selected_version="$($selected_node --version)"
+          [[ "$selected_version" =~ ^v22\. ]] || { echo "Expected setup-node to select Node 22, got $selected_version" >&2; exit 1; }
+          selected_root="$(dirname "$(dirname "$selected_node")")"
+          trusted_root=/usr/lib/forge-ci-node22
+          sudo install -d -o root -g root -m 0755 "$trusted_root"
+          sudo cp -a "$selected_root/." "$trusted_root/"
+          sudo chown -R root:root "$trusted_root"
+          sudo chmod -R go-w "$trusted_root"
+          validate_trusted_chain() {
+            local candidate="$1" current="$1"
+            while :; do
+              [[ -e "$current" || -L "$current" ]] || { echo "$current is missing" >&2; exit 1; }
+              [[ "$(stat -c '%U' "$current")" = root ]] || { echo "$current is not root-owned" >&2; exit 1; }
+              if [[ ! -L "$current" ]]; then
+                [[ $((8#$(stat -c '%a' "$current") & 022)) -eq 0 ]] || { echo "$current is group/other writable" >&2; exit 1; }
+              fi
+              [[ "$current" = / ]] && break
+              current="${current%/*}"
+              [[ -n "$current" ]] || current=/
+            done
+            current="$(readlink -f "$candidate")"
+            [[ "$current" = "$trusted_root/"* && -f "$current" ]] || { echo "Trusted candidate escaped its fixed tree" >&2; exit 1; }
+            while :; do
+              [[ "$(stat -c '%U' "$current")" = root ]] || { echo "$current is not root-owned" >&2; exit 1; }
+              [[ $((8#$(stat -c '%a' "$current") & 022)) -eq 0 ]] || { echo "$current is group/other writable" >&2; exit 1; }
+              [[ "$current" = / ]] && break
+              current="${current%/*}"
+              [[ -n "$current" ]] || current=/
+            done
+          }
+          for tool in node npm npx; do
+            sudo ln -sfn "$trusted_root/bin/$tool" "/usr/bin/$tool"
+            validate_trusted_chain "/usr/bin/$tool"
+          done
+          [[ "$(/usr/bin/node --version)" = "$selected_version" ]]
+          [[ "$(/usr/bin/npm --version)" = "$("$trusted_root/bin/npm" --version)" ]]
+          [[ "$(/usr/bin/npx --version)" = "$("$trusted_root/bin/npx" --version)" ]]
       - name: Exercise managed local installer migration orchestration
         working-directory: .
         run: bash scripts/test-install-managed-migrations.sh
+      - name: Prove isolated PostgreSQL 16 controller crash recovery
+        working-directory: web
+        run: npm run test:managed-migration-controller-restart
+      - name: Prove isolated Compose PostgreSQL administrator topology
+        working-directory: web
+        run: npm run test:compose-postgres-admin-upgrade
       - name: Install PostgreSQL 16 and redis-cli for migration proof
         working-directory: .
         run: |
           sudo apt-get update
-          sudo apt-get install --yes postgresql-16 redis-tools socat
+          sudo apt-get install --yes postgresql-16 redis-tools
           /usr/lib/postgresql/16/bin/postgres --version
           redis-cli --version
       - name: Create disposable migration and ordinary app logins
@@ -104,6 +152,9 @@ jobs:
           CREATE ROLE forge
             LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
             PASSWORD 'forge_registry_test';
+          CREATE ROLE forge_runtime_api_login
+            LOGIN INHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
+            PASSWORD 'forge_runtime_api_test';
           -- CI-only observer. PostgreSQL's default PUBLIC CONNECT/TEMPORARY
           -- privileges can still cover other disposable runner databases; this
           -- role is constrained by its direct attributes, memberships, and the
@@ -126,19 +177,17 @@ jobs:
         env:
           FORGE_MIGRATION_0026_DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_migration_0026_upgrade_test
           FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_migration_0026_upgrade_test
-      - name: Prove real installer-managed migration sequence and S5 cleanup
+      - name: Prove shared Docker/TCP migration controller and idempotent rerun
         working-directory: .
         run: bash scripts/ci/prove-installer-managed-migrations.sh
         env:
-          FORGE_INSTALLER_MANAGED_DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_installer_managed_migration_test
-          FORGE_INSTALLER_MANAGED_FAILURE_DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_installer_managed_s5_failure_test
+          FORGE_INSTALLER_MANAGED_APP_URL: postgresql://forge:forge_registry_test@localhost:5432/forge_installer_managed_migration_test
           FORGE_INSTALLER_MANAGED_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_installer_managed_migration_test
-          FORGE_INSTALLER_MANAGED_FAILURE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_installer_managed_s5_failure_test
           FORGE_INSTALLER_MANAGED_ADMIN_HOST: localhost
           FORGE_INSTALLER_MANAGED_ADMIN_USER: forge_e2e
           FORGE_INSTALLER_MANAGED_ADMIN_PASSWORD: forge
           FORGE_INSTALLER_MANAGED_ADMIN_DATABASE: forge_installer_managed_migration_test
-          FORGE_INSTALLER_MANAGED_FAILURE_ADMIN_DATABASE: forge_installer_managed_s5_failure_test
+          FORGE_RUNTIME_API_DATABASE_PASSWORD: forge_runtime_api_test
       - name: Prove exact legacy 0023/0025 DBR-1 repair and managed sequence
         working-directory: web
         run: |
@@ -149,43 +198,40 @@ jobs:
           native_user="$(/usr/bin/id -un)"
           sudo systemctl stop postgresql 2>/dev/null || true
           sudo install -d -m 0777 -o "$native_user" -g "$(/usr/bin/id -gn)" "$native_socket"
-          "$native_bin/initdb" --pgdata "$native_data" --username "$native_user" --auth trust --no-instructions
+          "$native_bin/initdb" --pgdata "$native_data" --username "$native_user" \
+            --auth-local peer --auth-host scram-sha-256 --no-instructions
           "$native_bin/pg_ctl" --pgdata "$native_data" \
-            --options "-p 5432 -k $native_socket -c listen_addresses=''" \
+            --options "-p 5433 -k $native_socket -c listen_addresses='localhost'" \
             --log "$RUNNER_TEMP/forge-native-pg16.log" start
-          socat TCP-LISTEN:5433,bind=127.0.0.1,reuseaddr,fork \
-            UNIX-CONNECT:"$native_socket/.s.PGSQL.5432" &
-          proxy_pid=$!
           cleanup_native() {
-            kill "$proxy_pid" 2>/dev/null || true
-            wait "$proxy_pid" 2>/dev/null || true
             "$native_bin/pg_ctl" --pgdata "$native_data" --mode fast stop 2>/dev/null || true
           }
           trap cleanup_native EXIT
           for attempt in $(seq 1 50); do
-            "$native_bin/pg_isready" --host 127.0.0.1 --port 5433 --dbname postgres && break
-            [ "$attempt" -lt 50 ] || { echo 'Native PostgreSQL socket proxy was not ready.' >&2; exit 1; }
+            "$native_bin/pg_isready" --host "$native_socket" --port 5433 --dbname postgres && break
+            [ "$attempt" -lt 50 ] || { echo 'Native PostgreSQL proof cluster was not ready.' >&2; exit 1; }
             sleep 0.1
           done
-          "$native_bin/psql" -X --host "$native_socket" --port 5432 --dbname postgres --set ON_ERROR_STOP=1 <<'SQL'
+          "$native_bin/psql" -X --host "$native_socket" --port 5433 --dbname postgres --set ON_ERROR_STOP=1 <<'SQL'
+          ALTER ROLE CURRENT_USER PASSWORD 'forge_native_admin_test';
           CREATE ROLE forge_migration_test
             LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
             PASSWORD 'forge_migration_test';
           CREATE DATABASE forge OWNER forge_migration_test;
           SQL
           export PATH="$native_bin:$PATH"
-          export PGPORT=5432
-          export FORGE_LEGACY_REPAIR_DATABASE_URL=postgresql://forge_migration_test:forge_migration_test@127.0.0.1:5433/forge
-          export FORGE_LEGACY_REPAIR_ADMIN_URL="postgresql://$native_user@127.0.0.1:5433/forge"
+          export PGPORT=5433
+          export FORGE_LEGACY_REPAIR_DATABASE_URL=postgresql://forge_migration_test:forge_migration_test@localhost:5433/forge
+          export FORGE_LEGACY_REPAIR_APP_URL=postgresql://forge:forge_legacy_repair_test@localhost:5433/forge
+          export FORGE_LEGACY_REPAIR_ADMIN_URL="postgresql://$native_user:forge_native_admin_test@localhost:5433/forge"
           export FORGE_LEGACY_REPAIR_ADMIN_HOST="$native_socket"
           export FORGE_LEGACY_REPAIR_ADMIN_SOCKET="$native_socket"
           export FORGE_LEGACY_REPAIR_ADMIN_USER="$native_user"
           export FORGE_LEGACY_REPAIR_ADMIN_PASSWORD=unused-local-trust
           export FORGE_LEGACY_REPAIR_ADMIN_DATABASE=forge
-          export FORGE_LEGACY_REPAIR_MIGRATION_HOST="$native_socket"
+          export FORGE_LEGACY_REPAIR_MIGRATION_HOST=localhost
           export FORGE_LEGACY_REPAIR_MIGRATION_USER=forge_migration_test
           export FORGE_LEGACY_REPAIR_MIGRATION_PASSWORD=forge_migration_test
-          export FORGE_LEGACY_REPAIR_PRODUCTION_NATIVE_ROUTE=1
           bash scripts/ci/prove-installer-legacy-migration-repair.sh
       - name: Prove populated migration 0026 to latest recovery upgrade and strict cutover
         run: npm run test:migration-0027-upgrade
@@ -226,6 +272,7 @@ jobs:
           psql "$FORGE_DATABASE_ADMIN_URL" --set ON_ERROR_STOP=1 --command "do \$\$ begin if pg_catalog.has_function_privilege('forge_migration_test', 'public.forge_begin_epic_172_s4_owner_bootstrap_v1()', 'execute') or pg_catalog.has_function_privilege('forge_migration_test', 'public.forge_finalize_epic_172_s4_owner_bootstrap_v1()', 'execute') or pg_catalog.pg_has_role('forge_migration_test', 'forge_s4_routines_owner', 'member') or pg_catalog.has_schema_privilege('forge_migration_test', 'forge', 'create') or pg_catalog.has_schema_privilege('forge_s4_routines_owner', 'public', 'create') or pg_catalog.has_schema_privilege('forge_s4_routines_owner', 'forge', 'create') or not pg_catalog.has_schema_privilege('forge_s4_routines_owner', 'forge', 'usage') then raise exception 'registry cleanup proof retained or removed authority'; end if; end \$\$;"
           test "$registry_failed" -ne 0
           bash scripts/ci/apply-verification-goal-registry-migration.sh
+          bash scripts/ci/apply-vnext-phase0-a1-runtime-foundation.sh
       - name: Create the freshly migrated isolated S4 PostgreSQL proof database
         run: |
           npm run protocol:bootstrap-epic-172-release-roles
@@ -236,6 +283,7 @@ jobs:
           npx tsx scripts/ci/migrate-through-0027.ts
           bash scripts/ci/apply-epic-172-s5-recovery-migration.sh
           bash scripts/ci/apply-verification-goal-registry-migration.sh
+          bash scripts/ci/apply-vnext-phase0-a1-runtime-foundation.sh
         env:
           DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_s4_ci_test
           FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_s4_ci_test
@@ -343,6 +391,18 @@ jobs:
         env:
           DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_epic_172_ci_test
           FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_epic_172_ci_test
+      - name: Apply VNext runtime foundation with failure-safe ownership
+        run: bash scripts/ci/apply-vnext-phase0-a1-runtime-foundation.sh
+        env:
+          DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_epic_172_ci_test
+          FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_epic_172_ci_test
+      - name: Run executable VNext Phase 0 A1 conformance contract
+        run: npm run test:vnext-phase0-conformance
+        env:
+          FORGE_VNEXT_RUNTIME_HANDOFF_RECOVERY_TEST_URL: postgresql://forge_e2e:forge@localhost:5432/postgres
+          FORGE_VNEXT_RUNTIME_POSTGRES_APP_TEST_URL: postgresql://forge:forge_registry_test@localhost:5432/forge_epic_172_ci_test
+          FORGE_VNEXT_RUNTIME_POSTGRES_API_TEST_URL: postgresql://forge_runtime_api_login:forge_runtime_api_test@localhost:5432/forge_epic_172_ci_test
+          FORGE_VNEXT_RUNTIME_POSTGRES_ADMIN_TEST_URL: postgresql://forge_e2e:forge@localhost:5432/forge_epic_172_ci_test
       - name: Configure disposable release and S4 principal passwords
         working-directory: .
         env:
@@ -357,6 +417,7 @@ jobs:
           ALTER ROLE forge_packet_issuer PASSWORD 'forge_packet_issuer_test';
           ALTER ROLE forge_local_evidence_reader PASSWORD 'forge_local_evidence_reader_test';
           ALTER ROLE forge_project_root_reconciler PASSWORD 'forge_project_root_reconciler_test';
+          GRANT forge_runtime_api TO forge_runtime_api_login WITH INHERIT TRUE;
           SQL
       - name: Materialize legacy root references through the dedicated principal
         env:
@@ -778,6 +839,10 @@ jobs:
           FORGE_VERIFICATION_GOAL_REGISTRY_POSTGRES_APP_TEST_URL: postgresql://forge:forge_registry_test@localhost:5432/forge_epic_172_ci_test
           FORGE_WORKFORCE_MATERIALIZER_REQUIRE_POSTGRES_TEST: '1'
           FORGE_WORKFORCE_MATERIALIZER_POSTGRES_ADMIN_TEST_URL: postgresql://forge_e2e:forge@localhost:5432/forge_epic_172_ci_test
+          FORGE_VNEXT_RUNTIME_REQUIRE_POSTGRES_TEST: '1'
+          FORGE_VNEXT_RUNTIME_POSTGRES_APP_TEST_URL: postgresql://forge:forge_registry_test@localhost:5432/forge_epic_172_ci_test
+          FORGE_VNEXT_RUNTIME_POSTGRES_API_TEST_URL: postgresql://forge_runtime_api_login:forge_runtime_api_test@localhost:5432/forge_epic_172_ci_test
+          FORGE_VNEXT_RUNTIME_POSTGRES_ADMIN_TEST_URL: postgresql://forge_e2e:forge@localhost:5432/forge_epic_172_ci_test
           FORGE_EPIC_172_TEST_APP_DATABASE_URL: postgresql://forge_app_test:forge_app_test@localhost:5432/forge_epic_172_ci_test
           FORGE_EPIC_172_TEST_WRITER_DATABASE_URL: postgresql://forge_release_evidence_writer:forge_writer_test@localhost:5432/forge_epic_172_ci_test
           FORGE_EPIC_172_TEST_TRANSITION_DATABASE_URL: postgresql://forge_release_transition:forge_transition_test@localhost:5432/forge_epic_172_ci_test

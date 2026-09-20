@@ -85,14 +85,14 @@ describe('verification goal snapshot migration', () => {
     )
   })
 
-  it('records migration 0033 as the current journal tip', async () => {
+  it('records migration 0034 as the current journal tip', async () => {
     const journal = JSON.parse(await readFile(
       path.join(process.cwd(), 'db/migrations/meta/_journal.json'),
       'utf8',
     )) as { entries: Array<{ idx: number; tag: string }> }
     expect(journal.entries.at(-1)).toEqual(expect.objectContaining({
-      idx: 33,
-      tag: '0033_verification_goal_registry_revisions',
+      idx: 34,
+      tag: '0034_vnext_phase0_a1_runtime_foundation',
     }))
   })
 
