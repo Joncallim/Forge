@@ -243,6 +243,28 @@ async function runFencedReconciler(sql: SqlClient, source: string): Promise<void
   await runWithDurableFencedControllerMarker(sql, async () => { await sql.unsafe(source) })
 }
 
+/** Drizzle always executes its idempotent ledger DDL before reading the
+ * ledger.  A legacy native database can still have that schema and table
+ * owned by its former installer migration login. Give only the one bounded
+ * ephemeral principal the exact temporary access it needs; DROP OWNED removes
+ * these grants before application reconnect is restored. */
+async function grantExistingMigrationLedgerAccess(sql: SqlClient, migrationRole: string): Promise<void> {
+  const [ledger] = await sql<{ schemaExists: boolean; tableKind: string | null; sequenceKind: string | null }[]>`
+    select pg_catalog.to_regnamespace('drizzle') is not null as "schemaExists",
+      (select relation.relkind::text from pg_catalog.pg_class relation
+        where relation.oid=pg_catalog.to_regclass('drizzle.__drizzle_migrations')) as "tableKind",
+      (select relation.relkind::text from pg_catalog.pg_class relation
+        where relation.oid=pg_catalog.to_regclass('drizzle.__drizzle_migrations_id_seq')) as "sequenceKind"
+  `
+  if (!ledger?.schemaExists) return
+  if (ledger.tableKind !== 'r' || ledger.sequenceKind !== 'S') {
+    throw new Error('Managed migration refused a non-canonical existing Drizzle ledger relation boundary.')
+  }
+  await sql.unsafe(`grant usage, create on schema drizzle to ${safe(migrationRole)};
+    grant select, insert on table drizzle.__drizzle_migrations to ${safe(migrationRole)};
+    grant usage on sequence drizzle.__drizzle_migrations_id_seq to ${safe(migrationRole)};`)
+}
+
 async function restoreDatabaseAcl(sql: ReturnType<typeof postgres>, database: string, snapshot: ProtectedMigrationDatabaseSnapshot): Promise<void> {
   const current = await snapshotDatabaseAcl(sql)
   if (current.databaseName !== snapshot.databaseName || current.databaseOid !== snapshot.databaseOid
@@ -554,6 +576,7 @@ export async function runManagedDockerMigration(): Promise<void> {
     lifecycleGeneration = await markProtectedMigrationControllerFenced(sql, protectedMigration, operationId, preparation.generation)
     await pauseForCiFenceSeam('FORGE_MANAGED_MIGRATION_PAUSE_AFTER_FENCE_MS')
     await sql.unsafe(`grant forge_schema_owner to ${safe(migrator)} with inherit true; grant connect, create on database ${database} to forge_schema_owner; grant usage, create on schema public to forge_schema_owner; grant connect on database ${database} to ${safe(migrator)};`)
+    await grantExistingMigrationLedgerAccess(sql, migrator)
 
     if (preparation.ledgerApplied) {
       lifecycleGeneration = await openRuntimeHandoff(sql, migrator, runtimePassword, operationId, lifecycleGeneration)

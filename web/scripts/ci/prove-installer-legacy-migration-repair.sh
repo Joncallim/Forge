@@ -1307,6 +1307,26 @@ run_managed_sequence() {
   )
 }
 
+assert_legacy_drizzle_owner_boundary() {
+  local owned_count
+  owned_count="$(admin_psql --no-align --tuples-only --quiet \
+    --set migration_role="$FORGE_LEGACY_REPAIR_MIGRATION_USER" --command "
+      SELECT
+        (SELECT count(*) FROM pg_catalog.pg_namespace namespace_row
+          WHERE namespace_row.nspname='drizzle'
+            AND namespace_row.nspowner=:'migration_role'::pg_catalog.regrole)
+        + (SELECT count(*) FROM pg_catalog.pg_class relation
+          JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid=relation.relnamespace
+          WHERE namespace_row.nspname='drizzle'
+            AND relation.relname IN ('__drizzle_migrations','__drizzle_migrations_id_seq')
+            AND relation.relkind IN ('r','S')
+            AND relation.relowner=:'migration_role'::pg_catalog.regrole);")"
+  [ "$owned_count" = 3 ] || {
+    echo 'Legacy managed-sequence proof no longer exercises a migration-login-owned Drizzle ledger.' >&2
+    exit 1
+  }
+}
+
 echo 'Proving accepted S4 boundary variants and later-ledger reruns.'
 prepare_legacy_fixture
 expect_s4_bootstrap_failure
@@ -1367,6 +1387,7 @@ assert_unchanged contaminated-0027-before contaminated-0027-after 'Exact install
 revoke_forge_contamination
 
 echo 'Proving the full managed sequence normalizes once and is then stable at latest.'
+assert_legacy_drizzle_owner_boundary
 run_managed_sequence
 # Whatever credential the preceding fixture left on the cluster-global forge
 # role, prove that the real controller provisions the protected environment

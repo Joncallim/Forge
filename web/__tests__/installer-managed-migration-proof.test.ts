@@ -176,7 +176,7 @@ describe('installer-managed migration proof', () => {
       expect(receive('oversized', 5, 'oversized').status).not.toBe(0)
       expect(installer).toContain('remaining=30')
       expect(installer).toContain('/bin/kill -TERM "$receiver"')
-      expect(installer).toContain('pack_bytes=3627641')
+      expect(installer).toContain('pack_bytes=3629085')
       expect(installer).toContain('archive_bytes=25950400')
       expect(installer).toContain('archive_bytes=27517304')
     } finally { rmSync(output, { recursive: true, force: true }) }
@@ -272,6 +272,8 @@ describe('installer-managed migration proof', () => {
     expect(sequence).not.toContain('run_managed_local_migration_sequence')
     expect(sequence).not.toContain('resolve_managed_local_admin')
     expect(sequence).not.toContain('MANAGED_LOCAL_ADMIN_MODE=current')
+    expect(legacyRepairProof).toContain('assert_legacy_drizzle_owner_boundary')
+    expect(legacyRepairProof).toContain('migration-login-owned Drizzle ledger')
     expect(legacyRepairProof).toContain('chmod 0600 "$managed_env"')
   })
 
