@@ -1260,7 +1260,8 @@ run_managed_sequence() {
     export FORGE_ENV_FILE="$managed_env"
     export FORGE_INSTALL_LIBRARY=1
     source "$REPO_ROOT/scripts/install.sh"
-    MANAGED_LOCAL_ADMIN_MODE=current
+    resolve_managed_local_admin \
+      || die "Legacy migration proof could not resolve the production native PostgreSQL administrator boundary."
     run_managed_local_migration_sequence
   )
 }

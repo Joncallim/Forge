@@ -248,6 +248,18 @@ describe('installer-managed migration proof', () => {
     expect(managedInstallerProof).not.toContain('FORGE_REGISTRY_FORCE_HANDOFF_FAILURE')
   })
 
+  it('resolves the complete native administrator boundary before the legacy managed sequence', () => {
+    const sequence = legacyRepairProof.slice(
+      legacyRepairProof.indexOf('run_managed_sequence()'),
+      legacyRepairProof.indexOf("echo 'Proving accepted S4 boundary variants"),
+    )
+    expect(sequence.indexOf('resolve_managed_local_admin')).toBeGreaterThan(-1)
+    expect(sequence.indexOf('resolve_managed_local_admin')).toBeLessThan(
+      sequence.indexOf('run_managed_local_migration_sequence'),
+    )
+    expect(sequence).not.toContain('MANAGED_LOCAL_ADMIN_MODE=current')
+  })
+
   it('derives the exact current ledger once from the authoritative Drizzle journal', () => {
     const expectations = execFileSync(
       'bash',
