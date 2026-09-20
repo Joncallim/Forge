@@ -5,6 +5,7 @@
 set -Eeuo pipefail
 
 : "${FORGE_LEGACY_REPAIR_DATABASE_URL:?Set the disposable migration URL.}"
+: "${FORGE_LEGACY_REPAIR_APP_URL:?Set the disposable Forge application URL.}"
 : "${FORGE_LEGACY_REPAIR_ADMIN_URL:?Set the disposable administrator URL.}"
 : "${FORGE_LEGACY_REPAIR_ADMIN_HOST:?Set the disposable administrator host.}"
 : "${FORGE_LEGACY_REPAIR_ADMIN_USER:?Set the disposable administrator user.}"
@@ -1252,11 +1253,11 @@ migrate_through_0027() {
 }
 
 managed_env="$TEMP_ROOT/managed.env"
-printf 'DATABASE_URL=%s\n' "$FORGE_LEGACY_REPAIR_DATABASE_URL" > "$managed_env"
+printf 'DATABASE_URL=%s\n' "$FORGE_LEGACY_REPAIR_APP_URL" > "$managed_env"
 chmod 0600 "$managed_env"
 run_managed_sequence() {
   (
-    export DATABASE_URL="$FORGE_LEGACY_REPAIR_DATABASE_URL"
+    export DATABASE_URL="$FORGE_LEGACY_REPAIR_APP_URL"
     export FORGE_DATABASE_ADMIN_URL="$FORGE_LEGACY_REPAIR_ADMIN_URL"
     export FORGE_ENV_FILE="$managed_env"
     export FORGE_INSTALL_LIBRARY=1
