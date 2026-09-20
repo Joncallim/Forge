@@ -248,15 +248,14 @@ describe('installer-managed migration proof', () => {
     expect(managedInstallerProof).not.toContain('FORGE_REGISTRY_FORCE_HANDOFF_FAILURE')
   })
 
-  it('resolves the complete native administrator boundary before the legacy managed sequence', () => {
+  it('uses the full production native migration boundary in the legacy proof', () => {
     const sequence = legacyRepairProof.slice(
       legacyRepairProof.indexOf('run_managed_sequence()'),
       legacyRepairProof.indexOf("echo 'Proving accepted S4 boundary variants"),
     )
-    expect(sequence.indexOf('resolve_managed_local_admin')).toBeGreaterThan(-1)
-    expect(sequence.indexOf('resolve_managed_local_admin')).toBeLessThan(
-      sequence.indexOf('run_managed_local_migration_sequence'),
-    )
+    expect(sequence).toContain('run_managed_local_migrations')
+    expect(sequence).not.toContain('run_managed_local_migration_sequence')
+    expect(sequence).not.toContain('resolve_managed_local_admin')
     expect(sequence).not.toContain('MANAGED_LOCAL_ADMIN_MODE=current')
   })
 
