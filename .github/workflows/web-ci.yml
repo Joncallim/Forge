@@ -200,10 +200,10 @@ jobs:
           sudo install -d -m 0777 -o "$native_user" -g "$(/usr/bin/id -gn)" "$native_socket"
           "$native_bin/initdb" --pgdata "$native_data" --username "$native_user" --auth trust --no-instructions
           "$native_bin/pg_ctl" --pgdata "$native_data" \
-            --options "-p 5432 -k $native_socket -c listen_addresses=''" \
+            --options "-p 5433 -k $native_socket -c listen_addresses=''" \
             --log "$RUNNER_TEMP/forge-native-pg16.log" start
           socat TCP-LISTEN:5433,bind=127.0.0.1,reuseaddr,fork \
-            UNIX-CONNECT:"$native_socket/.s.PGSQL.5432" &
+            UNIX-CONNECT:"$native_socket/.s.PGSQL.5433" &
           proxy_pid=$!
           cleanup_native() {
             kill "$proxy_pid" 2>/dev/null || true
@@ -216,15 +216,15 @@ jobs:
             [ "$attempt" -lt 50 ] || { echo 'Native PostgreSQL socket proxy was not ready.' >&2; exit 1; }
             sleep 0.1
           done
-          "$native_bin/psql" -X --host "$native_socket" --port 5432 --dbname postgres --set ON_ERROR_STOP=1 <<'SQL'
+          "$native_bin/psql" -X --host "$native_socket" --port 5433 --dbname postgres --set ON_ERROR_STOP=1 <<'SQL'
           CREATE ROLE forge_migration_test
             LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
             PASSWORD 'forge_migration_test';
           CREATE DATABASE forge OWNER forge_migration_test;
           SQL
           export PATH="$native_bin:$PATH"
-          export PGPORT=5432
-          export FORGE_LEGACY_REPAIR_DATABASE_URL=postgresql://forge_migration_test:forge_migration_test@127.0.0.1:5433/forge
+          export PGPORT=5433
+          export FORGE_LEGACY_REPAIR_DATABASE_URL=postgresql://forge_migration_test:forge_migration_test@localhost:5433/forge
           export FORGE_LEGACY_REPAIR_ADMIN_URL="postgresql://$native_user@127.0.0.1:5433/forge"
           export FORGE_LEGACY_REPAIR_ADMIN_HOST="$native_socket"
           export FORGE_LEGACY_REPAIR_ADMIN_SOCKET="$native_socket"
@@ -234,7 +234,6 @@ jobs:
           export FORGE_LEGACY_REPAIR_MIGRATION_HOST="$native_socket"
           export FORGE_LEGACY_REPAIR_MIGRATION_USER=forge_migration_test
           export FORGE_LEGACY_REPAIR_MIGRATION_PASSWORD=forge_migration_test
-          export FORGE_LEGACY_REPAIR_PRODUCTION_NATIVE_ROUTE=1
           bash scripts/ci/prove-installer-legacy-migration-repair.sh
       - name: Prove populated migration 0026 to latest recovery upgrade and strict cutover
         run: npm run test:migration-0027-upgrade

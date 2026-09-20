@@ -254,6 +254,8 @@ describe('installer-managed migration proof', () => {
       legacyRepairProof.indexOf("echo 'Proving accepted S4 boundary variants"),
     )
     expect(sequence).toContain('run_managed_local_migrations')
+    expect(sequence).toContain('FORGE_INSTALL_TEST_PSQL_SOCKET')
+    expect(sequence).toContain('FORGE_INSTALL_TEST_PSQL_PORT')
     expect(sequence).not.toContain('run_managed_local_migration_sequence')
     expect(sequence).not.toContain('resolve_managed_local_admin')
     expect(sequence).not.toContain('MANAGED_LOCAL_ADMIN_MODE=current')

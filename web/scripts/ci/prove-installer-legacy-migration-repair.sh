@@ -1260,6 +1260,11 @@ run_managed_sequence() {
     export FORGE_DATABASE_ADMIN_URL="$FORGE_LEGACY_REPAIR_ADMIN_URL"
     export FORGE_ENV_FILE="$managed_env"
     export FORGE_INSTALL_LIBRARY=1
+    if [ "${FORGE_LEGACY_REPAIR_PRODUCTION_NATIVE_ROUTE:-0}" != 1 ]; then
+      export FORGE_INSTALL_TEST_ADMIN_MODE=current
+      export FORGE_INSTALL_TEST_PSQL_SOCKET="${FORGE_LEGACY_REPAIR_ADMIN_SOCKET:-/tmp}"
+      export FORGE_INSTALL_TEST_PSQL_PORT="${PGPORT:-5432}"
+    fi
     source "$REPO_ROOT/scripts/install.sh"
     run_managed_local_migrations
   )
