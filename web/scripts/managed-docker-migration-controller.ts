@@ -25,6 +25,7 @@ const OWNER = 'forge_runtime_routines_owner'
 const API = 'forge_runtime_api'
 const execFileAsync = promisify(execFile)
 const NATIVE_AUTHORITY_LOST = 'Managed native controller lost its one reserved peer administrator connection; reconnect is forbidden.'
+const MAX_NATIVE_ENV_SNAPSHOT_BYTES = 1024 * 1024
 let nativeAuthorityConnectionLost = false
 type SqlClient = ReturnType<typeof postgres>
 
@@ -64,6 +65,15 @@ const normalizeDatabaseAcl = (value: unknown): DatabaseAcl => {
 const databaseSnapshotDigest = (databaseName: string, databaseOid: number, databaseOwnerOid: number, acl: unknown) => {
   const normalizedAcl = normalizeDatabaseAcl(acl).map((entry) => [entry.grantorOid, entry.grantor, entry.granteeOid, entry.grantee, entry.privilege, entry.grantable])
   return createHash('sha256').update(JSON.stringify([databaseName, databaseOid, databaseOwnerOid, normalizedAcl])).digest('hex')
+}
+
+function normalizeDatabaseOwnerSnapshot(snapshot: ProtectedMigrationDatabaseSnapshot, ownerOid: number, ownerName: string): ProtectedMigrationDatabaseSnapshot {
+  const ownerChanged = ownerOid !== snapshot.databaseOwnerOid
+  const acl = normalizeDatabaseAcl(snapshot.acl).map((entry) => ownerChanged && entry.grantorOid === snapshot.databaseOwnerOid
+    ? { ...entry, grantorOid: ownerOid, grantor: ownerName }
+    : entry).sort((left, right) => left.grantorOid - right.grantorOid || left.granteeOid - right.granteeOid
+      || left.privilege.localeCompare(right.privilege) || Number(left.grantable) - Number(right.grantable))
+  return { ...snapshot, databaseOwnerOid: ownerOid, acl, aclDigest: databaseSnapshotDigest(snapshot.databaseName, snapshot.databaseOid, ownerOid, acl) }
 }
 
 function orderAclReplay(snapshot: ProtectedMigrationDatabaseSnapshot): DatabaseAcl {
@@ -133,11 +143,13 @@ async function fenceRuntimeConnect(sql: ReturnType<typeof postgres>, database: s
       await transaction.unsafe(`set local role ${quoteCatalogIdentifier(grant.grantor)}; revoke connect on database ${database} from ${grantee} cascade`)
     }
   })
-  const [boundary] = await sql<{ appConnect: boolean; runtimeConnect: boolean }[]>`
-    select pg_catalog.has_database_privilege('forge', current_database(), 'connect') as "appConnect",
-      pg_catalog.has_database_privilege('forge_runtime_api_login', current_database(), 'connect') as "runtimeConnect"
+  const [boundary] = await sql<{ appReconnect: boolean; runtimeReconnect: boolean }[]>`
+    select (select rolcanlogin from pg_catalog.pg_roles where rolname='forge')
+        and pg_catalog.has_database_privilege('forge', current_database(), 'connect') as "appReconnect",
+      (select rolcanlogin from pg_catalog.pg_roles where rolname='forge_runtime_api_login')
+        and pg_catalog.has_database_privilege('forge_runtime_api_login', current_database(), 'connect') as "runtimeReconnect"
   `
-  if (boundary?.appConnect || boundary?.runtimeConnect) throw new Error('Managed migration failed to fence effective application CONNECT authority.')
+  if (boundary?.appReconnect || boundary?.runtimeReconnect) throw new Error('Managed migration failed to fence effective application reconnect authority.')
 }
 
 async function attestRuntimeQuiescence(sql: ReturnType<typeof postgres>): Promise<void> {
@@ -147,19 +159,87 @@ async function attestRuntimeQuiescence(sql: ReturnType<typeof postgres>): Promis
       where datname=pg_catalog.current_database() and usename=any(array['forge','forge_runtime_api_login'])
         and pid<>pg_catalog.pg_backend_pid()
     `
-    const [boundary] = await sql<{ sessions: number; appConnect: boolean; runtimeConnect: boolean }[]>`
+    const [boundary] = await sql<{ sessions: number; appReconnect: boolean; runtimeReconnect: boolean }[]>`
       select count(*) filter (where activity.pid is not null)::integer as sessions,
-        pg_catalog.has_database_privilege('forge', pg_catalog.current_database(), 'connect') as "appConnect",
-        pg_catalog.has_database_privilege('forge_runtime_api_login', pg_catalog.current_database(), 'connect') as "runtimeConnect"
+        (select rolcanlogin from pg_catalog.pg_roles where rolname='forge')
+          and pg_catalog.has_database_privilege('forge', pg_catalog.current_database(), 'connect') as "appReconnect",
+        (select rolcanlogin from pg_catalog.pg_roles where rolname='forge_runtime_api_login')
+          and pg_catalog.has_database_privilege('forge_runtime_api_login', pg_catalog.current_database(), 'connect') as "runtimeReconnect"
       from (values (1)) singleton(value)
       left join pg_catalog.pg_stat_activity activity
         on activity.datname=pg_catalog.current_database()
        and activity.usename=any(array['forge','forge_runtime_api_login'])
        and activity.pid<>pg_catalog.pg_backend_pid()
     `
-    if (!boundary?.appConnect && !boundary?.runtimeConnect && boundary?.sessions === 0) return
+    if (!boundary?.appReconnect && !boundary?.runtimeReconnect && boundary?.sessions === 0) return
   }
-  throw new Error('Managed migration could not prove zero application/runtime sessions with effective CONNECT still fenced.')
+  throw new Error('Managed migration could not prove zero application/runtime sessions with effective reconnect authority still fenced.')
+}
+
+/** PostgreSQL database ownership implies CONNECT and survives every ACL REVOKE.
+ * Disable the two long-lived logins before draining them, so a legacy `forge`
+ * database owner cannot race object creation between the drain and REASSIGN. */
+async function suspendApplicationLoginAuthority(sql: ReturnType<typeof postgres>): Promise<void> {
+  await sql.begin(async (transaction) => {
+    await transaction.unsafe(`alter role forge nologin nosuperuser nocreatedb nocreaterole noreplication nobypassrls noinherit;
+      alter role forge_runtime_api_login nologin nosuperuser nocreatedb nocreaterole noreplication nobypassrls noinherit;`)
+  })
+  const [boundary] = await sql<{ appLogin: boolean; runtimeLogin: boolean; appSuper: boolean; runtimeSuper: boolean }[]>`
+    select (select rolcanlogin from pg_catalog.pg_roles where rolname='forge') as "appLogin",
+      (select rolcanlogin from pg_catalog.pg_roles where rolname='forge_runtime_api_login') as "runtimeLogin",
+      (select rolsuper from pg_catalog.pg_roles where rolname='forge') as "appSuper",
+      (select rolsuper from pg_catalog.pg_roles where rolname='forge_runtime_api_login') as "runtimeSuper"
+  `
+  if (boundary?.appLogin || boundary?.runtimeLogin || boundary?.appSuper || boundary?.runtimeSuper) {
+    throw new Error('Managed migration failed to suspend application/runtime login authority before ownership reconciliation.')
+  }
+}
+
+async function assertApplicationRoleMembershipBoundary(sql: ReturnType<typeof postgres>): Promise<void> {
+  const [boundary] = await sql<{ unsafeMembership: boolean }[]>`
+    select exists(
+      select 1 from pg_catalog.pg_auth_members membership
+      join pg_catalog.pg_roles parent on parent.oid=membership.roleid
+      join pg_catalog.pg_roles member on member.oid=membership.member
+      where membership.roleid in ('forge'::pg_catalog.regrole, 'forge_runtime_api_login'::pg_catalog.regrole)
+        or (member.rolname in ('forge','forge_runtime_api_login') and (
+          membership.admin_option or not membership.inherit_option
+          or (membership.set_option and not (
+            member.rolname='forge_runtime_api_login' and parent.rolname=${API}
+            and not parent.rolcanlogin and not parent.rolinherit and not parent.rolsuper
+            and not parent.rolcreatedb and not parent.rolcreaterole and not parent.rolreplication and not parent.rolbypassrls
+            and membership.inherit_option and membership.set_option and not membership.admin_option
+          ))
+        ))
+    ) as "unsafeMembership"
+  `
+  if (boundary?.unsafeMembership) {
+    throw new Error('Managed migration refused application role memberships that widen or can assume a long-lived identity.')
+  }
+}
+
+async function pauseForCiFenceSeam(name: string): Promise<void> {
+  const raw = process.env[name] ?? '0'
+  if (!raw.match(/^\d{1,5}$/)) throw new Error(`Managed migration ${name} must be a bounded millisecond integer.`)
+  const milliseconds = Number(raw)
+  if (milliseconds === 0) return
+  if (process.env.CI !== 'true') throw new Error(`Managed migration ${name} is available only in CI proof mode.`)
+  await new Promise((resolvePause) => setTimeout(resolvePause, Math.min(milliseconds, 60_000)))
+}
+
+/** A legacy bootstrap can recognise NOLOGIN only when this reserved
+ * administrator session also proves the durable, owner-free CONNECT fence. */
+async function runWithDurableFencedControllerMarker<T>(sql: SqlClient, operation: () => Promise<T>): Promise<T> {
+  await sql`select pg_catalog.set_config('forge.managed_controller_fenced', '1', false)`
+  try {
+    return await operation()
+  } finally {
+    await sql`select pg_catalog.set_config('forge.managed_controller_fenced', '', false)`
+  }
+}
+
+async function runFencedReconciler(sql: SqlClient, source: string): Promise<void> {
+  await runWithDurableFencedControllerMarker(sql, async () => { await sql.unsafe(source) })
 }
 
 async function restoreDatabaseAcl(sql: ReturnType<typeof postgres>, database: string, snapshot: ProtectedMigrationDatabaseSnapshot): Promise<void> {
@@ -189,7 +269,7 @@ async function restoreDatabaseAcl(sql: ReturnType<typeof postgres>, database: st
   const restored = await snapshotDatabaseAcl(sql)
   if (restored.databaseName !== snapshot.databaseName || restored.databaseOid !== snapshot.databaseOid
     || restored.databaseOwnerOid !== snapshot.databaseOwnerOid || restored.aclDigest !== snapshot.aclDigest) {
-    throw new Error('Managed migration did not restore the exact database ACL snapshot including grantors.')
+    throw new Error(`Managed migration did not restore the exact database ACL snapshot including grantors: ${JSON.stringify({ expected: snapshot, restored })}`)
   }
 }
 
@@ -206,14 +286,27 @@ async function closeLifecycleCas(sql: ReturnType<typeof postgres>, migrationRole
   return BigInt(closed.generation)
 }
 
-async function finalizeLifecycleCas(sql: ReturnType<typeof postgres>, operationId: string, expectedGeneration: bigint): Promise<void> {
-  const [closed] = await sql`
-    update public.forge_protected_migration_handoffs set generation=generation+1, controller_phase='complete'
-    where migration_tag=${RUNTIME_MIGRATION_TAG} and operation_id=${operationId}::uuid
-      and controller_phase='restore_pending' and generation=${expectedGeneration.toString()}::bigint
-    returning generation
-  `
-  if (!closed) throw new Error('Managed migration ACL restoration lost its final operation/generation fence.')
+async function finalizeLifecycleAndRestoreLoginCas(sql: ReturnType<typeof postgres>, operationId: string, expectedGeneration: bigint): Promise<void> {
+  await sql.begin(async (transaction) => {
+    const [closed] = await transaction`
+      update public.forge_protected_migration_handoffs set generation=generation+1, controller_phase='complete'
+      where migration_tag=${RUNTIME_MIGRATION_TAG} and operation_id=${operationId}::uuid
+        and controller_phase='restore_pending' and generation=${expectedGeneration.toString()}::bigint
+      returning generation
+    `
+    if (!closed) throw new Error('Managed migration ACL restoration lost its final operation/generation fence.')
+    await transaction.unsafe(`alter role forge login nosuperuser nocreatedb nocreaterole noreplication nobypassrls noinherit;
+      alter role forge_runtime_api_login login nosuperuser nocreatedb nocreaterole noreplication nobypassrls noinherit;`)
+    const [boundary] = await transaction<{ appLogin: boolean; runtimeLogin: boolean; appSuper: boolean; runtimeSuper: boolean }[]>`
+      select (select rolcanlogin from pg_catalog.pg_roles where rolname='forge') as "appLogin",
+        (select rolcanlogin from pg_catalog.pg_roles where rolname='forge_runtime_api_login') as "runtimeLogin",
+        (select rolsuper from pg_catalog.pg_roles where rolname='forge') as "appSuper",
+        (select rolsuper from pg_catalog.pg_roles where rolname='forge_runtime_api_login') as "runtimeSuper"
+    `
+    if (!boundary?.appLogin || !boundary?.runtimeLogin || boundary.appSuper || boundary.runtimeSuper) {
+      throw new Error('Managed migration could not atomically publish completion with ordinary application/runtime login authority.')
+    }
+  })
 }
 
 async function openRuntimeHandoff(sql: ReturnType<typeof postgres>, migrationRole: string, runtimePassword: string | null, operationId: string, expectedGeneration: bigint): Promise<bigint> {
@@ -341,39 +434,14 @@ export async function runManagedDockerMigration(): Promise<void> {
       if not exists(select 1 from pg_roles where rolname='forge_runtime_api_login') then create role forge_runtime_api_login login noinherit connection limit 5 nosuperuser nocreatedb nocreaterole noreplication nobypassrls; end if;
       alter role forge password '${appPassword.replaceAll("'", "''")}';
     end $$;`)
-    // REASSIGN OWNED also reaches cluster-wide objects. Refuse it unless the
-    // only shared object owned by `forge` is this exact managed database; this
-    // prevents a second database or tablespace from entering the transition.
-    const [legacyOwnerScope] = await sql<{ foreignSharedOwnership: boolean }[]>`
-      select exists(
-        select 1 from pg_catalog.pg_shdepend dependency
-        where dependency.refclassid='pg_catalog.pg_authid'::pg_catalog.regclass
-          and dependency.refobjid='forge'::pg_catalog.regrole
-          and dependency.deptype='o'
-          and not (dependency.classid='pg_catalog.pg_database'::pg_catalog.regclass
-            and dependency.objid=(select oid from pg_catalog.pg_database where datname=pg_catalog.current_database()))
-      ) as "foreignSharedOwnership"
-    `
-    if (legacyOwnerScope?.foreignSharedOwnership) {
-      throw new Error('Managed Docker app owner transition refused forge-owned shared objects outside the exact current database.')
-    }
-    // A legacy install may have used the long-lived application login as the
-    // database and object owner. Move that authority to the non-login schema
-    // owner before writing any durable ACL snapshot. If the controller dies in
-    // this small pre-snapshot window, the committed owner transition is safe
-    // and the next run snapshots the already-normalized identity.
-    await sql.unsafe(`reassign owned by forge to forge_schema_owner; alter role forge nosuperuser nocreatedb nocreaterole noreplication nobypassrls noinherit;`)
-    const [normalizedOwner] = await sql<{ appSuper: boolean; appOwnsDatabase: boolean; appOwnsObjects: boolean }[]>`
-      select (select rolsuper from pg_catalog.pg_roles where rolname='forge') as "appSuper",
-        exists(select 1 from pg_catalog.pg_database where datname=pg_catalog.current_database() and datdba='forge'::regrole) as "appOwnsDatabase",
-        exists(select 1 from pg_catalog.pg_class where relnamespace='public'::regnamespace and relowner='forge'::regrole) as "appOwnsObjects"
-    `
-    if (normalizedOwner?.appSuper || normalizedOwner?.appOwnsDatabase || normalizedOwner?.appOwnsObjects) {
-      throw new Error('Managed Docker app ownership reconciliation did not reach the required boundary. ACL snapshot is forbidden until this transition completes.')
-    }
-    // The prepared row is durable before application CONNECT is touched. It
-    // carries the exact database/owner identity, normalized grantor-aware ACL,
-    // operation, phase, and generation needed after a hard process death.
+    // An alternate session can SET ROLE into a NOLOGIN role when it holds an
+    // incoming membership edge. Reject that topology before changing any
+    // cluster-wide role attribute; ordinary outbound capability memberships
+    // (for example runtime API grants) remain supported and are ACL-fenced.
+    await assertApplicationRoleMembershipBoundary(sql)
+    // Capture the intended grants before fencing. The durable preparation is
+    // written before CONNECT changes, so a crash either leaves the original
+    // owner/grants intact or leaves enough evidence for the next controller.
     const currentDatabaseAcl = await snapshotDatabaseAcl(sql)
     const [ledgerAtStart] = await sql<{ applied: boolean }[]>`
       select exists(select 1 from drizzle.__drizzle_migrations where created_at=${targetEntry.when}) as applied
@@ -382,24 +450,106 @@ export async function runManagedDockerMigration(): Promise<void> {
       throw error
     })
     const preparation = await prepareProtectedMigrationController(sql, protectedMigration, migrator, migratorPassword, migratorExpiresAt, operationId, currentDatabaseAcl, ledgerAtStart.applied)
+    // A completed rerun has already proved the exact durable/live ACL and
+    // owner snapshot inside prepareProtectedMigrationController. Keep it out
+    // of the reconnect fence entirely: fencing a complete row would create no
+    // new durable recovery phase, so a hard death could otherwise strand a
+    // complete row with live ACLs that no longer match its snapshot.
     if (preparation.mode === 'complete') {
       await sql.unsafe(`${runtimePassword ? `alter role forge_runtime_api_login password '${runtimePassword.replaceAll("'", "''")}';` : ''}
         grant ${API} to forge_runtime_api_login with inherit true;`)
       await sql.unsafe(await readFile(native?.reconcileSql ?? '../scripts/reconcile-forge-app-privileges.sql', 'utf8'))
       await ensureProtectedMigrationState(sql)
       await assertProtectedMigrationLiveAttestation(sql, protectedMigration, preparation.completedMigrationRole!)
+      if ((process.env.FORGE_MANAGED_MIGRATION_PAUSE_COMPLETED_RERUN_MS ?? '0') !== '0') {
+        await sql`select pg_catalog.set_config('application_name', 'forge_completed_rerun_pause', false)`
+      }
+      await pauseForCiFenceSeam('FORGE_MANAGED_MIGRATION_PAUSE_COMPLETED_RERUN_MS')
       return
     }
     // Snapshot every database privilege, then remove PUBLIC, direct, and
-    // inherited application CONNECT authority. The controller connection
-    // holding the lock remains alive until exact restoration is verified.
+    // inherited application CONNECT authority. Database ownership implies
+    // CONNECT irrespective of ACLs, so disable the long-lived logins first;
+    // only the controller's reserved administrator connection remains alive.
     databaseAcl = preparation.databaseSnapshot
     fenced = true
+    await suspendApplicationLoginAuthority(sql)
     await fenceRuntimeConnect(sql, database)
-    lifecycleGeneration = await markProtectedMigrationControllerFenced(sql, protectedMigration, operationId, preparation.generation)
-    const pauseAfterFence = Number.parseInt(process.env.FORGE_MANAGED_MIGRATION_PAUSE_AFTER_FENCE_MS ?? '0', 10)
-    if (pauseAfterFence > 0) await new Promise((resolvePause) => setTimeout(resolvePause, Math.min(pauseAfterFence, 60_000)))
     await attestRuntimeQuiescence(sql)
+    // Repeat after the drain so a concurrent administrator cannot widen the
+    // role-assumption boundary between the preliminary proof and REASSIGN.
+    await assertApplicationRoleMembershipBoundary(sql)
+    // Exercise the exact crash window between the durable preparation/login
+    // fence and REASSIGN. A restart adopts the prepared row while both app
+    // identities remain unable to reconnect.
+    await pauseForCiFenceSeam('FORGE_MANAGED_MIGRATION_PAUSE_AFTER_LOGIN_FENCE_MS')
+    // REASSIGN OWNED also reaches cluster-wide objects. Check its exact scope
+    // only after every application/runtime session is fenced and drained, so
+    // the long-lived login cannot race the attestation by creating new objects.
+    const [legacyOwnerScope] = await sql<{ foreignSharedOwnership: boolean }[]>`
+      select exists(
+        select 1 from pg_catalog.pg_shdepend dependency
+        where dependency.refclassid='pg_catalog.pg_authid'::pg_catalog.regclass
+          and dependency.refobjid='forge'::pg_catalog.regrole
+          and dependency.deptype='o'
+          and not (dependency.dbid=(select oid from pg_catalog.pg_database where datname=pg_catalog.current_database())
+            or (dependency.dbid=0 and dependency.classid='pg_catalog.pg_database'::pg_catalog.regclass
+              and dependency.objid=(select oid from pg_catalog.pg_database where datname=pg_catalog.current_database())))
+      ) as "foreignSharedOwnership"
+    `
+    if (legacyOwnerScope?.foreignSharedOwnership) {
+      throw new Error('Managed Docker app owner transition refused forge-owned shared objects outside the exact current database.')
+    }
+    const [ownerBoundary] = await sql<{ appOwnsCurrentDatabaseObjects: boolean }[]>`
+      select exists(
+        select 1 from pg_catalog.pg_shdepend dependency
+        where dependency.refclassid='pg_catalog.pg_authid'::pg_catalog.regclass
+          and dependency.refobjid='forge'::pg_catalog.regrole and dependency.deptype='o'
+          and (dependency.dbid=(select oid from pg_catalog.pg_database where datname=pg_catalog.current_database())
+            or (dependency.dbid=0 and dependency.classid='pg_catalog.pg_database'::pg_catalog.regclass
+              and dependency.objid=(select oid from pg_catalog.pg_database where datname=pg_catalog.current_database())))
+      ) as "appOwnsCurrentDatabaseObjects"
+    `
+    if (ownerBoundary?.appOwnsCurrentDatabaseObjects) {
+      databaseAcl = await sql.begin(async (transaction) => {
+        await transaction.unsafe('reassign owned by forge to forge_schema_owner; alter role forge nosuperuser nocreatedb nocreaterole noreplication nobypassrls noinherit;')
+        const [owner] = await transaction<{ ownerOid: number; ownerName: string }[]>`
+          select database_row.datdba::integer as "ownerOid", owner_role.rolname as "ownerName"
+          from pg_catalog.pg_database database_row join pg_catalog.pg_roles owner_role on owner_role.oid=database_row.datdba
+          where database_row.datname=pg_catalog.current_database()
+        `
+        if (!owner) throw new Error('Managed Docker app ownership reconciliation lost the normalized owner identity.')
+        const normalized = normalizeDatabaseOwnerSnapshot(preparation.databaseSnapshot, owner.ownerOid, owner.ownerName)
+        const [updated] = await transaction<{ generation: string }[]>`
+          update public.forge_protected_migration_handoffs
+          set database_owner_oid=${normalized.databaseOwnerOid}::oid,
+            database_acl=${transaction.json(normalized.acl as never)}, database_acl_digest=${normalized.aclDigest}
+          where migration_tag=${protectedMigration.migrationTag} and operation_id=${operationId}::uuid
+            and generation=${preparation.generation.toString()}::bigint
+            and controller_phase=${preparation.mode === 'complete' ? 'complete' : 'prepared'}
+          returning generation
+        `
+        if (!updated) throw new Error('Managed Docker app ownership reconciliation lost its durable snapshot fence.')
+        return normalized
+      }) as ProtectedMigrationDatabaseSnapshot
+    } else {
+      await sql.unsafe('alter role forge nosuperuser nocreatedb nocreaterole noreplication nobypassrls noinherit;')
+    }
+    const [normalizedOwner] = await sql<{ appSuper: boolean; appOwnsCurrentDatabaseObjects: boolean }[]>`
+      select (select rolsuper from pg_catalog.pg_roles where rolname='forge') as "appSuper",
+        exists(select 1 from pg_catalog.pg_shdepend dependency
+          where dependency.refclassid='pg_catalog.pg_authid'::pg_catalog.regclass
+            and dependency.refobjid='forge'::pg_catalog.regrole and dependency.deptype='o'
+            and (dependency.dbid=(select oid from pg_catalog.pg_database where datname=pg_catalog.current_database())
+              or (dependency.dbid=0 and dependency.classid='pg_catalog.pg_database'::pg_catalog.regclass
+                and dependency.objid=(select oid from pg_catalog.pg_database where datname=pg_catalog.current_database()))))
+          as "appOwnsCurrentDatabaseObjects"
+    `
+    if (normalizedOwner?.appSuper || normalizedOwner?.appOwnsCurrentDatabaseObjects) {
+      throw new Error('Managed Docker app ownership reconciliation did not reach the required fenced boundary.')
+    }
+    lifecycleGeneration = await markProtectedMigrationControllerFenced(sql, protectedMigration, operationId, preparation.generation)
+    await pauseForCiFenceSeam('FORGE_MANAGED_MIGRATION_PAUSE_AFTER_FENCE_MS')
     await sql.unsafe(`grant forge_schema_owner to ${safe(migrator)} with inherit true; grant connect, create on database ${database} to forge_schema_owner; grant usage, create on schema public to forge_schema_owner; grant connect on database ${database} to ${safe(migrator)};`)
 
     if (preparation.ledgerApplied) {
@@ -407,7 +557,7 @@ export async function runManagedDockerMigration(): Promise<void> {
       handoffOpened = true
       lifecycleGeneration = await closeRuntimeHandoff(sql, migrator, operationId, lifecycleGeneration)
       handoffOpened = false
-      await sql.unsafe(await readFile('../scripts/reconcile-forge-app-privileges.sql', 'utf8'))
+      await runFencedReconciler(sql, await readFile('../scripts/reconcile-forge-app-privileges.sql', 'utf8'))
       await ensureProtectedMigrationState(sql)
       const generation = await assertProtectedMigrationLiveAttestation(sql, protectedMigration, migrator)
       restoreGeneration = await closeLifecycleCas(sql, migrator, operationId, generation)
@@ -439,7 +589,8 @@ export async function runManagedDockerMigration(): Promise<void> {
     await runWithDatabaseUrlSentinel(() => runEpic172S3OwnerBootstrap(bootstrapUrls))
     await runChild('scripts/ci/migrate-through-0026.ts')
     const legacyRepairArtifactSource = native ? await readFile(native.legacyRepairSql, 'utf8') : undefined
-    await runWithDatabaseUrlSentinel(() => runEpic172LegacyReleaseRepair({ adminUrl, adminClient: sql, repairArtifactSource: legacyRepairArtifactSource }))
+    await runWithDurableFencedControllerMarker(sql, async () => await runWithDatabaseUrlSentinel(() =>
+      runEpic172LegacyReleaseRepair({ adminUrl, adminClient: sql, repairArtifactSource: legacyRepairArtifactSource })))
     await runWithDatabaseUrlSentinel(() => runEpic172S4RoleBootstrap(bootstrapUrls))
     await runChild('scripts/ci/migrate-through-0027.ts')
     await runWithDatabaseUrlSentinel(() => runEpic172S5OwnerBootstrap(false, bootstrapUrls))
@@ -471,7 +622,7 @@ export async function runManagedDockerMigration(): Promise<void> {
     // migration objects have already moved to their dedicated owner roles.
     await sql.unsafe(`reassign owned by ${safe(migrator)} to forge_schema_owner;`)
     // The reconciler is mandatory, not a best-effort repair after reconnect.
-    await sql.unsafe(await readFile(native?.reconcileSql ?? '../scripts/reconcile-forge-app-privileges.sql', 'utf8'))
+    await runFencedReconciler(sql, await readFile(native?.reconcileSql ?? '../scripts/reconcile-forge-app-privileges.sql', 'utf8'))
     // The shared reconciler grants legacy app access to ordinary public
     // tables.  Reapply the controller-only state ACL after that broad pass.
     await ensureProtectedMigrationState(sql)
@@ -532,17 +683,27 @@ export async function runManagedDockerMigration(): Promise<void> {
     }
     let restoreFailure: unknown = null
     if (cleanupFailures.length === 0 && fenced && databaseAcl) {
-      try { await restoreDatabaseAcl(sql, database, databaseAcl) } catch (error) { restoreFailure = error }
+      try {
+        await restoreDatabaseAcl(sql, database, databaseAcl)
+        fenced = false
+      } catch (error) { restoreFailure = error }
     }
     if (cleanupFailures.length === 0 && !restoreFailure && restoreGeneration !== null) {
-      try { await finalizeLifecycleCas(sql, operationId, restoreGeneration) } catch (error) { restoreFailure = error }
+      try {
+        await pauseForCiFenceSeam('FORGE_MANAGED_MIGRATION_PAUSE_AFTER_ACL_RESTORE_MS')
+        await finalizeLifecycleAndRestoreLoginCas(sql, operationId, restoreGeneration)
+      } catch (error) { restoreFailure = error }
     }
     if (locked) await sql`select pg_advisory_unlock(${LOCK})`.catch(() => {})
     reserved?.release()
     await pool.end({ timeout: 5 })
     await rm(childPrivateDirectory, { recursive: true, force: true })
     if (primaryFailure && (cleanupFailures.length > 0 || restoreFailure)) {
-      throw new AggregateError([primaryFailure, ...cleanupFailures, ...(restoreFailure ? [restoreFailure] : [])], 'Managed migration failed and cleanup could not safely restore application reconnect authority.')
+      const causes = [primaryFailure, ...cleanupFailures, ...(restoreFailure ? [restoreFailure] : [])]
+      const proofDetail = process.env.FORGE_MANAGED_MIGRATION_PROOF_HOST_CHILD === '1'
+        ? ` Causes: ${causes.map((cause) => cause instanceof Error ? cause.message : String(cause)).join(' | ').slice(0, 2048)}`
+        : ''
+      throw new AggregateError(causes, `Managed migration failed and cleanup could not safely restore application reconnect authority.${proofDetail}`)
     }
     if (primaryFailure) throw primaryFailure
     if (cleanupFailures.length > 0) throw new AggregateError(cleanupFailures, 'Managed migration cleanup failed; application reconnect authority remains fenced.')
@@ -580,7 +741,7 @@ async function assertInstalledHelperFile(path: string, label: string): Promise<v
   }
 }
 
-function parseProtectedEnvFile(raw: string): Map<string, string> {
+function parseProtectedEnvSnapshot(raw: string): Map<string, string> {
   const values = new Map<string, string>()
   for (const line of raw.split(/\r?\n/)) {
     const trimmed = line.trim()
@@ -589,11 +750,34 @@ function parseProtectedEnvFile(raw: string): Map<string, string> {
     if (separator <= 0) continue
     const key = trimmed.slice(0, separator).trim()
     if (!/^[A-Z_][A-Z0-9_]*$/.test(key)) continue
+    if (values.has(key)) throw new Error(`Managed native controller protected environment snapshot repeats ${key}.`)
     let value = trimmed.slice(separator + 1).trim()
     if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) value = value.slice(1, -1)
     values.set(key, value)
   }
+  for (const forbidden of ['FORGE_DATABASE_ADMIN_URL', 'PGHOST', 'PGPORT', 'PGUSER', 'PGPASSWORD', 'PGDATABASE']) {
+    if (values.has(forbidden)) throw new Error(`Managed native controller protected environment snapshot contains forbidden authority key ${forbidden}.`)
+  }
   return values
+}
+
+async function readProtectedEnvironmentSnapshot(expectedBytes: number, expectedDigest: string): Promise<Map<string, string>> {
+  if (!Number.isSafeInteger(expectedBytes) || expectedBytes < 1 || expectedBytes > MAX_NATIVE_ENV_SNAPSHOT_BYTES) {
+    throw new Error('Managed native controller protected environment snapshot byte count is out of bounds.')
+  }
+  const chunks: Buffer[] = []
+  let received = 0
+  for await (const chunk of process.stdin) {
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+    received += bytes.byteLength
+    if (received > expectedBytes) throw new Error('Managed native controller protected environment snapshot exceeded its declared byte count.')
+    chunks.push(bytes)
+  }
+  if (received !== expectedBytes) throw new Error('Managed native controller protected environment snapshot ended before its declared byte count.')
+  const snapshot = Buffer.concat(chunks, received)
+  const actualDigest = createHash('sha256').update(snapshot).digest('hex')
+  if (actualDigest !== expectedDigest) throw new Error('Managed native controller protected environment snapshot digest disagrees with its declared bytes.')
+  return parseProtectedEnvSnapshot(snapshot.toString('utf8'))
 }
 
 async function nativeControllerInputs(args: string[]): Promise<NativeControllerInputs | null> {
@@ -610,7 +794,8 @@ async function nativeControllerInputs(args: string[]): Promise<NativeControllerI
   if (inheritedAuthority.length > 0) throw new Error('Managed native controller inherited a forbidden database authority environment.')
   const port = option('--native-port')
   const databaseName = option('--native-database')
-  const envFile = option('--native-env-file')
+  const envBytesRaw = option('--native-env-bytes')
+  const envDigest = option('--native-env-sha256')
   const helperRoot = option('--native-helper-root')
   const childNode = option('--native-child-node')
   const reconcileSql = option('--native-reconcile-sql')
@@ -628,7 +813,7 @@ async function nativeControllerInputs(args: string[]): Promise<NativeControllerI
   const peerGid = integerOption('--native-peer-gid')
   if (!socket.startsWith('/') || !port?.match(/^\d{1,5}$/) || Number(port) < 1 || Number(port) > 65535
     || !databaseName?.match(/^[a-z_][a-z0-9_]*$/i)
-    || !envFile?.startsWith('/') || !helperRoot?.startsWith('/') || !childNode?.startsWith('/')
+    || !envBytesRaw?.match(/^\d+$/) || !envDigest?.match(/^[0-9a-f]{64}$/) || !helperRoot?.startsWith('/') || !childNode?.startsWith('/')
     || !reconcileSql?.startsWith('/') || !legacyRepairSql?.startsWith('/')) {
     throw new Error('Managed native controller received invalid non-secret routing arguments.')
   }
@@ -640,7 +825,7 @@ async function nativeControllerInputs(args: string[]): Promise<NativeControllerI
   await assertInstalledHelperFile(legacyRepairSql, 'legacy repair artifact')
   process.chdir(helperRoot)
   if (process.getuid?.() !== 0) throw new Error('Managed native controller requires root with distinct peer-admin and migration-child identities.')
-  const protectedValues = parseProtectedEnvFile(await readFile(envFile, 'utf8'))
+  const protectedValues = await readProtectedEnvironmentSnapshot(Number(envBytesRaw), envDigest)
   const adminUser = (await execFileAsync('/usr/bin/id', ['-nu', String(peerUid)])).stdout.trim()
   if (!adminUser.match(/^[a-z_][a-z0-9_]*$/i)) throw new Error('Managed native controller could not derive a safe peer administrator identity.')
   const resolvedPeerUid = Number((await execFileAsync('/usr/bin/id', ['-u', adminUser])).stdout.trim())

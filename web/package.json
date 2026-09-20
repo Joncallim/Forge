@@ -68,6 +68,7 @@
     "test:vnext-phase0-conformance": "node scripts/ci/run-vnext-phase0-contract.mjs",
     "test:vnext-protected-migration-recovery": "tsx scripts/ci/prove-vnext-protected-migration-handoff-recovery.ts",
     "test:managed-migration-controller-restart": "tsx scripts/ci/prove-managed-migration-controller-restart.ts",
+    "test:compose-postgres-admin-upgrade": "bash ../scripts/ci/prove-compose-postgres-admin-upgrade.sh",
     "test:mcp:s4-postgres": "FORGE_S4_REQUIRE_POSTGRES_TEST=1 vitest run __tests__/epic-172-s4-postgres.test.ts",
     "test:mcp:s5-postgres": "FORGE_S5_REQUIRE_POSTGRES_TEST=1 vitest run __tests__/epic-172-s5-postgres-routes.test.ts",
     "test:mcp:s4-redis": "node scripts/ci/run-mandatory-s4-redis-proof.mjs",

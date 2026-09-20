@@ -62,7 +62,38 @@ INSERT INTO forge_expected_protected_owner_inventory (relation_name, owner_name)
 DO $boundary$
 DECLARE
   protected_count integer;
+  fenced_controller boolean := false;
 BEGIN
+  -- The managed controller may hold `forge` at NOLOGIN while it has already
+  -- removed both CONNECT and ownership.  Accept that narrowly-scoped state
+  -- only for the controller's reserved-session marker plus a durable handoff
+  -- row whose exact current-database identity still matches.
+  IF pg_catalog.current_setting('forge.managed_controller_fenced', true) = '1'
+    AND pg_catalog.to_regclass('public.forge_protected_migration_handoffs') IS NOT NULL THEN
+    EXECUTE $fenced$
+      SELECT EXISTS (
+        SELECT 1 FROM public.forge_protected_migration_handoffs handoff
+        JOIN pg_catalog.pg_database database_row ON database_row.datname = pg_catalog.current_database()
+        WHERE handoff.migration_tag = '0034_vnext_phase0_a1_runtime_foundation'
+          AND handoff.controller_phase IN ('fenced','handoff_open','cleanup_complete','restore_pending','complete')
+          AND handoff.database_name = database_row.datname
+          AND handoff.database_oid = database_row.oid
+          AND handoff.database_owner_oid = database_row.datdba
+          AND handoff.database_acl IS NOT NULL
+          AND handoff.database_acl_digest ~ '^[0-9a-f]{64}$'
+      )
+      AND NOT pg_catalog.has_database_privilege('forge', pg_catalog.current_database(), 'connect')
+      AND NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_shdepend dependency
+        WHERE dependency.refclassid = 'pg_catalog.pg_authid'::pg_catalog.regclass
+          AND dependency.refobjid = 'forge'::pg_catalog.regrole
+          AND dependency.deptype = 'o'
+          AND (dependency.dbid = (SELECT oid FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database())
+            OR (dependency.dbid = 0 AND dependency.classid = 'pg_catalog.pg_database'::pg_catalog.regclass
+              AND dependency.objid = (SELECT oid FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database())))
+      )
+    $fenced$ INTO fenced_controller;
+  END IF;
   IF NOT EXISTS (
     SELECT 1
     FROM pg_catalog.pg_roles role_row
@@ -73,7 +104,7 @@ BEGIN
       AND NOT role_row.rolcreaterole
       AND NOT role_row.rolreplication
       AND NOT role_row.rolbypassrls
-  ) THEN
+  ) AND NOT fenced_controller THEN
     RAISE EXCEPTION 'forge app role is not a safe or known legacy login';
   END IF;
   IF EXISTS (
@@ -256,6 +287,7 @@ GRANT EXECUTE ON FUNCTION forge.create_vnext_generic_zero_mission_v1(bytea,uuid,
 DO $verify$
 DECLARE
   projection_name text;
+  fenced_controller boolean := false;
 BEGIN
   IF (SELECT count(*) FROM forge_expected_protected_owner_inventory) <> 44 OR EXISTS (
     SELECT 1
@@ -269,6 +301,32 @@ BEGIN
   ) THEN
     RAISE EXCEPTION 'fixed protected owner inventory changed during reconciliation';
   END IF;
+  IF pg_catalog.current_setting('forge.managed_controller_fenced', true) = '1'
+    AND pg_catalog.to_regclass('public.forge_protected_migration_handoffs') IS NOT NULL THEN
+    EXECUTE $fenced$
+      SELECT EXISTS (
+        SELECT 1 FROM public.forge_protected_migration_handoffs handoff
+        JOIN pg_catalog.pg_database database_row ON database_row.datname = pg_catalog.current_database()
+        WHERE handoff.migration_tag = '0034_vnext_phase0_a1_runtime_foundation'
+          AND handoff.controller_phase IN ('fenced','handoff_open','cleanup_complete','restore_pending','complete')
+          AND handoff.database_name = database_row.datname
+          AND handoff.database_oid = database_row.oid
+          AND handoff.database_owner_oid = database_row.datdba
+          AND handoff.database_acl IS NOT NULL
+          AND handoff.database_acl_digest ~ '^[0-9a-f]{64}$'
+      )
+      AND NOT pg_catalog.has_database_privilege('forge', pg_catalog.current_database(), 'connect')
+      AND NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_shdepend dependency
+        WHERE dependency.refclassid = 'pg_catalog.pg_authid'::pg_catalog.regclass
+          AND dependency.refobjid = 'forge'::pg_catalog.regrole
+          AND dependency.deptype = 'o'
+          AND (dependency.dbid = (SELECT oid FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database())
+            OR (dependency.dbid = 0 AND dependency.classid = 'pg_catalog.pg_database'::pg_catalog.regclass
+              AND dependency.objid = (SELECT oid FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database())))
+      )
+    $fenced$ INTO fenced_controller;
+  END IF;
   IF NOT EXISTS (
     SELECT 1
     FROM pg_catalog.pg_roles role_row
@@ -280,7 +338,7 @@ BEGIN
       AND NOT role_row.rolcreaterole
       AND NOT role_row.rolreplication
       AND NOT role_row.rolbypassrls
-  ) OR EXISTS (
+  ) AND NOT fenced_controller OR EXISTS (
     SELECT 1
     FROM pg_catalog.pg_auth_members membership
     WHERE membership.roleid = 'forge'::pg_catalog.regrole

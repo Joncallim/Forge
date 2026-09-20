@@ -127,6 +127,9 @@ jobs:
       - name: Prove isolated PostgreSQL 16 controller crash recovery
         working-directory: web
         run: npm run test:managed-migration-controller-restart
+      - name: Prove isolated Compose PostgreSQL administrator topology
+        working-directory: web
+        run: npm run test:compose-postgres-admin-upgrade
       - name: Install PostgreSQL 16 and redis-cli for migration proof
         working-directory: .
         run: |

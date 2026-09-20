@@ -1086,6 +1086,7 @@ async function exactOptionalForgeAppRoleBoundary(
   const [boundary] = await sql<readonly {
     roles: number
     exactRoles: number
+    fencedRole: number
     membershipEdges: number
   }[]>`
     SELECT
@@ -1094,13 +1095,41 @@ async function exactOptionalForgeAppRoleBoundary(
       (SELECT pg_catalog.count(*)::integer FROM pg_catalog.pg_roles
        WHERE rolname = 'forge' AND rolcanlogin AND NOT rolinherit AND NOT rolsuper
          AND NOT rolcreatedb AND NOT rolcreaterole AND NOT rolreplication AND NOT rolbypassrls) AS "exactRoles",
+      (SELECT pg_catalog.count(*)::integer FROM pg_catalog.pg_roles
+       WHERE rolname = 'forge' AND NOT rolcanlogin AND NOT rolinherit AND NOT rolsuper
+         AND NOT rolcreatedb AND NOT rolcreaterole AND NOT rolreplication AND NOT rolbypassrls) AS "fencedRole",
       (SELECT pg_catalog.count(*)::integer
        FROM pg_catalog.pg_auth_members membership
        WHERE membership.roleid = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = 'forge')
           OR membership.member = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = 'forge')) AS "membershipEdges"
   `
-  return boundary?.roles === 0
-    || (boundary?.roles === 1 && boundary.exactRoles === 1 && boundary.membershipEdges === 0)
+  if (boundary?.roles === 0 || (boundary?.roles === 1 && boundary.exactRoles === 1 && boundary.membershipEdges === 0)) return true
+  if (boundary?.roles !== 1 || boundary.fencedRole !== 1 || boundary.membershipEdges !== 0) return false
+  const [marker] = await sql<readonly { enabled: boolean; stateTable: string | null }[]>`
+    select pg_catalog.current_setting('forge.managed_controller_fenced', true) = '1' as enabled,
+      pg_catalog.to_regclass('public.forge_protected_migration_handoffs')::text as "stateTable"
+  `
+  if (!marker?.enabled || !marker.stateTable) return false
+  const [fenced] = await sql<readonly { exact: boolean }[]>`
+    select exists(
+      select 1 from public.forge_protected_migration_handoffs handoff
+      join pg_catalog.pg_database database_row on database_row.datname=pg_catalog.current_database()
+      where handoff.migration_tag='0034_vnext_phase0_a1_runtime_foundation'
+        and handoff.controller_phase in ('fenced','handoff_open','cleanup_complete','restore_pending','complete')
+        and handoff.database_name=database_row.datname and handoff.database_oid=database_row.oid
+        and handoff.database_owner_oid=database_row.datdba and handoff.database_acl is not null
+        and handoff.database_acl_digest ~ '^[0-9a-f]{64}$'
+    ) and not pg_catalog.has_database_privilege('forge', pg_catalog.current_database(), 'connect')
+      and not exists(
+        select 1 from pg_catalog.pg_shdepend dependency
+        where dependency.refclassid='pg_catalog.pg_authid'::pg_catalog.regclass
+          and dependency.refobjid='forge'::pg_catalog.regrole and dependency.deptype='o'
+          and (dependency.dbid=(select oid from pg_catalog.pg_database where datname=pg_catalog.current_database())
+            or (dependency.dbid=0 and dependency.classid='pg_catalog.pg_database'::pg_catalog.regclass
+              and dependency.objid=(select oid from pg_catalog.pg_database where datname=pg_catalog.current_database())))
+      ) as exact
+  `
+  return fenced?.exact === true
 }
 
 async function lockProtectedInstallerAclCatalog(

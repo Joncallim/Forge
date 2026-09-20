@@ -80,6 +80,8 @@ assert_not_contains 'FORGE_REPAIR_TEST_HOOK' "$REPAIR"
 assert_not_contains 'FORGE_REPAIR_PRODUCTION_NATIVE_ROUTE' "$REPAIR"
 assert_not_contains 'postgresql://forge:*@localhost:5432/forge|postgres://forge:*@localhost:5432/forge' "$INSTALLER"
 assert_not_contains 'postgresql://forge:*@localhost:5432/forge|postgres://forge:*@localhost:5432/forge' "$REPAIR"
+assert_not_contains 'exec 9<&- 2>/dev/null' "$INSTALLER"
+assert_not_contains 'exec {NATIVE_ENV_SNAPSHOT_FD}<&- 2>/dev/null' "$INSTALLER"
 assert_contains 'new TextDecoder("utf-8", { fatal: true })' "$INSTALLER"
 assert_contains 'new TextDecoder("utf-8", { fatal: true })' "$REPAIR"
 assert_contains 'readFileSync(0)' "$INSTALLER"
@@ -1209,12 +1211,18 @@ run_installer_privilege_routing_case docker-native-url "$managed_repair_url" doc
 
 run_controller_environment_case() {
   local case_dir="$TEST_ROOT/controller-environment"
-  mkdir -p "$case_dir/bin" "$case_dir/state"
+  local real_node real_sha256sum
+  real_node="$(command -v node)"
+  real_sha256sum="$(command -v sha256sum)"
+  mkdir -p "$case_dir/bin" "$case_dir/state" "$case_dir/helper"
   printf 'DATABASE_URL=postgresql://forge:%s@localhost:5432/forge\n' "$TEST_SECRET" > "$case_dir/forge.env"
+  chmod 600 "$case_dir/forge.env"
+  ln -s "$real_node" "$case_dir/helper/node"
   for command in node npm npx bash sudo; do
     printf '#!/usr/bin/env bash\nexit 0\n' > "$case_dir/bin/$command"
   done
   chmod +x "$case_dir/bin"/*
+  ln -s "$real_sha256sum" "$case_dir/bin/sha256sum"
   cat > "$case_dir/driver.sh" <<'EOF'
 #!/bin/bash
 FORGE_INSTALL_LIBRARY=1 source "$INSTALLER"
@@ -1234,13 +1242,14 @@ MANAGED_LOCAL_ADMIN_MODE=current
 MANAGED_LOCAL_ADMIN_USER=nobody
 MANAGED_LOCAL_ADMIN_SOCKET=/var/run/postgresql
 MANAGED_LOCAL_ADMIN_PORT=5432
-MANAGED_HELPER_ROOT=/opt/forge-managed-migration-helper-test
+MANAGED_HELPER_ROOT="$FORGE_TEST_HELPER_ROOT"
 run_managed_local_controller 'controller environment proof'
 EOF
   chmod +x "$case_dir/driver.sh"
   set +e
   INSTALLER="$INSTALLER" \
     FORGE_TEST_TOOLCHAIN_DIR="$case_dir/bin" \
+    FORGE_TEST_HELPER_ROOT="$case_dir/helper" \
     PATH="$case_dir/bin:$PATH" \
     UNRELATED_SECRET_SENTINEL='unrelated-value-must-not-reach-postgres' \
     DATABASE_URL='postgresql://ambient-admin:must-not-cross@invalid/forge' \
@@ -1265,6 +1274,9 @@ assert_contains '-i' "$CASE_DIR/dispatch"
 assert_contains '--native-socket' "$CASE_DIR/dispatch"
 assert_contains '--native-peer-uid' "$CASE_DIR/dispatch"
 assert_contains '--native-peer-gid' "$CASE_DIR/dispatch"
+assert_contains '--native-env-bytes' "$CASE_DIR/dispatch"
+assert_contains '--native-env-sha256' "$CASE_DIR/dispatch"
+assert_not_contains '--native-env-file' "$CASE_DIR/dispatch"
 assert_not_contains 'preserve-environment' "$CASE_DIR/dispatch"
 assert_not_contains 'preserve-env=' "$CASE_DIR/dispatch"
 assert_not_contains 'DATABASE_URL' "$CASE_DIR/dispatch"
@@ -1273,6 +1285,15 @@ assert_not_contains 'PGHOST' "$CASE_DIR/dispatch"
 assert_not_contains 'PGUSER' "$CASE_DIR/dispatch"
 assert_not_contains 'must-not-cross' "$CASE_DIR/dispatch"
 assert_not_contains "$TEST_SECRET" "$CASE_DIR/dispatch"
+
+fd_cleanup_stderr="$TEST_ROOT/fd-cleanup-stderr"
+FORGE_INSTALL_LIBRARY=1 /bin/bash -c '
+  source "$1"
+  exec {NATIVE_ENV_SNAPSHOT_FD}</dev/null
+  close_native_env_snapshot
+  printf "%s\n" fd-cleanup-stderr-preserved >&2
+' _ "$INSTALLER" 2>"$fd_cleanup_stderr"
+assert_contains 'fd-cleanup-stderr-preserved' "$fd_cleanup_stderr"
 
 run_shadow_refusal_case() {
   local case_dir="$TEST_ROOT/shadow-refusal"

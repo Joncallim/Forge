@@ -85,15 +85,17 @@ const closureFiles = [
   'db/migrations/meta/_journal.json',
 ].sort()
 const manifest = []
-const digest = createHash('sha256')
 for (const name of closureFiles) {
   const bytes = await readFile(resolve(output, name))
   const fileDigest = createHash('sha256').update(bytes).digest('hex')
   manifest.push({ name, bytes: bytes.length, sha256: fileDigest })
-  digest.update(`${name}\0${bytes.length}\0${fileDigest}\n`)
 }
 await writeFile(resolve(output, 'closure-manifest.json'), `${JSON.stringify({ version: 1, files: manifest }, null, 2)}\n`)
-await writeFile(resolve(output, 'bundle.sha256'), `${digest.digest('hex')}\n`)
+const pack = Buffer.from(`${JSON.stringify({ version: 1, files: await Promise.all(manifest.map(async (entry) => ({
+  ...entry, content: (await readFile(resolve(output, entry.name))).toString('base64'),
+}))) })}\n`)
+await writeFile(resolve(output, 'bundle.pack'), pack)
+await writeFile(resolve(output, 'bundle.sha256'), `${createHash('sha256').update(pack).digest('hex')}\n`)
 await writeFile(resolve(output, 'metafile.json'), `${JSON.stringify({
   ...result.metafile,
   forgeVerifiedAbsoluteInputs: verifiedInputs.sort(),

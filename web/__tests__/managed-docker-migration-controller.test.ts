@@ -1,7 +1,7 @@
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { dirname, resolve } from 'node:path'
+import { createHash } from 'node:crypto'
+import { readFileSync } from 'node:fs'
+import { dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
 
@@ -56,7 +56,7 @@ describe('managed Docker migration authority', () => {
     expect(controller).toContain("membership.inherit_option")
     expect(controller).toContain("grant.grantee === 'PUBLIC' ? 'public'")
     expect(controller).toContain('set local role ${quoteCatalogIdentifier(grant.grantor)}; revoke connect')
-    expect(controller).toContain('Managed migration did not restore the exact database ACL snapshot including grantors.')
+    expect(controller).toContain('Managed migration did not restore the exact database ACL snapshot including grantors:')
     expect(controller).toContain('prepareProtectedMigrationController')
     expect(state.indexOf('create role ${safeRole(migrationRole)}')).toBeLessThan(state.indexOf("controller_phase='prepared'"))
     expect(controller).toContain('grantorOid')
@@ -100,12 +100,25 @@ describe('managed Docker migration authority', () => {
     }
   })
 
-  it('attests and rejects any remaining application-owned public object before reconnect', () => {
+  it('attests all current-database ownership and rejects foreign shared ownership before reconnect', () => {
     expect(controller).toContain("dependency.deptype='o'")
     expect(controller).toContain('refused forge-owned shared objects outside the exact current database')
-    expect(controller).toContain("relowner='forge'::regrole")
-    expect(controller).toContain('Managed Docker app ownership reconciliation did not reach the required boundary.')
+    expect(controller).toContain('dependency.dbid=(select oid from pg_catalog.pg_database')
+    expect(controller).toContain('appOwnsCurrentDatabaseObjects')
+    expect(controller).toContain('assertApplicationRoleMembershipBoundary(sql)')
+    expect(controller).toContain('refused application role memberships that widen or can assume a long-lived identity')
+    expect(controller).toContain('Managed Docker app ownership reconciliation did not reach the required fenced boundary.')
     expect(controller).toContain('Managed Docker protected migration cleanup state changed before its CAS close.')
+  })
+
+  it('suspends login authority before ACL fencing so a legacy database owner cannot reconnect', () => {
+    expect(controller.indexOf('await suspendApplicationLoginAuthority(sql)')).toBeLessThan(controller.indexOf('await fenceRuntimeConnect(sql, database)'))
+    expect(controller.indexOf('await fenceRuntimeConnect(sql, database)')).toBeLessThan(controller.indexOf('await attestRuntimeQuiescence(sql)'))
+    expect(controller.indexOf('PAUSE_AFTER_LOGIN_FENCE_MS')).toBeLessThan(controller.indexOf('reassign owned by forge to forge_schema_owner'))
+    expect(controller).toContain('finalizeLifecycleAndRestoreLoginCas')
+    expect(controller).toContain('FORGE_MANAGED_MIGRATION_PAUSE_AFTER_ACL_RESTORE_MS')
+    expect(controller).toContain('atomically publish completion with ordinary application/runtime login authority')
+    expect(controller).toContain("and pg_catalog.has_database_privilege('forge', current_database(), 'connect') as \"appReconnect\"")
   })
 
   it('routes native managed installs through the same single controller', () => {
@@ -118,7 +131,9 @@ describe('managed Docker migration authority', () => {
     const dispatch = installer.slice(installer.indexOf('run_managed_local_controller()'), installer.indexOf('\n}\n', installer.indexOf('run_managed_local_controller()')) + 2)
     expect(dispatch).toContain('/usr/bin/env -i')
     expect(dispatch).toContain('--native-socket')
-    expect(dispatch).toContain('--native-env-file')
+    expect(dispatch).toContain('--native-env-bytes')
+    expect(dispatch).toContain('--native-env-sha256')
+    expect(dispatch).not.toContain('--native-env-file')
     expect(dispatch).not.toContain('preserve-environment')
     expect(dispatch).not.toContain('preserve-env=')
     expect(dispatch).not.toContain('DATABASE_URL')
@@ -131,30 +146,31 @@ describe('managed Docker migration authority', () => {
     expect(dispatch).toContain('--native-helper-root')
     expect(dispatch).not.toContain('--native-repo-root')
     expect(dispatch).not.toContain('--native-child-tsx')
-    expect(controller).toContain("const protectedValues = parseProtectedEnvFile(await readFile(envFile, 'utf8'))")
+    expect(controller).toContain("readProtectedEnvironmentSnapshot(Number(envBytesRaw), envDigest)")
+    expect(controller).toContain('MAX_NATIVE_ENV_SNAPSHOT_BYTES')
+    expect(controller).toContain('protected environment snapshot repeats')
+    expect(controller).toContain('protected environment snapshot digest disagrees')
     expect(controller).toContain("key === 'DATABASE_URL' || key === 'FORGE_DATABASE_ADMIN_URL' || key.startsWith('PG')")
+    expect(controller).not.toContain("option('--native-env-file')")
   })
 
   it('executes the native controller with no inherited database authority environment', () => {
-    const directory = mkdtempSync(resolve(tmpdir(), 'forge-native-controller-env-'))
-    const envFile = resolve(directory, 'forge.env')
-    writeFileSync(envFile, 'DATABASE_URL=postgresql://forge:secret@localhost/wrong_database\n', { mode: 0o600 })
+    const protectedSnapshot = 'DATABASE_URL=postgresql://forge:secret@localhost/wrong_database\n'
+    const protectedDigest = createHash('sha256').update(protectedSnapshot).digest('hex')
     const args = ['tsx', 'scripts/managed-docker-migration-controller.ts', '--run',
       '--native-socket', '/var/run/postgresql', '--native-port', '5432', '--native-database', 'forge',
-      '--native-env-file', envFile,
+      '--native-env-bytes', String(Buffer.byteLength(protectedSnapshot)), '--native-env-sha256', protectedDigest,
       '--native-helper-root', dirname(process.cwd()), '--native-peer-uid', '1', '--native-peer-gid', '1',
       '--native-child-node', '/usr/bin/gnutrue',
       '--native-reconcile-sql', '/usr/bin/gnutrue', '--native-legacy-repair-sql', '/usr/bin/gnutrue']
     const invoke = (env: NodeJS.ProcessEnv) => {
-      try { execFileSync('npx', args, { cwd: process.cwd(), env, encoding: 'utf8', stdio: 'pipe' }); return '' }
+      try { execFileSync('npx', args, { cwd: process.cwd(), env, input: protectedSnapshot, encoding: 'utf8', stdio: 'pipe' }); return '' }
       catch (error) { return `${(error as { stdout?: string }).stdout ?? ''}${(error as { stderr?: string }).stderr ?? ''}` }
     }
-    try {
-      const cleanOutput = invoke({ PATH: process.env.PATH, NODE_ENV: 'test' })
-      expect(cleanOutput).toContain('Managed native assert-migration-child-boundary child is not a regular installed file')
-      expect(cleanOutput).not.toContain('inherited a forbidden database authority environment')
-      expect(invoke({ PATH: process.env.PATH, NODE_ENV: 'test', DATABASE_URL: 'postgresql://ambient-admin:secret@host/forge' }))
-        .toContain('inherited a forbidden database authority environment')
-    } finally { rmSync(directory, { recursive: true, force: true }) }
+    const cleanOutput = invoke({ PATH: process.env.PATH, NODE_ENV: 'test' })
+    expect(cleanOutput).toContain('Managed native assert-migration-child-boundary child is not a regular installed file')
+    expect(cleanOutput).not.toContain('inherited a forbidden database authority environment')
+    expect(invoke({ PATH: process.env.PATH, NODE_ENV: 'test', DATABASE_URL: 'postgresql://ambient-admin:secret@host/forge' }))
+      .toContain('inherited a forbidden database authority environment')
   })
 })
