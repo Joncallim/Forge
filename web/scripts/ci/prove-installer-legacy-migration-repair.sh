@@ -1255,6 +1255,42 @@ migrate_through_0027() {
 managed_env="$TEMP_ROOT/managed.env"
 printf 'DATABASE_URL=%s\n' "$FORGE_LEGACY_REPAIR_APP_URL" > "$managed_env"
 chmod 0600 "$managed_env"
+
+assert_managed_app_credential_provisioned() {
+  (
+    cd "$WEB_ROOT"
+    FORGE_MANAGED_APP_URL="$FORGE_LEGACY_REPAIR_APP_URL" \
+      FORGE_ENCODED_ADMIN_URL="$FORGE_LEGACY_REPAIR_ADMIN_URL" node <<'NODE'
+const crypto = require('node:crypto')
+const postgres = require('postgres')
+const configured = new URL(process.env.FORGE_MANAGED_APP_URL)
+if (configured.username !== 'forge' || !configured.password) {
+  throw new Error('managed proof application URL is not the canonical forge credential')
+}
+const expected = decodeURIComponent(configured.password)
+const admin = postgres(process.env.FORGE_ENCODED_ADMIN_URL, { max: 1 })
+admin`SELECT rolpassword FROM pg_catalog.pg_authid WHERE rolname = 'forge'`
+  .then((rows) => {
+    const verifier = rows[0]?.rolpassword ?? ''
+    const match = /^SCRAM-SHA-256\$(\d+):([^$]+)\$([^:]+):(.+)$/.exec(verifier)
+    if (!match) throw new Error('managed controller did not leave a SCRAM password verifier for forge')
+    const salted = crypto.pbkdf2Sync(expected, Buffer.from(match[2], 'base64'), Number(match[1]), 32, 'sha256')
+    const clientKey = crypto.createHmac('sha256', salted).update('Client Key').digest()
+    const storedKey = crypto.createHash('sha256').update(clientKey).digest()
+    if (!crypto.timingSafeEqual(storedKey, Buffer.from(match[3], 'base64'))) {
+      throw new Error('managed controller did not provision the protected application credential')
+    }
+  })
+  .then(() => admin.end())
+  .catch(async (error) => {
+    await admin.end().catch(() => {})
+    console.error(error)
+    process.exitCode = 1
+  })
+NODE
+  )
+}
+
 run_managed_sequence() {
   (
     export DATABASE_URL="$FORGE_LEGACY_REPAIR_APP_URL"
@@ -1332,6 +1368,10 @@ revoke_forge_contamination
 
 echo 'Proving the full managed sequence normalizes once and is then stable at latest.'
 run_managed_sequence
+# The earlier encoded-password cases deliberately leave the cluster-global
+# forge role with their final hostile fixture password. Prove that the real
+# controller, not test setup, rotates it to the protected environment value.
+assert_managed_app_credential_provisioned
 # A real legacy install ran the broad app grant after reaching latest. Recreate
 # that state before the next upgrade so the 0028 normalizer sees a real shape.
 grant_exact_forge_contamination
@@ -1342,6 +1382,7 @@ assert_protected_forge_acl_count "$CANONICAL_PROTECTED_DIRECT_READ_COUNT"
 run_managed_sequence
 snapshot managed-latest-twice
 assert_unchanged managed-latest-once managed-latest-twice 'Managed latest rerun'
+assert_managed_app_credential_provisioned
 admin_psql \
   --set expected_migration_count="$FORGE_CURRENT_MIGRATION_COUNT" \
   --set expected_latest_migration_at="$FORGE_CURRENT_LATEST_MIGRATION_AT" <<'SQL'
