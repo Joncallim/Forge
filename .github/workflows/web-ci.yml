@@ -213,6 +213,7 @@ jobs:
             sleep 0.1
           done
           "$native_bin/psql" -X --host "$native_socket" --port 5433 --dbname postgres --set ON_ERROR_STOP=1 <<'SQL'
+          ALTER ROLE CURRENT_USER PASSWORD 'forge_native_admin_test';
           CREATE ROLE forge_migration_test
             LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
             PASSWORD 'forge_migration_test';
@@ -222,7 +223,7 @@ jobs:
           export PGPORT=5433
           export FORGE_LEGACY_REPAIR_DATABASE_URL=postgresql://forge_migration_test:forge_migration_test@localhost:5433/forge
           export FORGE_LEGACY_REPAIR_APP_URL=postgresql://forge:forge_legacy_repair_test@localhost:5433/forge
-          export FORGE_LEGACY_REPAIR_ADMIN_URL="postgresql://$native_user@localhost:5433/forge?host=$native_socket"
+          export FORGE_LEGACY_REPAIR_ADMIN_URL="postgresql://$native_user:forge_native_admin_test@localhost:5433/forge"
           export FORGE_LEGACY_REPAIR_ADMIN_HOST="$native_socket"
           export FORGE_LEGACY_REPAIR_ADMIN_SOCKET="$native_socket"
           export FORGE_LEGACY_REPAIR_ADMIN_USER="$native_user"
