@@ -222,7 +222,7 @@ jobs:
           export PGPORT=5433
           export FORGE_LEGACY_REPAIR_DATABASE_URL=postgresql://forge_migration_test:forge_migration_test@localhost:5433/forge
           export FORGE_LEGACY_REPAIR_APP_URL=postgresql://forge:forge_legacy_repair_test@localhost:5433/forge
-          export FORGE_LEGACY_REPAIR_ADMIN_URL="postgresql://$native_user@127.0.0.1:5433/forge"
+          export FORGE_LEGACY_REPAIR_ADMIN_URL="postgresql://$native_user@localhost:5433/forge?host=$native_socket"
           export FORGE_LEGACY_REPAIR_ADMIN_HOST="$native_socket"
           export FORGE_LEGACY_REPAIR_ADMIN_SOCKET="$native_socket"
           export FORGE_LEGACY_REPAIR_ADMIN_USER="$native_user"

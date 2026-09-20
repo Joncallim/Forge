@@ -196,6 +196,7 @@ describe('installer-managed migration proof', () => {
     expect(webCi).toContain('--auth-local peer --auth-host scram-sha-256')
     expect(webCi).toContain("-c listen_addresses='localhost'")
     expect(webCi).toContain('pg_isready" --host "$native_socket"')
+    expect(webCi).toContain('FORGE_LEGACY_REPAIR_ADMIN_URL="postgresql://$native_user@localhost:5433/forge?host=$native_socket"')
     expect(webCi).not.toContain('socat TCP-LISTEN:5433')
     expect(webCi).not.toContain('--auth trust')
   })
