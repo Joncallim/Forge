@@ -33,6 +33,8 @@ run_shared_docker_controller() {
     DATABASE_URL="$FORGE_INSTALLER_MANAGED_APP_URL" \
       FORGE_DATABASE_ADMIN_URL="$FORGE_INSTALLER_MANAGED_ADMIN_URL" \
       FORGE_MANAGED_DOCKER_MIGRATIONS=1 \
+      CI=true \
+      FORGE_MANAGED_MIGRATION_PROOF_HOST_CHILD=1 \
       "$NODE_BIN" "$TSX_CLI" scripts/managed-docker-migration-controller.ts --run
   )
 }
