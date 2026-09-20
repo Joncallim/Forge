@@ -229,7 +229,7 @@ jobs:
           export FORGE_LEGACY_REPAIR_ADMIN_USER="$native_user"
           export FORGE_LEGACY_REPAIR_ADMIN_PASSWORD=unused-local-trust
           export FORGE_LEGACY_REPAIR_ADMIN_DATABASE=forge
-          export FORGE_LEGACY_REPAIR_MIGRATION_HOST="$native_socket"
+          export FORGE_LEGACY_REPAIR_MIGRATION_HOST=localhost
           export FORGE_LEGACY_REPAIR_MIGRATION_USER=forge_migration_test
           export FORGE_LEGACY_REPAIR_MIGRATION_PASSWORD=forge_migration_test
           bash scripts/ci/prove-installer-legacy-migration-repair.sh

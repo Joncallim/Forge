@@ -198,6 +198,8 @@ describe('installer-managed migration proof', () => {
     expect(webCi).toContain('pg_isready" --host "$native_socket"')
     expect(webCi).toContain("ALTER ROLE CURRENT_USER PASSWORD 'forge_native_admin_test'")
     expect(webCi).toContain('FORGE_LEGACY_REPAIR_ADMIN_URL="postgresql://$native_user:forge_native_admin_test@localhost:5433/forge"')
+    expect(webCi).toContain('FORGE_LEGACY_REPAIR_MIGRATION_HOST=localhost')
+    expect(webCi).not.toContain('FORGE_LEGACY_REPAIR_MIGRATION_HOST="$native_socket"')
     expect(webCi).not.toContain('socat TCP-LISTEN:5433')
     expect(webCi).not.toContain('--auth trust')
   })
