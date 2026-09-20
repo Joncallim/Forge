@@ -134,7 +134,7 @@ jobs:
         working-directory: .
         run: |
           sudo apt-get update
-          sudo apt-get install --yes postgresql-16 redis-tools socat
+          sudo apt-get install --yes postgresql-16 redis-tools
           /usr/lib/postgresql/16/bin/postgres --version
           redis-cli --version
       - name: Create disposable migration and ordinary app logins
@@ -198,22 +198,18 @@ jobs:
           native_user="$(/usr/bin/id -un)"
           sudo systemctl stop postgresql 2>/dev/null || true
           sudo install -d -m 0777 -o "$native_user" -g "$(/usr/bin/id -gn)" "$native_socket"
-          "$native_bin/initdb" --pgdata "$native_data" --username "$native_user" --auth trust --no-instructions
+          "$native_bin/initdb" --pgdata "$native_data" --username "$native_user" \
+            --auth-local peer --auth-host scram-sha-256 --no-instructions
           "$native_bin/pg_ctl" --pgdata "$native_data" \
-            --options "-p 5433 -k $native_socket -c listen_addresses=''" \
+            --options "-p 5433 -k $native_socket -c listen_addresses='localhost'" \
             --log "$RUNNER_TEMP/forge-native-pg16.log" start
-          socat TCP-LISTEN:5433,bind=127.0.0.1,reuseaddr,fork \
-            UNIX-CONNECT:"$native_socket/.s.PGSQL.5433" &
-          proxy_pid=$!
           cleanup_native() {
-            kill "$proxy_pid" 2>/dev/null || true
-            wait "$proxy_pid" 2>/dev/null || true
             "$native_bin/pg_ctl" --pgdata "$native_data" --mode fast stop 2>/dev/null || true
           }
           trap cleanup_native EXIT
           for attempt in $(seq 1 50); do
-            "$native_bin/pg_isready" --host 127.0.0.1 --port 5433 --dbname postgres && break
-            [ "$attempt" -lt 50 ] || { echo 'Native PostgreSQL socket proxy was not ready.' >&2; exit 1; }
+            "$native_bin/pg_isready" --host "$native_socket" --port 5433 --dbname postgres && break
+            [ "$attempt" -lt 50 ] || { echo 'Native PostgreSQL proof cluster was not ready.' >&2; exit 1; }
             sleep 0.1
           done
           "$native_bin/psql" -X --host "$native_socket" --port 5433 --dbname postgres --set ON_ERROR_STOP=1 <<'SQL'

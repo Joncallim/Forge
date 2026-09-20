@@ -25,6 +25,7 @@ const populatedUpgradeAssertions = sourceFor('../scripts/ci/sql/migration-0027-e
 const installer = sourceFor('../../scripts/install.sh')
 const controller = sourceFor('../scripts/managed-docker-migration-controller.ts')
 const childBoundary = sourceFor('../scripts/ci/assert-migration-child-boundary.ts')
+const webCi = sourceFor('../../.github/workflows/web-ci.yml')
 const compose = sourceFor('../../docker-compose.yml')
 const migrationDockerfile = sourceFor('../Dockerfile.migration')
 const adminUpgrade = sourceFor('../../scripts/ci/upgrade-compose-postgres-admin.sh')
@@ -189,6 +190,14 @@ describe('installer-managed migration proof', () => {
     expect(controller).toContain("line.startsWith('node:')")
     expect(controller).toContain("uid === process.getuid?.()")
     expect(childBoundary).toContain('`/proc/${controllerPid}/environ`')
+  })
+
+  it('proves native administrator authority without a spoofable TCP-to-socket proxy', () => {
+    expect(webCi).toContain('--auth-local peer --auth-host scram-sha-256')
+    expect(webCi).toContain("-c listen_addresses='localhost'")
+    expect(webCi).toContain('pg_isready" --host "$native_socket"')
+    expect(webCi).not.toContain('socat TCP-LISTEN:5433')
+    expect(webCi).not.toContain('--auth trust')
   })
 
   it('converges the reserved legacy Compose administrator transition without exposing its credential', () => {
