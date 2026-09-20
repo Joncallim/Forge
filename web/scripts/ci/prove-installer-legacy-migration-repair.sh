@@ -1253,6 +1253,7 @@ migrate_through_0027() {
 
 managed_env="$TEMP_ROOT/managed.env"
 printf 'DATABASE_URL=%s\n' "$FORGE_LEGACY_REPAIR_DATABASE_URL" > "$managed_env"
+chmod 0600 "$managed_env"
 run_managed_sequence() {
   (
     export DATABASE_URL="$FORGE_LEGACY_REPAIR_DATABASE_URL"

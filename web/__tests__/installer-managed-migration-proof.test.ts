@@ -257,6 +257,7 @@ describe('installer-managed migration proof', () => {
     expect(sequence).not.toContain('run_managed_local_migration_sequence')
     expect(sequence).not.toContain('resolve_managed_local_admin')
     expect(sequence).not.toContain('MANAGED_LOCAL_ADMIN_MODE=current')
+    expect(legacyRepairProof).toContain('chmod 0600 "$managed_env"')
   })
 
   it('derives the exact current ledger once from the authoritative Drizzle journal', () => {
