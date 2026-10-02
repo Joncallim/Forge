@@ -561,7 +561,7 @@ Worker and workspace options:
 | Variable | Purpose |
 |---|---|
 | `FORGE_EMBED_WORKER` | Set `0` when running a separate worker |
-| `FORGE_AGENT_WEB_SEARCH` | Set `0` to disable no-key web research context |
+| `FORGE_AGENT_WEB_SEARCH` | Public web research is disabled by default. Set exactly `1` to opt in. This sends static public search queries to DuckDuckGo, an external public service separate from configured model providers. |
 | `FORGE_AGENT_CONFIG_DIR` | Optional override for app-editable agent prompt files; must stay inside the workspace |
 | `FORGE_PROMPT_UPGRADE_MODE` | `keep` or `overwrite` local workspace prompts during install/upgrade |
 | `FORGE_WORKFORCE_MATERIALIZATION` | Set `0` or `false` to disable default Workforce record materialization |

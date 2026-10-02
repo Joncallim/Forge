@@ -1430,7 +1430,7 @@ write_env_file() {
   ensure_env_value NEXT_PUBLIC_APP_URL "http://localhost:3000"
   ensure_env_value NEXT_TELEMETRY_DISABLED "1"
   ensure_env_value FORGE_EMBED_WORKER "1"
-  ensure_env_value FORGE_AGENT_WEB_SEARCH "1"
+  ensure_env_value FORGE_AGENT_WEB_SEARCH "0"
   ensure_env_value FORGE_WORKER_CLAIM_TIMEOUT_SECONDS "5"
   ensure_env_value FORGE_PASSKEYS_ENABLED "1"
   ensure_env_value FORGE_TRUST_PROXY "0"
