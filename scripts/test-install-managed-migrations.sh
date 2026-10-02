@@ -26,7 +26,16 @@ assert_contains() {
 }
 
 assert_not_contains() {
-  ! grep -Fq -- "$1" "$2" || fail "did not expect '$1' in $2"
+  [ -r "$2" ] || fail "negative-assertion input $2 is missing or unreadable"
+  local status=0
+  grep -Fq -- "$1" "$2" || status=$?
+  if [ "$status" -eq 0 ]; then
+    fail "did not expect '$1' in $2"
+  elif [ "$status" -eq 1 ]; then
+    return 0
+  else
+    fail "negative-assertion scanner error (status $status) on $2"
+  fi
 }
 
 assert_stages() {
@@ -1338,8 +1347,89 @@ run_trusted_candidate_toc_tou_case() {
 
 run_trusted_candidate_toc_tou_case
 
-if rg -F "$TEST_SECRET" "$TEST_ROOT" --glob '!forge.env' >/dev/null; then
-  fail 'test sentinel leaked outside the local environment fixture'
-fi
+assert_no_sentinel_leaks() {
+  local secret="$1"
+  local target_dir="$2"
+  
+  if ! command -v rg >/dev/null 2>&1; then
+    fail "negative-assertion scanner 'rg' is unavailable"
+  fi
+
+  local status=0
+  rg -F -q -- "$secret" "$target_dir" --glob '!forge.env' --hidden || status=$?
+  if [ "$status" -eq 0 ]; then
+    fail 'test sentinel leaked outside the local environment fixture'
+  elif [ "$status" -eq 1 ]; then
+    return 0
+  else
+    fail "negative-assertion scanner error (status $status) checking for sentinel leaks"
+  fi
+}
+
+run_negative_assertion_cases() {
+  local case_dir="$TEST_ROOT/negative-assertion"
+  mkdir -p "$case_dir"
+  local test_file="$case_dir/input"
+  printf 'alpha\nbeta\n' > "$test_file"
+
+  assert_not_contains 'gamma' "$test_file"
+
+  if (assert_not_contains 'alpha' "$case_dir/nonexistent" 2>/dev/null); then
+    fail 'assert_not_contains accepted a missing input file'
+  fi
+
+  if (assert_not_contains 'alpha' "$test_file" 2>/dev/null); then
+    fail 'assert_not_contains accepted an actual leak'
+  fi
+  
+  if (
+    grep() { return 2; }
+    export -f grep
+    assert_not_contains 'gamma' "$test_file" 2>/dev/null
+  ); then
+    fail 'assert_not_contains accepted a scanner error'
+  fi
+}
+run_negative_assertion_cases
+
+run_scanner_leak_cases() {
+  local case_dir="$TEST_ROOT/final-scanner"
+  mkdir -p "$case_dir"
+  
+  assert_no_sentinel_leaks 'MY_SECRET' "$case_dir"
+  
+  printf 'MY_SECRET\n' > "$case_dir/leak"
+  if (assert_no_sentinel_leaks 'MY_SECRET' "$case_dir" 2>/dev/null); then
+    fail 'assert_no_sentinel_leaks accepted an actual leak'
+  fi
+  rm -f "$case_dir/leak"
+
+  printf 'MY_SECRET\n' > "$case_dir/.hidden_leak"
+  if (assert_no_sentinel_leaks 'MY_SECRET' "$case_dir" 2>/dev/null); then
+    fail 'assert_no_sentinel_leaks missed a hidden leak'
+  fi
+  rm -f "$case_dir/.hidden_leak"
+
+  if (
+    PATH="/nonexistent"
+    assert_no_sentinel_leaks 'MY_SECRET' "$case_dir" 2>/dev/null
+  ); then
+    fail 'assert_no_sentinel_leaks accepted a missing command'
+  fi
+  
+  mkdir -p "$case_dir/unreadable"
+  chmod 000 "$case_dir/unreadable"
+  if (
+    assert_no_sentinel_leaks 'MY_SECRET' "$case_dir" 2>/dev/null
+  ); then
+    fail 'assert_no_sentinel_leaks accepted a scanner error (unreadable directory)'
+  fi
+  chmod 755 "$case_dir/unreadable"
+  rm -rf "$case_dir/unreadable"
+}
+run_scanner_leak_cases
+
+assert_no_sentinel_leaks "$TEST_SECRET" "$TEST_ROOT"
 
 printf 'PASS: managed local migration orchestration coverage\n'
+
